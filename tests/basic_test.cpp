@@ -1,0 +1,219 @@
+#include "vulkan_vm/vulkan_vm.hpp"
+#include "vulkan_vm/utils.hpp"
+
+#include <iostream>
+#include <vector>
+#include <cassert>
+
+using namespace vvm;
+
+int main() {
+    std::cout << "VulkanVM Basic Test\n";
+    
+    // Create Vulkan instance
+    VkApplicationInfo appInfo{};
+    appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    appInfo.pApplicationName = "VulkanVM Test";
+    appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
+    appInfo.apiVersion = VK_API_VERSION_1_3;
+    
+    std::vector<const char*> extensions = {
+        VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
+        VK_EXT_DEBUG_UTILS_EXTENSION_NAME
+    };
+    
+    VkInstanceCreateInfo instanceInfo{};
+    instanceInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    instanceInfo.pApplicationInfo = &appInfo;
+    instanceInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
+    instanceInfo.ppEnabledExtensionNames = extensions.data();
+    
+    VkInstance instance;
+    VkResult result = vkCreateInstance(&instanceInfo, nullptr, &instance);
+    assert(result == VK_SUCCESS);
+    
+    // Enumerate devices
+    auto devices = enumerateDevices(instance);
+    assert(!devices.empty());
+    
+    std::cout << "Found " << devices.size() << " device(s):\n";
+    for (const auto& dev : devices) {
+        std::cout << "  " << dev.props.deviceName 
+                  << " (vendor: 0x" << std::hex << dev.vendorID << std::dec
+                  << ", type: " << (dev.discrete ? "discrete" : "integrated") << ")\n";
+        
+        printDeviceProperties(dev.device);
+        printMemoryTypes(dev.memProps);
+        printQueueFamilies(dev.device);
+    }
+    
+    // Select best device
+    auto bestDevice = selectBestDevice(devices, true, 1024);  // At least 1GB
+    assert(bestDevice.has_value());
+    
+    std::cout << "\nSelected: " << bestDevice->props.deviceName << "\n";
+    
+    // Check required extensions
+    std::vector<const char*> requiredExts = {
+        VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
+#ifdef VVM_PLATFORM_LINUX
+        VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,  // Linux
+#elif defined(VVM_PLATFORM_WINDOWS)
+        VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,  // Windows
+#endif
+        VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
+        VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
+        VK_EXT_MEMORY_BUDGET_EXTENSION_NAME
+    };
+    
+    bool extsSupported = checkDeviceExtensionSupport(bestDevice->device, requiredExts);
+    std::cout << "Required extensions supported: " << (extsSupported ? "YES" : "NO") << "\n";
+    
+    // Create logical device
+    auto queues = findQueueFamilies(bestDevice->device);
+    
+    float queuePriority = 1.0f;
+    std::vector<VkDeviceQueueCreateInfo> queueInfos;
+    
+    auto addQueue = [&](std::optional<uint32_t> family, const char* name) {
+        if (family) {
+            VkDeviceQueueCreateInfo info{};
+            info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+            info.queueFamilyIndex = *family;
+            info.queueCount = 1;
+            info.pQueuePriorities = &queuePriority;
+            queueInfos.push_back(info);
+            std::cout << "  Queue " << name << ": family " << *family << "\n";
+        }
+    };
+    
+    addQueue(queues.graphics, "graphics");
+    addQueue(queues.compute, "compute");
+    addQueue(queues.transfer, "transfer");
+    
+    VkPhysicalDeviceFeatures2 features2{};
+    features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    
+    VkPhysicalDeviceBufferDeviceAddressFeatures addrFeatures{};
+    addrFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+    addrFeatures.bufferDeviceAddress = VK_TRUE;
+    addrFeatures.pNext = features2.pNext;
+    features2.pNext = &addrFeatures;
+    
+    VkPhysicalDeviceTimelineSemaphoreFeatures tsFeatures{};
+    tsFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
+    tsFeatures.timelineSemaphore = VK_TRUE;
+    tsFeatures.pNext = features2.pNext;
+    features2.pNext = &tsFeatures;
+    
+    VkPhysicalDeviceVulkan12Features v12Features{};
+    v12Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    v12Features.bufferDeviceAddress = VK_TRUE;
+    v12Features.timelineSemaphore = VK_TRUE;
+    v12Features.pNext = features2.pNext;
+    features2.pNext = &v12Features;
+    
+    VkDeviceCreateInfo deviceInfo{};
+    deviceInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    deviceInfo.queueCreateInfoCount = static_cast<uint32_t>(queueInfos.size());
+    deviceInfo.pQueueCreateInfos = queueInfos.data();
+    deviceInfo.pNext = &features2;
+    deviceInfo.enabledExtensionCount = static_cast<uint32_t>(requiredExts.size());
+    deviceInfo.ppEnabledExtensionNames = requiredExts.data();
+    
+    VkDevice device;
+    result = vkCreateDevice(bestDevice->device, &deviceInfo, nullptr, &device);
+    assert(result == VK_SUCCESS);
+    
+    // Get queues
+    VkQueue graphicsQueue, computeQueue, transferQueue;
+    if (queues.graphics) vkGetDeviceQueue(device, *queues.graphics, 0, &graphicsQueue);
+    if (queues.compute) vkGetDeviceQueue(device, *queues.compute, 0, &computeQueue);
+    if (queues.transfer) vkGetDeviceQueue(device, *queues.transfer, 0, &transferQueue);
+    
+    // Configure pool
+    DeviceConfig devConfig;
+    devConfig.physicalDevice = bestDevice->device;
+    devConfig.device = device;
+    devConfig.graphicsQueueFamily = queues.graphics.value_or(0);
+    devConfig.computeQueueFamily = queues.compute.value_or(0);
+    devConfig.transferQueueFamily = queues.transfer.value_or(0);
+    devConfig.graphicsQueue = graphicsQueue;
+    devConfig.computeQueue = computeQueue;
+    devConfig.transferQueue = transferQueue;
+    
+    PoolConfig poolConfig;
+    poolConfig.blockSize = 256 * 1024 * 1024;  // 256MB blocks
+    poolConfig.minAlignment = 256 * 1024;       // 256KB
+    poolConfig.enableHostVisible = true;
+    poolConfig.enableExternal = true;
+    poolConfig.enableDeviceAddress = true;
+    poolConfig.maxBlocks = 8;
+    
+    // Create pool
+    auto pool = UnifiedMemoryPool::create(devConfig, poolConfig);
+    assert(pool.has_value());
+    
+    std::cout << "\nPool created successfully\n";
+    
+    // Test allocations
+    std::cout << "\nTesting allocations...\n";
+    
+    // Allocate tensor buffers
+    auto alloc1 = pool->allocateTensor(64 * 1024 * 1024);  // 64MB
+    assert(alloc1.has_value());
+    std::cout << "  Alloc 1: 64MB at offset " << alloc1->offset 
+              << ", device address: 0x" << std::hex << alloc1->deviceAddress << std::dec << "\n";
+    
+    auto alloc2 = pool->allocateTensor(128 * 1024 * 1024);  // 128MB
+    assert(alloc2.has_value());
+    std::cout << "  Alloc 2: 128MB at offset " << alloc2->offset << "\n";
+    
+    auto alloc3 = pool->allocateTensor(32 * 1024 * 1024);  // 32MB
+    assert(alloc3.has_value());
+    std::cout << "  Alloc 3: 32MB at offset " << alloc3->offset << "\n";
+    
+    // Check stats
+    auto stats = pool->getStats();
+    std::cout << "\nPool Stats:\n";
+    std::cout << "  Total allocated: " << stats.totalAllocated / (1024*1024) << " MB\n";
+    std::cout << "  Total used: " << stats.totalUsed / (1024*1024) << " MB\n";
+    std::cout << "  Total free: " << stats.totalFree / (1024*1024) << " MB\n";
+    std::cout << "  Fragmentation: " << (stats.fragmentationRatio * 100) << "%\n";
+    std::cout << "  Blocks: " << stats.blockCount << "\n";
+    
+    // Test external memory export
+    if (poolConfig.enableExternal) {
+        std::cout << "\nTesting external memory export...\n";
+        auto exportInfo = pool->exportMemory(*alloc1, ExternalHandleType::OpaqueFd);
+        if (exportInfo) {
+            std::cout << "  Export successful, fd: " << exportInfo->fd << "\n";
+            #ifdef VVM_PLATFORM_LINUX
+            close(exportInfo->fd);
+            #endif
+        } else {
+            std::cout << "  Export not supported on this device\n";
+        }
+    }
+    
+    // Test deallocation
+    std::cout << "\nTesting deallocation...\n";
+    pool->deallocate(std::move(*alloc2));
+    
+    stats = pool->getStats();
+    std::cout << "  After dealloc: used=" << stats.totalUsed / (1024*1024) 
+              << " MB, free=" << stats.totalFree / (1024*1024) << " MB\n";
+    
+    // Cleanup
+    pool->deallocate(std::move(*alloc1));
+    pool->deallocate(std::move(*alloc3));
+    
+    // Destroy pool before device (pool owns Vulkan objects tied to the device)
+    pool.reset();
+    
+    vkDestroyDevice(device, nullptr);
+    vkDestroyInstance(instance, nullptr);
+    
+    std::cout << "\nAll tests passed!\n";
+    return 0;
+}

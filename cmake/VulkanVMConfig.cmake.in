@@ -1,0 +1,10 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Vulkan REQUIRED)
+
+if(NOT TARGET vulkan_vm)
+    include("${CMAKE_CURRENT_LIST_DIR}/VulkanVMTargets.cmake")
+endif()
+
+# Imported targets: vulkan_vm

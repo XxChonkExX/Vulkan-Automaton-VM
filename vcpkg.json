@@ -1,0 +1,21 @@
+{
+  "name": "vulkan-automaton-vm",
+  "version": "0.1.0",
+  "description": "Unified Vulkan Memory Pool for cross-vendor GPU computing",
+  "homepage": "https://github.com/XxChonkExX/Vulkan-Automaton-VM",
+  "license": "MIT",
+  "dependencies": [
+    "vulkan-headers",
+    "vulkan-loader",
+    "volk"
+  ],
+  "features": {
+    "tests": {
+      "description": "Build tests",
+      "dependencies": [
+        "gtest"
+      ]
+    }
+  },
+  "builtin-baseline": "2024.01.15"
+}

@@ -1,0 +1,72 @@
+# Build directories
+build/
+build-*/
+*.build/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+*.cmake
+
+# IDE
+.vscode/
+.idea/
+*.sln
+*.vcxproj*
+*.vcxproj.filters
+*.vcxproj.user
+*.suo
+
+# Compiled objects
+*.o
+*.obj
+*.lib
+*.dll
+*.so
+*.dylib
+*.a
+*.exe
+*.exp
+*.ilk
+*.pdb
+*.pch
+*.ipch
+
+# Output
+bin/
+lib/
+include/vulkan_vm/*.hpp.gch
+
+# Test output
+Testing/
+test-results.xml
+*.gcno
+*.gcda
+*.gcov
+
+# Logs
+*.log
+*.out
+
+# Temporary files
+*.tmp
+*.temp
+*~
+.DS_Store
+Thumbs.db
+
+# Package
+*.tar.gz
+*.zip
+*.tgz
+
+# Vulkan
+*.spv
+*.spvasm
+
+# Profiling
+*.trace
+*.perf
+*.vtune
