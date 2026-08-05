@@ -61,10 +61,27 @@ int BuddyAllocator::getLevelForSize(VkDeviceSize size) const {
 }
 
 BuddyNode* BuddyAllocator::findFree(BuddyNode* node, VkDeviceSize size) {
-    if (!node || !node->free || node->size < size) return nullptr;
-    if (node->level == maxLevel_ || node->size / 2 < size) return node;
+    if (!node || node->size < size) return nullptr;
     
-    if (!node->left) split(node);
+    // If node has children, we must search them (node is not a leaf)
+    if (node->left) {
+        if (!node->left) split(node);
+        
+        BuddyNode* result = findFree(node->left, size);
+        if (!result) result = findFree(node->right, size);
+        return result;
+    }
+    
+    // Node is a leaf
+    if (!node->free) return nullptr;
+    
+    // Leaf is free and size fits
+    if (node->size / 2 < size) {
+        return node;
+    }
+    
+    // Need to split to get smaller blocks
+    split(node);
     
     BuddyNode* result = findFree(node->left, size);
     if (!result) result = findFree(node->right, size);
@@ -79,6 +96,11 @@ void BuddyAllocator::split(BuddyNode* node) {
     node->right = createNode(node->offset + halfSize, halfSize, node->level + 1);
     node->left->parent = node;
     node->right->parent = node;
+    
+    // Parent is no longer a leaf - it's not "free" as a whole anymore
+    // (even if both children are free, the parent represents a region that
+    // can be split, so we don't consider it "free" as a single allocation)
+    node->free = false;
 }
 
 BuddyNode* BuddyAllocator::getBuddy(BuddyNode* node) {
@@ -93,12 +115,18 @@ void BuddyAllocator::merge(BuddyNode* node) {
         if (!buddy || !buddy->free) break;
         
         // Both free, merge
-        node->parent->free = true;
-        destroyNode(node->parent->left);
-        destroyNode(node->parent->right);
-        node->parent->left = nullptr;
-        node->parent->right = nullptr;
-        node = node->parent;
+        // Save parent before destroying children
+        BuddyNode* parent = node->parent;
+        
+        // Destroy the children
+        destroyNode(parent->left);
+        destroyNode(parent->right);
+        parent->left = nullptr;
+        parent->right = nullptr;
+        
+        // Parent is now a free leaf
+        parent->free = true;
+        node = parent;
     }
 }
 
@@ -106,16 +134,14 @@ std::optional<VkDeviceSize> BuddyAllocator::allocate(VkDeviceSize size) {
     BuddyNode* node = findFree(root_, size);
     if (!node) return std::nullopt;
     
-    node->free = false;
-    allocatedNodes_[node->offset] = {node, size};
-    
     // Split if larger than needed (but not below minSize)
     while (node->level < maxLevel_ && node->size / 2 >= size) {
         split(node);
         node = node->left;  // Use left child
-        node->free = false;
-        allocatedNodes_[node->offset] = {node, size};
     }
+    
+    node->free = false;
+    allocatedNodes_[node->offset] = {node, size};
     
     return node->offset;
 }

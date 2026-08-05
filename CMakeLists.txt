@@ -61,7 +61,6 @@ add_library(vulkan_vm
     src/cross_gpu/external_memory.cpp
     src/cross_gpu/multi_gpu_manager.cpp
     src/offload/host_shadow.cpp
-    src/offload/migration.cpp
     src/utils/vulkan_utils.cpp
     src/utils/error_handling.cpp
 )

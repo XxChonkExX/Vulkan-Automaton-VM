@@ -229,15 +229,19 @@ int main() {
     // 10. Demonstrate offload (swap to host)
     try {
         OffloadConfig offloadConfig;
-        offloadConfig.hostShadowSize = 2 * 1024 * 1024 * 1024;  // 2GB
+        offloadConfig.hostShadowSize = 2ull * 1024 * 1024 * 1024;  // 2GB
         offloadConfig.useMadvise = true;
         offloadConfig.useMprotect = true;
         offloadConfig.transferQueue = transferQueue;
         offloadConfig.transferQueueFamily = queues.transfer.value_or(queues.compute.value());
         
+        VVM_LOG_INFO("Creating OffloadManager with transferQueue=%p, queueFamily=%u", 
+                     transferQueue, queues.transfer.value_or(queues.compute.value()));
+        
         OffloadManager offloadManager(&*pool, offloadConfig);
         
         std::cout << "\nOffloading temp buffer to host...\n";
+        VVM_LOG_INFO("Calling offloadSync on tensor[3] (size=%llu MB)", tensors[3].size / (1024*1024));
         bool offloaded = offloadManager.offloadSync(tensors[3].alloc);
         if (offloaded) {
             std::cout << "  Offloaded " << (tensors[3].size / (1024*1024)) << " MB to host\n";

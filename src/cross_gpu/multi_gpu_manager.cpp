@@ -1,4 +1,5 @@
 #include "vulkan_vm/vulkan_vm.hpp"
+#include "vulkan_vm/buddy_allocator.hpp"
 #include "vulkan_vm/utils.hpp"
 #include "external_memory.hpp"
 

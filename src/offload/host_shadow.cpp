@@ -5,6 +5,10 @@
 #include <algorithm>
 #include <cstring>
 
+#ifdef VVM_PLATFORM_WINDOWS
+#include <windows.h>
+#endif
+
 #ifdef VVM_PLATFORM_LINUX
 #include <sys/mman.h>
 #include <unistd.h>
@@ -19,15 +23,35 @@ namespace vvm {
 
 HostShadowManager::HostShadowManager(VkPhysicalDevice physicalDevice, VkDevice device, const OffloadConfig& config)
     : physicalDevice_(physicalDevice), device_(device), config_(config) {
+    char logPath[MAX_PATH];
+    DWORD tempPathLen = GetTempPathA(MAX_PATH, logPath);
+    if (tempPathLen == 0 || tempPathLen >= MAX_PATH) {
+        strcpy_s(logPath, MAX_PATH, "C:\\temp\\");
+    }
+    strcat_s(logPath, MAX_PATH, "debug_host_shadow.log");
+    FILE* f = fopen(logPath, "a");
+    if (f) { fprintf(f, "=== HostShadowManager constructor START ===\n"); fclose(f); }
+    else {
+        // Try current directory
+        FILE* f2 = fopen("debug_host_shadow.log", "a");
+        if (f2) { fprintf(f2, "=== HostShadowManager constructor START (fallback) ===\n"); fclose(f2); }
+    }
+    VVM_LOG_INFO("HostShadowManager constructor: physicalDevice=%p, device=%p, hostShadowSize=%llu", 
+                 physicalDevice, device, config.hostShadowSize);
     createShadowBuffer();
+    VVM_LOG_INFO("createShadowBuffer completed, buffer=%p", shadowBuffer_.buffer);
+    fflush(stderr);
     
-    // Create command pool for copy operations
+    // Create command pool for copy operations using the transfer queue family
     VkCommandPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | 
                      VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    poolInfo.queueFamilyIndex = 0;  // Would be transfer queue family
-    vkCreateCommandPool(device_, &poolInfo, nullptr, &cmdPool_);
+    poolInfo.queueFamilyIndex = config.transferQueueFamily;  // Use the configured transfer queue family
+    VkResult res = vkCreateCommandPool(device_, &poolInfo, nullptr, &cmdPool_);
+    if (res != VK_SUCCESS) {
+        VVM_LOG_ERROR("Failed to create HostShadowManager command pool: %s", vkResultToString(res).c_str());
+    }
 }
 
 HostShadowManager::~HostShadowManager() {
@@ -38,6 +62,7 @@ HostShadowManager::~HostShadowManager() {
 }
 
 bool HostShadowManager::createShadowBuffer() {
+    VVM_LOG_INFO("createShadowBuffer: allocating buffer of size %llu", config_.hostShadowSize);
     VkBufferCreateInfo bufferInfo{};
     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bufferInfo.size = config_.hostShadowSize;
@@ -45,12 +70,17 @@ bool HostShadowManager::createShadowBuffer() {
                        VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     
-    if (vkCreateBuffer(device_, &bufferInfo, nullptr, &shadowBuffer_.buffer) != VK_SUCCESS) {
+    VkResult res = vkCreateBuffer(device_, &bufferInfo, nullptr, &shadowBuffer_.buffer);
+    if (res != VK_SUCCESS) {
+        VVM_LOG_ERROR("Failed to create shadow buffer: %s", vkResultToString(res).c_str());
         return false;
     }
+    VVM_LOG_INFO("Shadow buffer created: %p", shadowBuffer_.buffer);
     
     VkMemoryRequirements memReq;
     vkGetBufferMemoryRequirements(device_, shadowBuffer_.buffer, &memReq);
+    VVM_LOG_INFO("Memory requirements: size=%llu, alignment=%llu, memoryTypeBits=%u", 
+                 memReq.size, memReq.alignment, memReq.memoryTypeBits);
     
     // Find HOST_VISIBLE | HOST_COHERENT memory
     VkPhysicalDeviceMemoryProperties memProps;
@@ -68,9 +98,11 @@ bool HostShadowManager::createShadowBuffer() {
     }
     
     if (memTypeIndex == UINT32_MAX) {
+        VVM_LOG_ERROR("No HOST_VISIBLE|HOST_COHERENT memory type found");
         vkDestroyBuffer(device_, shadowBuffer_.buffer, nullptr);
         return false;
     }
+    VVM_LOG_INFO("Found memory type index %u", memTypeIndex);
     
     VkMemoryAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -78,17 +110,27 @@ bool HostShadowManager::createShadowBuffer() {
     allocInfo.memoryTypeIndex = memTypeIndex;
     
     if (vkAllocateMemory(device_, &allocInfo, nullptr, &shadowBuffer_.memory) != VK_SUCCESS) {
+        VVM_LOG_ERROR("Failed to allocate memory for shadow buffer");
         vkDestroyBuffer(device_, shadowBuffer_.buffer, nullptr);
         return false;
     }
+    VVM_LOG_INFO("Shadow memory allocated: %p", shadowBuffer_.memory);
     
-    if (vkBindBufferMemory(device_, shadowBuffer_.buffer, shadowBuffer_.memory, 0) != VK_SUCCESS) {
+    VkResult bindRes = vkBindBufferMemory(device_, shadowBuffer_.buffer, shadowBuffer_.memory, 0);
+    if (bindRes != VK_SUCCESS) {
+        VVM_LOG_ERROR("Failed to bind buffer memory: %s", vkResultToString(bindRes).c_str());
         vkFreeMemory(device_, shadowBuffer_.memory, nullptr);
         vkDestroyBuffer(device_, shadowBuffer_.buffer, nullptr);
         return false;
     }
+    VVM_LOG_INFO("Buffer memory bound successfully");
     
-    vkMapMemory(device_, shadowBuffer_.memory, 0, VK_WHOLE_SIZE, 0, &shadowBuffer_.mappedPtr);
+    VkResult mapRes = vkMapMemory(device_, shadowBuffer_.memory, 0, VK_WHOLE_SIZE, 0, &shadowBuffer_.mappedPtr);
+    if (mapRes != VK_SUCCESS) {
+        VVM_LOG_ERROR("Failed to map shadow memory: %s", vkResultToString(mapRes).c_str());
+        return false;
+    }
+    VVM_LOG_INFO("Shadow memory mapped at %p", shadowBuffer_.mappedPtr);
     shadowBuffer_.size = memReq.size;
     shadowBuffer_.freeRanges.emplace_back(0, memReq.size);
     
@@ -293,27 +335,50 @@ void MigrationEngine::releaseContext(MigrationContext* ctx) {
 }
 
 void MigrationEngine::submitCopy(MigrationContext* ctx, const MigrationRequest& req) {
+    VVM_LOG_INFO("submitCopy: ctx=%p, toHost=%d, size=%llu, deviceBuf=%p, hostBuf=%p, srcOffset=%llu, dstOffset=%llu", 
+                 ctx, req.toHost, req.size, req.allocation->buffer, req.hostShadowBuffer, req.srcOffset, req.dstOffset);
+    
+    if (!req.allocation || !req.allocation->buffer) {
+        VVM_LOG_ERROR("Device allocation buffer is NULL!");
+        return;
+    }
+    if (!req.hostShadowBuffer) {
+        VVM_LOG_ERROR("Host shadow buffer is NULL!");
+        return;
+    }
+    
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(ctx->cmdBuffer, &beginInfo);
+    VkResult res = vkBeginCommandBuffer(ctx->cmdBuffer, &beginInfo);
+    if (res != VK_SUCCESS) {
+        VVM_LOG_ERROR("vkBeginCommandBuffer failed: %s", vkResultToString(res).c_str());
+        return;
+    }
     
     VkBufferCopy copyRegion{};
     copyRegion.srcOffset = req.srcOffset;
     copyRegion.dstOffset = req.dstOffset;
     copyRegion.size = req.size;
     
+    VkBuffer deviceBuf = req.allocation->buffer;
+    VkBuffer hostBuf = req.hostShadowBuffer;
+    
     if (req.toHost) {
         // Device -> Host: src is allocation buffer, dst is shadow buffer
-        vkCmdCopyBuffer(ctx->cmdBuffer, req.allocation->buffer, 
-                       req.allocation->buffer, 1, &copyRegion);  // Simplified
+        VVM_LOG_INFO("Copying device->host: src=%p, dst=%p, size=%llu", deviceBuf, hostBuf, req.size);
+        vkCmdCopyBuffer(ctx->cmdBuffer, deviceBuf, hostBuf, 1, &copyRegion);
     } else {
         // Host -> Device: src is shadow buffer, dst is allocation buffer
-        vkCmdCopyBuffer(ctx->cmdBuffer, req.allocation->buffer,
-                       req.allocation->buffer, 1, &copyRegion);  // Simplified
+        VVM_LOG_INFO("Copying host->device: src=%p, dst=%p, size=%llu", hostBuf, deviceBuf, req.size);
+        vkCmdCopyBuffer(ctx->cmdBuffer, hostBuf, deviceBuf, 1, &copyRegion);
     }
     
-    vkEndCommandBuffer(ctx->cmdBuffer);
+    VkResult endRes = vkEndCommandBuffer(ctx->cmdBuffer);
+    if (endRes != VK_SUCCESS) {
+        VVM_LOG_ERROR("vkEndCommandBuffer failed: %s", vkResultToString(endRes).c_str());
+        return;
+    }
     
     // Submit with timeline semaphore
     timelineValue_++;
@@ -344,7 +409,12 @@ void MigrationEngine::submitCopy(MigrationContext* ctx, const MigrationRequest& 
         // Would need array for multiple semaphores
     }
     
-    vkQueueSubmit(transferQueue_, 1, &submitInfo, ctx->fence);
+    VkResult queueRes = vkQueueSubmit(transferQueue_, 1, &submitInfo, ctx->fence);
+    if (queueRes != VK_SUCCESS) {
+        VVM_LOG_ERROR("vkQueueSubmit failed: %s", vkResultToString(queueRes).c_str());
+    } else {
+        VVM_LOG_INFO("vkQueueSubmit succeeded, fence=%p", ctx->fence);
+    }
 }
 
 std::optional<MigrationOperation> MigrationEngine::submitMigration(const MigrationRequest& req) {
@@ -401,15 +471,45 @@ uint32_t MigrationEngine::getPendingCount() const {
 
 OffloadManager::OffloadManager(UnifiedMemoryPool* pool, const OffloadConfig& config)
     : pool_(pool), config_(config) {
-    shadowManager_ = std::make_unique<HostShadowManager>(
-        pool->getPhysicalDevice(),
-        pool->getDevice(), config);
+    char logPath[MAX_PATH];
+    DWORD tempPathLen = GetTempPathA(MAX_PATH, logPath);
+    if (tempPathLen == 0 || tempPathLen >= MAX_PATH) {
+        strcpy_s(logPath, MAX_PATH, "C:\\temp\\");
+    }
+    strcat_s(logPath, MAX_PATH, "debug_offload.log");
+    FILE* f = fopen(logPath, "a");
+    if (!f) {
+        f = fopen("debug_offload.log", "a");
+    }
+    if (f) { fprintf(f, "=== OffloadManager constructor START ===\n"); fclose(f); }
+    VVM_LOG_INFO("OffloadManager constructor: pool=%p, transferQueue=%p, transferQueueFamily=%u", 
+                 pool, config.transferQueue, config.transferQueueFamily);
+    fflush(stderr);
+    
+    try {
+        shadowManager_ = std::make_unique<HostShadowManager>(
+            pool->getPhysicalDevice(),
+            pool->getDevice(), config);
+        VVM_LOG_INFO("HostShadowManager created, buffer=%p, size=%llu", 
+                     shadowManager_->getBuffer(), shadowManager_->getSize());
+    } catch (const std::exception& e) {
+        VVM_LOG_ERROR("Exception creating HostShadowManager: %s", e.what());
+        throw;
+    } catch (...) {
+        VVM_LOG_ERROR("Unknown exception creating HostShadowManager");
+        throw;
+    }
     
     VkQueue transferQueue = config.transferQueue;
     uint32_t transferQueueFamily = config.transferQueueFamily;
     
+    VVM_LOG_INFO("Creating MigrationEngine with transferQueue=%p, queueFamily=%u", 
+                 transferQueue, transferQueueFamily);
+    fflush(stderr);
+    
     migrationEngine_ = std::make_unique<MigrationEngine>(
         pool->getDevice(), transferQueue, transferQueueFamily, 4);
+    VVM_LOG_INFO("MigrationEngine created");
 }
 
 OffloadManager::~OffloadManager() {
@@ -417,9 +517,17 @@ OffloadManager::~OffloadManager() {
 }
 
 std::optional<MigrationOperation> OffloadManager::offload(Allocation& alloc) {
+    VVM_LOG_INFO("offload: alloc=%p, size=%llu, offset=%llu", 
+                  &alloc, alloc.size, alloc.offset);
+    
     // Allocate region in host shadow
     auto shadowOffset = shadowManager_->allocateRegion(alloc.size);
-    if (!shadowOffset) return std::nullopt;
+    if (!shadowOffset) {
+        VVM_LOG_ERROR("Failed to allocate shadow region for offload (size=%llu)", alloc.size);
+        return std::nullopt;
+    }
+    
+    VVM_LOG_INFO("Allocated shadow region at offset %llu for size %llu", *shadowOffset, alloc.size);
     
     // Protect region (optional, for page fault detection)
     if (config_.useMprotect) {
@@ -433,15 +541,22 @@ std::optional<MigrationOperation> OffloadManager::offload(Allocation& alloc) {
     req.dstOffset = *shadowOffset;
     req.size = alloc.size;
     req.toHost = true;
+    req.hostShadowBuffer = shadowManager_->getBuffer();
+    
+    VVM_LOG_INFO("Submitting migration to host: srcOffset=%llu, dstOffset=%llu, size=%llu, hostShadowBuffer=%p", 
+                  alloc.offset, *shadowOffset, alloc.size, shadowManager_->getBuffer());
     
     auto op = migrationEngine_->submitMigration(req);
     if (op) {
+        VVM_LOG_INFO("Migration submitted successfully, op=%p", &*op);
         // Mark allocation as offloaded
         alloc.hostPtr = shadowManager_->mapRegion(*shadowOffset, alloc.size);
         
         std::lock_guard<std::mutex> lock(statsMutex_);
         stats_.bytesOffloaded += alloc.size;
         stats_.activeMigrations++;
+    } else {
+        VVM_LOG_ERROR("MigrationEngine::submitMigration returned nullopt");
     }
     
     return op;
@@ -463,6 +578,7 @@ std::optional<MigrationOperation> OffloadManager::reload(Allocation& alloc) {
     req.dstOffset = alloc.offset;
     req.size = alloc.size;
     req.toHost = false;
+    req.hostShadowBuffer = shadowManager_->getBuffer();
     
     auto op = migrationEngine_->submitMigration(req);
     if (op) {
@@ -477,8 +593,14 @@ std::optional<MigrationOperation> OffloadManager::reload(Allocation& alloc) {
 }
 
 bool OffloadManager::offloadSync(Allocation& alloc, uint64_t timeoutNs) {
+    VVM_LOG_DEBUG("offloadSync called: alloc=%p, size=%llu, timeout=%llu", 
+                  &alloc, alloc.size, timeoutNs);
+    
     auto op = offload(alloc);
-    if (!op) return false;
+    if (!op) {
+        VVM_LOG_ERROR("offload returned nullopt");
+        return false;
+    }
     
     VkResult res = vkWaitForFences(pool_->getDevice(), 1, &op->completionFence, 
                                    VK_TRUE, timeoutNs);
@@ -487,8 +609,11 @@ bool OffloadManager::offloadSync(Allocation& alloc, uint64_t timeoutNs) {
         std::lock_guard<std::mutex> lock(statsMutex_);
         stats_.activeMigrations--;
         stats_.completedMigrations++;
+        stats_.bytesOffloaded += alloc.size;
         return true;
     }
+    
+    VVM_LOG_ERROR("vkWaitForFences failed: %s", vkResultToString(res).c_str());
     return false;
 }
 

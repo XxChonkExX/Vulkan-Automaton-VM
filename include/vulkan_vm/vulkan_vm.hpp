@@ -19,6 +19,8 @@
 #include <span>
 #include <memory>
 
+#include "vulkan_vm/buddy_allocator.hpp"
+
 namespace vvm {
 
 // ============================================================================
@@ -76,7 +78,8 @@ struct BlockInfo {
 #ifdef VVM_PLATFORM_WINDOWS
     HANDLE exportHandle = nullptr;  // Windows external handle
 #endif
-    std::vector<std::pair<VkDeviceSize, VkDeviceSize>> freeRanges;  // {offset, size}
+    // Buddy allocator for this block (replaces freeRanges)
+    std::unique_ptr<class BuddyAllocator> buddy;
     VkMemoryPropertyFlags memoryFlags = 0;
     bool isHostVisible = false;
     bool isCoherent = false;
@@ -134,6 +137,9 @@ struct MigrationOperation {
     VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkPipelineStageFlags signalStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
 };
+
+// Forward declaration
+class OffloadManager;
 
 // ============================================================================
 // Statistics
@@ -219,8 +225,8 @@ private:
     std::optional<uint32_t> findMemoryType(VkMemoryPropertyFlags required,
                                            VkMemoryPropertyFlags preferred);
     std::optional<VkDeviceMemory> allocateBlock(VkDeviceSize size,
-                                                uint32_t memoryTypeIndex,
-                                                bool exportable);
+                                                 uint32_t memoryTypeIndex,
+                                                 bool exportable);
     std::optional<Allocation> subAllocate(VkDeviceSize size,
                                           VkDeviceSize alignment,
                                           uint32_t blockIndex);
@@ -228,12 +234,7 @@ private:
     
     // Buddy allocator helpers
     VkDeviceSize alignUp(VkDeviceSize value, VkDeviceSize alignment);
-    std::pair<VkDeviceSize, VkDeviceSize> findFreeRange(uint32_t blockIndex,
-                                                         VkDeviceSize size,
-                                                         VkDeviceSize alignment);
-    void addFreeRange(uint32_t blockIndex, VkDeviceSize offset, VkDeviceSize size);
-    void mergeFreeRanges(uint32_t blockIndex);
-
+    
     DeviceConfig deviceConfig_;
     PoolConfig config_;
     VkDevice device_ = VK_NULL_HANDLE;
@@ -241,6 +242,9 @@ private:
     uint32_t deviceLocalMemoryType_ = UINT32_MAX;
     uint32_t hostVisibleMemoryType_ = UINT32_MAX;
     VkCommandPool transferCmdPool_ = VK_NULL_HANDLE;
+    
+    // Offload manager for host swap
+    std::unique_ptr<OffloadManager> offloadManager_;
 };
 
 // ============================================================================

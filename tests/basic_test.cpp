@@ -1,5 +1,6 @@
 #include "vulkan_vm/vulkan_vm.hpp"
 #include "vulkan_vm/utils.hpp"
+#include "vulkan_vm/buddy_allocator.hpp"
 
 #include <iostream>
 #include <vector>
@@ -7,8 +8,64 @@
 
 using namespace vvm;
 
+using namespace vvm;
+
+void testBuddyAllocator() {
+    std::cout << "Testing BuddyAllocator..." << std::endl;
+    
+    // Test basic allocation/deallocation
+    BuddyAllocator allocator(256 * 1024 * 1024, 256 * 1024); // 256MB block, 256KB min
+    
+    // Allocate 64MB
+    auto offset1 = allocator.allocate(64 * 1024 * 1024);
+    if (!offset1.has_value() || *offset1 != 0) {
+        std::cerr << "FAIL: First allocation should be at offset 0, got " << (offset1.has_value() ? std::to_string(*offset1) : "none") << std::endl;
+        return;
+    }
+    std::cout << "  Allocated 64MB at offset " << *offset1 << std::endl;
+    
+    // Allocate 128MB - should be at offset 128MB (right half of block)
+    // because left 128MB is partially used by first allocation
+    auto offset2 = allocator.allocate(128 * 1024 * 1024);
+    if (!offset2.has_value() || *offset2 != 128 * 1024 * 1024) {
+        std::cerr << "FAIL: Second allocation should be at offset 128MB, got " << (offset2.has_value() ? std::to_string(*offset2) : "none") << std::endl;
+        return;
+    }
+    std::cout << "  Allocated 128MB at offset " << *offset2 << std::endl;
+    
+    // Allocate 32MB - should fit in the free 64MB slot at offset 64MB
+    auto offset3 = allocator.allocate(32 * 1024 * 1024);
+    if (!offset3.has_value() || *offset3 != 64 * 1024 * 1024) {
+        std::cerr << "FAIL: Third allocation should be at offset 64MB, got " << (offset3.has_value() ? std::to_string(*offset3) : "none") << std::endl;
+        return;
+    }
+    std::cout << "  Allocated 32MB at offset " << *offset3 << std::endl;
+    
+    // Check largest free
+    std::cout << "  Largest free: " << allocator.getLargestFree() / (1024*1024) << " MB" << std::endl;
+    
+    // Deallocate middle (the 128MB allocation)
+    allocator.deallocate(*offset2, 128 * 1024 * 1024);
+    std::cout << "  Deallocated 128MB" << std::endl;
+    
+    // Check largest free after merge - should be 128MB again
+    std::cout << "  Largest free after dealloc: " << allocator.getLargestFree() / (1024*1024) << " MB" << std::endl;
+    
+    // Allocate again - should get the 128MB slot back
+    auto offset4 = allocator.allocate(128 * 1024 * 1024);
+    if (!offset4.has_value() || *offset4 != 128 * 1024 * 1024) {
+        std::cerr << "FAIL: Fourth allocation should be at offset 128MB, got " << (offset4.has_value() ? std::to_string(*offset4) : "none") << std::endl;
+        return;
+    }
+    std::cout << "  Allocated 128MB at offset " << *offset4 << std::endl;
+    
+    std::cout << "BuddyAllocator test passed!" << std::endl;
+}
+
 int main() {
-    std::cout << "VulkanVM Basic Test\n";
+    testBuddyAllocator();
+    
+    // ... rest of main
     
     // Create Vulkan instance
     VkApplicationInfo appInfo{};

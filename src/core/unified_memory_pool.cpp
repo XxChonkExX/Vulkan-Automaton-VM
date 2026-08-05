@@ -1,5 +1,5 @@
 #include "vulkan_vm/vulkan_vm.hpp"
-#include "vulkan_vm/allocator.hpp"
+#include "vulkan_vm/buddy_allocator.hpp"
 #include "vulkan_vm/utils.hpp"
 
 #include <algorithm>
@@ -139,6 +139,22 @@ bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig&
         return false;
     }
     
+    // Create OffloadManager if offload is enabled
+    if (config_.enableHostVisible) {
+        OffloadConfig offloadConfig;
+        offloadConfig.hostShadowSize = config_.blockSize * 4;  // Default to 4x block size
+        offloadConfig.useMadvise = true;
+        offloadConfig.useMprotect = true;
+        offloadConfig.transferQueue = deviceConfig_.transferQueue;
+        offloadConfig.transferQueueFamily = deviceConfig_.transferQueueFamily != UINT32_MAX 
+            ? deviceConfig_.transferQueueFamily 
+            : deviceConfig_.graphicsQueueFamily;
+        
+        offloadManager_ = std::make_unique<OffloadManager>(this, offloadConfig);
+        VVM_LOG_INFO("OffloadManager created with host shadow size: %llu MB", 
+                     offloadConfig.hostShadowSize / (1024*1024));
+    }
+    
     VVM_LOG_INFO("UnifiedMemoryPool initialized successfully (blockSize=%llu MB, alignment=%llu KB)",
                  config_.blockSize / (1024*1024), config_.minAlignment / 1024);
     return true;
@@ -228,10 +244,12 @@ std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
     block.size = size;
     block.used = 0;
     block.hostPtr = hostPtr;
-    block.freeRanges.emplace_back(0, size);
     block.memoryFlags = memFlags;
     block.isHostVisible = isHostVisible;
     block.isCoherent = isCoherent;
+    
+    // Create buddy allocator for this block
+    block.buddy = std::make_unique<BuddyAllocator>(size, config_.minAlignment);
     
     // Export handle if requested
     if (exportable && config_.enableExternal) {
@@ -276,15 +294,14 @@ std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
 }
 
 std::optional<Allocation> UnifiedMemoryPool::allocate(VkDeviceSize size,
-                                                       VkBufferUsageFlags usage,
-                                                       VkMemoryPropertyFlags flags) {
+                                                        VkBufferUsageFlags usage,
+                                                        VkMemoryPropertyFlags flags) {
     // Align size
     size = alignUp(size, config_.minAlignment);
     
-    // Try existing blocks first
+    // Try existing blocks first - check buddy allocator
     for (uint32_t i = 0; i < blocks_.size(); ++i) {
-        auto range = findFreeRange(i, size, config_.minAlignment);
-        if (range.first != UINT64_MAX) {
+        if (blocks_[i].buddy && blocks_[i].buddy->getLargestFree() >= size) {
             return subAllocate(size, config_.minAlignment, i);
         }
     }
@@ -475,13 +492,19 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
 }
 
 std::optional<MigrationOperation> UnifiedMemoryPool::offloadToHost(Allocation& alloc) {
-    // TODO: Implement in migration.cpp
-    return std::nullopt;
+    if (!offloadManager_) {
+        VVM_LOG_WARN("offloadToHost called but OffloadManager not initialized");
+        return std::nullopt;
+    }
+    return offloadManager_->offload(alloc);
 }
 
 std::optional<MigrationOperation> UnifiedMemoryPool::reloadToDevice(Allocation& alloc) {
-    // TODO: Implement in migration.cpp
-    return std::nullopt;
+    if (!offloadManager_) {
+        VVM_LOG_WARN("reloadToDevice called but OffloadManager not initialized");
+        return std::nullopt;
+    }
+    return offloadManager_->reload(alloc);
 }
 
 void UnifiedMemoryPool::waitMigration(const MigrationOperation& op) {
@@ -499,8 +522,8 @@ PoolStats UnifiedMemoryPool::getStats() const {
         stats.totalFree += (block.size - block.used);
         stats.blockCount++;
         
-        for (const auto& range : block.freeRanges) {
-            stats.largestFreeBlock = std::max(stats.largestFreeBlock, range.second);
+        if (block.buddy) {
+            stats.largestFreeBlock = std::max(stats.largestFreeBlock, block.buddy->getLargestFree());
         }
     }
     
@@ -553,11 +576,22 @@ void UnifiedMemoryPool::trim() {
 std::optional<Allocation> UnifiedMemoryPool::subAllocate(VkDeviceSize size,
                                                           VkDeviceSize alignment,
                                                           uint32_t blockIndex) {
-    auto range = findFreeRange(blockIndex, size, alignment);
-    if (range.first == UINT64_MAX) return std::nullopt;
+    auto& block = blocks_[blockIndex];
+    if (!block.buddy) {
+        VVM_LOG_ERROR("Block %u has no buddy allocator", blockIndex);
+        return std::nullopt;
+    }
     
-    VkDeviceSize offset = range.first;
-    const auto& block = blocks_[blockIndex];
+    // Align size
+    size = alignUp(size, alignment);
+    
+    // Allocate from buddy allocator
+    auto offsetOpt = block.buddy->allocate(size);
+    if (!offsetOpt) {
+        return std::nullopt;
+    }
+    
+    VkDeviceSize offset = *offsetOpt;
     
     // Create buffer with external memory support if needed
     VkBufferCreateInfo bufferInfo{};
@@ -588,6 +622,7 @@ std::optional<Allocation> UnifiedMemoryPool::subAllocate(VkDeviceSize size,
     VkResult result = vkCreateBuffer(device_, &bufferInfo, nullptr, &buffer);
     if (result != VK_SUCCESS) {
         VVM_LOG_ERROR("vkCreateBuffer failed: %s", vkResultToString(result).c_str());
+        block.buddy->deallocate(offset, size);
         return std::nullopt;
     }
     
@@ -605,19 +640,11 @@ std::optional<Allocation> UnifiedMemoryPool::subAllocate(VkDeviceSize size,
     if (result != VK_SUCCESS) {
         VVM_LOG_ERROR("vkBindBufferMemory2 failed: %s", vkResultToString(result).c_str());
         vkDestroyBuffer(device_, buffer, nullptr);
+        block.buddy->deallocate(offset, size);
         return std::nullopt;
     }
     
-    // Update free ranges
-    blocks_[blockIndex].freeRanges.erase(
-        std::find(blocks_[blockIndex].freeRanges.begin(), 
-                  blocks_[blockIndex].freeRanges.end(), range));
-    
-    if (range.second > size) {
-        addFreeRange(blockIndex, offset + size, range.second - size);
-    }
-    
-    blocks_[blockIndex].used += size;
+    block.used += size;
     
     Allocation alloc;
     alloc.buffer = buffer;
@@ -648,54 +675,15 @@ void UnifiedMemoryPool::subDeallocate(Allocation&& alloc) {
     
     vkDestroyBuffer(device_, alloc.buffer, nullptr);
     
-    addFreeRange(alloc.blockIndex, alloc.offset, alloc.size);
-    mergeFreeRanges(alloc.blockIndex);
-    blocks_[alloc.blockIndex].used -= alloc.size;
+    auto& block = blocks_[alloc.blockIndex];
+    if (block.buddy) {
+        block.buddy->deallocate(alloc.offset, alloc.size);
+    }
+    block.used -= alloc.size;
 }
 
 VkDeviceSize UnifiedMemoryPool::alignUp(VkDeviceSize value, VkDeviceSize alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
-}
-
-std::pair<VkDeviceSize, VkDeviceSize> UnifiedMemoryPool::findFreeRange(
-    uint32_t blockIndex, VkDeviceSize size, VkDeviceSize alignment) {
-    
-    auto& ranges = blocks_[blockIndex].freeRanges;
-    for (auto it = ranges.begin(); it != ranges.end(); ++it) {
-        VkDeviceSize alignedOffset = alignUp(it->first, alignment);
-        VkDeviceSize available = it->second - (alignedOffset - it->first);
-        
-        if (available >= size) {
-            return {alignedOffset, available};
-        }
-    }
-    return {UINT64_MAX, 0};
-}
-
-void UnifiedMemoryPool::addFreeRange(uint32_t blockIndex, VkDeviceSize offset, VkDeviceSize size) {
-    blocks_[blockIndex].freeRanges.emplace_back(offset, size);
-    // Keep sorted by offset
-    std::sort(blocks_[blockIndex].freeRanges.begin(), 
-              blocks_[blockIndex].freeRanges.end(),
-              [](const auto& a, const auto& b) { return a.first < b.first; });
-}
-
-void UnifiedMemoryPool::mergeFreeRanges(uint32_t blockIndex) {
-    auto& ranges = blocks_[blockIndex].freeRanges;
-    if (ranges.size() < 2) return;
-    
-    std::vector<std::pair<VkDeviceSize, VkDeviceSize>> merged;
-    merged.push_back(ranges[0]);
-    
-    for (size_t i = 1; i < ranges.size(); ++i) {
-        auto& last = merged.back();
-        if (last.first + last.second == ranges[i].first) {
-            last.second += ranges[i].second;
-        } else {
-            merged.push_back(ranges[i]);
-        }
-    }
-    ranges = std::move(merged);
 }
 
 } // namespace vvm

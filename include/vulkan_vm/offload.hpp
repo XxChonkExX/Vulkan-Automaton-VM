@@ -98,6 +98,7 @@ public:
         bool toHost = true;  // true = device->host, false = host->device
         VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
         VkPipelineStageFlags signalStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        VkBuffer hostShadowBuffer = VK_NULL_HANDLE;  // Host shadow buffer for copy
     };
     
     std::optional<MigrationOperation> submitMigration(const MigrationRequest& req);

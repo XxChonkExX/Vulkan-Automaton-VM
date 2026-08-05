@@ -127,7 +127,7 @@ manager.waitAllIdle();
 ### Host Offload / Swap
 ```cpp
 OffloadConfig offloadConfig;
-offloadConfig.hostShadowSize = 4 * 1024 * 1024 * 1024;  // 4GB host buffer
+offloadConfig.hostShadowSize = 4ull * 1024 * 1024 * 1024;  // 4GB host buffer
 offloadConfig.useMadvise = true;
 offloadConfig.useMprotect = true;
 
@@ -185,6 +185,13 @@ apuConfig.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
 ## License
 
 MIT License - see LICENSE file.
+
+## Credits
+
+- **Grok (xAI)** — architectural review, offload/migration design review, and recommendations that shaped the buddy-backed pool and host shadow integration
+- **Deepseek** — implementation support and debugging across the codebase
+- **GLM** — review and refinements during development
+- **ChonkE** — project owner, 1% contributor
 
 ## Contributing
 
