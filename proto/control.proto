@@ -4,6 +4,8 @@ package vulkan_automaton.network;
 
 option cpp_namespace = "vvm::network";
 
+import "google/protobuf/empty.proto";
+
 // ============================================================================
 // Node identification
 // ============================================================================
@@ -111,7 +113,7 @@ message RegisterNodeRequest {
 message RegisterNodeResponse {
   bool success = 1;
   string error_message = 2;
-  repeated NodeInfo cluster_nodes = 2;  // current cluster view
+  repeated NodeInfo cluster_nodes = 3;  // current cluster view
 }
 
 message HeartbeatRequest {

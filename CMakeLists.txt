@@ -37,17 +37,29 @@ endif()
 # Threads for sync primitives
 find_package(Threads REQUIRED)
 
-# Network module dependencies
+# Windows SDK include path for windows.h
+if(WIN32)
+    # Try to find Windows 10 SDK
+    set(WIN10_SDK_VERSIONS "10.0.26100.0" "10.0.22621.0" "10.0.19041.0" "10.0.18362.0" "10.0.17763.0")
+    foreach(ver ${WIN10_SDK_VERSIONS})
+        if(EXISTS "C:/Program Files (x86)/Windows Kits/10/Include/${ver}/um/windows.h")
+            set(WINDOWS_SDK_INCLUDE_PATH "C:/Program Files (x86)/Windows Kits/10/Include/${ver}/um")
+            set(WINDOWS_SDK_INCLUDE_PATH_SHARED "C:/Program Files (x86)/Windows Kits/10/Include/${ver}/shared")
+            message(STATUS "Found Windows SDK ${ver}")
+            break()
+        endif()
+    endforeach()
+    if(NOT WINDOWS_SDK_INCLUDE_PATH)
+        message(WARNING "Windows SDK not found in standard locations")
+    endif()
+endif()
+
+# Network module dependencies (core builds standalone; gRPC/verbs optional)
 if(VVM_BUILD_NETWORK)
     find_package(Protobuf QUIET)
     find_package(gRPC QUIET)
-    if(NOT Protobuf_FOUND OR NOT gRPC_FOUND)
-        message(WARNING "Protobuf/gRPC not found, disabling network module")
-        set(VVM_BUILD_NETWORK OFF)
-    else()
-        find_package(ibverbs QUIET)
-        find_package(rdma_cm QUIET)
-    endif()
+    find_package(ibverbs QUIET)
+    find_package(rdma_cm QUIET)
 endif()
 
 # Include directories
@@ -65,7 +77,11 @@ add_library(vulkan_vm
     src/utils/error_handling.cpp
 )
 
-target_include_directories(vulkan_vm PRIVATE ${Vulkan_INCLUDE_DIRS})
+target_include_directories(vulkan_vm PRIVATE 
+    ${Vulkan_INCLUDE_DIRS}
+    ${WINDOWS_SDK_INCLUDE_PATH}
+    ${WINDOWS_SDK_INCLUDE_PATH_SHARED}
+)
 target_link_libraries(vulkan_vm PRIVATE
     ${Vulkan_LIBRARIES}
     Threads::Threads

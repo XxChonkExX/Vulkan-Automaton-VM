@@ -1,9 +1,11 @@
 #include "vulkan_vm/network.hpp"
-#include "vulkan_vm/network/rdma_transport.hpp"
-#include "vulkan_vm/network/cluster_client.hpp"
-#include "vulkan_vm/network/cluster_server.hpp"
 #include "vulkan_vm/vulkan_vm.hpp"
 #include "vulkan_vm/utils.hpp"
+
+#if defined(VVM_NETWORK_HAS_VERBS)
+#include "vulkan_vm/network/rdma_transport.hpp"
+#include <infiniband/verbs.h>
+#endif
 
 #include <mutex>
 
@@ -33,6 +35,7 @@ void shutdownNetwork() {
     }
 }
 
+#if defined(VVM_NETWORK_HAS_VERBS)
 bool isRdmaAvailable() {
     // Check for RDMA devices
     int numDevices = 0;
@@ -48,7 +51,7 @@ std::optional<std::string> getRecommendedRdmaNic() {
     int numDevices = 0;
     struct ibv_device** devList = ibv_get_device_list(&numDevices);
     if (!devList || numDevices == 0) return std::nullopt;
-    
+
     // Prefer devices with "mlx" prefix (Mellanox/NVIDIA)
     for (int i = 0; i < numDevices; ++i) {
         std::string name = ibv_get_device_name(devList[i]);
@@ -57,12 +60,21 @@ std::optional<std::string> getRecommendedRdmaNic() {
             return name;
         }
     }
-    
+
     // Return first available
     std::string name = ibv_get_device_name(devList[0]);
     ibv_free_device_list(devList);
     return name;
 }
+#else
+bool isRdmaAvailable() {
+    return false;
+}
+
+std::optional<std::string> getRecommendedRdmaNic() {
+    return std::nullopt;
+}
+#endif
 
 } // namespace network
 } // namespace vvm

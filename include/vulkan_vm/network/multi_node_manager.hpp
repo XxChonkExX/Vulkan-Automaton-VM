@@ -1,7 +1,8 @@
 #pragma once
 
 #include "vulkan_vm/vulkan_vm.hpp"
-#include "vulkan_vm/network/network_config.hpp"
+#include "vulkan_vm/network/network_types.hpp"
+#include "vulkan_vm/network/tcp_transport.hpp"
 #include <memory>
 #include <vector>
 #include <optional>
@@ -10,6 +11,8 @@
 #include <functional>
 #include <mutex>
 #include <unordered_map>
+#include <atomic>
+#include <thread>
 
 namespace vvm {
 namespace network {
@@ -30,8 +33,8 @@ class MultiNodePoolManager {
 public:
     // Factory
     static std::optional<MultiNodePoolManager> create(
-        const std::vector<DeviceConfig>& localDevices,
-        const PoolConfig& poolConfig,
+        const std::vector<vvm::DeviceConfig>& localDevices,
+        const vvm::PoolConfig& poolConfig,
         const NetworkConfig& networkConfig);
     
     // Non-copyable, movable
@@ -80,6 +83,9 @@ public:
     
     // Deallocate local allocation
     void deallocateLocal(Allocation&& alloc);
+
+    // Deallocate an allocation referenced by a remote descriptor (local or remote owner)
+    bool deallocateRemote(const RemoteAllocationDesc& desc);
     
     // ========================================================================
     // Remote allocation (request remote node to allocate)
@@ -181,6 +187,9 @@ public:
     // Find node with specific capability
     std::optional<NodeId> findNodeWithCapability(bool requireRdma, bool requireGpuDirect) const;
     
+    // Look up a registered (remote-visible) allocation by its local id.
+    std::optional<Allocation> getRegisteredAllocation(uint64_t localAllocId) const;
+    
     // Manual cluster operations
     bool registerWithCluster();
     void leaveCluster();
@@ -232,9 +241,33 @@ private:
     void cleanup();
     
     // Network components
-    std::unique_ptr<ClusterClient> clusterClient_;
-    std::unique_ptr<ClusterServer> clusterServer_;
-    std::unique_ptr<RdmaTransport> rdmaTransport_;
+    std::unique_ptr<ClusterClient> clusterClient_;   // optional gRPC client (when built with gRPC)
+    std::unique_ptr<ClusterServer> clusterServer_;   // optional gRPC server (when built with gRPC)
+    std::unique_ptr<RdmaTransport> rdmaTransport_;   // optional verbs transport (when built with libibverbs)
+
+    // TCP host-staged control + data plane (always available)
+    std::unique_ptr<TcpTransport> tcpTransport_;
+    uint16_t tcpPort_ = 0;
+    std::string localHost_ = "127.0.0.1";
+    std::vector<std::pair<std::string, uint16_t>> seedEndpoints_;
+
+    // Copy engine: device <-> host staging (for host-staged migration)
+    VkCommandPool copyCmdPool_ = VK_NULL_HANDLE;
+    VkQueue transferQueue_ = VK_NULL_HANDLE;
+    uint32_t transferQueueFamily_ = UINT32_MAX;
+
+    // Allocation registry: localAllocId -> Allocation (for remote access)
+    std::unordered_map<uint64_t, Allocation> remoteAllocs_;
+    mutable std::mutex allocsMutex_;
+    uint64_t nextAllocId_ = 1;
+
+    // Persistent peer connections: "host:port" -> ConnId
+    std::unordered_map<std::string, TcpTransport::ConnId> peerConns_;
+    mutable std::mutex connsMutex_;
+
+    // Heartbeat
+    std::thread heartbeatThread_;
+    std::atomic<bool> stopHeartbeat_{false};
     
     // Local pools (one per GPU)
     std::vector<UnifiedMemoryPool> localPools_;
@@ -280,6 +313,36 @@ private:
         Allocation& destination,
         bool toHost,  // true = pull from remote, false = push to remote
         uint64_t timeoutNs);
+
+    // ========================================================================
+    // TCP host-staged helpers
+    // ========================================================================
+
+    bool initCopyEngine();
+    std::optional<Allocation> createStaging(VkDeviceSize size);
+    bool copyDeviceToHost(const Allocation& src, VkDeviceSize srcOffset,
+                          const Allocation& staging, VkDeviceSize size);
+    bool copyHostToDevice(const Allocation& staging, const Allocation& dst,
+                          VkDeviceSize dstOffset, VkDeviceSize size);
+    bool runCopy(VkBuffer srcBuffer, VkBuffer dstBuffer,
+                 VkDeviceSize srcOffset, VkDeviceSize dstOffset, VkDeviceSize size);
+
+    uint64_t registerAllocation(Allocation&& alloc);
+    std::optional<Allocation> findAllocation(uint64_t localAllocId);
+    bool unregisterAllocation(uint64_t localAllocId);
+    std::optional<uint64_t> findAllocIdByBuffer(VkBuffer buffer);
+
+    TcpTransport::ConnId getPeerConnection(const std::string& host, uint16_t port);
+    void onTcpRequest(TcpMessage& request, TcpMessage& response);
+    std::optional<std::vector<NodeInfo>> handleRegisterRequest(const NodeInfo& info);
+    std::optional<RemoteAllocationDesc> handleAllocateRequest(const NodeId& requester, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags flags, bool enableRdma);
+    std::optional<RemoteAllocationDesc> handleExportRequest(const NodeId& owner, uint64_t localAllocId, bool enableRdma, bool forceHostShadow);
+    std::optional<Allocation> handleImportRequest(const NodeId& owner, const RemoteAllocationDesc& desc, VkBufferUsageFlags usage);
+    std::optional<NetworkMigrationOperation> handleMigrateRequest(const RemoteAllocationDesc& source, uint64_t destinationAllocId, bool useRdma, uint64_t timeoutNs);
+    void heartbeatLoop();
+    void mergeClusterView(const std::vector<NodeInfo>& view);
+    void parseListenAddress(const std::string& listenAddress, std::string& outHost, uint16_t& outPort);
+    static bool parseEndpoint(const std::string& endpoint, std::string& outHost, uint16_t& outPort);
 };
 
 } // namespace network

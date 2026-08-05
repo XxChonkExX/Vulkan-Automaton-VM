@@ -1,7 +1,7 @@
 #pragma once
 
 #include "vulkan_vm/vulkan_vm.hpp"
-#include "vulkan_vm/network/network_config.hpp"
+#include "vulkan_vm/network/network_types.hpp"
 #include <memory>
 #include <vector>
 #include <optional>

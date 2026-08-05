@@ -1,6 +1,6 @@
 #pragma once
 
-#include "vulkan_vm/network/network_config.hpp"
+#include "vulkan_vm/network/network_types.hpp"
 #include "vulkan_vm/network/rdma_transport.hpp"
 #include "vulkan_vm/vulkan_vm.hpp"
 #include <memory>
@@ -15,6 +15,9 @@
 
 namespace vvm {
 namespace network {
+
+// Forward declare
+class MultiNodePoolManager;
 
 // ============================================================================
 // Forward declaration for generated gRPC

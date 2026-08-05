@@ -1,7 +1,7 @@
 #pragma once
 
 // Network module main header
-#include "vulkan_vm/network/network_config.hpp"
+#include "vulkan_vm/network/network_types.hpp"
 #include "vulkan_vm/network/multi_node_manager.hpp"
 #include "vulkan_vm/network/rdma_transport.hpp"
 #include "vulkan_vm/network/cluster_client.hpp"

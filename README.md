@@ -159,6 +159,71 @@ for (size_t i = 0; i < devices.size(); ++i) {
 }
 ```
 
+### Multi-Node Network Module
+
+`vvm::network::MultiNodePoolManager` provides a host-staged, multi-node cluster for
+moving tensors between machines over plain TCP. It uses a Spark-inspired wire
+protocol: a versioned 32-byte header `[magic "VVMN"][u8 version][u8 x3 reserved]
+[u32 type][u32 flags][u32 bodyLen][u32 seq][u64 streamLen]` followed by a control
+body and an optional bulk stream transferred in 4 MB slices directly between the
+socket and a caller-provided buffer (no intermediate copy). Control-plane messages:
+`MsgRegisterNode`, `MsgGetClusterView`, `MsgAllocate`, `MsgExport`, `MsgImport`,
+`MsgMigratePull`, `MsgMigratePush`, `MsgHeartbeat`, `MsgLeaveCluster`, `MsgDeallocate`.
+
+The TCP control/data plane builds **with zero external dependencies** (Winsock on
+Windows, BSD sockets on Linux). gRPC and RDMA/verbs remain optional extras
+(promoted via `VVM_NETWORK_HAS_GRPC` / `VVM_NETWORK_HAS_VERBS`).
+
+```cpp
+using namespace vvm::network;
+
+NetworkConfig netA; netA.listenAddress = "0.0.0.0:51001";  // bootstrap seed
+auto nodeA = MultiNodePoolManager::create({devCfg}, poolCfg, netA);
+nodeA->start();                       // registers as cluster root (no seeds)
+nodeA->registerWithCluster();
+
+NetworkConfig netB; netB.listenAddress = "0.0.0.0:51002";
+netB.seedNodes = { "127.0.0.1:51001" };
+auto nodeB = MultiNodePoolManager::create({devCfg}, poolCfg, netB);
+nodeB->start();                       // connects to nodeA and joins the cluster
+nodeB->registerWithCluster();
+
+// Remote allocation + push migration (B -> A)
+auto src = nodeB->getLocalPool().allocate(size, /*...usage...*/, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+std::memset(src->hostPtr, 0xAB, size);
+
+auto dst = nodeB->allocateRemote(nodeA->getLocalNodeId(), size, /*...*/,
+                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+nodeB->migrateToRemote(*src, *dst, /*useRdma=*/false);  // streamed in 4 MB slices
+
+// Pull migration (B -> A): A pulls bytes from a remote allocation on B
+auto remoteDesc = nodeB->exportForRemote(*src, false, true);
+auto localDst   = nodeA->getLocalPool().allocate(size, /*...*/, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+nodeA->migrateFromRemote(*remoteDesc, *localDst, /*useRdma=*/false);
+```
+
+A working two-node loopback demo lives at `examples/network_test.cpp` and is built
+as the `network_test` target. Run it after building:
+
+```bash
+./build/examples/network_test.exe   # Windows
+./build/examples/network_test       # Linux
+```
+
+Expected: cluster registration, remote allocate, push verify `PASS`, pull verify
+`PASS`, `ALL TESTS PASSED`.
+
+| Network feature | Status |
+|-----------------|--------|
+| TCP control/data plane (zero deps) | ✅ |
+| Spark-style 32-byte header + 4 MB slice streaming | ✅ |
+| Cluster registration + heartbeat | ✅ |
+| Remote allocate / export / import / deallocate | ✅ |
+| Host-staged push/pull migration | ✅ |
+| gRPC control plane (optional) | ✅ (auto-enabled when gRPC found) |
+| RDMA/verbs GPU-direct (optional) | 🔧 (stubs; host-staged fallback always available) |
+
+
 ## Cross-Vendor Compatibility Matrix
 
 | Source → Target | Linux Handle | Windows Handle |
@@ -189,8 +254,8 @@ MIT License - see LICENSE file.
 ## Credits
 
 - **Nemotron** — primary coder
+- **Deepseek** — co-author of the multi-node network module (Spark-style TCP transport, host-staged push/pull migration, cluster registration, two-node loopback test) and implementation support across the codebase
 - **Grok (xAI)** — architectural review, offload/migration design review, and recommendations that shaped the buddy-backed pool and host shadow integration
-- **Deepseek** — implementation support and debugging across the codebase
 - **GLM** — review and refinements during development
 - **ChonkE** — project owner, 1% contributor
 
@@ -204,8 +269,11 @@ MIT License - see LICENSE file.
 
 ## Roadmap
 
+- [x] Multi-node cluster (TCP control/data plane, Spark-style streaming)
+- [x] Host-staged push/pull migration with byte-pattern verification
 - [ ] Sparse/residency support for virtual memory
 - [ ] Direct GPU↔GPU copy (P2P) without host staging
+- [ ] RDMA/verbs GPU-direct transport (stubs in place; host-staged fallback ships today)
 - [ ] Integration with ML frameworks (PyTorch, ONNX Runtime)
 - [ ] Windows WDDM2.6+ hardware scheduling hints
 - [ ] Android/Vulkan support

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "vulkan_vm/network/network_config.hpp"
+#include "vulkan_vm/network/network_types.hpp"
 #include "vulkan_vm/network/rdma_transport.hpp"
 #include <memory>
 #include <vector>
