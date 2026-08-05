@@ -20,6 +20,7 @@ option(VVM_BUILD_TESTS "Build tests" ON)
 option(VVM_BUILD_EXAMPLES "Build examples" OFF)
 option(VVM_ENABLE_VALIDATION "Enable Vulkan validation layers" ON)
 option(VVM_USE_VOLK "Use Volk for Vulkan loading" ON)
+option(VVM_BUILD_NETWORK "Build network/multi-node module" ON)
 
 # Vulkan
 find_package(Vulkan REQUIRED)
@@ -35,6 +36,19 @@ endif()
 
 # Threads for sync primitives
 find_package(Threads REQUIRED)
+
+# Network module dependencies
+if(VVM_BUILD_NETWORK)
+    find_package(Protobuf QUIET)
+    find_package(gRPC QUIET)
+    if(NOT Protobuf_FOUND OR NOT gRPC_FOUND)
+        message(WARNING "Protobuf/gRPC not found, disabling network module")
+        set(VVM_BUILD_NETWORK OFF)
+    else()
+        find_package(ibverbs QUIET)
+        find_package(rdma_cm QUIET)
+    endif()
+endif()
 
 # Include directories
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -85,6 +99,12 @@ target_include_directories(vulkan_vm PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
+
+# Network module
+if(VVM_BUILD_NETWORK)
+    add_subdirectory(src/network)
+    target_link_libraries(vulkan_vm PUBLIC vulkan_vm_network)
+endif()
 
 # Install
 install(TARGETS vulkan_vm

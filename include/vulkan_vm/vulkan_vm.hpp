@@ -310,3 +310,4 @@ struct Result {
 } // namespace vvm
 
 #include "vulkan_vm/offload.hpp"
+#include "vulkan_vm/network.hpp"

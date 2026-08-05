@@ -1,0 +1,222 @@
+#pragma once
+
+#include "vulkan_vm/vulkan_vm.hpp"
+#include "vulkan_vm/network/network_config.hpp"
+#include <memory>
+#include <vector>
+#include <optional>
+#include <string>
+#include <cstdint>
+#include <functional>
+
+namespace vvm {
+namespace network {
+
+// ============================================================================
+// RDMA Transport Interface
+// ============================================================================
+
+struct RdmaMemoryRegion {
+    void* addr = nullptr;           // local virtual address
+    uint64_t length = 0;            // size in bytes
+    uint32_t lkey = 0;              // local key
+    uint32_t rkey = 0;              // remote key
+    uint64_t rdmaAddr = 0;          // GPU-direct remote address (VkRemoteAddressNV)
+    
+    // Ownership
+    bool ownsMemory = false;        // if true, destructor frees memory
+    VkDeviceMemory vkMemory = VK_NULL_HANDLE;  // associated Vulkan memory
+    VkBuffer vkBuffer = VK_NULL_HANDLE;        // associated Vulkan buffer
+};
+
+struct RdmaConnection {
+    std::string remoteHost;
+    uint32_t remotePort = 0;
+    uint32_t remoteNodeIndex = 0;
+    
+    // RDMA queue pair info
+    uint32_t qpNum = 0;
+    uint16_t lid = 0;               // for InfiniBand
+    uint32_t qkey = 0;
+    uint32_t psn = 0;
+    
+    // State
+    bool connected = false;
+    bool gpuDirect = false;
+    
+    // Last activity
+    uint64_t lastActivityNs = 0;
+};
+
+class RdmaTransport {
+public:
+    // Factory
+    static std::unique_ptr<RdmaTransport> create(
+        const NetworkConfig& config,
+        VkPhysicalDevice physicalDevice,
+        VkDevice device);
+    
+    virtual ~RdmaTransport() = default;
+    
+    // Non-copyable, movable
+    RdmaTransport(const RdmaTransport&) = delete;
+    RdmaTransport& operator=(const RdmaTransport&) = delete;
+    RdmaTransport(RdmaTransport&&) noexcept = default;
+    RdmaTransport& operator=(RdmaTransport&&) noexcept = default;
+    
+    // ========================================================================
+    // Lifecycle
+    // ========================================================================
+    
+    virtual bool initialize() = 0;
+    virtual void shutdown() = 0;
+    virtual bool isReady() const = 0;
+    
+    // ========================================================================
+    // Memory registration (GPU-direct)
+    // ========================================================================
+    
+    // Register VkDeviceMemory for RDMA access (GPU-direct)
+    // Returns remote address and rkey for peer to use
+    virtual std::optional<RdmaMemoryRegion> registerGpuMemory(
+        VkDeviceMemory memory,
+        VkDeviceSize offset,
+        VkDeviceSize size,
+        VkBuffer buffer = VK_NULL_HANDLE) = 0;
+    
+    // Register host memory for RDMA (staged fallback)
+    virtual std::optional<RdmaMemoryRegion> registerHostMemory(
+        void* ptr,
+        size_t size) = 0;
+    
+    // Unregister memory region
+    virtual void unregisterMemory(const RdmaMemoryRegion& region) = 0;
+    
+    // ========================================================================
+    // Connection management
+    // ========================================================================
+    
+    // Connect to remote node (initiates RDMA CM connection)
+    virtual std::optional<RdmaConnection> connect(
+        const std::string& host,
+        uint32_t port,
+        uint32_t nodeIndex = 0) = 0;
+    
+    // Disconnect from remote node
+    virtual void disconnect(const RdmaConnection& conn) = 0;
+    
+    // Get active connections
+    virtual std::vector<RdmaConnection> getConnections() const = 0;
+    
+    // ========================================================================
+    // Data transfer
+    // ========================================================================
+    
+    // RDMA_WRITE: write local memory to remote
+    virtual bool rdmaWrite(
+        const RdmaConnection& conn,
+        const RdmaMemoryRegion& localRegion,
+        uint64_t remoteAddr,
+        uint32_t remoteRkey,
+        VkDeviceSize size,
+        uint64_t timeoutNs = UINT64_MAX) = 0;
+    
+    // RDMA_READ: read remote memory into local
+    virtual bool rdmaRead(
+        const RdmaConnection& conn,
+        const RdmaMemoryRegion& localRegion,
+        uint64_t remoteAddr,
+        uint32_t remoteRkey,
+        VkDeviceSize size,
+        uint64_t timeoutNs = UINT64_MAX) = 0;
+    
+    // Async operations with completion callback
+    using CompletionCallback = std::function<void(bool success, const std::string& error)>;
+    
+    virtual bool rdmaWriteAsync(
+        const RdmaConnection& conn,
+        const RdmaMemoryRegion& localRegion,
+        uint64_t remoteAddr,
+        uint32_t remoteRkey,
+        VkDeviceSize size,
+        CompletionCallback callback,
+        uint64_t timeoutNs = UINT64_MAX) = 0;
+    
+    virtual bool rdmaReadAsync(
+        const RdmaConnection& conn,
+        const RdmaMemoryRegion& localRegion,
+        uint64_t remoteAddr,
+        uint32_t remoteRkey,
+        VkDeviceSize size,
+        CompletionCallback callback,
+        uint64_t timeoutNs = UINT64_MAX) = 0;
+    
+    // ========================================================================
+    // Synchronization
+    // ========================================================================
+    
+    // Wait for all pending operations
+    virtual void flush() = 0;
+    
+    // Poll for completions (call periodically if not using callbacks)
+    virtual size_t pollCompletions() = 0;
+    
+    // ========================================================================
+    // Capabilities
+    // ========================================================================
+    
+    virtual bool supportsGpuDirect() const = 0;
+    virtual bool supportsRdmaWrite() const = 0;
+    virtual bool supportsRdmaRead() const = 0;
+    virtual std::string getBackendName() const = 0;  // "verbs", "ucx", etc.
+    
+    // Get NIC info
+    virtual std::string getLocalNicName() const = 0;
+    virtual uint32_t getLocalPort() const = 0;
+    virtual std::string getDeviceGuid() const = 0;
+};
+
+// ============================================================================
+// GPU-direct memory registration helper (NVIDIA path)
+// ============================================================================
+
+struct GpuDirectRegistration {
+    VkRemoteAddressNV remoteAddress = {0};
+    uint32_t rkey = 0;
+    struct ibv_mr* mr = nullptr;  // verbs memory region
+    bool valid = false;
+};
+
+// Register VkDeviceMemory for NVIDIA GPUDirect RDMA
+std::optional<GpuDirectRegistration> registerGpuMemoryForRdma(
+    VkDevice device,
+    VkPhysicalDevice physicalDevice,
+    VkDeviceMemory memory,
+    VkDeviceSize offset,
+    VkDeviceSize size,
+    const std::string& nicName = "");
+
+// Unregister
+void unregisterGpuMemoryForRdma(const GpuDirectRegistration& reg);
+
+// ============================================================================
+// DMA-BUF registration helper (AMD/Intel path)
+// ============================================================================
+
+struct DmaBufRegistration {
+    int fd = -1;
+    struct ibv_mr* mr = nullptr;
+    uint32_t rkey = 0;
+    bool valid = false;
+};
+
+// Register DMA-BUF fd for RDMA
+std::optional<DmaBufRegistration> registerDmaBufForRdma(
+    int dmaBufFd,
+    size_t size,
+    const std::string& nicName = "");
+
+void unregisterDmaBufForRdma(const DmaBufRegistration& reg);
+
+} // namespace network
+} // namespace vvm

@@ -1,0 +1,148 @@
+syntax = "proto3";
+
+package vulkan_automaton.network;
+
+option cpp_namespace = "vvm::network";
+
+// ============================================================================
+// Node identification
+// ============================================================================
+message NodeId {
+  string host = 1;
+  uint32 port = 2;
+  uint32 node_index = 3;
+  string uuid = 4;  // unique instance identifier
+}
+
+// ============================================================================
+// Allocation descriptors
+// ============================================================================
+message AllocationDescriptor {
+  NodeId owner = 1;
+  uint64 size = 2;
+  uint64 local_alloc_id = 3;     // internal allocation handle on owner
+  
+  // Fast path: GPU-direct RDMA
+  bool has_rdma_addr = 4;
+  bytes rdma_addr = 5;           // VkRemoteAddressNV (8 bytes)
+  uint32 rkey = 6;               // RDMA remote key for ibv_post_send
+  
+  // Fallback: host-staged
+  bool has_host_shadow = 7;
+  
+  // Buffer usage for remote import
+  uint32 usage_flags = 8;
+  
+  // Memory type info for remote import
+  uint32 memory_type_index = 9;
+  bool dedicated_allocation = 10;
+  
+  // External handle type (OPAQUE_FD, OPAQUE_WIN32, DMA_BUF, D3D12_HEAP)
+  uint32 external_handle_type = 11;
+  
+  // Handle data (for staged import when RDMA not available)
+  bytes external_handle = 12;
+}
+
+message AllocateRequest {
+  NodeId requester = 1;
+  uint64 size = 2;
+  uint32 usage_flags = 3;
+  uint32 memory_property_flags = 4;
+  bool enable_rdma = 5;
+  bool advertise = 6;  // register in cluster directory
+}
+
+message AllocateResponse {
+  bool success = 1;
+  string error_message = 2;
+  AllocationDescriptor descriptor = 3;
+}
+
+message ExportRequest {
+  uint64 local_alloc_id = 1;
+  bool enable_rdma = 2;
+  bool force_host_shadow = 3;  // for mixed-vendor clusters
+}
+
+message ExportResponse {
+  bool success = 1;
+  string error_message = 2;
+  AllocationDescriptor descriptor = 3;
+}
+
+message MigrateRequest {
+  AllocationDescriptor source = 1;
+  uint64 destination_alloc_id = 2;  // local alloc to receive data
+  bool use_rdma = 3;
+  uint64 timeout_ns = 4;
+}
+
+message MigrateResponse {
+  bool success = 1;
+  string error_message = 2;
+  uint64 bytes_transferred = 3;
+}
+
+message ImportRequest {
+  AllocationDescriptor descriptor = 1;
+  uint32 usage_flags = 2;
+}
+
+message ImportResponse {
+  bool success = 1;
+  string error_message = 2;
+  uint64 local_alloc_id = 3;  // handle for the imported allocation
+}
+
+message NodeInfo {
+  NodeId id = 1;
+  repeated string gpu_devices = 2;  // device names
+  string nic_name = 3;              // e.g., "mlx5_0"
+  bool rdma_capable = 4;
+  bool gpu_direct_capable = 5;
+  uint64 timestamp = 6;  // for freshness
+}
+
+message RegisterNodeRequest {
+  NodeInfo info = 1;
+}
+
+message RegisterNodeResponse {
+  bool success = 1;
+  string error_message = 2;
+  repeated NodeInfo cluster_nodes = 2;  // current cluster view
+}
+
+message HeartbeatRequest {
+  NodeId node = 1;
+  uint64 timestamp = 2;
+}
+
+message HeartbeatResponse {
+  bool success = 1;
+  repeated NodeInfo cluster_nodes = 2;  // updated view
+}
+
+// ============================================================================
+// Service definition
+// ============================================================================
+service ClusterManager {
+  // Allocation operations
+  rpc Allocate(AllocateRequest) returns (AllocateResponse);
+  rpc Export(ExportRequest) returns (ExportResponse);
+  rpc Import(ImportRequest) returns (ImportResponse);
+  
+  // Migration operations
+  rpc Migrate(MigrateRequest) returns (MigrateResponse);
+  
+  // Cluster membership
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  
+  // Streaming for async migration progress
+  rpc MigrateStream(stream MigrateRequest) returns (stream MigrateResponse);
+  
+  // Cluster directory
+  rpc GetClusterView(google.protobuf.Empty) returns (RegisterNodeResponse);
+}
