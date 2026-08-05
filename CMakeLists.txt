@@ -69,7 +69,6 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 add_library(vulkan_vm
     src/core/unified_memory_pool.cpp
     src/allocator/buddy_allocator.cpp
-    src/allocator/block_manager.cpp
     src/cross_gpu/external_memory.cpp
     src/cross_gpu/multi_gpu_manager.cpp
     src/offload/host_shadow.cpp
