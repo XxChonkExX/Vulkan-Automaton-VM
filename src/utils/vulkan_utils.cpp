@@ -584,6 +584,116 @@ void GpuTimer::reset() {
 }
 
 // ============================================================================
+// MemoryTypeSelector Implementation
+// ============================================================================
+
+MemoryTypeSelector::MemoryTypeSelector(VkPhysicalDevice pd)
+    : physicalDevice(pd), hasBudgetExt(false) {
+    if (physicalDevice != VK_NULL_HANDLE) {
+        refresh();
+    }
+}
+
+void MemoryTypeSelector::refresh() {
+    if (physicalDevice == VK_NULL_HANDLE) return;
+    
+    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
+    
+    // Check for memory budget extension
+    VkPhysicalDeviceMemoryProperties2 memProps2{};
+    memProps2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+    memProps2.pNext = &budget;
+    
+    budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    budget.pNext = nullptr;
+    
+    // Query extensions to check if budget is available
+    uint32_t extCount = 0;
+    vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extCount, nullptr);
+    std::vector<VkExtensionProperties> extensions(extCount);
+    vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extCount, extensions.data());
+    
+    for (const auto& ext : extensions) {
+        if (strcmp(ext.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0) {
+            hasBudgetExt = true;
+            break;
+        }
+    }
+    
+    if (hasBudgetExt) {
+        vkGetPhysicalDeviceMemoryProperties2(physicalDevice, &memProps2);
+    }
+}
+
+MemoryTypeSelector::SelectionResult MemoryTypeSelector::select(
+    VkMemoryPropertyFlags required,
+    VkMemoryPropertyFlags preferred,
+    VkDeviceSize minHeapBudget) const {
+    
+    SelectionResult best;
+    float bestScore = -1.0f;
+    
+    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+        const auto& type = memProps.memoryTypes[i];
+        
+        // Check required flags
+        if ((type.propertyFlags & required) != required) continue;
+        
+        uint32_t heapIndex = type.heapIndex;
+        if (heapIndex >= memProps.memoryHeapCount) continue;
+        
+        const auto& heap = memProps.memoryHeaps[heapIndex];
+        
+        VkDeviceSize heapBudget = hasBudgetExt ? budget.heapBudget[heapIndex] : heap.size;
+        VkDeviceSize heapUsage = hasBudgetExt ? budget.heapUsage[heapIndex] : 0;
+        VkDeviceSize available = (heapBudget > heapUsage) ? (heapBudget - heapUsage) : 0;
+        
+        if (minHeapBudget > 0 && available < minHeapBudget) continue;
+        
+        float utilization = (heapBudget > 0) ? 
+            static_cast<float>(heapUsage) / static_cast<float>(heapBudget) : 0.0f;
+        
+        // Score: prefer lower utilization, preferred flags match, device-local
+        float score = 1.0f - utilization;
+        
+        if ((type.propertyFlags & preferred) == preferred) score += 0.5f;
+        if (type.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) score += 0.3f;
+        if (type.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) score += 0.1f;
+        if (type.propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) score += 0.1f;
+        
+        if (score > bestScore) {
+            bestScore = score;
+            best.memoryTypeIndex = i;
+            best.heapBudget = heapBudget;
+            best.heapUsage = heapUsage;
+            best.heapUtilization = utilization;
+        }
+    }
+    
+    return best;
+}
+
+DedicatedAllocationInfo MemoryTypeSelector::getDedicatedAllocationInfo(
+    VkBufferCreateInfo* bufferInfo,
+    VkImageCreateInfo* imageInfo) const {
+    
+    DedicatedAllocationInfo info;
+    
+    if (!hasBudgetExt) return info;
+    
+    VkPhysicalDeviceMemoryProperties2 memProps2{};
+    memProps2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+    memProps2.pNext = nullptr;
+    
+    // For now, return basic info - full implementation would query
+    // VkPhysicalDeviceDedicatedAllocationImageCreateInfoNV etc.
+    info.requiresDedicatedAllocation = false;
+    info.prefersDedicatedAllocation = false;
+    
+    return info;
+}
+
+// ============================================================================
 // Logger
 // ============================================================================
 

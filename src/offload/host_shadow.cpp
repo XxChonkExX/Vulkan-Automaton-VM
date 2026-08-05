@@ -17,8 +17,8 @@ namespace vvm {
 // HostShadowManager Implementation
 // ============================================================================
 
-HostShadowManager::HostShadowManager(VkDevice device, const OffloadConfig& config)
-    : device_(device), config_(config) {
+HostShadowManager::HostShadowManager(VkPhysicalDevice physicalDevice, VkDevice device, const OffloadConfig& config)
+    : physicalDevice_(physicalDevice), device_(device), config_(config) {
     createShadowBuffer();
     
     // Create command pool for copy operations
@@ -52,10 +52,30 @@ bool HostShadowManager::createShadowBuffer() {
     VkMemoryRequirements memReq;
     vkGetBufferMemoryRequirements(device_, shadowBuffer_.buffer, &memReq);
     
+    // Find HOST_VISIBLE | HOST_COHERENT memory
+    VkPhysicalDeviceMemoryProperties memProps;
+    vkGetPhysicalDeviceMemoryProperties(physicalDevice_, &memProps);
+    
+    uint32_t memTypeIndex = UINT32_MAX;
+    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+        if ((memReq.memoryTypeBits & (1u << i)) &&
+            (memProps.memoryTypes[i].propertyFlags & 
+             (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+            (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+            memTypeIndex = i;
+            break;
+        }
+    }
+    
+    if (memTypeIndex == UINT32_MAX) {
+        vkDestroyBuffer(device_, shadowBuffer_.buffer, nullptr);
+        return false;
+    }
+    
     VkMemoryAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     allocInfo.allocationSize = memReq.size;
-    allocInfo.memoryTypeIndex = 0;  // Would find HOST_VISIBLE | HOST_COHERENT
+    allocInfo.memoryTypeIndex = memTypeIndex;
     
     if (vkAllocateMemory(device_, &allocInfo, nullptr, &shadowBuffer_.memory) != VK_SUCCESS) {
         vkDestroyBuffer(device_, shadowBuffer_.buffer, nullptr);
@@ -381,7 +401,9 @@ uint32_t MigrationEngine::getPendingCount() const {
 
 OffloadManager::OffloadManager(UnifiedMemoryPool* pool, const OffloadConfig& config)
     : pool_(pool), config_(config) {
-    shadowManager_ = std::make_unique<HostShadowManager>(pool->getDevice(), config);
+    shadowManager_ = std::make_unique<HostShadowManager>(
+        pool->getPhysicalDevice(),
+        pool->getDevice(), config);
     
     VkQueue transferQueue = config.transferQueue;
     uint32_t transferQueueFamily = config.transferQueueFamily;

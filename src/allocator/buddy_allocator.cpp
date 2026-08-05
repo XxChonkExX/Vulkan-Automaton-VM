@@ -4,12 +4,18 @@
 
 #include <algorithm>
 #include <cmath>
+#include <unordered_map>
 
 namespace vvm {
 
 // ============================================================================
 // BuddyAllocator Implementation
 // ============================================================================
+
+struct AllocatedNode {
+    BuddyNode* node;
+    VkDeviceSize size;
+};
 
 BuddyAllocator::BuddyAllocator(VkDeviceSize blockSize, VkDeviceSize minSize)
     : blockSize_(blockSize), minSize_(minSize) {
@@ -101,28 +107,31 @@ std::optional<VkDeviceSize> BuddyAllocator::allocate(VkDeviceSize size) {
     if (!node) return std::nullopt;
     
     node->free = false;
+    allocatedNodes_[node->offset] = {node, size};
     
     // Split if larger than needed (but not below minSize)
     while (node->level < maxLevel_ && node->size / 2 >= size) {
         split(node);
         node = node->left;  // Use left child
         node->free = false;
+        allocatedNodes_[node->offset] = {node, size};
     }
     
     return node->offset;
 }
 
 void BuddyAllocator::deallocate(VkDeviceSize offset, VkDeviceSize size) {
-    // Find the node (simplified - in production use offset map)
-    // For now, mark root as needing merge from this offset
-    // Full implementation would track allocated nodes
-    (void)offset;
-    (void)size;
-    // TODO: Implement proper deallocation with node tracking
+    auto it = allocatedNodes_.find(offset);
+    if (it == allocatedNodes_.end()) return;
+    
+    BuddyNode* node = it->second.node;
+    allocatedNodes_.erase(it);
+    
+    node->free = true;
+    merge(node);
 }
 
 VkDeviceSize BuddyAllocator::getLargestFree() const {
-    // Traverse to find largest free block
     std::function<VkDeviceSize(BuddyNode*)> findLargest = [&](BuddyNode* node) -> VkDeviceSize {
         if (!node) return 0;
         if (node->free) return node->size;
@@ -170,8 +179,8 @@ BlockManager::~BlockManager() {
 }
 
 std::optional<uint32_t> BlockManager::createBlock(VkDeviceSize size, 
-                                                   uint32_t memoryTypeIndex, 
-                                                   bool exportable) {
+                                                  uint32_t memoryTypeIndex, 
+                                                  bool exportable) {
     VkMemoryAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     allocInfo.allocationSize = size;
@@ -206,13 +215,9 @@ std::optional<uint32_t> BlockManager::createBlock(VkDeviceSize size,
         return std::nullopt;
     }
     
-    // Mapping requires the physical device's memory properties.
-    // The BlockManager is currently an internal utility; host mapping
-    // is handled by UnifiedMemoryPool directly. Assume not host-visible here.
     void* hostPtr = nullptr;
     bool hostVisible = false;
     
-    // Export handle
     int exportFd = -1;
     HANDLE exportHandle = nullptr;
     if (exportable && config_.enableExternal) {
@@ -270,7 +275,7 @@ void BlockManager::destroyBlock(uint32_t index) {
 }
 
 std::optional<BlockAllocation> BlockManager::allocate(VkDeviceSize size, 
-                                                       VkDeviceSize alignment) {
+                                                      VkDeviceSize alignment) {
     size = (size + alignment - 1) & ~(alignment - 1);
     
     // Try existing blocks

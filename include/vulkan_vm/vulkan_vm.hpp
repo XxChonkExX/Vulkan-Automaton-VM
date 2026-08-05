@@ -62,6 +62,8 @@ struct Allocation {
     bool isHostVisible = false;
     bool isExternal = false;
     bool isMapped = false;
+    bool isCoherent = false;
+    VkMemoryPropertyFlags memoryFlags = 0;
 };
 
 struct BlockInfo {
@@ -75,6 +77,9 @@ struct BlockInfo {
     HANDLE exportHandle = nullptr;  // Windows external handle
 #endif
     std::vector<std::pair<VkDeviceSize, VkDeviceSize>> freeRanges;  // {offset, size}
+    VkMemoryPropertyFlags memoryFlags = 0;
+    bool isHostVisible = false;
+    bool isCoherent = false;
 };
 
 // ============================================================================
@@ -96,6 +101,13 @@ struct ExternalMemoryInfo {
 #endif
     VkDeviceSize size = 0;
     uint32_t memoryTypeIndex = UINT32_MAX;
+    bool dedicatedAllocation = false;
+};
+
+// Dedicated allocation info for external memory
+struct DedicatedAllocationInfo {
+    bool requiresDedicatedAllocation = false;
+    bool prefersDedicatedAllocation = false;
 };
 
 // ============================================================================
@@ -108,6 +120,9 @@ struct OffloadConfig {
     bool useMprotect = true;                                // PROT_NONE on offload
     VkQueue transferQueue = VK_NULL_HANDLE;
     uint32_t transferQueueFamily = UINT32_MAX;
+    // Mapping lifetime management
+    bool persistentMapping = true;  // Keep mapped for coherent access
+    bool useCoherentMapping = true; // Use HOST_COHERENT for mapped regions
 };
 
 struct MigrationOperation {
@@ -116,6 +131,8 @@ struct MigrationOperation {
     VkFence completionFence = VK_NULL_HANDLE;
     VkSemaphore signalSemaphore = VK_NULL_HANDLE;
     VkSemaphore waitSemaphore = VK_NULL_HANDLE;
+    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkPipelineStageFlags signalStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
 };
 
 // ============================================================================
@@ -185,7 +202,9 @@ public:
     PoolStats getStats() const;
     DeviceMemoryInfo getDeviceMemoryInfo() const;
     const PoolConfig& getConfig() const { return config_; }
+    const DeviceConfig& getDeviceConfig() const { return deviceConfig_; }
     VkDevice getDevice() const { return device_; }
+    VkPhysicalDevice getPhysicalDevice() const { return deviceConfig_.physicalDevice; }
 
     // Maintenance
     void defragment();  // coalesce free ranges, migrate if needed

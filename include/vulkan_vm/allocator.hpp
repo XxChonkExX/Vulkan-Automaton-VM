@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vulkan_vm/vulkan_vm.hpp"
+#include <unordered_map>
 
 namespace vvm {
 
@@ -32,10 +33,16 @@ public:
     float getFragmentation() const;
     
 private:
+    struct AllocatedNode {
+        BuddyNode* node;
+        VkDeviceSize size;
+    };
+    
     BuddyNode* root_ = nullptr;
     VkDeviceSize blockSize_;
     VkDeviceSize minSize_;
     int maxLevel_;
+    std::unordered_map<VkDeviceSize, AllocatedNode> allocatedNodes_;
     
     BuddyNode* createNode(VkDeviceSize offset, VkDeviceSize size, int level);
     void destroyNode(BuddyNode* node);

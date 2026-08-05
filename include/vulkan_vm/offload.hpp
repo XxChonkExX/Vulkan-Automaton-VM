@@ -25,7 +25,7 @@ struct HostShadowBuffer {
 
 class HostShadowManager {
 public:
-    HostShadowManager(VkDevice device, const OffloadConfig& config);
+    HostShadowManager(VkPhysicalDevice physicalDevice, VkDevice device, const OffloadConfig& config);
     ~HostShadowManager();
     
     HostShadowManager(const HostShadowManager&) = delete;
@@ -56,6 +56,7 @@ public:
     void defragment();
 
 private:
+    VkPhysicalDevice physicalDevice_;
     VkDevice device_;
     OffloadConfig config_;
     HostShadowBuffer shadowBuffer_;

@@ -83,30 +83,40 @@ bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig&
     config_ = config;
     device_ = device.device;
     
-    // Find memory types
-    auto memProps = getDeviceMemoryInfo().memProps;
+    // Use MemoryTypeSelector for optimal memory type selection
+    MemoryTypeSelector selector(deviceConfig_.physicalDevice);
     
     // Prefer DEVICE_LOCAL for primary allocations
-    auto devLocalType = findMemoryTypeIndex(
-        memProps,
+    auto devLocalResult = selector.select(
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        config_.preferredFlags
+        config_.preferredFlags,
+        config_.blockSize  // Ensure enough budget for at least one block
     );
     
-    if (!devLocalType.has_value()) {
+    if (devLocalResult.memoryTypeIndex == UINT32_MAX) {
+        VVM_LOG_ERROR("Failed to find DEVICE_LOCAL memory type with sufficient budget");
         return false;
     }
-    deviceLocalMemoryType_ = *devLocalType;
+    deviceLocalMemoryType_ = devLocalResult.memoryTypeIndex;
+    VVM_LOG_INFO("Selected DEVICE_LOCAL memory type %u (heap budget: %llu MB, utilization: %.1f%%)",
+                 deviceLocalMemoryType_,
+                 devLocalResult.heapBudget / (1024*1024),
+                 devLocalResult.heapUtilization * 100.0f);
     
     // Host-visible for shadow/offload
     if (config_.enableHostVisible) {
-        auto hostVisibleType = findMemoryTypeIndex(
-            memProps,
+        auto hostVisibleResult = selector.select(
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            0
+            0,
+            256 * 1024 * 1024  // 256MB minimum
         );
-        if (hostVisibleType.has_value()) {
-            hostVisibleMemoryType_ = *hostVisibleType;
+        if (hostVisibleResult.memoryTypeIndex != UINT32_MAX) {
+            hostVisibleMemoryType_ = hostVisibleResult.memoryTypeIndex;
+            VVM_LOG_INFO("Selected HOST_VISIBLE memory type %u (heap budget: %llu MB)",
+                         hostVisibleMemoryType_,
+                         hostVisibleResult.heapBudget / (1024*1024));
+        } else {
+            VVM_LOG_WARN("No suitable HOST_VISIBLE memory type found");
         }
     }
     
@@ -119,11 +129,19 @@ bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig&
     poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     
     if (vkCreateCommandPool(device_, &poolInfo, nullptr, &transferCmdPool_) != VK_SUCCESS) {
+        VVM_LOG_ERROR("Failed to create transfer command pool");
         return false;
     }
     
     // Pre-allocate first block
-    return allocateBlock(config_.blockSize, deviceLocalMemoryType_, config_.enableExternal).has_value();
+    if (!allocateBlock(config_.blockSize, deviceLocalMemoryType_, config_.enableExternal).has_value()) {
+        VVM_LOG_ERROR("Failed to allocate initial memory block");
+        return false;
+    }
+    
+    VVM_LOG_INFO("UnifiedMemoryPool initialized successfully (blockSize=%llu MB, alignment=%llu KB)",
+                 config_.blockSize / (1024*1024), config_.minAlignment / 1024);
+    return true;
 }
 
 std::optional<uint32_t> UnifiedMemoryPool::findMemoryType(
@@ -142,16 +160,21 @@ std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
     
     // Export support for cross-GPU
     VkExportMemoryAllocateInfo exportInfo{};
+    void* pNext = nullptr;
+    
     if (exportable && config_.enableExternal) {
         exportInfo.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
         
         #ifdef VVM_PLATFORM_LINUX
-        exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+        exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT | 
+                                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
         #elif defined(VVM_PLATFORM_WINDOWS)
-        exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+        exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT | 
+                                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
         #endif
         
-        allocInfo.pNext = &exportInfo;
+        exportInfo.pNext = pNext;
+        pNext = &exportInfo;
     }
     
     // Device address support for bindless
@@ -159,13 +182,27 @@ std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
     if (config_.enableDeviceAddress) {
         flagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
         flagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-        flagsInfo.pNext = allocInfo.pNext;
-        allocInfo.pNext = &flagsInfo;
+        flagsInfo.pNext = pNext;
+        pNext = &flagsInfo;
     }
+    
+    // Dedicated allocation for external memory (more robust)
+    VkMemoryDedicatedAllocateInfo dedicatedInfo{};
+    if (exportable && config_.enableExternal) {
+        dedicatedInfo.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+        dedicatedInfo.buffer = VK_NULL_HANDLE;  // Will be set when buffer is created
+        dedicatedInfo.image = VK_NULL_HANDLE;
+        dedicatedInfo.pNext = pNext;
+        pNext = &dedicatedInfo;
+    }
+    
+    allocInfo.pNext = pNext;
     
     VkDeviceMemory memory;
     VkResult result = vkAllocateMemory(device_, &allocInfo, nullptr, &memory);
     if (result != VK_SUCCESS) {
+        VVM_LOG_ERROR("vkAllocateMemory failed: %s (size=%llu, type=%u)", 
+                      vkResultToString(result).c_str(), size, memoryTypeIndex);
         return std::nullopt;
     }
     
@@ -174,8 +211,16 @@ std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
     VkMemoryPropertyFlags memFlags;
     getMemoryTypeProperties(memoryTypeIndex, memFlags, getDeviceMemoryInfo().memProps);
     
-    if (memFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
-        vkMapMemory(device_, memory, 0, VK_WHOLE_SIZE, 0, &hostPtr);
+    bool isHostVisible = (memFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+    bool isCoherent = (memFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+    
+    if (isHostVisible) {
+        result = vkMapMemory(device_, memory, 0, VK_WHOLE_SIZE, 0, &hostPtr);
+        if (result != VK_SUCCESS) {
+            VVM_LOG_WARN("vkMapMemory failed: %s", vkResultToString(result).c_str());
+            hostPtr = nullptr;
+            isHostVisible = false;
+        }
     }
     
     BlockInfo block;
@@ -184,6 +229,9 @@ std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
     block.used = 0;
     block.hostPtr = hostPtr;
     block.freeRanges.emplace_back(0, size);
+    block.memoryFlags = memFlags;
+    block.isHostVisible = isHostVisible;
+    block.isCoherent = isCoherent;
     
     // Export handle if requested
     if (exportable && config_.enableExternal) {
@@ -191,12 +239,18 @@ std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
         VkMemoryGetFdInfoKHR fdInfo{};
         fdInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
         fdInfo.memory = memory;
+        // Try OPAQUE_FD first, fallback to DMA_BUF
         fdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
         
         PFN_vkGetMemoryFdKHR vkGetMemoryFdKHR = 
             (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(device_, "vkGetMemoryFdKHR");
         if (vkGetMemoryFdKHR) {
-            vkGetMemoryFdKHR(device_, &fdInfo, &block.exportFd);
+            VkResult res = vkGetMemoryFdKHR(device_, &fdInfo, &block.exportFd);
+            if (res != VK_SUCCESS) {
+                // Try DMA_BUF
+                fdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+                res = vkGetMemoryFdKHR(device_, &fdInfo, &block.exportFd);
+            }
         }
         #elif defined(VVM_PLATFORM_WINDOWS)
         VkMemoryGetWin32HandleInfoKHR handleInfo{};
@@ -207,7 +261,12 @@ std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
         PFN_vkGetMemoryWin32HandleKHR vkGetMemoryWin32HandleKHR = 
             (PFN_vkGetMemoryWin32HandleKHR)vkGetDeviceProcAddr(device_, "vkGetMemoryWin32HandleKHR");
         if (vkGetMemoryWin32HandleKHR) {
-            vkGetMemoryWin32HandleKHR(device_, &handleInfo, &block.exportHandle);
+            VkResult res = vkGetMemoryWin32HandleKHR(device_, &handleInfo, &block.exportHandle);
+            if (res != VK_SUCCESS) {
+                // Try D3D12_HEAP
+                handleInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
+                res = vkGetMemoryWin32HandleKHR(device_, &handleInfo, &block.exportHandle);
+            }
         }
         #endif
     }
@@ -266,15 +325,25 @@ std::optional<ExternalMemoryInfo> UnifiedMemoryPool::exportMemory(
     ExternalMemoryInfo info;
     info.type = type;
     info.size = alloc.size;
-    info.memoryTypeIndex = deviceLocalMemoryType_;  // plain uint32_t now
+    info.memoryTypeIndex = deviceLocalMemoryType_;
+    info.dedicatedAllocation = false;
     
     #ifdef VVM_PLATFORM_LINUX
     if (type == ExternalHandleType::OpaqueFd && block.exportFd >= 0) {
         info.fd = dup(block.exportFd);  // caller owns this fd
         return info;
+    } else if (type == ExternalHandleType::DmaBuf && block.exportFd >= 0) {
+        info.fd = dup(block.exportFd);
+        return info;
     }
     #elif defined(VVM_PLATFORM_WINDOWS)
     if (type == ExternalHandleType::OpaqueWin32 && block.exportHandle) {
+        HANDLE dupHandle;
+        DuplicateHandle(GetCurrentProcess(), block.exportHandle,
+                       GetCurrentProcess(), &dupHandle, 0, FALSE, DUPLICATE_SAME_ACCESS);
+        info.handle = dupHandle;
+        return info;
+    } else if (type == ExternalHandleType::D3D12Heap && block.exportHandle) {
         HANDLE dupHandle;
         DuplicateHandle(GetCurrentProcess(), block.exportHandle,
                        GetCurrentProcess(), &dupHandle, 0, FALSE, DUPLICATE_SAME_ACCESS);
@@ -298,41 +367,89 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
     allocInfo.allocationSize = info.size;
     allocInfo.memoryTypeIndex = info.memoryTypeIndex;
     
+    void* pNext = nullptr;
+    
     #ifdef VVM_PLATFORM_LINUX
     if (info.type == ExternalHandleType::OpaqueFd && info.fd >= 0) {
         importFdInfo.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
         importFdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
         importFdInfo.fd = info.fd;
-        allocInfo.pNext = &importFdInfo;
+        importFdInfo.pNext = pNext;
+        pNext = &importFdInfo;
+    } else if (info.type == ExternalHandleType::DmaBuf && info.fd >= 0) {
+        importFdInfo.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
+        importFdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        importFdInfo.fd = info.fd;
+        importFdInfo.pNext = pNext;
+        pNext = &importFdInfo;
     }
     #elif defined(VVM_PLATFORM_WINDOWS)
     if (info.type == ExternalHandleType::OpaqueWin32 && info.handle) {
         importWin32Info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR;
         importWin32Info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
         importWin32Info.handle = info.handle;
-        allocInfo.pNext = &importWin32Info;
+        importWin32Info.pNext = pNext;
+        pNext = &importWin32Info;
+    } else if (info.type == ExternalHandleType::D3D12Heap && info.handle) {
+        importWin32Info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR;
+        importWin32Info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
+        importWin32Info.handle = info.handle;
+        importWin32Info.pNext = pNext;
+        pNext = &importWin32Info;
     }
     #endif
     
+    // Dedicated allocation for imported memory
+    dedicatedInfo.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+    dedicatedInfo.buffer = VK_NULL_HANDLE;
+    dedicatedInfo.image = VK_NULL_HANDLE;
+    dedicatedInfo.pNext = pNext;
+    pNext = &dedicatedInfo;
+    
+    allocInfo.pNext = pNext;
+    
     VkDeviceMemory memory;
     if (vkAllocateMemory(device_, &allocInfo, nullptr, &memory) != VK_SUCCESS) {
+        VVM_LOG_ERROR("Failed to allocate memory for import");
         return std::nullopt;
     }
     
-    // Create buffer bound to imported memory
+    // Create buffer with external memory support
     VkBufferCreateInfo bufferInfo{};
     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bufferInfo.size = info.size;
     bufferInfo.usage = usage;
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     
+    // External memory buffer create info
+    VkExternalMemoryBufferCreateInfo extBufferInfo{};
+    #ifdef VVM_PLATFORM_LINUX
+    extBufferInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+                                VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    #elif defined(VVM_PLATFORM_WINDOWS)
+    extBufferInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT |
+                                VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
+    #endif
+    extBufferInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+    extBufferInfo.pNext = bufferInfo.pNext;
+    bufferInfo.pNext = &extBufferInfo;
+    
     VkBuffer buffer;
     if (vkCreateBuffer(device_, &bufferInfo, nullptr, &buffer) != VK_SUCCESS) {
+        VVM_LOG_ERROR("Failed to create buffer for imported memory");
         vkFreeMemory(device_, memory, nullptr);
         return std::nullopt;
     }
     
-    if (vkBindBufferMemory(device_, buffer, memory, 0) != VK_SUCCESS) {
+    // Bind with bindInfo2 for device group support
+    VkBindBufferMemoryInfo bindInfo{};
+    bindInfo.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO;
+    bindInfo.buffer = buffer;
+    bindInfo.memory = memory;
+    bindInfo.memoryOffset = 0;
+    
+    if (vkBindBufferMemory2(device_, 1, &bindInfo) != VK_SUCCESS) {
+        VVM_LOG_ERROR("Failed to bind imported memory");
         vkDestroyBuffer(device_, buffer, nullptr);
         vkFreeMemory(device_, memory, nullptr);
         return std::nullopt;
@@ -344,6 +461,8 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
     alloc.offset = 0;
     alloc.size = info.size;
     alloc.isExternal = true;
+    alloc.isHostVisible = false;
+    alloc.isMapped = false;
     
     if (config_.enableDeviceAddress) {
         VkBufferDeviceAddressInfo addrInfo{};
@@ -438,8 +557,9 @@ std::optional<Allocation> UnifiedMemoryPool::subAllocate(VkDeviceSize size,
     if (range.first == UINT64_MAX) return std::nullopt;
     
     VkDeviceSize offset = range.first;
+    const auto& block = blocks_[blockIndex];
     
-    // Create buffer
+    // Create buffer with external memory support if needed
     VkBufferCreateInfo bufferInfo{};
     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bufferInfo.size = size;
@@ -449,13 +569,41 @@ std::optional<Allocation> UnifiedMemoryPool::subAllocate(VkDeviceSize size,
                        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     
+    // External memory buffer create info for cross-GPU
+    VkExternalMemoryBufferCreateInfo extBufferInfo{};
+    if (block.exportFd >= 0 || block.exportHandle) {
+        extBufferInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+        #ifdef VVM_PLATFORM_LINUX
+        extBufferInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+                                    VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        #elif defined(VVM_PLATFORM_WINDOWS)
+        extBufferInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT |
+                                    VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
+        #endif
+        extBufferInfo.pNext = bufferInfo.pNext;
+        bufferInfo.pNext = &extBufferInfo;
+    }
+    
     VkBuffer buffer;
-    if (vkCreateBuffer(device_, &bufferInfo, nullptr, &buffer) != VK_SUCCESS) {
+    VkResult result = vkCreateBuffer(device_, &bufferInfo, nullptr, &buffer);
+    if (result != VK_SUCCESS) {
+        VVM_LOG_ERROR("vkCreateBuffer failed: %s", vkResultToString(result).c_str());
         return std::nullopt;
     }
     
     // Bind to memory at offset
-    if (vkBindBufferMemory(device_, buffer, blocks_[blockIndex].memory, offset) != VK_SUCCESS) {
+    VkBindBufferMemoryInfo bindInfo{};
+    bindInfo.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO;
+    bindInfo.buffer = buffer;
+    bindInfo.memory = block.memory;
+    bindInfo.memoryOffset = offset;
+    
+    VkBindBufferMemoryDeviceGroupInfo deviceGroupInfo{};
+    // For cross-GPU, we'd set device indices here
+    
+    result = vkBindBufferMemory2(device_, 1, &bindInfo);
+    if (result != VK_SUCCESS) {
+        VVM_LOG_ERROR("vkBindBufferMemory2 failed: %s", vkResultToString(result).c_str());
         vkDestroyBuffer(device_, buffer, nullptr);
         return std::nullopt;
     }
@@ -473,13 +621,16 @@ std::optional<Allocation> UnifiedMemoryPool::subAllocate(VkDeviceSize size,
     
     Allocation alloc;
     alloc.buffer = buffer;
-    alloc.memory = blocks_[blockIndex].memory;
+    alloc.memory = block.memory;
     alloc.offset = offset;
     alloc.size = size;
     alloc.blockIndex = blockIndex;
-    alloc.isHostVisible = (blocks_[blockIndex].hostPtr != nullptr);
+    alloc.isHostVisible = block.isHostVisible;
+    alloc.isMapped = (block.hostPtr != nullptr);
+    alloc.isCoherent = block.isCoherent;
+    alloc.memoryFlags = block.memoryFlags;
     alloc.hostPtr = alloc.isHostVisible 
-        ? static_cast<char*>(blocks_[blockIndex].hostPtr) + offset 
+        ? static_cast<char*>(block.hostPtr) + offset 
         : nullptr;
     
     if (config_.enableDeviceAddress) {

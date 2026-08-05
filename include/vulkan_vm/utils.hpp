@@ -63,6 +63,42 @@ bool checkDeviceExtensionSupport(VkPhysicalDevice device,
                                   const std::vector<const char*>& required);
 bool checkInstanceExtensionSupport(const std::vector<const char*>& required);
 
+// Memory type selection with budget awareness
+struct MemoryTypeSelector {
+    VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+    VkPhysicalDeviceMemoryProperties memProps{};
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    bool hasBudgetExt = false;
+    
+    explicit MemoryTypeSelector(VkPhysicalDevice pd = VK_NULL_HANDLE);
+    void refresh();
+    
+    // Find best memory type considering budget, heap, and flags
+    struct SelectionResult {
+        uint32_t memoryTypeIndex = UINT32_MAX;
+        VkDeviceSize heapBudget = 0;
+        VkDeviceSize heapUsage = 0;
+        float heapUtilization = 0.0f;
+    };
+    
+    SelectionResult select(VkMemoryPropertyFlags required,
+                           VkMemoryPropertyFlags preferred = 0,
+                           VkDeviceSize minHeapBudget = 0) const;
+    
+    // Get dedicated allocation requirements
+    DedicatedAllocationInfo getDedicatedAllocationInfo(
+        VkBufferCreateInfo* bufferInfo,
+        VkImageCreateInfo* imageInfo = nullptr) const;
+};
+
+inline VkDeviceSize getHeapBudget(const VkPhysicalDeviceMemoryBudgetPropertiesEXT& budget, uint32_t heapIndex) {
+    return budget.heapBudget[heapIndex];
+}
+
+inline VkDeviceSize getHeapUsage(const VkPhysicalDeviceMemoryBudgetPropertiesEXT& budget, uint32_t heapIndex) {
+    return budget.heapUsage[heapIndex];
+}
+
 // Debug helpers
 void printMemoryTypes(const VkPhysicalDeviceMemoryProperties& props);
 void printQueueFamilies(VkPhysicalDevice physicalDevice);
