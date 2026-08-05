@@ -188,6 +188,7 @@ MIT License - see LICENSE file.
 
 ## Credits
 
+- **Nemotron** — primary coder
 - **Grok (xAI)** — architectural review, offload/migration design review, and recommendations that shaped the buddy-backed pool and host shadow integration
 - **Deepseek** — implementation support and debugging across the codebase
 - **GLM** — review and refinements during development
