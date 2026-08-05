@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 
 namespace vvm {
 

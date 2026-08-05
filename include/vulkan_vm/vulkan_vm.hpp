@@ -18,6 +18,7 @@
 #include <string>
 #include <span>
 #include <memory>
+#include <mutex>
 
 #include "vulkan_vm/buddy_allocator.hpp"
 
@@ -326,6 +327,9 @@ private:
     
     // Buddy allocator helpers
     VkDeviceSize alignUp(VkDeviceSize value, VkDeviceSize alignment);
+    
+    // Thread safety: all public methods are guarded by this mutex
+    mutable std::mutex mutex_;
     
     DeviceConfig deviceConfig_;
     PoolConfig config_;
