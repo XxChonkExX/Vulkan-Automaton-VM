@@ -221,6 +221,124 @@ private:
 };
 
 // ============================================================================
+// RAII Wrappers for Vulkan Handles
+// ============================================================================
+
+template<typename Handle, typename Deleter>
+class UniqueHandle {
+public:
+    UniqueHandle() = default;
+    UniqueHandle(Handle h, Deleter d) : handle_(h), deleter_(std::move(d)) {}
+    
+    UniqueHandle(UniqueHandle&& other) noexcept
+        : handle_(other.handle_), deleter_(std::move(other.deleter_)) {
+        other.handle_ = VK_NULL_HANDLE;
+    }
+    
+    UniqueHandle& operator=(UniqueHandle&& other) noexcept {
+        if (this != &other) {
+            reset();
+            handle_ = other.handle_;
+            deleter_ = std::move(other.deleter_);
+            other.handle_ = VK_NULL_HANDLE;
+        }
+        return *this;
+    }
+    
+    ~UniqueHandle() { reset(); }
+    
+    void reset() {
+        if (handle_ != VK_NULL_HANDLE && deleter_) {
+            deleter_(handle_);
+            handle_ = VK_NULL_HANDLE;
+        }
+    }
+    
+    Handle get() const { return handle_; }
+    explicit operator bool() const { return handle_ != VK_NULL_HANDLE; }
+    Handle release() { Handle h = handle_; handle_ = VK_NULL_HANDLE; return h; }
+    
+private:
+    Handle handle_ = VK_NULL_HANDLE;
+    Deleter deleter_;
+};
+
+// Convenience aliases for common Vulkan handles
+using UniqueDeviceMemory = UniqueHandle<VkDeviceMemory, std::function<void(VkDeviceMemory)>>;
+using UniqueBuffer = UniqueHandle<VkBuffer, std::function<void(VkBuffer)>>;
+using UniqueCommandPool = UniqueHandle<VkCommandPool, std::function<void(VkCommandPool)>>;
+using UniqueFence = UniqueHandle<VkFence, std::function<void(VkFence)>>;
+using UniqueSemaphore = UniqueHandle<VkSemaphore, std::function<void(VkSemaphore)>>;
+using UniqueQueryPool = UniqueHandle<VkQueryPool, std::function<void(VkQueryPool)>>;
+
+// Helper factories
+inline UniqueDeviceMemory makeUniqueDeviceMemory(VkDevice device, VkDeviceMemory memory) {
+    return UniqueDeviceMemory(memory, [device](VkDeviceMemory m) { vkFreeMemory(device, m, nullptr); });
+}
+
+inline UniqueBuffer makeUniqueBuffer(VkDevice device, VkBuffer buffer) {
+    return UniqueBuffer(buffer, [device](VkBuffer b) { vkDestroyBuffer(device, b, nullptr); });
+}
+
+inline UniqueCommandPool makeUniqueCommandPool(VkDevice device, VkCommandPool pool) {
+    return UniqueCommandPool(pool, [device](VkCommandPool p) { vkDestroyCommandPool(device, p, nullptr); });
+}
+
+inline UniqueFence makeUniqueFence(VkDevice device, VkFence fence) {
+    return UniqueFence(fence, [device](VkFence f) { vkDestroyFence(device, f, nullptr); });
+}
+
+inline UniqueSemaphore makeUniqueSemaphore(VkDevice device, VkSemaphore semaphore) {
+    return UniqueSemaphore(semaphore, [device](VkSemaphore s) { vkDestroySemaphore(device, s, nullptr); });
+}
+
+inline UniqueQueryPool makeUniqueQueryPool(VkDevice device, VkQueryPool pool) {
+    return UniqueQueryPool(pool, [device](VkQueryPool p) { vkDestroyQueryPool(device, p, nullptr); });
+}
+
+// RAII wrapper for external memory handles (FD on Linux, HANDLE on Windows)
+class ExternalHandle {
+public:
+    ExternalHandle() = default;
+    
+    #ifdef VVM_PLATFORM_LINUX
+    explicit ExternalHandle(int fd) : fd_(fd) {}
+    ~ExternalHandle() { if (fd_ >= 0) close(fd_); }
+    
+    ExternalHandle(ExternalHandle&& other) noexcept : fd_(other.fd_) { other.fd_ = -1; }
+    ExternalHandle& operator=(ExternalHandle&& other) noexcept {
+        if (this != &other) { if (fd_ >= 0) close(fd_); fd_ = other.fd_; other.fd_ = -1; }
+        return *this;
+    }
+    
+    int get() const { return fd_; }
+    explicit operator bool() const { return fd_ >= 0; }
+    int release() { int fd = fd_; fd_ = -1; return fd; }
+    
+    #elif defined(VVM_PLATFORM_WINDOWS)
+    explicit ExternalHandle(HANDLE handle) : handle_(handle) {}
+    ~ExternalHandle() { if (handle_) CloseHandle(handle_); }
+    
+    ExternalHandle(ExternalHandle&& other) noexcept : handle_(other.handle_) { other.handle_ = nullptr; }
+    ExternalHandle& operator=(ExternalHandle&& other) noexcept {
+        if (this != &other) { if (handle_) CloseHandle(handle_); handle_ = other.handle_; other.handle_ = nullptr; }
+        return *this;
+    }
+    
+    HANDLE get() const { return handle_; }
+    explicit operator bool() const { return handle_ != nullptr; }
+    HANDLE release() { HANDLE h = handle_; handle_ = nullptr; return h; }
+    #endif
+    
+private:
+    #ifdef VVM_PLATFORM_LINUX
+    int fd_ = -1;
+    #elif defined(VVM_PLATFORM_WINDOWS)
+    HANDLE handle_ = nullptr;
+    #endif
+};
+
+// ============================================================================
 // Resource Management
 // ============================================================================
 
@@ -263,7 +381,7 @@ public:
         return available_.size();
     }
     
-private:
+    private:
     Creator create_;
     Destructor destroy_;
     std::vector<T> available_;
