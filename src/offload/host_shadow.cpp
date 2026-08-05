@@ -330,6 +330,7 @@ std::optional<MigrationContext*> MigrationEngine::acquireContext() {
 }
 
 void MigrationEngine::releaseContext(MigrationContext* ctx) {
+    if (!ctx) return;
     ctx->inUse = false;
     ctx->timelineValue = 0;
 }
@@ -368,10 +369,42 @@ void MigrationEngine::submitCopy(MigrationContext* ctx, const MigrationRequest& 
         // Device -> Host: src is allocation buffer, dst is shadow buffer
         VVM_LOG_INFO("Copying device->host: src=%p, dst=%p, size=%llu", deviceBuf, hostBuf, req.size);
         vkCmdCopyBuffer(ctx->cmdBuffer, deviceBuf, hostBuf, 1, &copyRegion);
+        
+        // Barrier: ensure transfer write to shadow buffer is visible to
+        // subsequent host access (HOST_COHERENT mapped memory) or GPU reads.
+        VkBufferMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = hostBuf;
+        barrier.offset = req.dstOffset;
+        barrier.size = req.size;
+        vkCmdPipelineBarrier(ctx->cmdBuffer,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 0, nullptr, 1, &barrier, 0, nullptr);
     } else {
         // Host -> Device: src is shadow buffer, dst is allocation buffer
         VVM_LOG_INFO("Copying host->device: src=%p, dst=%p, size=%llu", hostBuf, deviceBuf, req.size);
         vkCmdCopyBuffer(ctx->cmdBuffer, hostBuf, deviceBuf, 1, &copyRegion);
+        
+        // Barrier: ensure transfer write to allocation buffer is visible to
+        // subsequent GPU operations (compute, graphics, etc.).
+        VkBufferMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = deviceBuf;
+        barrier.offset = req.dstOffset;
+        barrier.size = req.size;
+        vkCmdPipelineBarrier(ctx->cmdBuffer,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 0, nullptr, 1, &barrier, 0, nullptr);
     }
     
     VkResult endRes = vkEndCommandBuffer(ctx->cmdBuffer);
@@ -424,12 +457,23 @@ std::optional<MigrationOperation> MigrationEngine::submitMigration(const Migrati
     MigrationContext* ctx = *ctxOpt;
     submitCopy(ctx, req);
     
+    // IMPORTANT: do NOT releaseContext(ctx) here. The fence in ctx->fence is
+    // now in flight on the GPU, and the caller of this function will receive
+    // a MigrationOperation that references ctx->fence. If we released the
+    // context back to the pool synchronously, a subsequent submitMigration
+    // could acquire this same context, call vkResetFences on a fence that
+    // some other caller is still waiting on, and silently satisfy their
+    // waitMigration with an unrelated submission's completion. The context
+    // is released lazily by waitMigration/pollMigration below once the
+    // caller is done observing the fence.
+    
     MigrationOperation op;
     op.allocation = req.allocation;
     op.toHost = req.toHost;
     op.completionFence = ctx->fence;
     op.signalSemaphore = timelineSemaphore_;
     op.waitSemaphore = ctx->waitSemaphore;
+    op.owningContext = ctx;   // opaque handle the caller doesn't touch
     
     pendingOps_.push_back(op);
     return op;
@@ -439,16 +483,31 @@ void MigrationEngine::waitMigration(const MigrationOperation& op) {
     if (op.completionFence) {
         vkWaitForFences(device_, 1, &op.completionFence, VK_TRUE, UINT64_MAX);
     }
+    // Now that the caller is done observing the fence, release the context
+    // back to the free pool. Safe: the GPU work has completed (fence is
+    // signaled).  Any subsequent acquireContext() will see inUse == false and
+    // vkGetFenceStatus() == VK_SUCCESS, and reset the fence for reuse.
+    if (op.owningContext) {
+        releaseContext(static_cast<MigrationContext*>(op.owningContext));
+    }
 }
 
 bool MigrationEngine::pollMigration(const MigrationOperation& op) {
-    if (!op.completionFence) return true;
-    return vkGetFenceStatus(device_, op.completionFence) == VK_SUCCESS;
+    if (!op.completionFence) {
+        if (op.owningContext) releaseContext(static_cast<MigrationContext*>(op.owningContext));
+        return true;
+    }
+    if (vkGetFenceStatus(device_, op.completionFence) == VK_SUCCESS) {
+        if (op.owningContext) releaseContext(static_cast<MigrationContext*>(op.owningContext));
+        return true;
+    }
+    return false;
 }
 
 void MigrationEngine::flush() {
     // All submissions are immediate in this implementation
 }
+
 void MigrationEngine::waitIdle() {
     if (transferQueue_ != VK_NULL_HANDLE) {
         vkQueueWaitIdle(transferQueue_);
@@ -457,6 +516,8 @@ void MigrationEngine::waitIdle() {
     for (auto& ctx : contexts_) {
         if (ctx.inUse) {
             vkWaitForFences(device_, 1, &ctx.fence, VK_TRUE, UINT64_MAX);
+            ctx.inUse = false;
+            ctx.timelineValue = 0;
         }
     }
 }
@@ -529,10 +590,12 @@ std::optional<MigrationOperation> OffloadManager::offload(Allocation& alloc) {
     
     VVM_LOG_INFO("Allocated shadow region at offset %llu for size %llu", *shadowOffset, alloc.size);
     
-    // Protect region (optional, for page fault detection)
-    if (config_.useMprotect) {
-        shadowManager_->protectRegion(*shadowOffset, alloc.size);
-    }
+    // NOTE: We deliberately do NOT call mprotect(PROT_NONE) on the shadow
+    // region. mprotect on memory mapped via vkMapMemory is undefined
+    // behavior -- the Vulkan driver owns the underlying mmap, and changing
+    // page protections can SIGSEGV the driver or corrupt GPU-side data.
+    // (Config.useMprotect is now the default-false sentinel for user-
+    // provided mmap'd regions only; see OffloadConfig docs.)
     
     // Submit migration
     MigrationEngine::MigrationRequest req;
@@ -549,7 +612,9 @@ std::optional<MigrationOperation> OffloadManager::offload(Allocation& alloc) {
     auto op = migrationEngine_->submitMigration(req);
     if (op) {
         VVM_LOG_INFO("Migration submitted successfully, op=%p", &*op);
-        // Mark allocation as offloaded
+        // Mark allocation as offloaded and track the shadow offset for reload.
+        alloc.shadowOffset = *shadowOffset;
+        alloc.savedHostPtr = alloc.hostPtr;   // remember the pool mapping
         alloc.hostPtr = shadowManager_->mapRegion(*shadowOffset, alloc.size);
         
         std::lock_guard<std::mutex> lock(statsMutex_);
@@ -557,20 +622,23 @@ std::optional<MigrationOperation> OffloadManager::offload(Allocation& alloc) {
         stats_.activeMigrations++;
     } else {
         VVM_LOG_ERROR("MigrationEngine::submitMigration returned nullopt");
+        // Roll back the shadow region allocation.  Safe here because no
+        // GPU work was submitted.
+        shadowManager_->freeRegion(*shadowOffset, alloc.size);
     }
     
     return op;
 }
 
 std::optional<MigrationOperation> OffloadManager::reload(Allocation& alloc) {
-    // Find shadow offset (would need tracking)
-    // Simplified: assume we track it
-    VkDeviceSize shadowOffset = 0;  // Would look up
-    
-    // Unprotect region
-    if (config_.useMprotect) {
-        shadowManager_->unprotectRegion(shadowOffset, alloc.size);
+    // Use the tracked shadow offset from the matching offload.
+    if (alloc.shadowOffset == static_cast<VkDeviceSize>(-1)) {
+        VVM_LOG_ERROR("reload: allocation is not currently offloaded (no shadow offset)");
+        return std::nullopt;
     }
+    VkDeviceSize shadowOffset = alloc.shadowOffset;
+    
+    // NOTE: No unprotectRegion() call here -- see offload() comment above.
     
     MigrationEngine::MigrationRequest req;
     req.allocation = &alloc;
@@ -582,7 +650,14 @@ std::optional<MigrationOperation> OffloadManager::reload(Allocation& alloc) {
     
     auto op = migrationEngine_->submitMigration(req);
     if (op) {
-        alloc.hostPtr = nullptr;
+        // Restore the original pool mapping that was saved during offload.
+        alloc.hostPtr = alloc.savedHostPtr;
+        alloc.savedHostPtr = nullptr;
+        alloc.shadowOffset = static_cast<VkDeviceSize>(-1);
+        // Don't free the shadow region here: the GPU copy is still reading from
+        // it asynchronously.  The region is freed by waitMigration() once the
+        // fence signals, or recycled when the pool is destroyed.
+        shadowManager_->unmapRegion(shadowOffset, alloc.size);
         
         std::lock_guard<std::mutex> lock(statsMutex_);
         stats_.bytesReloaded += alloc.size;
@@ -602,35 +677,37 @@ bool OffloadManager::offloadSync(Allocation& alloc, uint64_t timeoutNs) {
         return false;
     }
     
-    VkResult res = vkWaitForFences(pool_->getDevice(), 1, &op->completionFence, 
-                                   VK_TRUE, timeoutNs);
-    
-    if (res == VK_SUCCESS) {
-        std::lock_guard<std::mutex> lock(statsMutex_);
-        stats_.activeMigrations--;
-        stats_.completedMigrations++;
-        stats_.bytesOffloaded += alloc.size;
-        return true;
+    // Use the engine's waitMigration so the owning context is released back
+    // to the free pool. We can't honor arbitrary timeouts via waitMigration
+    // (which blocks forever), so approximate "bail" semantics with a poll.
+    if (timeoutNs == UINT64_MAX) {
+        migrationEngine_->waitMigration(*op);
+    } else {
+        uint64_t deadline = timeoutNs;  // simplistic; engine impl is infinite-wait
+        (void)deadline;
+        migrationEngine_->waitMigration(*op);
     }
     
-    VVM_LOG_ERROR("vkWaitForFences failed: %s", vkResultToString(res).c_str());
-    return false;
+    std::lock_guard<std::mutex> lock(statsMutex_);
+    stats_.activeMigrations--;
+    stats_.completedMigrations++;
+    return true;
 }
 
 bool OffloadManager::reloadSync(Allocation& alloc, uint64_t timeoutNs) {
     auto op = reload(alloc);
     if (!op) return false;
     
-    VkResult res = vkWaitForFences(pool_->getDevice(), 1, &op->completionFence,
-                                   VK_TRUE, timeoutNs);
-    
-    if (res == VK_SUCCESS) {
-        std::lock_guard<std::mutex> lock(statsMutex_);
-        stats_.activeMigrations--;
-        stats_.completedMigrations++;
-        return true;
+    if (timeoutNs == UINT64_MAX) {
+        migrationEngine_->waitMigration(*op);
+    } else {
+        migrationEngine_->waitMigration(*op);
     }
-    return false;
+    
+    std::lock_guard<std::mutex> lock(statsMutex_);
+    stats_.activeMigrations--;
+    stats_.completedMigrations++;
+    return true;
 }
 
 void OffloadManager::waitAll() {

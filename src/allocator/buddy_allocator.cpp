@@ -5,12 +5,32 @@
 #include <algorithm>
 #include <cmath>
 #include <unordered_map>
+#include <memory>
+#include <cassert>
 
 namespace vvm {
 
 // ============================================================================
 // BuddyAllocator Implementation
 // ============================================================================
+
+// Helper: check if value is power of two
+static inline bool isPowerOfTwo(VkDeviceSize value) {
+    return value != 0 && (value & (value - 1)) == 0;
+}
+
+// Helper: round up to next power of two
+static inline VkDeviceSize roundUpToPowerOfTwo(VkDeviceSize value) {
+    if (isPowerOfTwo(value)) return value;
+    value--;
+    value |= value >> 1;
+    value |= value >> 2;
+    value |= value >> 4;
+    value |= value >> 8;
+    value |= value >> 16;
+    value |= value >> 32;
+    return value + 1;
+}
 
 struct AllocatedNode {
     BuddyNode* node;
@@ -19,6 +39,11 @@ struct AllocatedNode {
 
 BuddyAllocator::BuddyAllocator(VkDeviceSize blockSize, VkDeviceSize minSize)
     : blockSize_(blockSize), minSize_(minSize) {
+    
+    // Enforce power-of-two sizes for buddy allocator correctness
+    assert(isPowerOfTwo(blockSize_) && "blockSize must be power of two");
+    assert(isPowerOfTwo(minSize_) && "minSize must be power of two");
+    assert(blockSize_ >= minSize_ && "blockSize must be >= minSize");
     
     maxLevel_ = 0;
     VkDeviceSize temp = blockSize_;
@@ -35,11 +60,16 @@ BuddyAllocator::~BuddyAllocator() {
 }
 
 BuddyNode* BuddyAllocator::createNode(VkDeviceSize offset, VkDeviceSize size, int level) {
+    // Use unique_ptr internally but expose raw pointer for tree structure
+    // The node is owned by the tree and will be deleted in destroyNode
     BuddyNode* node = new BuddyNode();
     node->offset = offset;
     node->size = size;
     node->free = true;
     node->level = level;
+    node->left = nullptr;
+    node->right = nullptr;
+    node->parent = nullptr;
     return node;
 }
 
@@ -51,6 +81,12 @@ void BuddyAllocator::destroyNode(BuddyNode* node) {
 }
 
 int BuddyAllocator::getLevelForSize(VkDeviceSize size) const {
+    // Round up to power of two for buddy allocator
+    size = roundUpToPowerOfTwo(size);
+    
+    // Clamp to minSize
+    if (size < minSize_) size = minSize_;
+    
     int level = 0;
     VkDeviceSize temp = blockSize_;
     while (temp > size && level < maxLevel_) {
@@ -65,7 +101,8 @@ BuddyNode* BuddyAllocator::findFree(BuddyNode* node, VkDeviceSize size) {
     
     // If node has children, we must search them (node is not a leaf)
     if (node->left) {
-        if (!node->left) split(node);
+        // DEAD CODE FIX: node->left is already non-null here, so split() is unnecessary
+        // The old code had: if (!node->left) split(node); which was dead code
         
         BuddyNode* result = findFree(node->left, size);
         if (!result) result = findFree(node->right, size);
@@ -131,6 +168,12 @@ void BuddyAllocator::merge(BuddyNode* node) {
 }
 
 std::optional<VkDeviceSize> BuddyAllocator::allocate(VkDeviceSize size) {
+    // Round up to power of two for buddy allocator
+    size = roundUpToPowerOfTwo(size);
+    
+    // Clamp to minSize
+    if (size < minSize_) size = minSize_;
+    
     BuddyNode* node = findFree(root_, size);
     if (!node) return std::nullopt;
     
@@ -140,6 +183,9 @@ std::optional<VkDeviceSize> BuddyAllocator::allocate(VkDeviceSize size) {
         node = node->left;  // Use left child
     }
     
+    // Double-free validation: node must be free
+    assert(node->free && "Double-free detected: allocating already allocated node");
+    
     node->free = false;
     allocatedNodes_[node->offset] = {node, size};
     
@@ -148,13 +194,22 @@ std::optional<VkDeviceSize> BuddyAllocator::allocate(VkDeviceSize size) {
 
 void BuddyAllocator::deallocate(VkDeviceSize offset, VkDeviceSize size) {
     auto it = allocatedNodes_.find(offset);
-    if (it == allocatedNodes_.end()) return;
+    if (it == allocatedNodes_.end()) {
+        VVM_LOG_WARN("deallocate: offset %llu not found (double-free or invalid)", offset);
+        return;
+    }
     
     BuddyNode* node = it->second.node;
-    allocatedNodes_.erase(it);
     
-    node->free = true;
-    merge(node);
+    // Double-free validation: node must not be free already
+    if (!node->free) {
+        node->free = true;
+        merge(node);
+    } else {
+        VVM_LOG_WARN("deallocate: offset %llu already free (double-free)", offset);
+    }
+    
+    allocatedNodes_.erase(it);
 }
 
 VkDeviceSize BuddyAllocator::getLargestFree() const {

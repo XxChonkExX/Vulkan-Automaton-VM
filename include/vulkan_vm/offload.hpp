@@ -23,6 +23,9 @@ struct HostShadowBuffer {
     #endif
 };
 
+// Thread Safety: HostShadowManager is NOT thread-safe. All methods must be
+// externally synchronized.
+
 class HostShadowManager {
 public:
     HostShadowManager(VkPhysicalDevice physicalDevice, VkDevice device, const OffloadConfig& config);
@@ -39,12 +42,16 @@ public:
     void* mapRegion(VkDeviceSize offset, VkDeviceSize size);
     void unmapRegion(VkDeviceSize offset, VkDeviceSize size);
     
-    // Advise kernel (Linux)
+    // Advise kernel (Linux ONLY -- unsafe on memory mapped via vkMapMemory).
+    // These helpers exist for potential use on user-allocated mmap'd regions
+    // only, and are NOT called by the standard offload/reload flow. Calling
+    // madvise() on Vulkan driver-owned mappings can corrupt GPU-side data.
     void adviseDontNeed(VkDeviceSize offset, VkDeviceSize size);
     void adviseWillNeed(VkDeviceSize offset, VkDeviceSize size);
     void adviseFree(VkDeviceSize offset, VkDeviceSize size);  // MADV_FREE
     
-    // Protect/unprotect (mprotect)
+    // Protect/unprotect (mprotect). Linux ONLY -- unsafe on memory mapped
+    // via vkMapMemory, may SIGSEGV the driver. NOT called by offload/reload.
     void protectRegion(VkDeviceSize offset, VkDeviceSize size);   // PROT_NONE
     void unprotectRegion(VkDeviceSize offset, VkDeviceSize size); // PROT_READ|WRITE
     
@@ -79,6 +86,10 @@ struct MigrationContext {
     uint64_t timelineValue = 0;
     bool inUse = false;
 };
+
+// Thread Safety: MigrationEngine is NOT thread-safe. All methods must be
+// externally synchronized. The maxConcurrent parameter controls internal
+// command buffer/fence pool size, not thread concurrency.
 
 class MigrationEngine {
 public:
@@ -133,6 +144,10 @@ private:
 // ============================================================================
 // High-Level Offload Manager
 // ============================================================================
+
+// Thread Safety: OffloadManager is NOT thread-safe. All methods must be
+// externally synchronized. The internal MigrationEngine and HostShadowManager
+// are also not thread-safe.
 
 class OffloadManager {
 public:

@@ -66,6 +66,79 @@ struct Allocation {
     bool isMapped = false;
     bool isCoherent = false;
     VkMemoryPropertyFlags memoryFlags = 0;
+    // Offload tracking: when the allocation is offloaded to the host shadow
+    // buffer, this holds the offset within that shadow buffer. UINT64_MAX means
+    // the allocation is not currently offloaded.
+    VkDeviceSize shadowOffset = static_cast<VkDeviceSize>(-1);
+
+    // Saved from the original pool mapping so reload can restore it.
+    void* savedHostPtr = nullptr;
+};
+
+// Forward declaration for RAII wrapper
+class UnifiedMemoryPool;
+
+// RAII wrapper for Allocation - automatically returns to pool on destruction.
+// Usage: auto alloc = pool->allocate(...); UniqueAllocation ua(pool, std::move(alloc));
+// Note: Not thread-safe; pool operations must be externally synchronized.
+class UniqueAllocation {
+public:
+    using Deleter = void(*)(UnifiedMemoryPool*, Allocation&&);
+    
+    UniqueAllocation() = default;
+    // NOTE: Use make() factory instead of constructor for proper deleter setup
+    UniqueAllocation(UnifiedMemoryPool* pool, Allocation&& alloc)
+        : pool_(pool), alloc_(std::move(alloc)), deleter_(nullptr) {}
+    
+    UniqueAllocation(UniqueAllocation&& other) noexcept
+        : pool_(other.pool_), alloc_(std::move(other.alloc_)), deleter_(other.deleter_) {
+        other.pool_ = nullptr;
+        other.deleter_ = nullptr;
+    }
+    
+    UniqueAllocation& operator=(UniqueAllocation&& other) noexcept {
+        if (this != &other) {
+            reset();
+            pool_ = other.pool_;
+            alloc_ = std::move(other.alloc_);
+            deleter_ = other.deleter_;
+            other.pool_ = nullptr;
+            other.deleter_ = nullptr;
+        }
+        return *this;
+    }
+    
+    ~UniqueAllocation() { reset(); }
+    
+    void reset() {
+        if (pool_ && alloc_.buffer != VK_NULL_HANDLE && deleter_) {
+            deleter_(pool_, std::move(alloc_));
+            alloc_ = {};
+        }
+    }
+    
+    Allocation* get() { return alloc_.buffer != VK_NULL_HANDLE ? &alloc_ : nullptr; }
+    const Allocation* get() const { return alloc_.buffer != VK_NULL_HANDLE ? &alloc_ : nullptr; }
+    Allocation* operator->() { return get(); }
+    const Allocation* operator->() const { return get(); }
+    explicit operator bool() const { return alloc_.buffer != VK_NULL_HANDLE; }
+    
+    // Release ownership without deallocating
+    Allocation release() {
+        Allocation tmp = std::move(alloc_);
+        alloc_ = {};
+        pool_ = nullptr;
+        deleter_ = nullptr;
+        return tmp;
+    }
+    
+    // Factory to create with proper deleter
+    static UniqueAllocation make(UnifiedMemoryPool* pool, Allocation&& alloc);
+    
+private:
+    UnifiedMemoryPool* pool_ = nullptr;
+    Allocation alloc_;
+    Deleter deleter_ = nullptr;
 };
 
 struct BlockInfo {
@@ -75,6 +148,7 @@ struct BlockInfo {
     VkDeviceSize offset = 0;  // for host-visible shadow
     void* hostPtr = nullptr;
     int exportFd = -1;        // Linux external handle
+    VkExternalMemoryHandleTypeFlagBits exportHandleType = static_cast<VkExternalMemoryHandleTypeFlagBits>(0);  // which handle type was exported
 #ifdef VVM_PLATFORM_WINDOWS
     HANDLE exportHandle = nullptr;  // Windows external handle
 #endif
@@ -119,8 +193,8 @@ struct DedicatedAllocationInfo {
 
 struct OffloadConfig {
     VkDeviceSize hostShadowSize = 4 * 1024 * 1024 * 1024;  // 4GB host shadow
-    bool useMadvise = true;                                 // MADV_DONTNEED/FREE
-    bool useMprotect = true;                                // PROT_NONE on offload
+    bool useMadvise = false;                                // unsafe on vkMapMemory memory; kept only for future user-mmap regions
+    bool useMprotect = false;                               // unsafe on vkMapMemory memory; enables page-fault detection only
     VkQueue transferQueue = VK_NULL_HANDLE;
     uint32_t transferQueueFamily = UINT32_MAX;
     // Mapping lifetime management
@@ -136,6 +210,11 @@ struct MigrationOperation {
     VkSemaphore waitSemaphore = VK_NULL_HANDLE;
     VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkPipelineStageFlags signalStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    // Opaque pointer to the owning MigrationContext. The engine releases this
+    // context back to the pool when waitMigration/pollMigration observes the
+    // fence signaled. Kept opaque here to avoid a circular include with
+    // offload.hpp (which defines MigrationContext).
+    void* owningContext = nullptr;
 };
 
 // Forward declaration
@@ -165,6 +244,12 @@ struct DeviceMemoryInfo {
 // ============================================================================
 // Core Interface
 // ============================================================================
+//
+// Thread Safety: UnifiedMemoryPool is NOT thread-safe. All public methods
+// must be externally synchronized by the caller. Concurrent calls to
+// allocate/deallocate/exportMemory/importMemory/offloadToHost/reloadToDevice
+// from multiple threads will result in data races. Use a mutex or other
+// synchronization primitive if multi-threaded access is required.
 
 class UnifiedMemoryPool {
 public:
@@ -179,16 +264,23 @@ public:
     UnifiedMemoryPool& operator=(UnifiedMemoryPool&&) noexcept;
     ~UnifiedMemoryPool();
 
-    // Allocation
+// Allocation
     std::optional<Allocation> allocate(VkDeviceSize size,
                                        VkBufferUsageFlags usage,
                                        VkMemoryPropertyFlags flags = 0);
     
+    // Allocate a dedicated VkDeviceMemory for a single exportable buffer.
+    // Each exportable allocation gets its own dedicated memory (not sub-allocated).
+    // This is required by the Vulkan spec for reliable external memory import.
+    std::optional<Allocation> allocateDedicatedExportable(
+        VkDeviceSize size, VkBufferUsageFlags usage,
+        VkMemoryPropertyFlags flags = 0);
+    
     std::optional<Allocation> allocateTensor(VkDeviceSize size,
                                              VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                                                         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-                                                                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                                                                         VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                                                                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                                                                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                                                     VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     
     void deallocate(Allocation&& alloc);
 
@@ -239,6 +331,8 @@ private:
     PoolConfig config_;
     VkDevice device_ = VK_NULL_HANDLE;
     std::vector<BlockInfo> blocks_;
+    // Dedicated allocations (exportable/imported) tracked separately from blocks
+    std::vector<Allocation> dedicatedAllocations_;
     uint32_t deviceLocalMemoryType_ = UINT32_MAX;
     uint32_t hostVisibleMemoryType_ = UINT32_MAX;
     VkCommandPool transferCmdPool_ = VK_NULL_HANDLE;
@@ -312,6 +406,23 @@ struct Result {
 };
 
 } // namespace vvm
+
+// Inline implementation of UniqueAllocation::make (requires UnifiedMemoryPool to be fully defined)
+namespace vvm {
+inline void uniqueAllocationDeleter(UnifiedMemoryPool* pool, Allocation&& alloc) {
+    if (pool && alloc.buffer != VK_NULL_HANDLE) {
+        pool->deallocate(std::move(alloc));
+    }
+}
+
+inline UniqueAllocation UniqueAllocation::make(UnifiedMemoryPool* pool, Allocation&& alloc) {
+    UniqueAllocation ua;
+    ua.pool_ = pool;
+    ua.alloc_ = std::move(alloc);
+    ua.deleter_ = &uniqueAllocationDeleter;
+    return ua;
+}
+}
 
 #include "vulkan_vm/offload.hpp"
 #include "vulkan_vm/network.hpp"

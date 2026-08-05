@@ -21,6 +21,7 @@ struct VendorPairCaps {
     bool nvidiaToAmd = false;
     bool nvidiaToIntel = false;
     bool amdToIntel = false;
+    bool amdToNvidia = false;
     bool sameVendor = true;
     ExternalHandleType recommendedType = ExternalHandleType::OpaqueFd;
     std::string notes;

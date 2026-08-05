@@ -86,6 +86,51 @@ void getMemoryTypeProperties(uint32_t memoryTypeIndex,
     }
 }
 
+std::optional<uint32_t> findImportMemoryTypeIndex(VkPhysicalDevice dstPhysicalDevice,
+                                                   uint32_t srcMemoryTypeIndex,
+                                                   VkMemoryPropertyFlags requiredFlags,
+                                                   VkExternalMemoryHandleTypeFlagBits handleType) {
+    (void)srcMemoryTypeIndex;  // Not directly portable, but can be used as hint
+    
+    // Query destination device's memory properties
+    VkPhysicalDeviceMemoryProperties memProps;
+    vkGetPhysicalDeviceMemoryProperties(dstPhysicalDevice, &memProps);
+    
+    // Query external memory properties for the handle type
+    VkPhysicalDeviceExternalBufferInfo extInfo{};
+    extInfo.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO;
+    extInfo.handleType = handleType;
+    extInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    
+    VkExternalBufferProperties extProps{};
+    extProps.sType = VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES;
+    vkGetPhysicalDeviceExternalBufferProperties(dstPhysicalDevice, &extInfo, &extProps);
+    
+    // Check if the handle type is supported at all
+    VkExternalMemoryHandleTypeFlags compatibleHandleTypes = extProps.externalMemoryProperties.compatibleHandleTypes;
+    if ((compatibleHandleTypes & handleType) == 0) {
+        VVM_LOG_WARN("findImportMemoryTypeIndex: handle type %u not supported on destination device",
+                     handleType);
+        return std::nullopt;
+    }
+    
+    // Core Vulkan doesn't provide a direct "compatible memory types" bitmask.
+    // We iterate all memory types and find one with required flags.
+    // In practice, any memory type with the right flags should work if the
+    // handle type is supported (per spec, the compatibleHandleTypes check is
+    // the primary gate).
+    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+        if ((memProps.memoryTypes[i].propertyFlags & requiredFlags) == requiredFlags) {
+            return i;
+        }
+    }
+    
+    VVM_LOG_WARN("findImportMemoryTypeIndex: no memory type with required flags 0x%x",
+                 requiredFlags);
+    return std::nullopt;
+}
+
 // ============================================================================
 // Device Enumeration & Selection
 // ============================================================================

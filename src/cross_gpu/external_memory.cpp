@@ -327,22 +327,21 @@ VendorPairCaps getCrossVendorCaps(VkPhysicalDevice src, VkPhysicalDevice dst) {
         caps.recommendedType = ExternalHandleType::OpaqueFd;
         caps.notes = "OPAQUE_FD: Same-vendor or limited cross-vendor";
     }
-    #elif defined(VVM_PLATFORM_WINDOWS)
-    // Windows: NVIDIA uses D3D12_HEAP, others use OPAQUE_WIN32
-    // Cross-vendor needs D3D12_HEAP on NVIDIA side + OPAQUE_WIN32 on other
-    if (srcNvidia && srcCaps.supportsD3D12Heap && (dstAmd || dstIntel) && dstCaps.supportsOpaqueWin32) {
-        caps.recommendedType = ExternalHandleType::D3D12Heap;  // Export as D3D12_HEAP from NVIDIA
-        caps.nvidiaToAmd = true;
-        caps.nvidiaToIntel = true;
-        caps.notes = "NVIDIA(D3D12_HEAP) -> AMD/Intel(OPAQUE_WIN32)";
-    } else if ((srcAmd || srcIntel) && srcCaps.supportsOpaqueWin32 && dstNvidia && dstCaps.supportsD3D12Heap) {
-        caps.recommendedType = ExternalHandleType::OpaqueWin32;  // Export as OPAQUE_WIN32 from AMD/Intel
-        caps.nvidiaToAmd = true;
-        caps.nvidiaToIntel = true;
-        caps.notes = "AMD/Intel(OPAQUE_WIN32) -> NVIDIA(D3D12_HEAP)";
-    } else if (srcCaps.supportsOpaqueWin32 && dstCaps.supportsOpaqueWin32) {
+#elif defined(VVM_PLATFORM_WINDOWS)
+    // Windows: For cross-vendor compatibility, both sides MUST use the SAME handle type.
+    // NVIDIA supports both D3D12_HEAP and OPAQUE_WIN32; AMD/Intel typically only OPAQUE_WIN32.
+    // Therefore, OPAQUE_WIN32 is the only universally compatible handle type for cross-vendor.
+    if (srcCaps.supportsOpaqueWin32 && dstCaps.supportsOpaqueWin32) {
         caps.recommendedType = ExternalHandleType::OpaqueWin32;
-        caps.notes = "OPAQUE_WIN32: Same vendor or NVIDIA<->NVIDIA";
+        caps.nvidiaToAmd = srcNvidia && (dstAmd || dstIntel);
+        caps.nvidiaToIntel = srcNvidia && dstIntel;
+        caps.amdToNvidia = (srcAmd || srcIntel) && dstNvidia;
+        caps.notes = "OPAQUE_WIN32: Universal cross-vendor on Windows (both sides use same handle type)";
+    }
+    // NVIDIA-to-NVIDIA can optionally use D3D12_HEAP for better performance
+    else if (srcNvidia && dstNvidia && srcCaps.supportsD3D12Heap && dstCaps.supportsD3D12Heap) {
+        caps.recommendedType = ExternalHandleType::D3D12Heap;
+        caps.notes = "D3D12_HEAP: NVIDIA-to-NVIDIA only (better performance)";
     }
     #endif
     

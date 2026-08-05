@@ -36,6 +36,15 @@ std::optional<uint32_t> findMemoryTypeIndex(const VkPhysicalDeviceMemoryProperti
                                              VkMemoryPropertyFlags required,
                                              VkMemoryPropertyFlags preferred = 0);
 
+// Find memory type index for importing external memory on a DESTINATION device.
+// Given the source device's memory type index and required flags, this queries
+// the destination device's memory properties to find a compatible type.
+// This is required because memoryTypeIndex is NOT portable across devices.
+std::optional<uint32_t> findImportMemoryTypeIndex(VkPhysicalDevice dstPhysicalDevice,
+                                                   uint32_t srcMemoryTypeIndex,
+                                                   VkMemoryPropertyFlags requiredFlags,
+                                                   VkExternalMemoryHandleTypeFlagBits handleType);
+
 void getMemoryTypeProperties(uint32_t memoryTypeIndex, 
                              VkMemoryPropertyFlags& flags,
                              const VkPhysicalDeviceMemoryProperties& memProps);

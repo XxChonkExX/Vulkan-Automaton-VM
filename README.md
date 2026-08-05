@@ -43,15 +43,15 @@ VulkanVM provides a `UnifiedMemoryPool` that:
 | Feature | Status |
 |---------|--------|
 | Persistent large-block allocation | ✅ |
-| Buddy sub-allocator (256KB alignment) | ✅ |
+| Buddy sub-allocator (256KB alignment, pow2 enforcement) | ✅ |
 | Cross-vendor memory sharing (AMD↔NVIDIA↔Intel) | ✅ |
 | Linux: OPAQUE_FD, DMA-BUF | ✅ |
 | Windows: OPAQUE_WIN32, D3D12_HEAP | ✅ |
 | Bindless device addresses | ✅ |
 | Host shadow buffer for swap | ✅ |
 | Async migration (device↔host) | ✅ |
-| madvise(MADV_DONTNEED/FREE) | ✅ |
-| mprotect(PROT_NONE) for page faults | ✅ |
+| madvise(MADV_DONTNEED/FREE) | 🔧 (opt-in, unsafe on vkMapMemory memory) |
+| mprotect(PROT_NONE) for page faults | 🔧 (opt-in, unsafe on vkMapMemory memory) |
 | Timeline semaphore sync | ✅ |
 | Multi-GPU pool manager | ✅ |
 
@@ -128,8 +128,8 @@ manager.waitAllIdle();
 ```cpp
 OffloadConfig offloadConfig;
 offloadConfig.hostShadowSize = 4ull * 1024 * 1024 * 1024;  // 4GB host buffer
-offloadConfig.useMadvise = true;
-offloadConfig.useMprotect = true;
+// offloadConfig.useMadvise = true;    // opt-in only; unsafe on vkMapMemory memory
+// offloadConfig.useMprotect = true;   // opt-in only; unsafe on vkMapMemory memory
 
 OffloadManager offloadManager(&pool, offloadConfig);
 
@@ -220,8 +220,8 @@ Expected: cluster registration, remote allocate, push verify `PASS`, pull verify
 | Cluster registration + heartbeat | ✅ |
 | Remote allocate / export / import / deallocate | ✅ |
 | Host-staged push/pull migration | ✅ |
-| gRPC control plane (optional) | ✅ (auto-enabled when gRPC found) |
-| RDMA/verbs GPU-direct (optional) | 🔧 (stubs; host-staged fallback always available) |
+| gRPC control plane (optional) | 🔧 (experimental; auto-enabled when gRPC found) |
+| RDMA/verbs GPU-direct (optional) | 🔧 (experimental; stubs only; host-staged fallback always available) |
 
 
 ## Cross-Vendor Compatibility Matrix
@@ -254,9 +254,9 @@ MIT License - see LICENSE file.
 ## Credits
 
 - **Nemotron** — primary coder
-- **Deepseek** — co-author of the multi-node network module (Spark-style TCP transport, host-staged push/pull migration, cluster registration, two-node loopback test) and implementation support across the codebase
-- **Grok (xAI)** — architectural review, offload/migration design review, and recommendations that shaped the buddy-backed pool and host shadow integration
-- **GLM** — review and refinements during development
+- **Deepseek** — primary coder, co-author of the multi-node network module (Spark-style TCP transport, host-staged push/pull migration, cluster registration, two-node loopback test) and implementation support across the codebase
+- **GLM** — primary coder, review and refinements during development
+- **NVIDIA** — network module framework and implementation foundation; special thanks for supporting Open Source despite being a Mega-Corp
 - **ChonkE** — project owner, 1% contributor
 
 ## Contributing
@@ -271,9 +271,12 @@ MIT License - see LICENSE file.
 
 - [x] Multi-node cluster (TCP control/data plane, Spark-style streaming)
 - [x] Host-staged push/pull migration with byte-pattern verification
+- [x] Buddy allocator pow2 enforcement & double-free validation
+- [x] External memory dedicated allocation model (1 VkDeviceMemory per shareable alloc)
+- [x] Cross-device memory type re-selection on import
 - [ ] Sparse/residency support for virtual memory
 - [ ] Direct GPU↔GPU copy (P2P) without host staging
-- [ ] RDMA/verbs GPU-direct transport (stubs in place; host-staged fallback ships today)
+- [ ] RDMA/verbs GPU-direct transport (stubs in place; experimental)
 - [ ] Integration with ML frameworks (PyTorch, ONNX Runtime)
 - [ ] Windows WDDM2.6+ hardware scheduling hints
 - [ ] Android/Vulkan support
