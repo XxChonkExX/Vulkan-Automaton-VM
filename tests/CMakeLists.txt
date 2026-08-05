@@ -15,6 +15,16 @@ target_include_directories(basic_test PRIVATE
 
 add_test(NAME basic_test COMMAND basic_test)
 
+# Minimal test for debugging
+add_executable(minimal_test minimal_test.cpp)
+target_link_libraries(minimal_test PRIVATE vulkan_vm)
+target_include_directories(minimal_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${Vulkan_INCLUDE_DIRS}
+)
+
+add_test(NAME minimal_test COMMAND minimal_test)
+
 # Multi-GPU test (if multiple GPUs available)
 # add_executable(multi_gpu_test multi_gpu_test.cpp)
 # target_link_libraries(multi_gpu_test PRIVATE vulkan_vm)

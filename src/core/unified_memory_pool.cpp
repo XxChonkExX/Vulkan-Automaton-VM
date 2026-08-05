@@ -31,7 +31,8 @@ UnifiedMemoryPool::UnifiedMemoryPool(UnifiedMemoryPool&& other) noexcept
     , deviceLocalMemoryType_(other.deviceLocalMemoryType_)
     , hostVisibleMemoryType_(other.hostVisibleMemoryType_)
     , transferCmdPool_(other.transferCmdPool_)
-    , offloadManager_(std::move(other.offloadManager_)) {
+    , offloadManager_(std::move(other.offloadManager_))
+    , mutex_() {
     
     other.device_ = VK_NULL_HANDLE;
     other.transferCmdPool_ = VK_NULL_HANDLE;
@@ -57,6 +58,11 @@ UnifiedMemoryPool& UnifiedMemoryPool::operator=(UnifiedMemoryPool&& other) noexc
             }
         }
         
+        // Lock both mutexes to avoid deadlock
+        std::lock(mutex_, other.mutex_);
+        std::lock_guard<std::mutex> lock_this(mutex_, std::adopt_lock);
+        std::lock_guard<std::mutex> lock_other(other.mutex_, std::adopt_lock);
+        
         deviceConfig_ = std::move(other.deviceConfig_);
         config_ = std::move(other.config_);
         device_ = other.device_;
@@ -66,6 +72,7 @@ UnifiedMemoryPool& UnifiedMemoryPool::operator=(UnifiedMemoryPool&& other) noexc
         hostVisibleMemoryType_ = other.hostVisibleMemoryType_;
         transferCmdPool_ = other.transferCmdPool_;
         offloadManager_ = std::move(other.offloadManager_);
+        // mutex_ is not moved - keep our own
         
         other.device_ = VK_NULL_HANDLE;
         other.transferCmdPool_ = VK_NULL_HANDLE;
@@ -516,6 +523,8 @@ std::optional<Allocation> UnifiedMemoryPool::allocateDedicatedExportable(
 std::optional<Allocation> UnifiedMemoryPool::allocate(VkDeviceSize size,
                                                         VkBufferUsageFlags usage,
                                                         VkMemoryPropertyFlags flags) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
     // Align size
     size = alignUp(size, config_.minAlignment);
     
@@ -548,6 +557,7 @@ std::optional<Allocation> UnifiedMemoryPool::allocateTensor(VkDeviceSize size,
 }
 
 void UnifiedMemoryPool::deallocate(Allocation&& alloc) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (alloc.blockIndex < blocks_.size()) {
         subDeallocate(std::move(alloc));
     }
@@ -555,6 +565,8 @@ void UnifiedMemoryPool::deallocate(Allocation&& alloc) {
 
 std::optional<ExternalMemoryInfo> UnifiedMemoryPool::exportMemory(
     const Allocation& alloc, ExternalHandleType type) {
+    
+    std::lock_guard<std::mutex> lock(mutex_);
     
     ExternalMemoryInfo info;
     info.type = type;
@@ -658,6 +670,8 @@ std::optional<ExternalMemoryInfo> UnifiedMemoryPool::exportMemory(
 
 std::optional<Allocation> UnifiedMemoryPool::importMemory(
     const ExternalMemoryInfo& info, VkBufferUsageFlags usage) {
+    
+    std::lock_guard<std::mutex> lock(mutex_);
     
     // Step 1: Determine the VkExternalMemoryHandleTypeFlagBits for import
     VkExternalMemoryHandleTypeFlagBits importHandleType = static_cast<VkExternalMemoryHandleTypeFlagBits>(0);
@@ -833,6 +847,7 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
 }
 
 std::optional<MigrationOperation> UnifiedMemoryPool::offloadToHost(Allocation& alloc) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!offloadManager_) {
         VVM_LOG_WARN("offloadToHost called but OffloadManager not initialized");
         return std::nullopt;
@@ -841,6 +856,7 @@ std::optional<MigrationOperation> UnifiedMemoryPool::offloadToHost(Allocation& a
 }
 
 std::optional<MigrationOperation> UnifiedMemoryPool::reloadToDevice(Allocation& alloc) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!offloadManager_) {
         VVM_LOG_WARN("reloadToDevice called but OffloadManager not initialized");
         return std::nullopt;
@@ -849,12 +865,14 @@ std::optional<MigrationOperation> UnifiedMemoryPool::reloadToDevice(Allocation& 
 }
 
 void UnifiedMemoryPool::waitMigration(const MigrationOperation& op) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (op.completionFence) {
         vkWaitForFences(device_, 1, &op.completionFence, VK_TRUE, UINT64_MAX);
     }
 }
 
 PoolStats UnifiedMemoryPool::getStats() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     PoolStats stats;
     for (const auto& block : blocks_) {
         stats.totalAllocated += block.size;
@@ -877,6 +895,7 @@ PoolStats UnifiedMemoryPool::getStats() const {
 }
 
 DeviceMemoryInfo UnifiedMemoryPool::getDeviceMemoryInfo() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     DeviceMemoryInfo info;
     vkGetPhysicalDeviceMemoryProperties(deviceConfig_.physicalDevice, &info.memProps);
     
@@ -902,10 +921,12 @@ DeviceMemoryInfo UnifiedMemoryPool::getDeviceMemoryInfo() const {
 }
 
 void UnifiedMemoryPool::defragment() {
+    std::lock_guard<std::mutex> lock(mutex_);
     // TODO: Implement block compaction
 }
 
 void UnifiedMemoryPool::trim() {
+    std::lock_guard<std::mutex> lock(mutex_);
     // TODO: Release empty blocks
 }
 
