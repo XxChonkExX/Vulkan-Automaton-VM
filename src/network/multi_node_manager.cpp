@@ -502,7 +502,7 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
     (void)forceHostShadow;
 #endif
 
-    // Host-staged fallback
+// Host-staged fallback
     std::optional<Allocation> promoted;
     std::optional<ExternalMemoryInfo> exportInfo;
     if (!netDesc.hasRdmaAddr) {
@@ -514,6 +514,7 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
         // external handle.
         const Allocation* exportSrc = &alloc;
         if (alloc.blockIndex != UINT32_MAX) {
+            VVM_LOG_INFO("exportForRemote: promoting sub-allocated allocation to dedicated exportable");
             promoted = localPools_[0].allocateDedicatedExportable(
                 alloc.size,
                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -522,12 +523,17 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
                 VVM_LOG_ERROR("exportForRemote: failed to promote sub-allocated allocation to dedicated");
                 return std::nullopt;
             }
+            VVM_LOG_INFO("exportForRemote: promotion succeeded, promoted blockIndex={}, hostPtr={}", 
+                         promoted->blockIndex, promoted->hostPtr ? "non-null" : "null");
             bool copied = false;
             if (alloc.hostPtr && promoted->hostPtr) {
                 std::memcpy(promoted->hostPtr, alloc.hostPtr, static_cast<size_t>(alloc.size));
                 copied = true;
+                VVM_LOG_INFO("exportForRemote: memcpy copy succeeded");
             } else {
+                VVM_LOG_INFO("exportForRemote: using runCopy for GPU copy");
                 copied = runCopy(alloc.buffer, promoted->buffer, 0, 0, alloc.size);
+                VVM_LOG_INFO("exportForRemote: runCopy returned {}", copied);
             }
             if (!copied) {
                 VVM_LOG_ERROR("exportForRemote: failed to copy data into dedicated allocation");
@@ -541,14 +547,19 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
         // OWNS the handle; we keep it alive in a process-local registry so a
         // same-process import can consume it (cross-process hosts stage data).
         #ifdef VVM_PLATFORM_LINUX
+        VVM_LOG_INFO("exportForRemote: calling exportMemory on Linux");
         exportInfo = localPools_[0].exportMemory(*exportSrc, vvm::ExternalHandleType::OpaqueFd);
-        netDesc.handleType = exportInfo ? vvm::ExternalHandleType::OpaqueFd
-                                        : netDesc.handleType;
         #elif defined(VVM_PLATFORM_WINDOWS)
+        VVM_LOG_INFO("exportForRemote: calling exportMemory on Windows");
         exportInfo = localPools_[0].exportMemory(*exportSrc, vvm::ExternalHandleType::OpaqueWin32);
+        #endif
+        VVM_LOG_INFO("exportForRemote: exportMemory returned {}", exportInfo ? "success" : "failed");
+        if (!exportInfo) {
+            VVM_LOG_ERROR("exportForRemote: failed to export handle for allocation");
+            return std::nullopt;
+        }
         netDesc.handleType = exportInfo ? vvm::ExternalHandleType::OpaqueWin32
                                         : netDesc.handleType;
-        #endif
         if (!exportInfo) {
             VVM_LOG_ERROR("exportForRemote: failed to export handle for allocation");
             return std::nullopt;
@@ -563,6 +574,7 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
     // address it and remote read-back sees the exported data.
     uint64_t allocId = 0;
     if (promoted) {
+        VVM_LOG_INFO("exportForRemote: registering promoted allocation");
         allocId = registerAllocation(std::move(*promoted));
     } else if (auto existing = findAllocIdByBuffer(alloc.buffer)) {
         allocId = *existing;
@@ -570,10 +582,12 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
         allocId = registerAllocation(Allocation(alloc));  // copy for registry
     }
     netDesc.localAllocId = allocId;
+    VVM_LOG_INFO("exportForRemote: returning desc with allocId={}", allocId);
 
     // Keep the exported handle alive so a same-process peer can import it
-    // zero-copy. Ownership moves to the importing peer (or is closed when the
-    // export is deallocated / the manager stops).
+    // zero-copy. Ownership moves to the importing peer (consumed by
+    // createLocalAllocationForImport) or is closed when the export is
+    // deallocated / the manager stops.
     if (exportInfo) {
         std::lock_guard<std::mutex> lock(g_pendingExportsMutex);
         g_pendingExports[pendingKey(localNodeId_, allocId)] = std::move(*exportInfo);
@@ -1054,7 +1068,21 @@ bool MultiNodePoolManager::runCopy(VkBuffer srcBuffer, VkBuffer dstBuffer,
 
     VkResult res = vkQueueSubmit(transferQueue_, 1, &submitInfo, fence);
     if (res == VK_SUCCESS) {
-        vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+        // Use a 10-second timeout instead of infinite wait to prevent hangs
+        // if the GPU fails to signal the fence (driver issue, queue starvation, etc.)
+        constexpr uint64_t kCopyTimeoutNs = 10ull * 1000 * 1000 * 1000;  // 10 seconds
+        VkResult waitRes = vkWaitForFences(device, 1, &fence, VK_TRUE, kCopyTimeoutNs);
+        if (waitRes == VK_TIMEOUT) {
+            VVM_LOG_ERROR("runCopy: fence wait timed out after 10 seconds (GPU copy may be stuck)");
+            vkDestroyFence(device, fence, nullptr);
+            vkFreeCommandBuffers(device, copyCmdPool_, 1, &cmdBuffer);
+            return false;
+        } else if (waitRes != VK_SUCCESS) {
+            VVM_LOG_ERROR("runCopy: vkWaitForFences failed: {}", vkResultToString(waitRes));
+            vkDestroyFence(device, fence, nullptr);
+            vkFreeCommandBuffers(device, copyCmdPool_, 1, &cmdBuffer);
+            return false;
+        }
     } else {
         VVM_LOG_ERROR("runCopy: vkQueueSubmit failed: {}", vkResultToString(res));
     }
@@ -1529,13 +1557,19 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::handleAllocateRequest(
     VVM_LOG_INFO("Allocate request from {}: {} bytes", requester.toString(), size);
 
     auto alloc = allocateLocal(size, usage, flags, false);
-    if (!alloc) return std::nullopt;
+    if (!alloc) {
+        VVM_LOG_ERROR("allocateLocal failed for {} bytes", size);
+        return std::nullopt;
+    }
+    VVM_LOG_INFO("Allocate local succeeded, size={}", alloc->size);
 
     auto desc = exportForRemote(*alloc, enableRdma, false);
     if (!desc) {
+        VVM_LOG_ERROR("exportForRemote failed");
         localPools_[0].deallocate(std::move(*alloc));
         return std::nullopt;
     }
+    VVM_LOG_INFO("exportForRemote succeeded, allocId={}", desc->localAllocId);
     return desc;
 }
 

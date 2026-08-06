@@ -325,7 +325,7 @@ VkMemoryPropertyFlags UnifiedMemoryPool::usageToFlags(MemoryUsage usage) const {
 }
 
 bool UnifiedMemoryPool::wouldExceedBudget(VkDeviceSize additionalBytes) const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    // Note: caller must hold mutex_ if called from within another locked method
     VkDeviceSize currentPool = 0;
     for (const auto& block : blocks_) currentPool += block.size;
     for (const auto& alloc : dedicatedAllocations_) currentPool += alloc.size;
@@ -511,122 +511,147 @@ std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
 }
 
 // Allocate a dedicated VkDeviceMemory for a single exportable buffer.
-// Each exportable allocation gets its own dedicated memory (not sub-allocated).
-// This is required by the Vulkan spec for reliable external memory import.
-std::optional<Allocation> UnifiedMemoryPool::allocateDedicatedExportable(
-    VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags flags) {
-    
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    size = alignUp(size, config_.minAlignment);
-    
-    // Select memory type - prefer device-local for exportable
-    uint32_t memType = deviceLocalMemoryType_;
-    if (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
-        memType = (hostVisibleMemoryType_ != UINT32_MAX) ? hostVisibleMemoryType_ : deviceLocalMemoryType_;
-    }
-    
-    // Step 1: Create buffer with VkExternalMemoryBufferCreateInfo
-    VkExternalMemoryBufferCreateInfo extBufferInfo{};
-    extBufferInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
-    #ifdef VVM_PLATFORM_LINUX
-    extBufferInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
-                                VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-    #elif defined(VVM_PLATFORM_WINDOWS)
-    extBufferInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT |
-                                VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
-    #endif
-    
-    VkBufferCreateInfo bufferInfo{};
-    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufferInfo.size = size;
-    bufferInfo.usage = usage;
-    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    bufferInfo.pNext = &extBufferInfo;
-    
-    VkBuffer buffer;
-    VkResult result = vkCreateBuffer(device_, &bufferInfo, nullptr, &buffer);
-    if (result != VK_SUCCESS) {
-        VVM_LOG_ERROR("vkCreateBuffer failed for dedicated exportable: %s", vkResultToString(result).c_str());
-        return std::nullopt;
-    }
-    
-    // Step 2: Get memory requirements
-    VkMemoryRequirements memReq;
-    vkGetBufferMemoryRequirements(device_, buffer, &memReq);
-    
-    // Budget check: fail soft instead of stealing VRAM past the configured cap.
-    if (wouldExceedBudget(memReq.size)) {
-        vkDestroyBuffer(device_, buffer, nullptr);
-        return std::nullopt;
-    }
-    
-    // Step 3: Allocate dedicated memory for this buffer
-    VkMemoryDedicatedAllocateInfo dedicatedInfo{};
-    dedicatedInfo.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
-    dedicatedInfo.buffer = buffer;
-    dedicatedInfo.image = VK_NULL_HANDLE;
-    
-    VkExportMemoryAllocateInfo exportInfo{};
-    exportInfo.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
-    #ifdef VVM_PLATFORM_LINUX
-    exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
-                             VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-    #elif defined(VVM_PLATFORM_WINDOWS)
-    exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT |
-                             VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
-    #endif
-    exportInfo.pNext = &dedicatedInfo;
-    
-    VkMemoryAllocateFlagsInfo flagsInfo{};
-    flagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
-    flagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-    flagsInfo.pNext = &exportInfo;
-    
-    VkMemoryAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.allocationSize = memReq.size;
-    allocInfo.memoryTypeIndex = memType;
-    allocInfo.pNext = &flagsInfo;
-    
-    VkDeviceMemory memory;
-    result = vkAllocateMemory(device_, &allocInfo, nullptr, &memory);
-    if (result != VK_SUCCESS) {
-        VVM_LOG_ERROR("vkAllocateMemory failed for dedicated exportable: %s", vkResultToString(result).c_str());
-        vkDestroyBuffer(device_, buffer, nullptr);
-        return std::nullopt;
-    }
-    
-    // Step 4: Bind buffer to memory
-    VkBindBufferMemoryInfo bindInfo{};
-    bindInfo.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO;
-    bindInfo.buffer = buffer;
-    bindInfo.memory = memory;
-    bindInfo.memoryOffset = 0;
-    
-    result = vkBindBufferMemory2(device_, 1, &bindInfo);
-    if (result != VK_SUCCESS) {
-        VVM_LOG_ERROR("vkBindBufferMemory2 failed for dedicated exportable: %s", vkResultToString(result).c_str());
-        vkFreeMemory(device_, memory, nullptr);
-        vkDestroyBuffer(device_, buffer, nullptr);
-        return std::nullopt;
-    }
-    
+    // Each exportable allocation gets its own dedicated memory (not sub-allocated).
+    // This is required by the Vulkan spec for reliable external memory import.
+    std::optional<Allocation> UnifiedMemoryPool::allocateDedicatedExportable(
+        VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags flags) {
+        
+        VVM_LOG_INFO("allocateDedicatedExportable: size={}, usage=0x{:x}, flags=0x{:x}", size, usage, flags);
+        
+        std::lock_guard<std::mutex> lock(mutex_);
+        VVM_LOG_INFO("allocateDedicatedExportable: lock acquired");
+        
+        size = alignUp(size, config_.minAlignment);
+        VVM_LOG_INFO("allocateDedicatedExportable: aligned size={}", size);
+        
+        // Select memory type - prefer device-local for exportable
+        uint32_t memType = deviceLocalMemoryType_;
+        if (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+            memType = (hostVisibleMemoryType_ != UINT32_MAX) ? hostVisibleMemoryType_ : deviceLocalMemoryType_;
+        }
+        VVM_LOG_INFO("allocateDedicatedExportable: memType={}, deviceLocal={}, hostVisible={}", 
+                     memType, deviceLocalMemoryType_, hostVisibleMemoryType_);
+        
+        // Step 1: Create buffer with VkExternalMemoryBufferCreateInfo
+        VkExternalMemoryBufferCreateInfo extBufferInfo{};
+        extBufferInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+        #ifdef VVM_PLATFORM_LINUX
+        extBufferInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+                                    VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        #elif defined(VVM_PLATFORM_WINDOWS)
+        extBufferInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT |
+                                    VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
+        #endif
+        
+        VkBufferCreateInfo bufferInfo{};
+        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufferInfo.size = size;
+        bufferInfo.usage = usage;
+        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        bufferInfo.pNext = &extBufferInfo;
+        
+        VkBuffer buffer;
+        VkResult result = vkCreateBuffer(device_, &bufferInfo, nullptr, &buffer);
+        VVM_LOG_INFO("allocateDedicatedExportable: vkCreateBuffer result={}", result);
+        if (result != VK_SUCCESS) {
+            VVM_LOG_ERROR("vkCreateBuffer failed for dedicated exportable: %s", vkResultToString(result).c_str());
+            return std::nullopt;
+        }
+        
+        // Step 2: Get memory requirements
+        VkMemoryRequirements memReq;
+        vkGetBufferMemoryRequirements(device_, buffer, &memReq);
+        VVM_LOG_INFO("allocateDedicatedExportable: memReq.size={}, memReq.memoryTypeBits=0x{:x}", memReq.size, memReq.memoryTypeBits);
+        
+        // Budget check: fail soft instead of stealing VRAM past the configured cap.
+        if (wouldExceedBudget(memReq.size)) {
+            VVM_LOG_ERROR("allocateDedicatedExportable: would exceed budget");
+            vkDestroyBuffer(device_, buffer, nullptr);
+            return std::nullopt;
+        }
+        VVM_LOG_INFO("allocateDedicatedExportable: budget check passed");
+        
+        // Step 3: Allocate dedicated memory for this buffer
+        VkMemoryDedicatedAllocateInfo dedicatedInfo{};
+        dedicatedInfo.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+        dedicatedInfo.buffer = buffer;
+        dedicatedInfo.image = VK_NULL_HANDLE;
+        
+        VkExportMemoryAllocateInfo exportInfo{};
+        exportInfo.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+        #ifdef VVM_PLATFORM_LINUX
+        exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+                                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        #elif defined(VVM_PLATFORM_WINDOWS)
+        exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT |
+                                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
+        #endif
+        exportInfo.pNext = &dedicatedInfo;
+        
+        VkMemoryAllocateFlagsInfo flagsInfo{};
+        flagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+        flagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        flagsInfo.pNext = &exportInfo;
+        
+        VkMemoryAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memReq.size;
+        allocInfo.memoryTypeIndex = memType;
+        allocInfo.pNext = &flagsInfo;
+        
+        VkDeviceMemory memory;
+        VVM_LOG_INFO("allocateDedicatedExportable: calling vkAllocateMemory (memType={}, size={})", memType, memReq.size);
+        result = vkAllocateMemory(device_, &allocInfo, nullptr, &memory);
+        VVM_LOG_INFO("allocateDedicatedExportable: vkAllocateMemory result={}", result);
+        if (result != VK_SUCCESS) {
+            VVM_LOG_ERROR("vkAllocateMemory failed for dedicated exportable: %s", vkResultToString(result).c_str());
+            vkDestroyBuffer(device_, buffer, nullptr);
+            return std::nullopt;
+        }
+        VVM_LOG_INFO("allocateDedicatedExportable: vkAllocateMemory succeeded");
+        
+        // Step 4: Bind buffer to memory
+        VkBindBufferMemoryInfo bindInfo{};
+        bindInfo.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO;
+        bindInfo.buffer = buffer;
+        bindInfo.memory = memory;
+        bindInfo.memoryOffset = 0;
+        
+        result = vkBindBufferMemory2(device_, 1, &bindInfo);
+        VVM_LOG_INFO("allocateDedicatedExportable: vkBindBufferMemory2 result={}", result);
+        if (result != VK_SUCCESS) {
+            VVM_LOG_ERROR("vkBindBufferMemory2 failed for dedicated exportable: %s", vkResultToString(result).c_str());
+            vkFreeMemory(device_, memory, nullptr);
+            vkDestroyBuffer(device_, buffer, nullptr);
+            return std::nullopt;
+        }
+VVM_LOG_INFO("allocateDedicatedExportable: bind succeeded");
+     
     // Step 5: Map if host-visible
+    VVM_LOG_INFO("allocateDedicatedExportable: checking host visibility (memType={})", memType);
+    VVM_LOG_INFO("allocateDedicatedExportable: calling getMemoryTypeProperties");
     void* hostPtr = nullptr;
     VkMemoryPropertyFlags memFlags;
     getMemoryTypeProperties(memType, memFlags, getDeviceMemoryInfo().memProps);
+    VVM_LOG_INFO("allocateDedicatedExportable: getMemoryTypeProperties returned, memFlags=0x{:x}", memFlags);
     
     bool isHostVisible = (memFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
     bool isCoherent = (memFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+    VVM_LOG_INFO("allocateDedicatedExportable: isHostVisible={}, isCoherent={}", isHostVisible, isCoherent);
     
     if (isHostVisible) {
+        VVM_LOG_INFO("allocateDedicatedExportable: calling vkMapMemory");
         result = vkMapMemory(device_, memory, 0, VK_WHOLE_SIZE, 0, &hostPtr);
+        VVM_LOG_INFO("allocateDedicatedExportable: vkMapMemory result={}", result);
         if (result != VK_SUCCESS) {
-            VVM_LOG_WARN("vkMapMemory failed for dedicated exportable: %s", vkResultToString(result).c_str());
+            VVM_LOG_ERROR("vkMapMemory failed for dedicated exportable: %s (will not be mappable)", 
+                          vkResultToString(result).c_str());
             hostPtr = nullptr;
-            isHostVisible = false;
+            // Don't clear isHostVisible - the memory type IS host-visible, just mapping failed
         }
+        VVM_LOG_INFO("allocateDedicatedExportable: hostPtr={}", hostPtr ? "non-null" : "null");
+    } else {
+        VVM_LOG_INFO("allocateDedicatedExportable: memory NOT host-visible, skipping vkMapMemory");
     }
     
     // Step 6: Get device address
@@ -653,9 +678,11 @@ std::optional<Allocation> UnifiedMemoryPool::allocateDedicatedExportable(
     alloc.hostPtr = hostPtr;
     alloc.deviceAddress = deviceAddress;
     
+    VVM_LOG_INFO("allocateDedicatedExportable: pushing to dedicatedAllocations_");
     // Track dedicated allocation for cleanup in destructor
     dedicatedAllocations_.push_back(alloc);
     
+    VVM_LOG_INFO("allocateDedicatedExportable: returning allocation (hostPtr={})", hostPtr ? "non-null" : "null");
     return alloc;
 }
 
@@ -1043,7 +1070,7 @@ PoolStats UnifiedMemoryPool::getStats() const {
 }
 
 DeviceMemoryInfo UnifiedMemoryPool::getDeviceMemoryInfo() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    // Note: caller must hold mutex_ if called from within a locked method
     DeviceMemoryInfo info;
     vkGetPhysicalDeviceMemoryProperties(deviceConfig_.physicalDevice, &info.memProps);
     

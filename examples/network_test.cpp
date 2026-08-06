@@ -322,7 +322,10 @@ int main() {
     const VkDeviceSize kTestSize = 16ull * 1024 * 1024;
 
     std::cout << "\n--- Remote allocate ---\n";
-    auto remoteDesc = mgrB->allocateRemote(mgrA->getLocalNodeId(), kTestSize);
+    auto remoteDesc = mgrB->allocateRemote(
+        mgrA->getLocalNodeId(), kTestSize,
+        0,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     if (!remoteDesc) {
         std::cerr << "FAIL: allocateRemote returned nullopt\n";
         ++failures;
