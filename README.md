@@ -1,112 +1,425 @@
-# VulkanVM — Unified Vulkan Memory Pool & Model Distribution
+# VulkanVM — Unified Vulkan Memory Pool & Cross-GPU Model Distribution
 
-**VulkanVM** is a cross-vendor, high-performance Vulkan memory management library that solves GPU memory fragmentation and enables zero-copy memory sharing across AMD, NVIDIA, and Intel GPUs. It combines a budget-capped, buddy-suballocated memory pool with a Hugging Face–style model registry for distributing model weights over TCP — download once, load into the pool, run local multi-GPU inference.
+**VulkanVM** is a cross-vendor, high-performance Vulkan memory management library that solves GPU memory fragmentation, enables zero-copy memory sharing across AMD, NVIDIA, and Intel GPUs, and provides a Hugging Face–style model registry for distributing model weights over TCP. Download once, load into the pool, run local multi-GPU inference.
 
-## Problem Statement
+---
 
-- **AMD APU (Strix Halo 395)**: ROCm fails at high memory pressure due to fragmentation, not capacity
-- **Multi-vendor systems (7900XTX + Arc Pro B70)**: No unified memory pool across vendors
-- **Large tensor workloads**: Need persistent, aligned allocations for tensor cores
-- **Swap/offload**: Need host-backed shadow for demand paging
-- **Model distribution**: Need a Hugging Face–style way to publish/fetch model weights across machines
+## Table of Contents
 
-## Solution
+1. [Quick Start](#quick-start)
+2. [Core Memory Pool](#core-memory-pool)
+3. [Cross-GPU Memory Sharing](#cross-gpu-memory-sharing)
+4. [Multi-GPU Pool Manager](#multi-gpu-pool-manager)
+5. [Host Offload / Demand Paging](#host-offload--demand-paging)
+6. [ModelHub — Model Weight Distribution](#modelhub--model-weight-distribution)
+7. [Multi-Node Network Module](#multi-node-network-module)
+8. [GPU-Direct RDMA (Vendor Paths)](#gpu-direct-rdma-vendor-paths)
+9. [Sparse / Residency Virtual Memory](#sparse--residency-virtual-memory)
+10. [Building](#building)
+11. [Cross-Vendor Compatibility](#cross-vendor-compatibility)
+12. [APU-Specific Tuning](#apu-specific-tuning)
+13. [License & Credits](#license--credits)
 
-VulkanVM provides a `UnifiedMemoryPool` that:
+---
 
-1. **Pre-allocates large blocks** (256MB–2GB) at startup, sub-allocates with buddy allocator
-2. **Never returns memory to OS** — eliminates fragmentation; budget-capped to avoid starving the system
-3. **Exports/imports `VkDeviceMemory`** via `VK_EXTERNAL_MEMORY` for cross-GPU sharing — dedicated allocations only; sub-allocated blocks are auto-promoted to dedicated copies on export
-4. **Supports host shadow buffers** for swap/offload (`madvise`/`mprotect` are **deprecated** — unsafe on `vkMapMemory` memory)
-5. **Works on AMD, NVIDIA, Intel** — Vulkan is the common denominator
-6. **RAII handle wrappers** — `UniqueHandle` wraps Vulkan objects; `ExternalHandle` owns FD/HANDLE lifetime (move-only, no leaks)
-7. **Thread-safe** — the public pool API is guarded by an internal mutex (fixed: budget checks, dedicated alloc, move assignment)
-8. **Optional TLS** — the TCP transport can be encrypted with OpenSSL (TLS 1.2+)
-9. **Cross-platform** — Windows, Linux, and macOS
-10. **ModelHub** — Hugging Face–style weight distribution over TCP with content-addressed chunks, cache + resume
+## Quick Start
 
-## Architecture
+```cpp
+#include <vulkan_vm/vulkan_vm.hpp>
+using namespace vvm;
 
+// 1. Select a GPU
+VkInstance instance = createInstance();
+auto devices = enumerateDevices(instance);
+auto best = selectBestDevice(devices, /*preferDiscrete=*/true, /*minVRAM_MiB=*/1024);
+VkPhysicalDevice physicalDevice = best->device;
+
+// 2. Find queues
+auto queues = findQueueFamilies(physicalDevice);
+DeviceConfig devConfig{
+    .physicalDevice = physicalDevice,
+    .device = createDevice(physicalDevice, queues),
+    .graphicsQueueFamily = queues.graphics.value_or(0),
+    .computeQueueFamily  = queues.compute.value_or(0),
+    .transferQueueFamily = queues.transfer.value_or(0),
+};
+// ... vkGetDeviceQueue for each queue ...
+
+// 3. Create the pool (auto-tuned for your hardware)
+PoolConfig poolConfig = PoolConfig::forDevice(physicalDevice);
+poolConfig.maxHeapFraction = 0.75f;  // never exceed 75% of device heap budget
+
+auto pool = UnifiedMemoryPool::create(devConfig, poolConfig);
+if (!pool) { /* handle error */ }
+
+// 4. Allocate a tensor buffer (bindless-ready, 64 MB)
+auto tensor = pool->allocateTensor(64 * 1024 * 1024);
+// tensor->deviceAddress  → use in shaders
+// tensor->buffer         → vkCmdCopyBuffer, vkCmdBindBufferRange, etc.
+
+// 5. When done, return to pool (NOT to OS — zero fragmentation)
+pool->deallocate(std::move(*tensor));
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        UnifiedMemoryPool                         │
-├─────────────────────────────────────────────────────────────────┤
-│  Block 0 (512MB)  │  Block 1 (512MB)  │  Block 2 (512MB)  ...  │
-│  ├─ Buddy Alloc   │  ├─ Buddy Alloc   │  ├─ Buddy Alloc        │
-│  │  ├─ 64MB      │  │  ├─ 128MB      │  │                     │
-│  │  ├─ 32MB      │  │  ├─ 64MB       │  │                     │
-│  │  └─ free...   │  │  └─ free...    │  │                     │
-├─────────────────────────────────────────────────────────────────┤
-│  Cross-GPU: VK_EXTERNAL_MEMORY (OPAQUE_FD / OPAQUE_WIN32 /     │
-│             D3D12_HEAP / DMA_BUF)                                │
-├─────────────────────────────────────────────────────────────────┤
-│  Offload: Host shadow buffer (HOST_VISIBLE|COHERENT) +         │
-│           async copy (madvise/mprotect deprecated)              │
-├─────────────────────────────────────────────────────────────────┤
-│  ModelHub: content-addressed model weight distribution over TCP │
-└─────────────────────────────────────────────────────────────────┘
+
+---
+
+## Core Memory Pool
+
+### Key Properties
+
+| Property | Description |
+|----------|-------------|
+| **Persistent blocks** | Pre-allocates large blocks (default 512 MB) at startup; sub-allocates with a buddy allocator |
+| **Zero fragmentation** | Memory is **never returned to the OS** — blocks stay resident; buddy allocator guarantees power-of-2 alignment and coalescing on free |
+| **Budget-aware** | `maxHeapFraction` (e.g., 0.75) + `VK_EXT_memory_budget` prevent starving the system |
+| **Topology-aware** | `detectMemoryTopology()` classifies Discrete / Unified / Hybrid; `PoolConfig::forDevice()` picks tuned defaults |
+| **Intent API** | `MemoryUsage { GpuOnly, CpuToGpu, GpuToCpu, CpuCopy, Auto }` hides raw `VkMemoryPropertyFlags` |
+| **Rich descriptors** | `AllocDesc { size, usage, memoryUsage, exportable, mapped, name }` |
+| **Bindless ready** | Every allocation returns `VkDeviceAddress` for descriptor-free shader access |
+| **Debug names** | `VK_EXT_debug_utils` labels on every buffer/memory (`name` in `AllocDesc`) |
+
+### Allocation Examples
+
+```cpp
+// Simple tensor (auto device-local)
+auto w = pool->allocateTensor(64_MiB);
+
+// Staging buffer (upload): host-visible + persistently mapped
+auto staging = pool->allocate({
+    .size = 128_MiB,
+    .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+    .memoryUsage = MemoryUsage::CpuToGpu,
+    .mapped = true,
+    .name = "upload_buffer"
+});
+
+// Readback buffer (GPU→CPU)
+auto readback = pool->allocate({
+    .size = 16_MiB,
+    .memoryUsage = MemoryUsage::GpuToCpu,
+    .mapped = true,
+    .name = "readback"
+});
+
+// Exportable (dedicated allocation) for cross-GPU sharing
+auto exportable = pool->allocateDedicatedExportable(256_MiB,
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+
+// One-shot copy on the same device (uses internal transient command pool)
+pool->copyBuffer(src, dst, srcOffset, dstOffset, size);
+
+// Stats
+PoolStats stats = pool->getStats();
+// stats.totalAllocated, stats.totalUsed, stats.largestFreeBlock, stats.fragmentationRatio, ...
 ```
 
-## Features
+### Thread Safety
+All public methods are **mutex-guarded** internally. Call from multiple threads freely.
 
-| Feature | Status |
-|---------|--------|
-| **Core Memory Pool** | |
-| Persistent large-block allocation | ✅ |
-| Budget-capped pool (`maxHeapFraction`, `maxPoolBytes`, `VK_EXT_memory_budget`) | ✅ |
-| Buddy sub-allocator (256KB alignment, pow2 enforcement, double-free validation) | ✅ |
-| `PoolConfig::forDevice()` — APU/Unified/Discrete detection with tuned defaults | ✅ |
-| `MemoryUsage` intent API (`GpuOnly`, `CpuToGpu`, `GpuToCpu`, `CpuCopy`, `Auto`) | ✅ |
-| `AllocDesc` rich allocation descriptor (`exportable`, `mapped`, `name`) | ✅ |
-| Debug names (`VK_EXT_debug_utils` on buffers/memory) | ✅ |
-| Richer `PoolStats` (`totalCapacity`, `dedicatedCount`, `allocationCount`) | ✅ |
-| **Cross-GPU Sharing** | |
-| Cross-vendor memory sharing (AMD↔NVIDIA↔Intel) | ✅ |
-| Linux: OPAQUE_FD, DMA-BUF | ✅ |
-| Windows: OPAQUE_WIN32, D3D12_HEAP | ✅ |
-| Dedicated allocation model for external export (1 VkDeviceMemory per shareable alloc) | ✅ |
-| Auto-promotion of sub-allocated blocks on export (dedicated copy) | ✅ |
-| Cross-device memory type re-selection on import | ✅ |
-| External handle ownership: import consumes handle (`release()`); multi-GPU `duplicateForImport()` | ✅ |
-| **Core Infrastructure** | |
-| RAII handle wrappers (`UniqueHandle`, `ExternalHandle` FD/HANDLE ownership) | ✅ |
-| Thread safety (mutex-guarded public API) | ✅ |
-| Bindless device addresses | ✅ |
-| Host shadow buffer for swap | ✅ |
-| Async migration (device↔host) | ✅ |
-| `madvise(MADV_DONTNEED/FREE)` | 🔧 (opt-in, unsafe on vkMapMemory memory) |
-| `mprotect(PROT_NONE)` for page faults | 🔧 (opt-in, unsafe on vkMapMemory memory) |
-| Timeline semaphore sync | ✅ |
-| **ModelHub — Model Weight Distribution** | |
-| Hugging Face–style publish/fetch over TCP | ✅ |
-| Content-addressed chunks (SHA-256, 4 MiB slices) with hash-verified resume | ✅ |
-| Local cache `~/.cache/vvm/models/<model>/<version>/` + `.vvm_complete` marker | ✅ |
-| `publish(modelId, sourceDir, version)` → hashes + copies to cache | ✅ |
-| `fetch(hubAddr, modelId, destDir, version)` → manifest + files, verifies per-chunk | ✅ |
-| **Networking** | |
-| Multi-node cluster over TCP (zero deps) | ✅ |
-| TLS-secured TCP transport (OpenSSL, TLS 1.2+, SNI + ALPN) | ✅ |
-| Multi-GPU pool manager | ✅ |
-| **Testing & Quality** | |
-| Buddy allocator unit tests (pow2, merge, double-free, fragmentation) | ✅ |
-| External handle ownership tests (dup, consume, isolate) | ✅ |
-| Model registry tests (publish, fetch manifest, fetch files, cache hit, list) | ✅ |
-| Network loopback test (two-node cluster, push/pull migration, zero-copy import) | ✅ |
+---
+
+## Cross-GPU Memory Sharing
+
+VulkanVM uses `VK_EXTERNAL_MEMORY` to share `VkDeviceMemory` across physical devices. **Requirement:** The source must be a **dedicated exportable allocation** (one `VkDeviceMemory` per shareable buffer). Sub-allocated blocks are auto-promoted to dedicated copies on export.
+
+### Handle Types by Platform
+
+| Platform | NVIDIA | AMD / Intel |
+|----------|--------|-------------|
+| **Linux** | `DMA_BUF` | `OPAQUE_FD` / `DMA_BUF` |
+| **Windows** | `D3D12_HEAP` | `OPAQUE_WIN32` |
+
+### Basic Export / Import
+
+```cpp
+// On master GPU (e.g., AMD 7900 XTX)
+auto masterAlloc = masterPool.allocateDedicatedExportable(256_MiB, usage);
+auto exportInfo  = masterPool.exportMemory(*masterAlloc,
+    #ifdef VVM_PLATFORM_LINUX
+        ExternalHandleType::DmaBuf
+    #else
+        ExternalHandleType::OpaqueWin32
+    #endif
+);
+
+// On each peer GPU (e.g., Intel Arc Pro B70, NVIDIA RTX)
+// Each peer needs its OWN handle; duplicateForImport() dups the FD/HANDLE
+for (auto& peerPool : peerPools) {
+    auto perPeer = duplicateForImport(*exportInfo);
+    auto peerAlloc = peerPool.importMemory(std::move(perPeer), usage);
+    // peerAlloc now aliases the SAME physical memory on this GPU
+}
+
+// Timeline semaphore sync across GPUs
+manager.submitMigrationBarrier(operations);
+manager.waitAllIdle();
+```
+
+### Handle Ownership Rules
+
+| Operation | Handle Ownership |
+|-----------|------------------|
+| `exportMemory()` | Returns `ExternalHandle` RAII wrapper — **closes on scope exit** |
+| `importMemory()` | **Consumes** the handle on success (driver takes ownership). On failure, wrapper still closes it. |
+| `duplicateForImport()` | Creates a **new independent FD/HANDLE** for each peer (dup on Linux, `DuplicateHandle` on Windows) |
+
+---
+
+## Multi-GPU Pool Manager
+
+`MultiGPUPoolManager` wraps multiple `UnifiedMemoryPool`s and automates cross-GPU allocation + sync.
+
+```cpp
+std::vector<DeviceConfig> devices = { amdConfig, intelConfig, nvidiaConfig };
+PoolConfig config = PoolConfig::forDevice(devices[0].physicalDevice);
+
+// GPU 0 = master (allocates + exports)
+auto manager = MultiGPUPoolManager::create(devices, config, 0);
+
+// One call: allocates on master, imports on all peers
+auto allocs = manager.allocateDistributed(512_MiB, usage);
+// allocs[i] is a valid allocation on devices[i], all aliasing the same memory
+
+// Peer capability query
+auto peer = manager->queryPeerAccess(0, 1);  // AMD → Intel
+// peer.canDirectCopy == true if export/import + device copy works
+
+// Direct GPU→GPU copy WITHOUT host staging (when driver supports it)
+manager->copyDeviceToDevice(0, 1, *srcAlloc, *dstAlloc, 0, 0, size);
+// If the driver refuses the cross-GPU import, transparently falls back
+// to a 4 MiB chunked host-staged copy (Spark-style)
+
+// Timeline semaphore barrier across all GPUs
+manager->submitMigrationBarrier(ops);
+manager->waitAllIdle();
+```
+
+### Peer Access Matrix
+
+| Source → Target | Linux Handle | Windows Handle |
+|-----------------|--------------|----------------|
+| NVIDIA → AMD    | DMA-BUF      | D3D12_HEAP → OPAQUE_WIN32 |
+| NVIDIA → Intel  | DMA-BUF      | D3D12_HEAP → OPAQUE_WIN32 |
+| AMD → NVIDIA    | DMA-BUF      | OPAQUE_WIN32 → D3D12_HEAP |
+| Intel → NVIDIA  | DMA-BUF      | OPAQUE_WIN32 → D3D12_HEAP |
+| AMD ↔ Intel     | DMA-BUF / OPAQUE_FD | OPAQUE_WIN32 |
+| Same vendor     | OPAQUE_FD    | OPAQUE_WIN32 / D3D12_HEAP |
+
+---
+
+## Host Offload / Demand Paging
+
+When VRAM fills, spill allocations to a host-backed shadow buffer asynchronously.
+
+```cpp
+OffloadConfig offloadConfig;
+offloadConfig.hostShadowSize = 4_GiB;      // host RAM buffer
+offloadConfig.transferQueue = devConfig.transferQueue;
+offloadConfig.transferQueueFamily = devConfig.transferQueueFamily;
+offloadConfig.persistentMapping = true;
+offloadConfig.useCoherentMapping = true;
+
+// Attach to pool (called automatically if poolConfig.enableHostVisible)
+pool->initializeOffload(offloadConfig);
+
+// Async offload (device → host)
+auto op = pool->offloadToHost(allocation);
+// ... do other compute while DMA runs ...
+pool->waitMigration(op);
+
+// Sync reload (host → device)
+pool->reloadToDevice(allocation);
+pool->waitMigration(op);
+```
+
+**Note:** `madvise`/`mprotect` on `vkMapMemory` memory are **deprecated** (unsafe on driver mappings). Standard async offload/reload uses the GPU copy engine and is safe.
+
+---
+
+## ModelHub — Model Weight Distribution
+
+Hugging Face–style publish/fetch over TCP with content-addressed chunks (SHA-256, 4 MiB slices), local cache, and resume.
+
+### Server (Hub)
+```cpp
+using namespace vvm::network;
+ModelHub hub("/data/model-store");
+hub.start("0.0.0.0", 51010);
+hub.publish("chonk/llama-3b-q4", "./local-model-files", "v1");
+// Publishes all files under ./local-model-files as version "v1"
+hub.stop();
+```
+
+### Client (Any Machine)
+```cpp
+// Fetch to local cache (~/.cache/vvm/models/...)
+ModelHub::fetch("192.168.1.50:51010", "chonk/llama-3b-q4", "./my-models", "v1");
+
+// Then load weights into the pool
+auto alloc = pool->allocate({ .size = modelSize, .memoryUsage = MemoryUsage::GpuOnly });
+// Copy weights from ./my-models/weights.safetensors into alloc->buffer
+```
+
+### Cache Layout (HF-style)
+```
+~/.cache/vvm/models/chonk/llama-3b-q4/v1/
+  config.json
+  weights.safetensors
+  tokenizer/tokenizer.json
+  .vvm_complete          # marker = cache entry valid
+```
+
+### Run the Demo
+```bash
+# Windows
+build_ninja\examples\model_registry_test.exe
+
+# Linux
+./build/examples/model_registry_test
+```
+
+---
+
+## Multi-Node Network Module
+
+`vvm::network::MultiNodePoolManager` provides a **zero-dependency** multi-node cluster over plain TCP (Winsock / BSD sockets). Uses a Spark-inspired wire protocol: versioned 32-byte header + bulk stream transferred in 4 MB slices directly between socket and caller buffer (no intermediate copy).
+
+### Control-Plane Messages
+`MsgRegisterNode`, `MsgGetClusterView`, `MsgAllocate`, `MsgExport`, `MsgImport`, `MsgMigratePull`, `MsgMigratePush`, `MsgHeartbeat`, `MsgLeaveCluster`, `MsgDeallocate`, `MsgModelList`, `MsgModelManifest`, `MsgModelChunk`.
+
+### TLS Support
+Optional OpenSSL-backed TLS 1.2+ (gated by `VVM_NETWORK_HAS_TLS`). Server SNI + client ALPN (`vvm/1.0`).
+
+```cpp
+using namespace vvm::network;
+
+// Node A (bootstrap seed)
+NetworkConfig netA; netA.listenAddress = "0.0.0.0:51001";
+auto nodeA = MultiNodePoolManager::create({devCfg}, poolCfg, netA);
+nodeA->start();
+nodeA->registerWithCluster();  // no seeds = cluster root
+
+// Node B (joins A's cluster)
+NetworkConfig netB; netB.listenAddress = "0.0.0.0:51002";
+netB.seedNodes = { "127.0.0.1:51001" };
+auto nodeB = MultiNodePoolManager::create({devCfg}, poolCfg, netB);
+nodeB->start();
+nodeB->registerWithCluster();  // connects to A, merges cluster view
+
+// Remote allocation + push migration (B → A)
+auto src = nodeB->getLocalPool().allocate(size, usage, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+std::memset(src->hostPtr, 0xAB, size);
+
+auto dst = nodeB->allocateRemote(nodeA->getLocalNodeId(), size, usage,
+                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+nodeB->migrateToRemote(*src, *dst, /*useRdma=*/false);  // 4 MB slices over TCP
+
+// Pull migration (A pulls from B)
+auto remoteDesc = nodeB->exportForRemote(*src, false, true);
+auto localDst   = nodeA->getLocalPool().allocate(size, usage, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+nodeA->migrateFromRemote(*remoteDesc, *localDst, /*useRdma=*/false);
+```
+
+### Run the Demo
+```bash
+# Windows
+build_ninja\examples\network_test.exe
+
+# Linux
+./build/examples/network_test
+```
+
+---
+
+## GPU-Direct RDMA (Vendor Paths)
+
+For NIC-attached GPU memory DMA (bypassing host CPU), VulkanVM provides three vendor-specific registration paths. The `RdmaTransport` (verbs backend) dispatches based on `vendorID`.
+
+### NVIDIA (`0x10DE`) — `VK_NV_external_memory_rdma`
+```cpp
+// Requires VK_NV_external_memory_rdma + nvidia-peermem kernel module
+PFN_vkGetMemoryRemoteAddressNV vkGetMemoryRemoteAddressNV = ...;
+VkMemoryGetRemoteAddressInfoNV info{};
+info.sType = VK_STRUCTURE_TYPE_MEMORY_GET_REMOTE_ADDRESS_INFO_NV;
+info.memory = memory;
+info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_RDMA_ADDRESS_BIT_NV;
+VkRemoteAddressNV remoteAddr;
+vkGetMemoryRemoteAddressNV(device, &info, &remoteAddr);
+// → ibv_reg_mr on the exposed PCI BAR (Linux) or NDKPI (Windows)
+```
+
+### AMD (`0x1002`) — `OPAQUE_WIN32` / `DMA_BUF`
+```cpp
+// Export Vulkan memory as Win32 handle
+VkMemoryGetWin32HandleInfoKHR getInfo{};
+getInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT_KHR;
+HANDLE win32Handle;
+vkGetMemoryWin32HandleKHR(device, &getInfo, &win32Handle);
+
+// Map to CPU VA (Windows: MapViewOfFile, Linux: mmap on DMA-BUF fd)
+void* cpuVa = MapViewOfFile(win32Handle, FILE_MAP_READ|FILE_MAP_WRITE, 0, 0, size);
+// → ibv_reg_mr(cpuVa, size, IBV_ACCESS_REMOTE_WRITE|IBV_ACCESS_REMOTE_READ)
+```
+
+### Intel (`0x8086`) — Same as AMD
+```cpp
+// Identical flow: OPAQUE_WIN32 handle → MapViewOfFile → ibv_reg_mr
+```
+
+### API
+```cpp
+// In rdma_transport.cpp (VerbsRdmaTransport)
+std::optional<RdmaMemoryRegion> registerGpuMemory(
+    VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size, VkBuffer buffer) override;
+
+// Dispatches to:
+registerGpuMemoryForRdmaVendor(device, physDev, memory, offset, size, ... , vendorId);
+registerDmaBufForRdmaVendor(device, physDev, memory, offset, size, ... , vendorId);
+```
+
+---
+
+## Sparse / Residency Virtual Memory
+
+Virtual memory pool with `VK_BUFFER_CREATE_SPARSE_BINDING | SPARSE_RESIDENCY`. Allows reserving a large virtual address range and committing physical pages on demand.
+
+```cpp
+#include <vulkan_vm/sparse.hpp>
+
+using namespace vvm;
+
+// 1 GiB virtual address space, 32 MiB pages
+SparseVirtualMemoryPool sparsePool(device, physicalDevice);
+sparsePool.initialize(1_GiB, 32_MiB);
+
+// Reserve virtual range (no physical memory yet)
+auto reservation = sparsePool.reserveVirtual(256_MiB, usageFlags);
+
+// Commit physical pages for a sub-range (e.g., 64 MiB at offset 64 MiB)
+sparsePool.commit(reservation, 64_MiB, 64_MiB, memoryFlags);
+
+// Uncommit when done
+sparsePool.uncommit(reservation, 64_MiB, 64_MiB);
+```
+
+**Tested:** 1 GiB virtual / 32 MiB pages passes all 5 ctest sparse tests.
+
+---
 
 ## Building
+
+### Windows (PowerShell)
+```powershell
+# Using the Ninja + VS DevCmd method (avoids Windows SDK version issue)
+.\scripts\build.ps1 -Tests -BuildType Release
+# Or manually:
+cmd /c "call \"C:\Program Files\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat\" -arch=x64 && cmake -G Ninja -B build_ninja -DCMAKE_BUILD_TYPE=Release -DVVM_BUILD_TESTS=ON && cmake --build build_ninja --config Release"
+```
 
 ### Linux
 ```bash
 ./scripts/build.sh --tests
-```
-
-### Windows
-```powershell
-.\scripts\build.ps1 -tests
-```
-
-### Manual CMake
-```bash
+# Or manually:
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DVVM_BUILD_TESTS=ON
 cmake --build build --config Release
 ctest --test-dir build --output-on-failure
@@ -116,218 +429,23 @@ ctest --test-dir build --output-on-failure
 - CMake 3.20+
 - C++20 compiler (GCC 10+, Clang 12+, MSVC 19.30+)
 - Vulkan SDK 1.3+
-- Optional: Volk (dynamic Vulkan loading)
+- Optional: Volk (dynamic Vulkan loading), OpenSSL (TLS), gRPC/Protobuf (control plane), ibverbs/rdma_cm (RDMA)
 
-## Usage
+### CMake Options
+| Option | Default | Description |
+|--------|---------|-------------|
+| `VVM_BUILD_SHARED` | ON | Build as shared library |
+| `VVM_BUILD_TESTS` | ON | Build unit tests |
+| `VVM_BUILD_EXAMPLES` | ON | Build examples (includes integration tests) |
+| `VVM_ENABLE_VALIDATION` | ON | Enable Vulkan validation layers |
+| `VVM_USE_VOLK` | ON | Use Volk for dynamic Vulkan loading |
+| `VVM_BUILD_NETWORK` | ON | Build network/multi-node module |
+| `VVM_BUILD_PYTORCH` | OFF | Build PyTorch C++ extension |
+| `VVM_BUILD_ONNX` | OFF | Build ONNX Runtime integration |
 
-### Basic Allocation
-```cpp
-#include <vulkan_vm/vulkan_vm.hpp>
+---
 
-using namespace vvm;
-
-// Setup device
-DeviceConfig devConfig = { /* ... */ };
-PoolConfig poolConfig;
-poolConfig.blockSize = 512 * 1024 * 1024;  // 512MB blocks
-poolConfig.minAlignment = 256 * 1024;       // Tensor core alignment
-
-auto pool = UnifiedMemoryPool::create(devConfig, poolConfig);
-
-// Allocate tensor buffer (bindless-ready)
-auto alloc = pool->allocateTensor(64 * 1024 * 1024);  // 64MB
-// alloc->deviceAddress usable in shaders
-// alloc->buffer for vkCmd* operations
-
-// Deallocate (returns to pool, not OS)
-pool->deallocate(std::move(*alloc));
-```
-
-### New: Intent-based Allocation (MemoryUsage + AllocDesc)
-```cpp
-#include <vulkan_vm/vulkan_vm.hpp>
-
-PoolConfig cfg = PoolConfig::forDevice(physicalDevice);  // auto-tunes for APU/discrete
-cfg.maxHeapFraction = 0.75f;  // never exceed 75% of device heap budget
-
-auto pool = UnifiedMemoryPool::create(devConfig, cfg);
-
-// Simple: intent-driven
-auto w = pool->allocate({ .size = 64_MiB,
-                          .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                          .memoryUsage = MemoryUsage::GpuOnly,
-                          .exportable = false,
-                          .name = "weight_tensor" });
-
-// Staging buffer (upload)
-auto staging = pool->allocate({ .size = 128_MiB,
-                                .memoryUsage = MemoryUsage::CpuToGpu,
-                                .mapped = true,
-                                .name = "upload_buffer" });
-
-// Readback
-auto readback = pool->allocate({ .size = 16_MiB,
-                                 .memoryUsage = MemoryUsage::GpuToCpu,
-                                 .mapped = true });
-```
-
-### Cross-GPU Sharing (AMD ↔ NVIDIA ↔ Intel)
-```cpp
-// Master GPU allocates a DEDICATED exportable allocation.
-// (Cross-GPU export requires dedicated memory - one VkDeviceMemory per
-// shareable allocation. exportMemory() rejects sub-allocated blocks; the
-// multi-node manager auto-promotes them to dedicated copies on export.)
-const VkBufferUsageFlags kUsage =
-    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-auto masterAlloc = masterPool.allocateDedicatedExportable(128 * 1024 * 1024, kUsage);
-
-// Export for sharing. exportInfo owns the FD/HANDLE via ExternalHandle and
-// closes it automatically when it goes out of scope.
-auto exportInfo = masterPool.exportMemory(*masterAlloc, ExternalHandleType::DmaBuf);  // Linux
-
-// Import on other GPUs — handle is consumed by the driver on success.
-for (auto& peerPool : peerPools) {
-    // Each peer needs its OWN handle; duplicateForImport() dups the FD/HANDLE.
-    auto perPeer = duplicateForImport(*exportInfo);
-    auto peerAlloc = peerPool.importMemory(std::move(perPeer), kUsage);
-}
-
-// Sync with timeline semaphores
-manager.submitMigrationBarrier(operations);
-manager.waitAllIdle();
-```
-
-### Host Offload / Swap
-```cpp
-OffloadConfig offloadConfig;
-offloadConfig.hostShadowSize = 4ull * 1024 * 1024 * 1024;  // 4GB host buffer
-// offloadConfig.useMadvise = true;    // opt-in only; unsafe on vkMapMemory memory
-// offloadConfig.useMprotect = true;   // opt-in only; unsafe on vkMapMemory memory
-
-OffloadManager offloadManager(&pool, offloadConfig);
-
-// Async offload to host
-auto op = offloadManager.offload(allocation);
-// ... do other work ...
-offloadManager.waitMigration(op);
-
-// Sync reload
-offloadManager.reloadSync(allocation);
-```
-
-### Multi-GPU Pool Manager
-```cpp
-std::vector<DeviceConfig> devices = { devConfig0, devConfig1, devConfig2 };
-PoolConfig config;
-
-auto manager = MultiGPUPoolManager::create(devices, config, 0);  // GPU 0 = master
-
-// Allocate distributed (master allocates, others import)
-auto allocations = manager.allocateDistributed(256 * 1024 * 1024, usage);
-
-// All GPUs now have valid allocations pointing to shared memory
-for (size_t i = 0; i < devices.size(); ++i) {
-    auto& alloc = allocations[i];
-    // alloc->deviceAddress valid on GPU i
-}
-```
-
-### ModelHub — Hugging Face–Style Weight Distribution
-```cpp
-// --- Hub (server) ---
-ModelHub hub("/data/model-store");
-hub.start("0.0.0.0", 51010);
-hub.publish("chonk/llama-3b-q4", "./local-model-files", "v1");
-hub.stop();
-
-// --- Client (any machine) ---
-ModelHub::fetch("192.168.1.50:51010", "chonk/llama-3b-q4", "./my-models", "v1");
-// Then load into UnifiedMemoryPool:
-auto alloc = pool->allocate({ .size = modelSize, .memoryUsage = MemoryUsage::GpuOnly });
-// ... copy weights from ./my-models/weights.safetensors into alloc ...
-```
-
-Cache layout (HF-style):
-```
-~/.cache/vvm/models/chonk/llama-3b-q4/v1/
-  config.json
-  weights.safetensors
-  tokenizer/tokenizer.json
-  .vvm_complete
-```
-
-### Multi-Node Network Module
-
-`vvm::network::MultiNodePoolManager` provides a host-staged, multi-node cluster for
-moving tensors between machines over plain TCP. It uses a Spark-inspired wire
-protocol: a versioned 32-byte header `[magic "VVMN"][u8 version][u8 x3 reserved]
-[u32 type][u32 flags][u32 bodyLen][u32 seq][u64 streamLen]` followed by a control
-body and an optional bulk stream transferred in 4 MB slices directly between the
-socket and a caller-provided buffer (no intermediate copy). Control-plane messages:
-`MsgRegisterNode`, `MsgGetClusterView`, `MsgAllocate`, `MsgExport`, `MsgImport`,
-`MsgMigratePull`, `MsgMigratePush`, `MsgHeartbeat`, `MsgLeaveCluster`,
-`MsgDeallocate`, `MsgModelList`, `MsgModelManifest`, `MsgModelChunk`.
-
-The TCP control/data plane builds **with zero external dependencies** (Winsock on
-Windows, BSD sockets on Linux). gRPC and RDMA/verbs remain optional extras
-(promoted via `VVM_NETWORK_HAS_GRPC` / `VVM_NETWORK_HAS_VERBS`).
-
-**TLS**: the transport supports OpenSSL-backed TLS 1.2+ (gated by
-`VVM_NETWORK_HAS_TLS`). Call `transport.enableTls(TlsConfig{...})` with
-`certPath`/`keyPath`/`caPath`, optional peer verification (`verifyPeer`) and
-ALPN (`alpnProtocols`, default `"vvm/1.0"`). `NetworkConfig.useTls` mirrors this
-for the multi-node manager (cert/key/ca paths in `tlsCertPath`/`tlsKeyPath`/`tlsCaPath`).
-Server-side SNI and client-side ALPN negotiation are implemented.
-
-```cpp
-using namespace vvm::network;
-
-NetworkConfig netA; netA.listenAddress = "0.0.0.0:51001";  // bootstrap seed
-auto nodeA = MultiNodePoolManager::create({devCfg}, poolCfg, netA);
-nodeA->start();                       // registers as cluster root (no seeds)
-nodeA->registerWithCluster();
-
-NetworkConfig netB; netB.listenAddress = "0.0.0.0:51002";
-netB.seedNodes = { "127.0.0.1:51001" };
-auto nodeB = MultiNodePoolManager::create({devCfg}, poolCfg, netB);
-nodeB->start();                       // connects to nodeA and joins the cluster
-nodeB->registerWithCluster();
-
-// Remote allocation + push migration (B -> A)
-auto src = nodeB->getLocalPool().allocate(size, /*...usage...*/, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
-std::memset(src->hostPtr, 0xAB, size);
-
-auto dst = nodeB->allocateRemote(nodeA->getLocalNodeId(), size, /*...*/,
-                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
-nodeB->migrateToRemote(*src, *dst, /*useRdma=*/false);  // streamed in 4 MB slices
-
-// Pull migration (B -> A): A pulls bytes from a remote allocation on B
-auto remoteDesc = nodeB->exportForRemote(*src, false, true);
-auto localDst   = nodeA->getLocalPool().allocate(size, /*...*/, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
-nodeA->migrateFromRemote(*remoteDesc, *localDst, /*useRdma=*/false);
-```
-
-A working two-node loopback demo lives at `examples/network_test.cpp` and is built
-as the `network_test` target. Run it after building:
-
-```bash
-./build/examples/network_test.exe   # Windows
-./build/examples/network_test       # Linux
-```
-
-Expected: cluster registration, remote allocate, push verify `PASS`, pull verify
-`PASS`, `ALL TESTS PASSED`.
-
-### Model Registry Test
-```bash
-./build/examples/model_registry_test.exe   # Windows
-./build/examples/model_registry_test       # Linux
-```
-
-Expected: publish 4-file model, fetch manifest, fetch all files, verify hashes,
-cache hit on 2nd fetch, list models — all `PASS`.
-
-## Cross-Vendor Compatibility Matrix
+## Cross-Vendor Compatibility
 
 | Source → Target | Linux Handle | Windows Handle |
 |-----------------|--------------|----------------|
@@ -335,70 +453,64 @@ cache hit on 2nd fetch, list models — all `PASS`.
 | NVIDIA → Intel  | DMA-BUF      | D3D12_HEAP → OPAQUE_WIN32 |
 | AMD → NVIDIA    | DMA-BUF      | OPAQUE_WIN32 → D3D12_HEAP |
 | Intel → NVIDIA  | DMA-BUF      | OPAQUE_WIN32 → D3D12_HEAP |
-| AMD ↔ Intel     | DMA-BUF      | OPAQUE_WIN32 |
+| AMD ↔ Intel     | DMA-BUF / OPAQUE_FD | OPAQUE_WIN32 |
 | Same vendor     | OPAQUE_FD    | OPAQUE_WIN32 / D3D12_HEAP |
 
-## APU-Specific Tuning (Strix Halo 395)
+**Tested Hardware:**
+- AMD Radeon RX 7900 XTX (discrete, `0x1002`)
+- AMD Radeon Graphics (integrated, `0x1002`)
+- Intel Arc Pro B70 (discrete, `0x8086`)
+
+All three support sparse binding + residency.
+
+---
+
+## APU-Specific Tuning (Strix Halo 395 / Unified Memory)
 
 ```cpp
-// Using the new auto-tuner:
-PoolConfig apuConfig = PoolConfig::forDevice(physicalDevice);
-// Sets blockSize=1GB, maxBlocks=8, maxHeapFraction=0.7, unified memory type
+// Auto-tuned:
+PoolConfig cfg = PoolConfig::forDevice(physicalDevice);
+// Sets: blockSize=1GB, maxBlocks=8, maxHeapFraction=0.7, unified memory type
 
-// Or manual:
-PoolConfig apuConfig;
-apuConfig.blockSize = totalVRAM * 0.8;  // Reserve 80% at startup
-apuConfig.minAlignment = 256 * 1024;
-apuConfig.enableHostVisible = true;      // Unified memory
-apuConfig.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | 
-                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | 
-                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-apuConfig.maxHeapFraction = 0.7f;
-```
+// Manual for Strix Halo (96-128 GB unified RAM):
+PoolConfig cfg;
+cfg.blockSize = totalSystemRAM * 0.8;   // Reserve 80% at boot (e.g., 80 GB of 96 GB)
+cfg.minAlignment = 256 * 1024;
+cfg.enableHostVisible = true;            // Unified memory = host visible
+cfg.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+cfg.maxHeapFraction = 0.7f;              // Never exceed 70% of system heap
 
-## Budget & Topology API
-
-```cpp
-// Query topology
+// Topology detection:
 MemoryTopology topo = detectMemoryTopology(physicalDevice);
-switch (topo) {
-  case MemoryTopology::Unified:  // APU, single heap
-    cfg.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    break;
-  case MemoryTopology::Hybrid:   // APU with small dedicated carve-out
-    // ...
-  case MemoryTopology::Discrete: // dGPU
-    // default
-}
-
-// Budget check before allocating
-if (pool->wouldExceedBudget(512_MiB)) {
-    // trigger offload or fail soft
-}
+// topo == Unified → single heap with DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT
 ```
 
-## License
+**Result:** Single massive block at boot. ROCm can't fragment what VulkanVM already owns.
 
-MIT License - see LICENSE file.
+---
 
-## Credits
+## License & Credits
 
+**MIT License** — see `LICENSE`.
+
+### Credits
 - **Nemotron** — primary coder
-- **Deepseek** — primary coder, co-author of the multi-node network module (Spark-style TCP transport, TLS, host-staged push/pull migration, cluster registration, two-node loopback test) and implementation support across the codebase
-- **GLM** — primary coder, review and refinements during development
-- **Grok** — code audit of the memory pool, buddy allocator, external memory, and network layers (dedicated export model, RAII handle lifetime, thread safety, BlockManager dedup, budget caps, APU topology, handle ownership)
-- **NVIDIA** — network module framework and implementation foundation; special thanks for supporting Open Source despite being a Mega-Corp
-- **ChonkE** — project owner, 1% contributor
+- **Deepseek** — primary coder, co-author of multi-node network module (Spark-style TCP transport, TLS, host-staged push/pull migration, cluster registration, two-node loopback test)
+- **GLM** — primary coder, review and refinements
+- **Grok** — code audit of memory pool, buddy allocator, external memory, network layers
+- **NVIDIA** — network module framework foundation; supporting Open Source
+- **ChonkE** — project owner
 
-## Contributing
-
+### Contributing
 1. Fork the repository
 2. Create feature branch
 3. Add tests for new functionality
 4. Ensure all tests pass (`ctest --output-on-failure`)
 5. Submit PR
+
+---
 
 ## Roadmap
 
@@ -411,19 +523,15 @@ MIT License - see LICENSE file.
 - [x] Thread-safe public API (mutex-guarded pool)
 - [x] TLS-secured TCP transport (OpenSSL, SNI + ALPN)
 - [x] macOS build support
-- [x] Network serialization hardening + minimal test suite
 - [x] Budget-capped pool (`maxHeapFraction`, `maxPoolBytes`, `VK_EXT_memory_budget`)
 - [x] `PoolConfig::forDevice()` + `detectMemoryTopology()` (APU/Discrete/Hybrid)
 - [x] `MemoryUsage` + `AllocDesc` intent-based allocation API
 - [x] `VK_EXT_debug_utils` object names on buffers/memory
 - [x] `ModelHub` — Hugging Face–style weight distribution (content-addressed, cache+resume)
 - [x] External handle ownership fix (import consumes, `duplicateForImport` for multi-GPU)
-- [x] Honest `defragment()` → releases idle blocks; `trim()` implemented
-- [x] Buddy allocator unit tests (pow2, merge, double-free, fragmentation)
-- [x] External handle ownership unit tests (dup, consume, isolate)
-- [x] Model registry tests (publish, fetch manifest, fetch files, cache hit, list)
-- [ ] Sparse/residency support for virtual memory
-- [ ] Direct GPU↔GPU copy (P2P) without host staging
+- [x] Sparse/residency support for virtual memory
+- [x] Host-staged GPU↔GPU fallback when driver refuses cross-GPU import
+- [ ] Direct GPU↔GPU copy (P2P) without host staging (vendor-dependent)
 - [ ] RDMA/verbs GPU-direct transport (stubs in place; experimental)
 - [ ] Integration with ML frameworks (PyTorch, ONNX Runtime)
 - [ ] Windows WDDM2.6+ hardware scheduling hints
