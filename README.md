@@ -14,9 +14,13 @@ A cross-vendor, high-performance Vulkan memory management library designed to so
 VulkanVM provides a `UnifiedMemoryPool` that:
 1. **Pre-allocates large blocks** (256MB-2GB) at startup, sub-allocates with buddy allocator
 2. **Never returns memory to OS** - eliminates fragmentation
-3. **Exports/imports `VkDeviceMemory`** via `VK_EXTERNAL_MEMORY` for cross-GPU sharing
-4. **Supports host shadow buffers** with `madvise`/`mprotect` for swap/offload
+3. **Exports/imports `VkDeviceMemory`** via `VK_EXTERNAL_MEMORY` for cross-GPU sharing — dedicated allocations only; sub-allocated blocks are auto-promoted to dedicated copies on export
+4. **Supports host shadow buffers** for swap/offload (`madvise`/`mprotect` are opt-in only — unsafe on `vkMapMemory` memory)
 5. **Works on AMD, NVIDIA, Intel** - Vulkan is the common denominator
+6. **RAII handle wrappers** — `UniqueHandle` wraps Vulkan objects; `ExternalHandle` owns FD/HANDLE lifetime (move-only, no leaks)
+7. **Thread-safe** — the public pool API is guarded by an internal mutex
+8. **Optional TLS** — the TCP transport can be encrypted with OpenSSL (TLS 1.2+)
+9. **Cross-platform** — Windows, Linux, and macOS
 
 ## Architecture
 
@@ -43,10 +47,15 @@ VulkanVM provides a `UnifiedMemoryPool` that:
 | Feature | Status |
 |---------|--------|
 | Persistent large-block allocation | ✅ |
-| Buddy sub-allocator (256KB alignment, pow2 enforcement) | ✅ |
+| Buddy sub-allocator (256KB alignment, pow2 enforcement, double-free validation) | ✅ |
 | Cross-vendor memory sharing (AMD↔NVIDIA↔Intel) | ✅ |
 | Linux: OPAQUE_FD, DMA-BUF | ✅ |
 | Windows: OPAQUE_WIN32, D3D12_HEAP | ✅ |
+| Dedicated allocation model for external export (1 VkDeviceMemory per shareable alloc) | ✅ |
+| Auto-promotion of sub-allocated blocks on export (dedicated copy) | ✅ |
+| Cross-device memory type re-selection on import | ✅ |
+| RAII handle wrappers (`UniqueHandle`, `ExternalHandle` FD/HANDLE ownership) | ✅ |
+| Thread safety (mutex-guarded public API) | ✅ |
 | Bindless device addresses | ✅ |
 | Host shadow buffer for swap | ✅ |
 | Async migration (device↔host) | ✅ |
@@ -54,6 +63,8 @@ VulkanVM provides a `UnifiedMemoryPool` that:
 | mprotect(PROT_NONE) for page faults | 🔧 (opt-in, unsafe on vkMapMemory memory) |
 | Timeline semaphore sync | ✅ |
 | Multi-GPU pool manager | ✅ |
+| Multi-node cluster over TCP (zero deps) | ✅ |
+| TLS-secured TCP transport (OpenSSL, TLS 1.2+) | ✅ |
 
 ## Building
 
@@ -107,15 +118,21 @@ pool->deallocate(std::move(*alloc));
 
 ### Cross-GPU Sharing (AMD ↔ NVIDIA ↔ Intel)
 ```cpp
-// Master GPU allocates
-auto masterAlloc = masterPool.allocateTensor(128 * 1024 * 1024);
+// Master GPU allocates a DEDICATED exportable allocation.
+// (Cross-GPU export requires dedicated memory - one VkDeviceMemory per
+// shareable allocation. exportMemory() rejects sub-allocated blocks; the
+// multi-node manager auto-promotes them to dedicated copies on export.)
+const VkBufferUsageFlags kUsage =
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+auto masterAlloc = masterPool.allocateDedicatedExportable(128 * 1024 * 1024, kUsage);
 
-// Export for sharing
+// Export for sharing. exportInfo owns the FD/HANDLE via ExternalHandle and
+// closes it automatically when it goes out of scope.
 auto exportInfo = masterPool.exportMemory(*masterAlloc, ExternalHandleType::DmaBuf);  // Linux
 
 // Import on other GPUs
 for (auto& peerPool : peerPools) {
-    auto peerAlloc = peerPool.importMemory(exportInfo, usage);
+    auto peerAlloc = peerPool.importMemory(*exportInfo, kUsage);
     // peerAlloc->deviceAddress valid on peer GPU
 }
 
@@ -174,6 +191,13 @@ The TCP control/data plane builds **with zero external dependencies** (Winsock o
 Windows, BSD sockets on Linux). gRPC and RDMA/verbs remain optional extras
 (promoted via `VVM_NETWORK_HAS_GRPC` / `VVM_NETWORK_HAS_VERBS`).
 
+**TLS**: the transport supports OpenSSL-backed TLS 1.2+ (gated by
+`VVM_NETWORK_HAS_TLS`). Call `transport.enableTls(TlsConfig{...})` with
+`certPath`/`keyPath`/`caPath`, optional peer verification (`verifyPeer`) and
+ALPN (`alpnProtocols`, default `"vvm/1.0"`). `NetworkConfig.useTls` mirrors this
+for the multi-node manager (cert/key/ca paths in `tlsCertPath`/`tlsKeyPath`/`tlsCaPath`).
+Server-side SNI and client-side ALPN negotiation are implemented.
+
 ```cpp
 using namespace vvm::network;
 
@@ -217,9 +241,11 @@ Expected: cluster registration, remote allocate, push verify `PASS`, pull verify
 |-----------------|--------|
 | TCP control/data plane (zero deps) | ✅ |
 | Spark-style 32-byte header + 4 MB slice streaming | ✅ |
+| TLS-secured transport (OpenSSL, TLS 1.2+, SNI + ALPN) | ✅ |
 | Cluster registration + heartbeat | ✅ |
 | Remote allocate / export / import / deallocate | ✅ |
 | Host-staged push/pull migration | ✅ |
+| Auto-promotion of sub-allocated exports to dedicated copies | ✅ |
 | gRPC control plane (optional) | 🔧 (experimental; auto-enabled when gRPC found) |
 | RDMA/verbs GPU-direct (optional) | 🔧 (experimental; stubs only; host-staged fallback always available) |
 
@@ -254,8 +280,9 @@ MIT License - see LICENSE file.
 ## Credits
 
 - **Nemotron** — primary coder
-- **Deepseek** — primary coder, co-author of the multi-node network module (Spark-style TCP transport, host-staged push/pull migration, cluster registration, two-node loopback test) and implementation support across the codebase
+- **Deepseek** — primary coder, co-author of the multi-node network module (Spark-style TCP transport, TLS, host-staged push/pull migration, cluster registration, two-node loopback test) and implementation support across the codebase
 - **GLM** — primary coder, review and refinements during development
+- **Grok** — code audit of the memory pool, buddy allocator, external memory, and network layers (dedicated export model, RAII handle lifetime, thread safety, BlockManager dedup)
 - **NVIDIA** — network module framework and implementation foundation; special thanks for supporting Open Source despite being a Mega-Corp
 - **ChonkE** — project owner, 1% contributor
 
@@ -273,7 +300,12 @@ MIT License - see LICENSE file.
 - [x] Host-staged push/pull migration with byte-pattern verification
 - [x] Buddy allocator pow2 enforcement & double-free validation
 - [x] External memory dedicated allocation model (1 VkDeviceMemory per shareable alloc)
+- [x] RAII handle wrappers (`UniqueHandle`, `ExternalHandle` FD/HANDLE lifetime)
 - [x] Cross-device memory type re-selection on import
+- [x] Thread-safe public API (mutex-guarded pool)
+- [x] TLS-secured TCP transport (OpenSSL, SNI + ALPN)
+- [x] macOS build support
+- [x] Network serialization hardening + minimal test suite
 - [ ] Sparse/residency support for virtual memory
 - [ ] Direct GPU↔GPU copy (P2P) without host staging
 - [ ] RDMA/verbs GPU-direct transport (stubs in place; experimental)
