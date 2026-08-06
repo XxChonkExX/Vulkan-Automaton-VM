@@ -52,6 +52,15 @@ target_include_directories(external_handle_test PRIVATE
 )
 add_test(NAME external_handle_test COMMAND external_handle_test)
 
+# Sparse / residency virtual memory test (requires sparseResidencyBuffer feature)
+add_executable(sparse_test sparse_test.cpp)
+target_link_libraries(sparse_test PRIVATE vulkan_vm)
+target_include_directories(sparse_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
+add_test(NAME sparse_test COMMAND sparse_test)
+
 # Python integration tests (require built extensions)
 if(VVM_BUILD_PYTORCH)
     add_test(NAME pytorch_integration_test

@@ -148,6 +148,7 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 # Library
 add_library(vulkan_vm
     src/core/unified_memory_pool.cpp
+    src/core/sparse_memory.cpp
     src/allocator/buddy_allocator.cpp
     src/cross_gpu/external_memory.cpp
     src/cross_gpu/multi_gpu_manager.cpp
