@@ -25,6 +25,16 @@ target_include_directories(minimal_test PRIVATE
 
 add_test(NAME minimal_test COMMAND minimal_test)
 
+# CPU-only buddy allocator tests (no Vulkan device required)
+add_executable(buddy_test buddy_test.cpp)
+target_link_libraries(buddy_test PRIVATE vulkan_vm)
+target_include_directories(buddy_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${Vulkan_INCLUDE_DIRS}
+)
+
+add_test(NAME buddy_test COMMAND buddy_test)
+
 # Multi-GPU test (if multiple GPUs available)
 # add_executable(multi_gpu_test multi_gpu_test.cpp)
 # target_link_libraries(multi_gpu_test PRIVATE vulkan_vm)

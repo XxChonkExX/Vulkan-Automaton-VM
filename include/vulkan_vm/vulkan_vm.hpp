@@ -151,11 +151,9 @@ struct BlockInfo {
     VkDeviceSize used = 0;
     VkDeviceSize offset = 0;  // for host-visible shadow
     void* hostPtr = nullptr;
-    int exportFd = -1;        // Linux external handle
-    VkExternalMemoryHandleTypeFlagBits exportHandleType = static_cast<VkExternalMemoryHandleTypeFlagBits>(0);  // which handle type was exported
-#ifdef VVM_PLATFORM_WINDOWS
-    HANDLE exportHandle = nullptr;  // Windows external handle
-#endif
+    // NOTE: Pool blocks are NEVER exportable. Cross-GPU sharing must go
+    // through allocateDedicatedExportable() -> exportMemory() so every
+    // exported allocation has its own dedicated VkDeviceMemory.
     // Buddy allocator for this block (replaces freeRanges)
     std::unique_ptr<class BuddyAllocator> buddy;
     VkMemoryPropertyFlags memoryFlags = 0;
@@ -307,14 +305,17 @@ private:
     UnifiedMemoryPool() = default;
     bool initialize(const DeviceConfig& device, const PoolConfig& config);
     
+    // Verify required Vulkan features/extensions were enabled at device creation.
+    bool validateDeviceCapabilities() const;
+    
     std::optional<uint32_t> findMemoryType(VkMemoryPropertyFlags required,
                                            VkMemoryPropertyFlags preferred);
     std::optional<VkDeviceMemory> allocateBlock(VkDeviceSize size,
-                                                 uint32_t memoryTypeIndex,
-                                                 bool exportable);
+                                                 uint32_t memoryTypeIndex);
     std::optional<Allocation> subAllocate(VkDeviceSize size,
                                           VkDeviceSize alignment,
-                                          uint32_t blockIndex);
+                                          uint32_t blockIndex,
+                                          VkBufferUsageFlags usage);
     void subDeallocate(Allocation&& alloc);
     
     // Buddy allocator helpers
