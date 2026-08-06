@@ -15,6 +15,11 @@ add_executable(offload_test offload_test.cpp)
 target_link_libraries(offload_test PRIVATE vulkan_vm)
 target_include_directories(offload_test PRIVATE ${Vulkan_INCLUDE_DIRS})
 
+# Model registry test (publish/fetch model weights)
+add_executable(model_registry_test model_registry_test.cpp)
+target_link_libraries(model_registry_test PRIVATE vulkan_vm vulkan_vm_network)
+target_include_directories(model_registry_test PRIVATE ${Vulkan_INCLUDE_DIRS})
+
 # Multi-GPU example (requires multiple GPUs)
 # add_executable(multi_gpu multi_gpu.cpp)
 # target_link_libraries(multi_gpu PRIVATE vulkan_vm)

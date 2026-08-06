@@ -34,6 +34,10 @@ enum : uint32_t {
     MsgHeartbeat      = 8,
     MsgLeaveCluster   = 9,
     MsgDeallocate     = 10,  // request: free an allocation by id on its owner
+    // Model registry messages (Hugging Face–style weight distribution)
+    MsgModelList      = 11,  // request list of published models
+    MsgModelManifest  = 12,  // request/response with model manifest
+    MsgModelChunk     = 13,  // request chunk; response carries streamed chunk data
 };
 
 enum : uint32_t {

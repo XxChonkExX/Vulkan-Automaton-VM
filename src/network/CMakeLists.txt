@@ -12,6 +12,7 @@ set(NETWORK_CORE_SRCS
     tcp_transport.cpp
     multi_node_manager.cpp
     network.cpp
+    model_registry.cpp
 )
 
 set(NETWORK_DEFS
@@ -97,6 +98,9 @@ install(FILES
     include/vulkan_vm/network/rdma_transport.hpp
     include/vulkan_vm/network/cluster_client.hpp
     include/vulkan_vm/network/cluster_server.hpp
+    include/vulkan_vm/network/model_registry.hpp
+    include/vulkan_vm/network/model_types.hpp
+    include/vulkan_vm/network/sha256.hpp
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/vulkan_vm/network
 )
 
