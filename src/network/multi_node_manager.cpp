@@ -1108,21 +1108,20 @@ std::optional<uint64_t> MultiNodePoolManager::findAllocIdByBuffer(VkBuffer buffe
 TcpTransport::ConnId MultiNodePoolManager::getPeerConnection(const std::string& host, uint16_t port) {
     std::string key = host + ":" + std::to_string(port);
 
-    {
-        std::lock_guard<std::mutex> lock(connsMutex_);
-        auto it = peerConns_.find(key);
-        if (it != peerConns_.end() && tcpTransport_->isConnected(it->second)) {
-            return it->second;
-        }
+    std::lock_guard<std::mutex> lock(connsMutex_);
+    auto it = peerConns_.find(key);
+    if (it != peerConns_.end() && tcpTransport_->isConnected(it->second)) {
+        return it->second;
     }
 
     if (!tcpTransport_) return 0;
 
+    // Hold the lock during connect to prevent TOCTOU race where two threads
+    // simultaneously create connections to the same peer.
     auto conn = tcpTransport_->connect(host, port,
                                        static_cast<int32_t>(networkConfig_.connectTimeout.count()));
     if (!conn || *conn == 0) return 0;
 
-    std::lock_guard<std::mutex> lock(connsMutex_);
     peerConns_[key] = *conn;
     return *conn;
 }
@@ -1460,37 +1459,16 @@ std::optional<Allocation> MultiNodePoolManager::createLocalAllocationForImport(
         return std::nullopt;
     }
 
+    // SECURITY: OS handles (FDs/HANDLEs) are process-relative and CANNOT be
+    // transferred over TCP. The externalHandle field in RemoteAllocationDesc
+    // is only valid for same-process imports (handled above via g_pendingExports).
+    // Cross-machine peers must use host-staged copies. Reject any network-received
+    // handle values to prevent FD/HANDLE injection attacks.
     if (!desc.externalHandle.empty()) {
-        ExternalMemoryInfo extInfo;
-        extInfo.type = static_cast<vvm::ExternalHandleType>(desc.handleType);
-        extInfo.size = desc.size;
-        extInfo.memoryTypeIndex = desc.memoryTypeIndex;
-
-        #ifdef VVM_PLATFORM_LINUX
-        if (desc.handleType == vvm::ExternalHandleType::OpaqueFd || desc.handleType == vvm::ExternalHandleType::DmaBuf) {
-            // On Linux, handle is an int (fd) - 4 bytes
-            if (desc.externalHandle.size() >= sizeof(int)) {
-                int fd = *reinterpret_cast<const int*>(desc.externalHandle.data());
-                extInfo.handle = ExternalHandle(fd);
-            }
-        }
-        #elif defined(VVM_PLATFORM_WINDOWS)
-        if (desc.handleType == vvm::ExternalHandleType::OpaqueWin32 || desc.handleType == vvm::ExternalHandleType::D3D12Heap) {
-            // On Windows, handle is a HANDLE (void*, 8 bytes on 64-bit)
-            if (desc.externalHandle.size() >= sizeof(HANDLE)) {
-                HANDLE handle = *reinterpret_cast<const HANDLE*>(desc.externalHandle.data());
-                extInfo.handle = ExternalHandle(handle);
-            }
-        }
-        #endif
-
-        // Consume: on success the driver takes ownership of the handle; on
-        // failure extInfo's destructor closes it (leaving the original
-        // exporter's handle untouched).
-        auto imported = localPools_[0].importMemory(std::move(extInfo), usage);
-        if (imported) {
-            return imported;
-        }
+        VVM_LOG_WARN("importRemote: rejecting %zu-byte external handle received over network "
+                     "(OS handles are process-relative and cannot be transferred via TCP; "
+                     "use host-staged migration instead)",
+                     desc.externalHandle.size());
     }
 
     return alloc;

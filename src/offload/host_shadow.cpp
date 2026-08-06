@@ -5,10 +5,6 @@
 #include <algorithm>
 #include <cstring>
 
-#ifdef VVM_PLATFORM_WINDOWS
-#include <windows.h>
-#endif
-
 #ifdef VVM_PLATFORM_LINUX
 #include <sys/mman.h>
 #include <unistd.h>
@@ -23,24 +19,10 @@ namespace vvm {
 
 HostShadowManager::HostShadowManager(VkPhysicalDevice physicalDevice, VkDevice device, const OffloadConfig& config)
     : physicalDevice_(physicalDevice), device_(device), config_(config) {
-    char logPath[MAX_PATH];
-    DWORD tempPathLen = GetTempPathA(MAX_PATH, logPath);
-    if (tempPathLen == 0 || tempPathLen >= MAX_PATH) {
-        strcpy_s(logPath, MAX_PATH, "C:\\temp\\");
-    }
-    strcat_s(logPath, MAX_PATH, "debug_host_shadow.log");
-    FILE* f = fopen(logPath, "a");
-    if (f) { fprintf(f, "=== HostShadowManager constructor START ===\n"); fclose(f); }
-    else {
-        // Try current directory
-        FILE* f2 = fopen("debug_host_shadow.log", "a");
-        if (f2) { fprintf(f2, "=== HostShadowManager constructor START (fallback) ===\n"); fclose(f2); }
-    }
-    VVM_LOG_INFO("HostShadowManager constructor: physicalDevice=%p, device=%p, hostShadowSize=%llu", 
+    VVM_LOG_INFO("HostShadowManager: physicalDevice=%p, device=%p, hostShadowSize=%llu",
                  physicalDevice, device, config.hostShadowSize);
     createShadowBuffer();
-    VVM_LOG_INFO("createShadowBuffer completed, buffer=%p", shadowBuffer_.buffer);
-    fflush(stderr);
+    VVM_LOG_INFO("HostShadowManager: shadow buffer created, size=%llu", shadowBuffer_.size);
     
     // Create command pool for copy operations using the transfer queue family
     VkCommandPoolCreateInfo poolInfo{};
@@ -483,6 +465,10 @@ void MigrationEngine::waitMigration(const MigrationOperation& op) {
     if (op.completionFence) {
         vkWaitForFences(device_, 1, &op.completionFence, VK_TRUE, UINT64_MAX);
     }
+    // Invoke completion callback (e.g., shadow region cleanup) after fence signals.
+    if (op.onComplete) {
+        op.onComplete();
+    }
     // Now that the caller is done observing the fence, release the context
     // back to the free pool. Safe: the GPU work has completed (fence is
     // signaled).  Any subsequent acquireContext() will see inUse == false and
@@ -494,10 +480,12 @@ void MigrationEngine::waitMigration(const MigrationOperation& op) {
 
 bool MigrationEngine::pollMigration(const MigrationOperation& op) {
     if (!op.completionFence) {
+        if (op.onComplete) op.onComplete();
         if (op.owningContext) releaseContext(static_cast<MigrationContext*>(op.owningContext));
         return true;
     }
     if (vkGetFenceStatus(device_, op.completionFence) == VK_SUCCESS) {
+        if (op.onComplete) op.onComplete();
         if (op.owningContext) releaseContext(static_cast<MigrationContext*>(op.owningContext));
         return true;
     }
@@ -532,20 +520,8 @@ uint32_t MigrationEngine::getPendingCount() const {
 
 OffloadManager::OffloadManager(UnifiedMemoryPool* pool, const OffloadConfig& config)
     : pool_(pool), config_(config) {
-    char logPath[MAX_PATH];
-    DWORD tempPathLen = GetTempPathA(MAX_PATH, logPath);
-    if (tempPathLen == 0 || tempPathLen >= MAX_PATH) {
-        strcpy_s(logPath, MAX_PATH, "C:\\temp\\");
-    }
-    strcat_s(logPath, MAX_PATH, "debug_offload.log");
-    FILE* f = fopen(logPath, "a");
-    if (!f) {
-        f = fopen("debug_offload.log", "a");
-    }
-    if (f) { fprintf(f, "=== OffloadManager constructor START ===\n"); fclose(f); }
-    VVM_LOG_INFO("OffloadManager constructor: pool=%p, transferQueue=%p, transferQueueFamily=%u", 
+    VVM_LOG_INFO("OffloadManager: pool=%p, transferQueue=%p, transferQueueFamily=%u",
                  pool, config.transferQueue, config.transferQueueFamily);
-    fflush(stderr);
     
     try {
         shadowManager_ = std::make_unique<HostShadowManager>(
@@ -637,9 +613,9 @@ std::optional<MigrationOperation> OffloadManager::reload(Allocation& alloc) {
         return std::nullopt;
     }
     VkDeviceSize shadowOffset = alloc.shadowOffset;
-    
+
     // NOTE: No unprotectRegion() call here -- see offload() comment above.
-    
+
     MigrationEngine::MigrationRequest req;
     req.allocation = &alloc;
     req.srcOffset = shadowOffset;
@@ -647,23 +623,29 @@ std::optional<MigrationOperation> OffloadManager::reload(Allocation& alloc) {
     req.size = alloc.size;
     req.toHost = false;
     req.hostShadowBuffer = shadowManager_->getBuffer();
-    
+
     auto op = migrationEngine_->submitMigration(req);
     if (op) {
         // Restore the original pool mapping that was saved during offload.
         alloc.hostPtr = alloc.savedHostPtr;
         alloc.savedHostPtr = nullptr;
         alloc.shadowOffset = static_cast<VkDeviceSize>(-1);
-        // Don't free the shadow region here: the GPU copy is still reading from
-        // it asynchronously.  The region is freed by waitMigration() once the
-        // fence signals, or recycled when the pool is destroyed.
         shadowManager_->unmapRegion(shadowOffset, alloc.size);
-        
+
+        // Free the shadow region after GPU copy completes. The migration engine's
+        // waitMigration releases the context once the fence signals; we hook the
+        // cleanup into the operation's completion by wrapping the shadow free.
+        VkDeviceSize regionSize = alloc.size;
+        MigrationOperation* opPtr = &*op;
+        opPtr->onComplete = [this, shadowOffset, regionSize]() {
+            shadowManager_->freeRegion(shadowOffset, regionSize);
+        };
+
         std::lock_guard<std::mutex> lock(statsMutex_);
         stats_.bytesReloaded += alloc.size;
         stats_.activeMigrations++;
     }
-    
+
     return op;
 }
 

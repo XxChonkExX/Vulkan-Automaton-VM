@@ -733,7 +733,23 @@ void TcpTransport::acceptLoop() {
         SocketType client = accept(impl_->listener, reinterpret_cast<sockaddr*>(&peer), &addrLen);
         if (client == kInvalidSocket) {
             if (!impl_->running) break;
-            continue;
+            // Distinguish transient errors (continue) from fatal errors (break).
+#ifdef VVM_PLATFORM_WINDOWS
+            int err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK || err == WSAEINTR) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+            VVM_LOG_ERROR("acceptLoop: fatal error %d, stopping accept loop", err);
+            break;
+#else
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+            VVM_LOG_ERROR("acceptLoop: fatal error %d ({}), stopping accept loop", errno, strerror(errno));
+            break;
+#endif
         }
         setTimeouts(client, 30000);
         uint64_t id = impl_->nextConnId++;

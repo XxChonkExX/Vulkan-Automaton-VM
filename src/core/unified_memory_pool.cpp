@@ -714,7 +714,10 @@ std::optional<Allocation> UnifiedMemoryPool::allocateTensor(VkDeviceSize size,
 
 void UnifiedMemoryPool::deallocate(Allocation&& alloc) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (alloc.blockIndex < blocks_.size()) {
+    if (alloc.blockIndex == UINT32_MAX) {
+        // Dedicated allocation - destroy directly
+        subDeallocate(std::move(alloc));
+    } else if (alloc.blockIndex < blocks_.size()) {
         subDeallocate(std::move(alloc));
     }
 }
@@ -1192,17 +1195,27 @@ std::optional<Allocation> UnifiedMemoryPool::subAllocate(VkDeviceSize size,
 
 void UnifiedMemoryPool::subDeallocate(Allocation&& alloc) {
     // Dedicated allocations (blockIndex == UINT32_MAX) have their own VkDeviceMemory
-    // and VkBuffer - destroy both directly
+    // and VkBuffer - destroy both directly and remove from tracking
     if (alloc.blockIndex == UINT32_MAX) {
-        vkDestroyBuffer(device_, alloc.buffer, nullptr);
-        vkFreeMemory(device_, alloc.memory, nullptr);
+        if (alloc.buffer) vkDestroyBuffer(device_, alloc.buffer, nullptr);
+        if (alloc.memory) {
+            if (alloc.hostPtr) vkUnmapMemory(device_, alloc.memory);
+            vkFreeMemory(device_, alloc.memory, nullptr);
+        }
+        // Remove from dedicatedAllocations_ to prevent double-free in destructor
+        dedicatedAllocations_.erase(
+            std::remove_if(dedicatedAllocations_.begin(), dedicatedAllocations_.end(),
+                [&alloc](const Allocation& a) {
+                    return a.buffer == alloc.buffer && a.memory == alloc.memory;
+                }),
+            dedicatedAllocations_.end());
         return;
     }
-    
+
     if (alloc.blockIndex >= blocks_.size()) return;
-    
+
     vkDestroyBuffer(device_, alloc.buffer, nullptr);
-    
+
     auto& block = blocks_[alloc.blockIndex];
     if (block.buddy) {
         block.buddy->deallocate(alloc.offset, alloc.size);
@@ -1211,6 +1224,20 @@ void UnifiedMemoryPool::subDeallocate(Allocation&& alloc) {
 }
 
 VkDeviceSize UnifiedMemoryPool::alignUp(VkDeviceSize value, VkDeviceSize alignment) {
+    // Validate power-of-2 alignment (required for bitwise rounding)
+    if (alignment == 0) return value;
+    if ((alignment & (alignment - 1)) != 0) {
+        VVM_LOG_ERROR("alignUp: non-power-of-2 alignment %llu; rounding up to next pow2", alignment);
+        // Round alignment up to next power-of-2 to maintain correctness
+        alignment--;
+        alignment |= alignment >> 1;
+        alignment |= alignment >> 2;
+        alignment |= alignment >> 4;
+        alignment |= alignment >> 8;
+        alignment |= alignment >> 16;
+        alignment |= alignment >> 32;
+        alignment++;
+    }
     return (value + alignment - 1) & ~(alignment - 1);
 }
 

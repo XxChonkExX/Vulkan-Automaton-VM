@@ -21,6 +21,7 @@
 #include <span>
 #include <memory>
 #include <mutex>
+#include <functional>
 
 #include "vulkan_vm/buddy_allocator.hpp"
 #include "vulkan_vm/utils.hpp"
@@ -242,6 +243,9 @@ struct MigrationOperation {
     // fence signaled. Kept opaque here to avoid a circular include with
     // offload.hpp (which defines MigrationContext).
     void* owningContext = nullptr;
+    // Optional callback invoked after the operation completes (fence signaled).
+    // Used for cleanup actions like freeing shadow regions after reload.
+    std::function<void()> onComplete;
 };
 
 // Forward declaration
