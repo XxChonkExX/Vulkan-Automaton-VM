@@ -76,9 +76,13 @@ if(VVM_BUILD_ONNX)
     )
 endif()
 
-# Multi-GPU test (if multiple GPUs available)
-# add_executable(multi_gpu_test multi_gpu_test.cpp)
-# target_link_libraries(multi_gpu_test PRIVATE vulkan_vm)
+# Multi-GPU P2P test (requires >= 2 physical devices; skipped on limited HW)
+add_executable(multi_gpu_test multi_gpu_test.cpp)
+target_link_libraries(multi_gpu_test PRIVATE vulkan_vm)
+target_include_directories(multi_gpu_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
 
 # Stress test
 # add_executable(stress_test stress_test.cpp)

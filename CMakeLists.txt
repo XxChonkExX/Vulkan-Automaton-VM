@@ -1,4 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
+
+# Set Windows SDK version BEFORE project() to avoid defaulting to unavailable 10.0.28000.0
+if(WIN32)
+    set(CMAKE_SYSTEM_VERSION "10.0.22621.0" CACHE STRING "Windows SDK version" FORCE)
+    set(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION "10.0.22621.0" CACHE STRING "Windows SDK version" FORCE)
+endif()
+
 project(VulkanVM LANGUAGES CXX VERSION 0.1.0)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -69,6 +76,14 @@ if(WIN32)
         else()
             message(WARNING "Windows SDK not found - build may fail without proper include paths")
         endif()
+    endif()
+
+    # Explicitly set Windows SDK version for MSBuild to avoid defaulting to unavailable 10.0.28000.0
+    if(WINDOWS_SDK_UM)
+        string(REGEX MATCH "10\\.0\\.[0-9]+" WINDOWS_SDK_VERSION "${WINDOWS_SDK_UM}")
+        set(CMAKE_SYSTEM_VERSION "${WINDOWS_SDK_VERSION}" CACHE STRING "Windows SDK version" FORCE)
+        set(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION "${WINDOWS_SDK_VERSION}" CACHE STRING "Windows SDK version" FORCE)
+        message(STATUS "Setting CMAKE_SYSTEM_VERSION=${CMAKE_SYSTEM_VERSION} and CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION=${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}")
     endif()
 
     # Find Windows SDK library path (for ws2_32.lib, kernel32.lib, etc.)

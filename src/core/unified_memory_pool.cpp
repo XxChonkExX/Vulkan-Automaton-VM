@@ -510,10 +510,29 @@ std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
     return memory;
 }
 
+// ---------------------------------------------------------------------------
+// Vendor-aware export handle type selection.
+// Some drivers reject bitmask union of handle types that they don't
+// actually support, even though the spec says they should be fine.
+// We restrict the mask to a single known-good type per vendor.
+// ---------------------------------------------------------------------------
+static VkExternalMemoryHandleTypeFlags getExportHandleTypes(VkPhysicalDevice phys) {
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(phys, &props);
+    uint32_t vendor = props.vendorID;
+
+    #ifdef VVM_PLATFORM_WINDOWS
+    if (vendor == 0x10DE)
+        return VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
+    return VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+    #else
+    return VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+           VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    #endif
+}
+
 // Allocate a dedicated VkDeviceMemory for a single exportable buffer.
-    // Each exportable allocation gets its own dedicated memory (not sub-allocated).
-    // This is required by the Vulkan spec for reliable external memory import.
-    std::optional<Allocation> UnifiedMemoryPool::allocateDedicatedExportable(
+        std::optional<Allocation> UnifiedMemoryPool::allocateDedicatedExportable(
         VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags flags) {
         
         VVM_LOG_INFO("allocateDedicatedExportable: size={}, usage=0x{:x}, flags=0x{:x}", size, usage, flags);
@@ -523,25 +542,12 @@ std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
         
         size = alignUp(size, config_.minAlignment);
         VVM_LOG_INFO("allocateDedicatedExportable: aligned size={}", size);
-        
-        // Select memory type - prefer device-local for exportable
-        uint32_t memType = deviceLocalMemoryType_;
-        if (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
-            memType = (hostVisibleMemoryType_ != UINT32_MAX) ? hostVisibleMemoryType_ : deviceLocalMemoryType_;
-        }
-        VVM_LOG_INFO("allocateDedicatedExportable: memType={}, deviceLocal={}, hostVisible={}", 
-                     memType, deviceLocalMemoryType_, hostVisibleMemoryType_);
-        
-        // Step 1: Create buffer with VkExternalMemoryBufferCreateInfo
+
+// Step 1: Create buffer with VkExternalMemoryBufferCreateInfo
         VkExternalMemoryBufferCreateInfo extBufferInfo{};
         extBufferInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
-        #ifdef VVM_PLATFORM_LINUX
-        extBufferInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
-                                    VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-        #elif defined(VVM_PLATFORM_WINDOWS)
-        extBufferInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT |
-                                    VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
-        #endif
+        VkExternalMemoryHandleTypeFlags ht = getExportHandleTypes(deviceConfig_.physicalDevice);
+        extBufferInfo.handleTypes = ht;
         
         VkBufferCreateInfo bufferInfo{};
         bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -569,23 +575,39 @@ std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
             vkDestroyBuffer(device_, buffer, nullptr);
             return std::nullopt;
         }
-        VVM_LOG_INFO("allocateDedicatedExportable: budget check passed");
-        
-        // Step 3: Allocate dedicated memory for this buffer
-        VkMemoryDedicatedAllocateInfo dedicatedInfo{};
+VVM_LOG_INFO("allocateDedicatedExportable: budget check passed");
+
+        // Re-configure memory type from memoryTypeBits (which accounts for
+        // external handle type support) if the initial pre-selection doesn't match.
+        uint32_t memType = deviceLocalMemoryType_;
+        if (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+            memType = (hostVisibleMemoryType_ != UINT32_MAX) ? hostVisibleMemoryType_ : deviceLocalMemoryType_;
+        }
+        if ((memType >= 32) || ((memReq.memoryTypeBits & (1u << memType)) == 0)) {
+            VkMemoryPropertyFlags requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+            if (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+                requiredFlags |= VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            }
+            const auto& mp = getDeviceMemoryInfo().memProps;
+            for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+                if ((memReq.memoryTypeBits & (1u << i)) &&
+                    (mp.memoryTypes[i].propertyFlags & requiredFlags) == requiredFlags) {
+                    memType = i;
+                    break;
+                }
+            }
+        }
+        VVM_LOG_INFO("allocateDedicatedExportable: memType={} (memoryTypeBits=0x{:x})", 
+                     memType, memReq.memoryTypeBits);
+
+VkMemoryDedicatedAllocateInfo dedicatedInfo{};
         dedicatedInfo.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
         dedicatedInfo.buffer = buffer;
         dedicatedInfo.image = VK_NULL_HANDLE;
-        
+
         VkExportMemoryAllocateInfo exportInfo{};
         exportInfo.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
-        #ifdef VVM_PLATFORM_LINUX
-        exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
-                                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-        #elif defined(VVM_PLATFORM_WINDOWS)
-        exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT |
-                                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
-        #endif
+        exportInfo.handleTypes = ht;
         exportInfo.pNext = &dedicatedInfo;
         
         VkMemoryAllocateFlagsInfo flagsInfo{};
@@ -904,7 +926,6 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
     // Step 4: Build import chain with the ACTUAL buffer in VkMemoryDedicatedAllocateInfo
     VkImportMemoryFdInfoKHR importFdInfo{};
     VkImportMemoryWin32HandleInfoKHR importWin32Info{};
-    VkMemoryDedicatedAllocateInfo dedicatedInfo{};
     
     VkMemoryAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -944,6 +965,7 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
     #endif
     
     // Dedicated allocation for imported memory - NOW with the actual buffer!
+    VkMemoryDedicatedAllocateInfo dedicatedInfo{};
     dedicatedInfo.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
     dedicatedInfo.buffer = buffer;
     dedicatedInfo.image = VK_NULL_HANDLE;
@@ -962,8 +984,12 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
     allocInfo.pNext = pNext;
     
     VkDeviceMemory memory;
-    if (vkAllocateMemory(device_, &allocInfo, nullptr, &memory) != VK_SUCCESS) {
-        VVM_LOG_ERROR("Failed to allocate memory for import");
+    VkResult allocResult = vkAllocateMemory(device_, &allocInfo, nullptr, &memory);
+    if (allocResult != VK_SUCCESS) {
+        VVM_LOG_ERROR("Failed to allocate memory for import: %s (VkResult=%d) [memTypeIndex=%u size=%llu handleType=%u]",
+                      vkResultToString(allocResult).c_str(), static_cast<int>(allocResult),
+                      memoryTypeIndex, static_cast<unsigned long long>(info.size),
+                      static_cast<unsigned>(importHandleType));
         vkDestroyBuffer(device_, buffer, nullptr);
         // Handle NOT consumed: info keeps ownership and its destructor closes it.
         return std::nullopt;
@@ -1015,6 +1041,81 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
     dedicatedAllocations_.push_back(alloc);
     
     return alloc;
+}
+
+bool UnifiedMemoryPool::copyBuffer(const Allocation& src, const Allocation& dst,
+                                   VkDeviceSize srcOffset, VkDeviceSize dstOffset,
+                                   VkDeviceSize size, VkFence fence) {
+    if (!device_ || src.buffer == VK_NULL_HANDLE || dst.buffer == VK_NULL_HANDLE ||
+        size == 0) return false;
+
+    VkQueue queue = deviceConfig_.transferQueue != VK_NULL_HANDLE
+                        ? deviceConfig_.transferQueue
+                        : deviceConfig_.graphicsQueue;
+    uint32_t family = deviceConfig_.transferQueueFamily != UINT32_MAX
+                          ? deviceConfig_.transferQueueFamily
+                          : deviceConfig_.graphicsQueueFamily;
+    if (queue == VK_NULL_HANDLE) return false;
+
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandPoolCreateInfo cp{};
+    cp.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    cp.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    cp.queueFamilyIndex = family;
+    if (vkCreateCommandPool(device_, &cp, nullptr, &pool) != VK_SUCCESS) return false;
+
+    VkCommandBufferAllocateInfo cba{};
+    cba.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cba.commandPool = pool;
+    cba.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cba.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(device_, &cba, &cmd) != VK_SUCCESS) {
+        vkDestroyCommandPool(device_, pool, nullptr);
+        return false;
+    }
+
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VkBufferCopy region{};
+    region.srcOffset = srcOffset;
+    region.dstOffset = dstOffset;
+    region.size = size;
+    VkResult rc = VK_SUCCESS;
+    if ((rc = vkBeginCommandBuffer(cmd, &bi)) != VK_SUCCESS ||
+        (vkCmdCopyBuffer(cmd, src.buffer, dst.buffer, 1, &region),
+         (rc = vkEndCommandBuffer(cmd)) != VK_SUCCESS)) {
+        vkDestroyCommandPool(device_, pool, nullptr);
+        return false;
+    }
+
+    bool waitInternal = (fence == VK_NULL_HANDLE);
+    VkFence done = fence;
+    VkFence internalFence = VK_NULL_HANDLE;
+    if (waitInternal) {
+        VkFenceCreateInfo fi{};
+        fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        if (vkCreateFence(device_, &fi, nullptr, &internalFence) != VK_SUCCESS) {
+            vkDestroyCommandPool(device_, pool, nullptr);
+            return false;
+        }
+        done = internalFence;
+    }
+
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    rc = vkQueueSubmit(queue, 1, &si, done);
+
+    if (waitInternal && rc == VK_SUCCESS) {
+        rc = vkWaitForFences(device_, 1, &internalFence, VK_TRUE, UINT64_MAX);
+    }
+
+    if (internalFence) vkDestroyFence(device_, internalFence, nullptr);
+    vkDestroyCommandPool(device_, pool, nullptr);
+    return rc == VK_SUCCESS;
 }
 
 std::optional<MigrationOperation> UnifiedMemoryPool::offloadToHost(Allocation& alloc) {

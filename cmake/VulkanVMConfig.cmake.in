@@ -1,10 +1,30 @@
 @PACKAGE_INIT@
 
 include(CMakeFindDependencyMacro)
-find_dependency(Vulkan REQUIRED)
 
-if(NOT TARGET vulkan_vm)
-    include("${CMAKE_CURRENT_LIST_DIR}/VulkanVMTargets.cmake")
+# Dependencies
+find_dependency(Vulkan REQUIRED)
+find_dependency(Threads REQUIRED)
+
+# Optional dependencies
+if("@VVM_USE_VOLK@")
+    find_dependency(Volk)
 endif()
 
-# Imported targets: vulkan_vm
+# Network dependencies (optional)
+if("@VVM_BUILD_NETWORK@")
+    find_dependency(Protobuf QUIET)
+    find_dependency(gRPC QUIET)
+    find_dependency(ibverbs QUIET)
+    find_dependency(rdma_cm QUIET)
+    find_dependency(OpenSSL QUIET)
+endif()
+
+# Include targets
+include("${CMAKE_CURRENT_LIST_DIR}/VulkanVMTargets.cmake")
+
+# Provide imported target alias
+add_library(VulkanVM::VulkanVM ALIAS vulkan_vm)
+if(TARGET vulkan_vm_network)
+    add_library(VulkanVM::VulkanVMNetwork ALIAS vulkan_vm_network)
+endif()

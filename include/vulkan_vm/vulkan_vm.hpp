@@ -345,6 +345,12 @@ public:
     std::optional<MigrationOperation> reloadToDevice(Allocation& alloc);
     void waitMigration(const MigrationOperation& op);
 
+    // One-shot copy between two allocations on the same device via transfer
+    // queue. Creates a transient command pool/buffer, submits, waits, destroys.
+    bool copyBuffer(const Allocation& src, const Allocation& dst,
+                    VkDeviceSize srcOffset, VkDeviceSize dstOffset,
+                    VkDeviceSize size, VkFence fence = VK_NULL_HANDLE);
+
     // Stats & Info
     PoolStats getStats() const;
     DeviceMemoryInfo getDeviceMemoryInfo() const;
@@ -430,7 +436,49 @@ public:
     // Allocate on master, import on others
     std::vector<std::optional<Allocation>> allocateDistributed(VkDeviceSize size,
                                                                 VkBufferUsageFlags usage);
-    
+
+    // Peer access capability between two managed devices. This is a combined
+    // check of external memory export/import support plus the vendor cross-pair
+    // recommendation; true driver-level P2P depends on the platform/driver.
+    struct PeerAccessInfo {
+        bool canDirectCopy = false;   // export (src) + import (dst) + GPU copy viable
+        bool externalMemorySupported = false;
+        ExternalHandleType recommendedType = ExternalHandleType::OpaqueFd;
+        std::string notes;
+    };
+    PeerAccessInfo queryPeerAccess(uint32_t srcDeviceIndex,
+                                   uint32_t dstDeviceIndex) const;
+
+    // Direct GPU->GPU copy WITHOUT host staging when possible. The source
+    // memory is exported from the src device and imported (aliased) on the dst
+    // device, then a vkCmdCopyBuffer is issued on the dst device's copy queue.
+    // When 'src' is a dedicated exportable allocation AND the dst driver
+    // accepts the cross-GPU import, no bytes pass through host memory. If the
+    // src is sub-allocated OR the driver refuses the cross-GPU import, the
+    // call transparently falls back to a chunked host-staged peer copy.
+    // If `fence` is null an internal fence is waited on before returning.
+    // Returns false only if BOTH the fast path and the fallback fail.
+    bool copyDeviceToDevice(uint32_t srcDeviceIndex, uint32_t dstDeviceIndex,
+                            const Allocation& src, const Allocation& dst,
+                            VkDeviceSize srcOffset = 0,
+                            VkDeviceSize dstOffset = 0,
+                            VkDeviceSize size = VK_WHOLE_SIZE,
+                            VkFence fence = VK_NULL_HANDLE);
+
+private:
+    // Host-staged fallback for copyDeviceToDevice. Used when the cross-GPU
+    // external memory import fails (driver/hardware limitation, e.g. dGPU->iGPU
+    // on Windows). Copies data through host-visible staging buffers on both
+    // devices, chunked at kHostStagedChunkSize to bound peak host memory use.
+    // Supports arbitrary 'src' allocation (dedicated OR sub-allocated), which
+    // is a relaxation not available to the export/import fast path.
+    bool copyDeviceToDeviceHostStaged(uint32_t srcDeviceIndex, uint32_t dstDeviceIndex,
+                                      const Allocation& src, const Allocation& dst,
+                                      VkDeviceSize srcOffset, VkDeviceSize dstOffset,
+                                      VkDeviceSize size, VkFence fence);
+
+public:
+
     // Synchronize across GPUs
     void submitMigrationBarrier(const std::vector<MigrationOperation>& ops);
     void waitAllIdle();
