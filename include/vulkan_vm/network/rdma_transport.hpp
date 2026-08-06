@@ -44,6 +44,10 @@ struct RdmaConnection {
     bool connected = false;
     bool gpuDirect = false;
     
+    // Internal opaque pointer to rdma_cm_id*, set by transport implementation.
+    // Callers must not touch this; it is private to the transport.
+    void* internalId_ = nullptr;
+    
     // Last activity
     uint64_t lastActivityNs = 0;
 };
@@ -196,9 +200,6 @@ std::optional<GpuDirectRegistration> registerGpuMemoryForRdma(
     VkDeviceSize size,
     const std::string& nicName = "");
 
-// Unregister
-void unregisterGpuMemoryForRdma(const GpuDirectRegistration& reg);
-
 // ============================================================================
 // DMA-BUF registration helper (AMD/Intel path)
 // ============================================================================
@@ -217,6 +218,37 @@ std::optional<DmaBufRegistration> registerDmaBufForRdma(
     const std::string& nicName = "");
 
 void unregisterDmaBufForRdma(const DmaBufRegistration& reg);
+
+// ============================================================================
+// Vendor-specific GPU-direct registration
+// ============================================================================
+
+// Vendor-agnostic dispatch: returns the appropriate registration struct
+// based on GPU vendor ID.
+std::optional<GpuDirectRegistration> registerGpuMemoryForRdmaVendor(
+    VkDevice device,
+    VkPhysicalDevice physicalDevice,
+    VkDeviceMemory memory,
+    VkDeviceSize offset,
+    VkDeviceSize size,
+    VkQueue transferQueue,
+    uint32_t transferQueueFamily,
+    const std::string& nicName,
+    uint32_t vendorId);
+
+std::optional<DmaBufRegistration> registerDmaBufForRdmaVendor(
+    VkDevice device,
+    VkPhysicalDevice physicalDevice,
+    VkDeviceMemory memory,
+    VkDeviceSize offset,
+    VkDeviceSize size,
+    VkQueue transferQueue,
+    uint32_t transferQueueFamily,
+    const std::string& nicName,
+    uint32_t vendorId);
+
+void unregisterVendorGpuMemory(const GpuDirectRegistration& reg, uint32_t vendorId);
+void unregisterVendorDmaBuf(const DmaBufRegistration& reg, uint32_t vendorId);
 
 } // namespace network
 } // namespace vvm
