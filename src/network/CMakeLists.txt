@@ -46,6 +46,15 @@ else()
     message(STATUS "VulkanVM network: RDMA/verbs transport disabled (host-staged TCP only)")
 endif()
 
+# TLS support via OpenSSL
+if(OPENSSL_FOUND)
+    message(STATUS "VulkanVM network: TLS support enabled via OpenSSL")
+    list(APPEND NETWORK_DEFS VVM_NETWORK_HAS_TLS=1)
+    set(VVM_NETWORK_TLS_LIBS ${OPENSSL_LIBRARIES})
+else()
+    message(STATUS "VulkanVM network: TLS support disabled (OpenSSL not found)")
+endif()
+
 add_library(vulkan_vm_network ${NETWORK_CORE_SRCS})
 
 target_include_directories(vulkan_vm_network PRIVATE
@@ -61,6 +70,7 @@ target_link_libraries(vulkan_vm_network PRIVATE
     Threads::Threads
     ${VVM_NETWORK_GRPC_LIBS}
     ${VVM_NETWORK_VERBS_LIBS}
+    ${VVM_NETWORK_TLS_LIBS}
 )
 
 # Winsock is required by the TCP transport on Windows.

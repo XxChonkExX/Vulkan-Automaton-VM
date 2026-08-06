@@ -8,6 +8,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#elif VVM_PLATFORM_MACOS
+#include <TargetConditionals.h>
 #endif
 
 #include <vulkan/vulkan.h>
@@ -18,6 +20,7 @@
 #include <string>
 #include <span>
 #include <memory>
+#include <mutex>
 #include <mutex>
 
 #include "vulkan_vm/buddy_allocator.hpp"

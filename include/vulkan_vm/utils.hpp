@@ -451,6 +451,86 @@ std::string logFormat(const char* fmt, Args&&... args) {
 
 }  // namespace detail
 
+// ============================================================================
+// Serialization helpers (used by network transport)
+// ============================================================================
+
+namespace detail {
+
+inline void putU8(std::vector<uint8_t>& b, uint8_t v) { b.push_back(v); }
+
+inline void putU16(std::vector<uint8_t>& b, uint16_t v) {
+    b.push_back(static_cast<uint8_t>(v & 0xFF));
+    b.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+}
+
+inline void putU32(std::vector<uint8_t>& b, uint32_t v) {
+    for (int i = 0; i < 4; ++i) b.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
+}
+
+inline void putU64(std::vector<uint8_t>& b, uint64_t v) {
+    for (int i = 0; i < 8; ++i) b.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
+}
+
+inline void putStr(std::vector<uint8_t>& b, const std::string& s) {
+    putU32(b, static_cast<uint32_t>(s.size()));
+    b.insert(b.end(), s.begin(), s.end());
+}
+
+inline void putBytes(std::vector<uint8_t>& b, const std::vector<uint8_t>& data) {
+    putU32(b, static_cast<uint32_t>(data.size()));
+    b.insert(b.end(), data.begin(), data.end());
+}
+
+inline bool getU8(const uint8_t*& p, const uint8_t* end, uint8_t& out) {
+    if (p >= end) return false;
+    out = *p++;
+    return true;
+}
+
+inline bool getU16(const uint8_t*& p, const uint8_t* end, uint16_t& out) {
+    if (p + 2 > end) return false;
+    out = static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+    p += 2;
+    return true;
+}
+
+inline bool getU32(const uint8_t*& p, const uint8_t* end, uint32_t& out) {
+    if (p + 4 > end) return false;
+    out = 0;
+    for (int i = 0; i < 4; ++i) out |= static_cast<uint32_t>(p[i]) << (8 * i);
+    p += 4;
+    return true;
+}
+
+inline bool getU64(const uint8_t*& p, const uint8_t* end, uint64_t& out) {
+    if (p + 8 > end) return false;
+    out = 0;
+    for (int i = 0; i < 8; ++i) out |= static_cast<uint64_t>(p[i]) << (8 * i);
+    p += 8;
+    return true;
+}
+
+inline bool getStr(const uint8_t*& p, const uint8_t* end, std::string& out) {
+    uint32_t len = 0;
+    if (!getU32(p, end, len)) return false;
+    if (p + len > end) return false;
+    out.assign(reinterpret_cast<const char*>(p), len);
+    p += len;
+    return true;
+}
+
+inline bool getBytes(const uint8_t*& p, const uint8_t* end, std::vector<uint8_t>& out) {
+    uint32_t len = 0;
+    if (!getU32(p, end, len)) return false;
+    if (p + len > end) return false;
+    out.assign(p, p + len);
+    p += len;
+    return true;
+}
+
+}  // namespace detail
+
 class Logger {
 public:
     static Logger& instance();
