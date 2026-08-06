@@ -24,6 +24,8 @@ option(VVM_BUILD_EXAMPLES "Build examples (includes integration tests)" ON)
 option(VVM_ENABLE_VALIDATION "Enable Vulkan validation layers" ON)
 option(VVM_USE_VOLK "Use Volk for Vulkan loading" ON)
 option(VVM_BUILD_NETWORK "Build network/multi-node module" ON)
+option(VVM_BUILD_PYTORCH "Build PyTorch C++ extension" OFF)
+option(VVM_BUILD_ONNX "Build ONNX Runtime integration" OFF)
 
 # Vulkan
 find_package(Vulkan REQUIRED)
@@ -39,6 +41,11 @@ endif()
 
 # Threads for sync primitives
 find_package(Threads REQUIRED)
+
+# Python3 for PyTorch/ONNX integration tests
+if(VVM_BUILD_PYTORCH OR VVM_BUILD_ONNX)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
+endif()
 
 # Windows SDK and MSVC include paths
 if(WIN32)
@@ -229,6 +236,15 @@ endif()
 # Examples
 if(VVM_BUILD_EXAMPLES)
     add_subdirectory(examples)
+endif()
+
+# Python bindings
+if(VVM_BUILD_PYTORCH)
+    add_subdirectory(python/vulkanvm_torch)
+endif()
+
+if(VVM_BUILD_ONNX)
+    add_subdirectory(python/vulkanvm_onnx)
 endif()
 
 # Package config

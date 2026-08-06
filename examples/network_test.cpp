@@ -191,6 +191,8 @@ static vvm::PoolConfig makePoolConfig() {
     cfg.enableExternal = true;
     cfg.enableDeviceAddress = true;
     cfg.maxBlocks = 8;
+    cfg.maxHeapFraction = 0.0f;  // Explicitly disable budget cap for tests
+    cfg.maxPoolBytes = 0;
     return cfg;
 }
 

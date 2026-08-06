@@ -52,6 +52,21 @@ target_include_directories(external_handle_test PRIVATE
 )
 add_test(NAME external_handle_test COMMAND external_handle_test)
 
+# Python integration tests (require built extensions)
+if(VVM_BUILD_PYTORCH)
+    add_test(NAME pytorch_integration_test
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/pytorch_integration_test.py
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    )
+endif()
+
+if(VVM_BUILD_ONNX)
+    add_test(NAME onnx_integration_test
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/onnx_integration_test.py
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    )
+endif()
+
 # Multi-GPU test (if multiple GPUs available)
 # add_executable(multi_gpu_test multi_gpu_test.cpp)
 # target_link_libraries(multi_gpu_test PRIVATE vulkan_vm)
