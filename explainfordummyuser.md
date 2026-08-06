@@ -152,4 +152,25 @@ auto allocs = manager.allocateDistributed(256 * 1024 * 1024, usage);
 
 ---
 
+## Recent Improvements (Post-Audit)
+
+### Thread Safety Hardened
+- **Budget checks now mutex-protected**: `wouldExceedBudget()` and `allocateDedicatedExportable()` properly lock the pool mutex
+- **Move assignment fixed**: Self-assignment deadlock resolved by early check before acquiring locks
+
+### Unsafe APIs Deprecated
+- `madvise()` / `mprotect()` on `vkMapMemory` regions **marked `[[deprecated]]`** — these can corrupt GPU driver mappings
+- Use standard async offload/reload instead; kernel page reclaim happens naturally on memory pressure
+
+### Network Transport Hardened
+- **Connection idle timeout** (default 5 min) with background cleanup thread
+- Prevents stuck connections from consuming server resources indefinitely
+
+### Buddy Allocator Robustness
+- **OOM-safe**: Uses `nothrow new`, returns `std::nullopt` on allocation failure instead of crashing
+- **Self-validation**: `isValid()` method checks initialization state
+- **Graceful degradation**: Split failures fall back to larger block instead of corrupting tree
+
+---
+
 **Bottom line:** Install it, link it, call `UnifiedMemoryPool::create()`. It either works or returns `std::nullopt`. No system modification. No risk. Test on your Strix Halo first — that's where it shines.

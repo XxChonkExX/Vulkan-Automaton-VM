@@ -17,10 +17,10 @@ VulkanVM provides a `UnifiedMemoryPool` that:
 1. **Pre-allocates large blocks** (256MB–2GB) at startup, sub-allocates with buddy allocator
 2. **Never returns memory to OS** — eliminates fragmentation; budget-capped to avoid starving the system
 3. **Exports/imports `VkDeviceMemory`** via `VK_EXTERNAL_MEMORY` for cross-GPU sharing — dedicated allocations only; sub-allocated blocks are auto-promoted to dedicated copies on export
-4. **Supports host shadow buffers** for swap/offload (`madvise`/`mprotect` are opt-in only — unsafe on `vkMapMemory` memory)
+4. **Supports host shadow buffers** for swap/offload (`madvise`/`mprotect` are **deprecated** — unsafe on `vkMapMemory` memory)
 5. **Works on AMD, NVIDIA, Intel** — Vulkan is the common denominator
 6. **RAII handle wrappers** — `UniqueHandle` wraps Vulkan objects; `ExternalHandle` owns FD/HANDLE lifetime (move-only, no leaks)
-7. **Thread-safe** — the public pool API is guarded by an internal mutex
+7. **Thread-safe** — the public pool API is guarded by an internal mutex (fixed: budget checks, dedicated alloc, move assignment)
 8. **Optional TLS** — the TCP transport can be encrypted with OpenSSL (TLS 1.2+)
 9. **Cross-platform** — Windows, Linux, and macOS
 10. **ModelHub** — Hugging Face–style weight distribution over TCP with content-addressed chunks, cache + resume
@@ -41,7 +41,7 @@ VulkanVM provides a `UnifiedMemoryPool` that:
 │             D3D12_HEAP / DMA_BUF)                                │
 ├─────────────────────────────────────────────────────────────────┤
 │  Offload: Host shadow buffer (HOST_VISIBLE|COHERENT) +         │
-│           async copy + madvise/mprotect                         │
+│           async copy (madvise/mprotect deprecated)              │
 ├─────────────────────────────────────────────────────────────────┤
 │  ModelHub: content-addressed model weight distribution over TCP │
 └─────────────────────────────────────────────────────────────────┘
