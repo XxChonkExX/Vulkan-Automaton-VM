@@ -35,6 +35,16 @@ target_include_directories(buddy_test PRIVATE
 
 add_test(NAME buddy_test COMMAND buddy_test)
 
+# CPU-only external-handle ownership tests (dup/multi-import, consume semantics)
+add_executable(external_handle_test external_handle_test.cpp)
+target_link_libraries(external_handle_test PRIVATE vulkan_vm)
+target_include_directories(external_handle_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${Vulkan_INCLUDE_DIRS}
+)
+
+add_test(NAME external_handle_test COMMAND external_handle_test)
+
 # Multi-GPU test (if multiple GPUs available)
 # add_executable(multi_gpu_test multi_gpu_test.cpp)
 # target_link_libraries(multi_gpu_test PRIVATE vulkan_vm)

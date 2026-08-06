@@ -2,6 +2,10 @@
 
 #include <vulkan/vulkan.h>
 
+#ifdef VVM_PLATFORM_LINUX
+#include <unistd.h>
+#endif
+
 #include <vector>
 #include <string>
 #include <optional>
@@ -398,6 +402,35 @@ struct ExternalMemoryInfo {
     ExternalMemoryInfo(const ExternalMemoryInfo&) = delete;
     ExternalMemoryInfo& operator=(const ExternalMemoryInfo&) = delete;
 };
+
+// Duplicate an exported handle so multiple peers can import the SAME memory
+// independently. Vulkan consumes one handle per successful import, so N peers
+// need N distinct handles. dup() on Linux, DuplicateHandle() on Windows.
+// The returned ExternalMemoryInfo independently owns its OWN handle; the
+// source stays untouched (its handle remains valid for the original exporter).
+inline ExternalMemoryInfo duplicateForImport(const ExternalMemoryInfo& src) {
+    ExternalMemoryInfo copy;
+    copy.type = src.type;
+    copy.size = src.size;
+    copy.memoryTypeIndex = src.memoryTypeIndex;
+    copy.dedicatedAllocation = src.dedicatedAllocation;
+#ifdef VVM_PLATFORM_LINUX
+    if (src.handle) {
+        int dupFd = dup(src.handle.get());
+        if (dupFd >= 0) copy.handle = ExternalHandle(dupFd);
+    }
+#elif defined(VVM_PLATFORM_WINDOWS)
+    if (src.handle) {
+        HANDLE dupHandle = nullptr;
+        if (DuplicateHandle(GetCurrentProcess(), src.handle.get(),
+                            GetCurrentProcess(), &dupHandle, 0, FALSE,
+                            DUPLICATE_SAME_ACCESS)) {
+            copy.handle = ExternalHandle(dupHandle);
+        }
+    }
+#endif
+    return copy;
+}
 
 // ============================================================================
 // Resource Management

@@ -1430,7 +1430,10 @@ std::optional<Allocation> MultiNodePoolManager::createLocalAllocationForImport(
         }
         #endif
 
-        auto imported = localPools_[0].importMemory(extInfo, usage);
+        // Consume: on success the driver takes ownership of the handle; on
+        // failure extInfo's destructor closes it (leaving the original
+        // exporter's handle untouched).
+        auto imported = localPools_[0].importMemory(std::move(extInfo), usage);
         if (imported) {
             return imported;
         }

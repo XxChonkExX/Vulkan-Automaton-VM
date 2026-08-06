@@ -216,11 +216,7 @@ int main() {
         if (exportInfo) {
             std::cout << "  Exported: type=" << static_cast<int>(exportInfo->type)
                       << ", size=" << (exportInfo->size / (1024*1024)) << " MB\n";
-            #ifdef VVM_PLATFORM_LINUX
-            close(exportInfo->handle.get());
-            #elif defined(VVM_PLATFORM_WINDOWS)
-            CloseHandle(exportInfo->handle.get());
-            #endif
+            // RAII closes the exported handle when exportInfo goes out of scope.
         } else {
             std::cout << "  Export not supported on this device\n";
         }

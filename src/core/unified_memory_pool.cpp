@@ -645,7 +645,7 @@ std::optional<ExternalMemoryInfo> UnifiedMemoryPool::exportMemory(
 }
 
 std::optional<Allocation> UnifiedMemoryPool::importMemory(
-    const ExternalMemoryInfo& info, VkBufferUsageFlags usage) {
+    ExternalMemoryInfo&& info, VkBufferUsageFlags usage) {
     
     std::lock_guard<std::mutex> lock(mutex_);
     
@@ -775,8 +775,13 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
     if (vkAllocateMemory(device_, &allocInfo, nullptr, &memory) != VK_SUCCESS) {
         VVM_LOG_ERROR("Failed to allocate memory for import");
         vkDestroyBuffer(device_, buffer, nullptr);
+        // Handle NOT consumed: info keeps ownership and its destructor closes it.
         return std::nullopt;
     }
+    
+    // On success the driver owns the OS handle (FD/HANDLE). Release it from
+    // the RAII wrapper so its destructor does NOT double-close it.
+    info.handle.release();
     
     // Step 5: Bind buffer to memory
     VkBindBufferMemoryInfo bindInfo{};

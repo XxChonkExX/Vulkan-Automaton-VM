@@ -279,7 +279,13 @@ public:
     std::optional<ExternalMemoryInfo> exportMemory(const Allocation& alloc,
                                                    ExternalHandleType type);
     
-    std::optional<Allocation> importMemory(const ExternalMemoryInfo& info,
+    // Ownership contract: on SUCCESS the OS handle (FD/HANDLE) is transferred
+    // to the driver and info is emptied (importMemory consumes it). Pass an
+    // ExternalMemoryInfo that owns a handle you no longer need afterwards,
+    // e.g. from exportMemory or duplicateForImport. Use duplicateForImport
+    // when the same memory must be imported on multiple peers.
+    // On FAILURE, info still owns the handle and its destructor closes it.
+    std::optional<Allocation> importMemory(ExternalMemoryInfo&& info,
                                            VkBufferUsageFlags usage);
 
     // Offload/Swap

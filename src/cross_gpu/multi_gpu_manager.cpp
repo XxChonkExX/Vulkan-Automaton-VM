@@ -124,13 +124,13 @@ std::vector<std::optional<Allocation>> MultiGPUPoolManager::allocateDistributed(
             master.config.physicalDevice,
             peer.config.physicalDevice);
         
-        // Create import info from export info (move the handle)
-        ExternalMemoryInfo importInfo;
+        // Create import info from export info. Each peer needs its OWN dup'ed
+        // handle because a successful import consumes (transfers) one handle.
+        auto importInfo = duplicateForImport(*exportInfo);
         importInfo.type = pairCaps.recommendedType;
         importInfo.size = exportInfo->size;
         importInfo.memoryTypeIndex = exportInfo->memoryTypeIndex;
         importInfo.dedicatedAllocation = exportInfo->dedicatedAllocation;
-        importInfo.handle = std::move(exportInfo->handle);  // Move the handle
         
         // Handle type conversion for NVIDIA<->AMD/Intel on Windows
         #ifdef VVM_PLATFORM_WINDOWS
@@ -148,7 +148,7 @@ std::vector<std::optional<Allocation>> MultiGPUPoolManager::allocateDistributed(
         }
         #endif
         
-        auto peerAlloc = peer.pool.importMemory(importInfo, usage);
+        auto peerAlloc = peer.pool.importMemory(std::move(importInfo), usage);
         results[i] = peerAlloc;
         
         if (!peerAlloc) {
@@ -165,12 +165,10 @@ std::vector<std::optional<Allocation>> MultiGPUPoolManager::allocateDistributed(
         }
     }
     
-    // Close exported handle (master keeps its allocation)
-    #ifdef VVM_PLATFORM_LINUX
-    if (exportInfo && exportInfo->handle) close(exportInfo->handle.get());
-    #elif defined(VVM_PLATFORM_WINDOWS)
-    if (exportInfo && exportInfo->handle) CloseHandle(exportInfo->handle.get());
-    #endif
+    // exportInfo still owns the ORIGINAL handle; it is not moved/closed here.
+    // Its destructor closes it once, after all peers have dup'ed their own.
+    // (dup / DuplicateHandle created independent copies for each import.)
+    (void)exportInfo;
     
     return results;
 }

@@ -166,11 +166,7 @@ int main() {
         auto exportInfo = pool->exportMemory(*alloc1, ExternalHandleType::OpaqueFd);
         if (exportInfo) {
             std::cout << "  Export successful" << std::endl;
-            #ifdef VVM_PLATFORM_LINUX
-            close(exportInfo->handle.get());
-            #elif defined(VVM_PLATFORM_WINDOWS)
-            CloseHandle(exportInfo->handle.get());
-            #endif
+            // RAII closes the exported handle when exportInfo goes out of scope.
         } else {
             std::cout << "  Export not supported on this device" << std::endl;
         }
