@@ -568,102 +568,77 @@ std::optional<ExternalMemoryInfo> UnifiedMemoryPool::exportMemory(
     
     std::lock_guard<std::mutex> lock(mutex_);
     
+    // Only support dedicated allocations for cross-GPU export.
+    // Sub-allocated blocks are NOT supported for cross-GPU export because
+    // Vulkan external memory import requires dedicated allocations for
+    // reliable cross-device import. Sub-allocating from a shared block
+    // and then exporting the whole block (or a sub-range) is fragile
+    // across vendors and violates the Vulkan spec for reliable import.
+    if (alloc.blockIndex != UINT32_MAX) {
+        VVM_LOG_ERROR("exportMemory: only dedicated allocations (blockIndex == UINT32_MAX) are supported for cross-GPU export. Sub-allocated blocks are not supported.");
+        return std::nullopt;
+    }
+    
+    // Dedicated allocation - export directly from alloc.memory
     ExternalMemoryInfo info;
     info.type = type;
     info.size = alloc.size;
+    info.memoryTypeIndex = UINT32_MAX;  // Will be re-selected by importer
+    info.dedicatedAllocation = true;
     
-    // For dedicated exportable allocations, memory is the dedicated VkDeviceMemory
-    // For sub-allocated blocks, we need the block's exported handle
-    if (alloc.blockIndex == UINT32_MAX) {
-        // Dedicated allocation - export directly from alloc.memory
-        info.memoryTypeIndex = UINT32_MAX;  // Will be re-selected by importer
-        info.dedicatedAllocation = true;
+    #ifdef VVM_PLATFORM_LINUX
+    if (type == ExternalHandleType::OpaqueFd || type == ExternalHandleType::DmaBuf) {
+        VkMemoryGetFdInfoKHR fdInfo{};
+        fdInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
+        fdInfo.memory = alloc.memory;
         
-        #ifdef VVM_PLATFORM_LINUX
-        if (type == ExternalHandleType::OpaqueFd || type == ExternalHandleType::DmaBuf) {
-            VkMemoryGetFdInfoKHR fdInfo{};
-            fdInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
-            fdInfo.memory = alloc.memory;
-            
-            switch (type) {
-                case ExternalHandleType::OpaqueFd:
-                    fdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-                    break;
-                case ExternalHandleType::DmaBuf:
-                    fdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-                    break;
-                default:
-                    return std::nullopt;
-            }
-            
-            PFN_vkGetMemoryFdKHR vkGetMemoryFdKHR = 
-                (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(device_, "vkGetMemoryFdKHR");
-            if (!vkGetMemoryFdKHR) return std::nullopt;
-            
-            int fd = -1;
-            if (vkGetMemoryFdKHR(device_, &fdInfo, &fd) != VK_SUCCESS) return std::nullopt;
-            info.fd = fd;
-            return info;
+        switch (type) {
+            case ExternalHandleType::OpaqueFd:
+                fdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+                break;
+            case ExternalHandleType::DmaBuf:
+                fdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+                break;
+            default:
+                return std::nullopt;
         }
-        #elif defined(VVM_PLATFORM_WINDOWS)
-        if (type == ExternalHandleType::OpaqueWin32 || type == ExternalHandleType::D3D12Heap) {
-            VkMemoryGetWin32HandleInfoKHR handleInfo{};
-            handleInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR;
-            handleInfo.memory = alloc.memory;
-            
-            switch (type) {
-                case ExternalHandleType::OpaqueWin32:
-                    handleInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
-                    break;
-                case ExternalHandleType::D3D12Heap:
-                    handleInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
-                    break;
-                default:
-                    return std::nullopt;
-            }
-            
-            PFN_vkGetMemoryWin32HandleKHR vkGetMemoryWin32HandleKHR = 
-                (PFN_vkGetMemoryWin32HandleKHR)vkGetDeviceProcAddr(device_, "vkGetMemoryWin32HandleKHR");
-            if (!vkGetMemoryWin32HandleKHR) return std::nullopt;
-            
-            HANDLE handle = nullptr;
-            if (vkGetMemoryWin32HandleKHR(device_, &handleInfo, &handle) != VK_SUCCESS) return std::nullopt;
-            info.handle = handle;
-            return info;
-        }
-        #endif
-    } else {
-        // Sub-allocated block - use block's exported handle
-        if (alloc.blockIndex >= blocks_.size()) return std::nullopt;
         
-        const auto& block = blocks_[alloc.blockIndex];
-        info.memoryTypeIndex = deviceLocalMemoryType_;
-        info.dedicatedAllocation = false;
+        PFN_vkGetMemoryFdKHR vkGetMemoryFdKHR = 
+            (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(device_, "vkGetMemoryFdKHR");
+        if (!vkGetMemoryFdKHR) return std::nullopt;
         
-        #ifdef VVM_PLATFORM_LINUX
-        if (type == ExternalHandleType::OpaqueFd && block.exportFd >= 0) {
-            info.fd = dup(block.exportFd);  // caller owns this fd
-            return info;
-        } else if (type == ExternalHandleType::DmaBuf && block.exportFd >= 0) {
-            info.fd = dup(block.exportFd);
-            return info;
-        }
-        #elif defined(VVM_PLATFORM_WINDOWS)
-        if (type == ExternalHandleType::OpaqueWin32 && block.exportHandle) {
-            HANDLE dupHandle;
-            DuplicateHandle(GetCurrentProcess(), block.exportHandle,
-                           GetCurrentProcess(), &dupHandle, 0, FALSE, DUPLICATE_SAME_ACCESS);
-            info.handle = dupHandle;
-            return info;
-        } else if (type == ExternalHandleType::D3D12Heap && block.exportHandle) {
-            HANDLE dupHandle;
-            DuplicateHandle(GetCurrentProcess(), block.exportHandle,
-                           GetCurrentProcess(), &dupHandle, 0, FALSE, DUPLICATE_SAME_ACCESS);
-            info.handle = dupHandle;
-            return info;
-        }
-        #endif
+        int fd = -1;
+        if (vkGetMemoryFdKHR(device_, &fdInfo, &fd) != VK_SUCCESS) return std::nullopt;
+        info.handle = ExternalHandle(fd);  // RAII wrapper takes ownership
+        return info;
     }
+    #elif defined(VVM_PLATFORM_WINDOWS)
+    if (type == ExternalHandleType::OpaqueWin32 || type == ExternalHandleType::D3D12Heap) {
+        VkMemoryGetWin32HandleInfoKHR handleInfo{};
+        handleInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR;
+        handleInfo.memory = alloc.memory;
+        
+        switch (type) {
+            case ExternalHandleType::OpaqueWin32:
+                handleInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+                break;
+            case ExternalHandleType::D3D12Heap:
+                handleInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
+                break;
+            default:
+                return std::nullopt;
+        }
+        
+        PFN_vkGetMemoryWin32HandleKHR vkGetMemoryWin32HandleKHR = 
+            (PFN_vkGetMemoryWin32HandleKHR)vkGetDeviceProcAddr(device_, "vkGetMemoryWin32HandleKHR");
+        if (!vkGetMemoryWin32HandleKHR) return std::nullopt;
+        
+        HANDLE handle = nullptr;
+        if (vkGetMemoryWin32HandleKHR(device_, &handleInfo, &handle) != VK_SUCCESS) return std::nullopt;
+        info.handle = ExternalHandle(handle);  // RAII wrapper takes ownership
+        return info;
+    }
+    #endif
     
     return std::nullopt;
 }
@@ -747,17 +722,17 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
     
     void* pNext = nullptr;
     
-    #ifdef VVM_PLATFORM_LINUX
-    if (info.type == ExternalHandleType::OpaqueFd && info.fd >= 0) {
+#ifdef VVM_PLATFORM_LINUX
+    if (info.type == ExternalHandleType::OpaqueFd && info.handle) {
         importFdInfo.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
         importFdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-        importFdInfo.fd = info.fd;
+        importFdInfo.fd = info.handle.get();  // Use RAII wrapper's get()
         importFdInfo.pNext = pNext;
         pNext = &importFdInfo;
-    } else if (info.type == ExternalHandleType::DmaBuf && info.fd >= 0) {
+    } else if (info.type == ExternalHandleType::DmaBuf && info.handle) {
         importFdInfo.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
         importFdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-        importFdInfo.fd = info.fd;
+        importFdInfo.fd = info.handle.get();  // Use RAII wrapper's get()
         importFdInfo.pNext = pNext;
         pNext = &importFdInfo;
     }
@@ -765,13 +740,13 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
     if (info.type == ExternalHandleType::OpaqueWin32 && info.handle) {
         importWin32Info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR;
         importWin32Info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
-        importWin32Info.handle = info.handle;
+        importWin32Info.handle = info.handle.get();  // Use RAII wrapper's get()
         importWin32Info.pNext = pNext;
         pNext = &importWin32Info;
     } else if (info.type == ExternalHandleType::D3D12Heap && info.handle) {
         importWin32Info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR;
         importWin32Info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
-        importWin32Info.handle = info.handle;
+        importWin32Info.handle = info.handle.get();  // Use RAII wrapper's get()
         importWin32Info.pNext = pNext;
         pNext = &importWin32Info;
     }

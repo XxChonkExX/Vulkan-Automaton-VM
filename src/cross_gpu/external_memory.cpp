@@ -212,30 +212,30 @@ std::optional<Allocation> importMemory(const ImportMemoryParams& params) {
     void* pNext = nullptr;
     
     #ifdef VVM_PLATFORM_LINUX
-    if (params.info.type == ExternalHandleType::OpaqueFd && params.info.fd >= 0) {
+    if (params.info.type == ExternalHandleType::OpaqueFd && params.info.handle.get() >= 0) {
         importFdInfo.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
         importFdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-        importFdInfo.fd = params.info.fd;
+        importFdInfo.fd = params.info.handle.get();
         importFdInfo.pNext = pNext;
         pNext = &importFdInfo;
-    } else if (params.info.type == ExternalHandleType::DmaBuf && params.info.fd >= 0) {
+    } else if (params.info.type == ExternalHandleType::DmaBuf && params.info.handle.get() >= 0) {
         importFdInfo.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
         importFdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-        importFdInfo.fd = params.info.fd;
+        importFdInfo.fd = params.info.handle.get();
         importFdInfo.pNext = pNext;
         pNext = &importFdInfo;
     }
     #elif defined(VVM_PLATFORM_WINDOWS)
-    if (params.info.type == ExternalHandleType::OpaqueWin32 && params.info.handle) {
+    if (params.info.type == ExternalHandleType::OpaqueWin32 && params.info.handle.get()) {
         importWin32Info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR;
         importWin32Info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
-        importWin32Info.handle = params.info.handle;
+        importWin32Info.handle = params.info.handle.get();
         importWin32Info.pNext = pNext;
         pNext = &importWin32Info;
-    } else if (params.info.type == ExternalHandleType::D3D12Heap && params.info.handle) {
+    } else if (params.info.type == ExternalHandleType::D3D12Heap && params.info.handle.get()) {
         importWin32Info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR;
         importWin32Info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
-        importWin32Info.handle = params.info.handle;
+        importWin32Info.handle = params.info.handle.get();
         importWin32Info.pNext = pNext;
         pNext = &importWin32Info;
     }

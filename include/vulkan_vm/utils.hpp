@@ -1,6 +1,7 @@
 #pragma once
 
-#include "vulkan_vm/vulkan_vm.hpp"
+#include <vulkan/vulkan.h>
+
 #include <vector>
 #include <string>
 #include <optional>
@@ -78,6 +79,9 @@ bool checkDeviceExtensionSupport(VkPhysicalDevice device,
 bool checkInstanceExtensionSupport(const std::vector<const char*>& required);
 
 // Memory type selection with budget awareness
+struct MemoryTypeSelector;
+struct DedicatedAllocationInfo;  // Forward declaration
+
 struct MemoryTypeSelector {
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties memProps{};
@@ -296,13 +300,25 @@ inline UniqueQueryPool makeUniqueQueryPool(VkDevice device, VkQueryPool pool) {
     return UniqueQueryPool(pool, [device](VkQueryPool p) { vkDestroyQueryPool(device, p, nullptr); });
 }
 
+// ============================================================================
+// External Handle Types
+// ============================================================================
+
+enum class ExternalHandleType {
+    OpaqueFd,      // Linux: VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT
+    OpaqueWin32,   // Windows: VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
+    D3D12Heap,     // Windows: VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT
+    DmaBuf         // Linux: VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+};
+
 // RAII wrapper for external memory handles (FD on Linux, HANDLE on Windows)
 class ExternalHandle {
 public:
     ExternalHandle() = default;
     
     #ifdef VVM_PLATFORM_LINUX
-    explicit ExternalHandle(int fd) : fd_(fd) {}
+    // Allow implicit construction from int (fd)
+    ExternalHandle(int fd) : fd_(fd) {}
     ~ExternalHandle() { if (fd_ >= 0) close(fd_); }
     
     ExternalHandle(ExternalHandle&& other) noexcept : fd_(other.fd_) { other.fd_ = -1; }
@@ -316,7 +332,8 @@ public:
     int release() { int fd = fd_; fd_ = -1; return fd; }
     
     #elif defined(VVM_PLATFORM_WINDOWS)
-    explicit ExternalHandle(HANDLE handle) : handle_(handle) {}
+    // Allow implicit construction from HANDLE
+    ExternalHandle(HANDLE handle) : handle_(handle) {}
     ~ExternalHandle() { if (handle_) CloseHandle(handle_); }
     
     ExternalHandle(ExternalHandle&& other) noexcept : handle_(other.handle_) { other.handle_ = nullptr; }
@@ -336,6 +353,50 @@ private:
     #elif defined(VVM_PLATFORM_WINDOWS)
     HANDLE handle_ = nullptr;
     #endif
+};
+
+// ============================================================================
+// External Memory Info
+// ============================================================================
+
+struct ExternalMemoryInfo {
+    ExternalHandleType type = ExternalHandleType::OpaqueFd;
+    ExternalHandle handle;  // RAII wrapper for FD (Linux) or HANDLE (Windows)
+    VkDeviceSize size = 0;
+    uint32_t memoryTypeIndex = UINT32_MAX;
+    bool dedicatedAllocation = false;
+
+    // Move-only due to ExternalHandle member
+    ExternalMemoryInfo() = default;
+    ExternalMemoryInfo(ExternalMemoryInfo&& other) noexcept
+        : type(other.type)
+        , handle(std::move(other.handle))
+        , size(other.size)
+        , memoryTypeIndex(other.memoryTypeIndex)
+        , dedicatedAllocation(other.dedicatedAllocation) {
+        other.type = ExternalHandleType::OpaqueFd;
+        other.size = 0;
+        other.memoryTypeIndex = UINT32_MAX;
+        other.dedicatedAllocation = false;
+    }
+
+    ExternalMemoryInfo& operator=(ExternalMemoryInfo&& other) noexcept {
+        if (this != &other) {
+            type = other.type;
+            handle = std::move(other.handle);
+            size = other.size;
+            memoryTypeIndex = other.memoryTypeIndex;
+            dedicatedAllocation = other.dedicatedAllocation;
+            other.type = ExternalHandleType::OpaqueFd;
+            other.size = 0;
+            other.memoryTypeIndex = UINT32_MAX;
+            other.dedicatedAllocation = false;
+        }
+        return *this;
+    }
+
+    ExternalMemoryInfo(const ExternalMemoryInfo&) = delete;
+    ExternalMemoryInfo& operator=(const ExternalMemoryInfo&) = delete;
 };
 
 // ============================================================================

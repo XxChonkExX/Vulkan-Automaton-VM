@@ -217,9 +217,9 @@ int main() {
             std::cout << "  Exported: type=" << static_cast<int>(exportInfo->type)
                       << ", size=" << (exportInfo->size / (1024*1024)) << " MB\n";
             #ifdef VVM_PLATFORM_LINUX
-            close(exportInfo->fd);
+            close(exportInfo->handle.get());
             #elif defined(VVM_PLATFORM_WINDOWS)
-            CloseHandle(exportInfo->handle);
+            CloseHandle(exportInfo->handle.get());
             #endif
         } else {
             std::cout << "  Export not supported on this device\n";

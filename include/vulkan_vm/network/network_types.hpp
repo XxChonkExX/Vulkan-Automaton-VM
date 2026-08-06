@@ -2,6 +2,8 @@
 
 #include <vulkan/vulkan.h>
 
+#include "vulkan_vm/utils.hpp"
+
 #include <string>
 #include <vector>
 #include <optional>
@@ -10,22 +12,6 @@
 
 namespace vvm {
 namespace network {
-
-// ============================================================================
-// External handle types
-// ============================================================================
-
-enum class ExternalHandleType : uint32_t {
-    OpaqueFd = 0,
-    OpaqueWin32 = 1,
-    D3D12Heap = 2,
-    DmaBuf = 3,
-    RdmaAddress = 4,  // VK_NV_external_memory_rdma
-};
-
-// ============================================================================
-// Network Configuration
-// ============================================================================
 
 struct NetworkConfig {
     // gRPC server
@@ -129,7 +115,7 @@ struct RemoteAllocationDesc {
     bool dedicatedAllocation = false;
     
     // External handle type
-    ExternalHandleType handleType = ExternalHandleType::OpaqueFd;
+    vvm::ExternalHandleType handleType = vvm::ExternalHandleType::OpaqueFd;
     
     // Handle data (for staged import when RDMA not available)
     std::vector<uint8_t> externalHandle;  // serialized fd/handle

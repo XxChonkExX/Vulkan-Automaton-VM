@@ -244,9 +244,9 @@ int main() {
         std::cout << "\nTesting external memory export...\n";
         auto exportInfo = pool->exportMemory(*alloc1, ExternalHandleType::OpaqueFd);
         if (exportInfo) {
-            std::cout << "  Export successful, fd: " << exportInfo->fd << "\n";
+            std::cout << "  Export successful\n";
             #ifdef VVM_PLATFORM_LINUX
-            close(exportInfo->fd);
+            close(exportInfo->handle.get());
             #endif
         } else {
             std::cout << "  Export not supported on this device\n";

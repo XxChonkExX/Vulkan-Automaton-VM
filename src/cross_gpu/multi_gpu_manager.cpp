@@ -124,8 +124,13 @@ std::vector<std::optional<Allocation>> MultiGPUPoolManager::allocateDistributed(
             master.config.physicalDevice,
             peer.config.physicalDevice);
         
-        ExternalMemoryInfo importInfo = *exportInfo;
+        // Create import info from export info (move the handle)
+        ExternalMemoryInfo importInfo;
         importInfo.type = pairCaps.recommendedType;
+        importInfo.size = exportInfo->size;
+        importInfo.memoryTypeIndex = exportInfo->memoryTypeIndex;
+        importInfo.dedicatedAllocation = exportInfo->dedicatedAllocation;
+        importInfo.handle = std::move(exportInfo->handle);  // Move the handle
         
         // Handle type conversion for NVIDIA<->AMD/Intel on Windows
         #ifdef VVM_PLATFORM_WINDOWS
@@ -136,10 +141,10 @@ std::vector<std::optional<Allocation>> MultiGPUPoolManager::allocateDistributed(
         
         if (masterNvidia && !peerNvidia) {
             // Master is NVIDIA (exported D3D12_HEAP), peer imports as OPAQUE_WIN32
-            importInfo.type = ExternalHandleType::OpaqueWin32;
+            importInfo.type = vvm::ExternalHandleType::OpaqueWin32;
         } else if (!masterNvidia && peerNvidia) {
             // Master is AMD/Intel (exported OPAQUE_WIN32), peer imports as D3D12_HEAP
-            importInfo.type = ExternalHandleType::D3D12Heap;
+            importInfo.type = vvm::ExternalHandleType::D3D12Heap;
         }
         #endif
         
@@ -162,9 +167,9 @@ std::vector<std::optional<Allocation>> MultiGPUPoolManager::allocateDistributed(
     
     // Close exported handle (master keeps its allocation)
     #ifdef VVM_PLATFORM_LINUX
-    if (exportInfo->fd >= 0) close(exportInfo->fd);
+    if (exportInfo && exportInfo->handle) close(exportInfo->handle.get());
     #elif defined(VVM_PLATFORM_WINDOWS)
-    if (exportInfo->handle) CloseHandle(exportInfo->handle);
+    if (exportInfo && exportInfo->handle) CloseHandle(exportInfo->handle.get());
     #endif
     
     return results;

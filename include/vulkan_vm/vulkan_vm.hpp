@@ -21,9 +21,9 @@
 #include <span>
 #include <memory>
 #include <mutex>
-#include <mutex>
 
 #include "vulkan_vm/buddy_allocator.hpp"
+#include "vulkan_vm/utils.hpp"
 
 namespace vvm {
 
@@ -167,23 +167,8 @@ struct BlockInfo {
 // Cross-GPU Sharing
 // ============================================================================
 
-enum class ExternalHandleType {
-    OpaqueFd,      // Linux: VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT
-    OpaqueWin32,   // Windows: VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
-    D3D12Heap,     // Windows: VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT
-    DmaBuf         // Linux: VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
-};
-
-struct ExternalMemoryInfo {
-    ExternalHandleType type = ExternalHandleType::OpaqueFd;
-    int fd = -1;           // Linux
-#ifdef VVM_PLATFORM_WINDOWS
-    HANDLE handle = nullptr;  // Windows
-#endif
-    VkDeviceSize size = 0;
-    uint32_t memoryTypeIndex = UINT32_MAX;
-    bool dedicatedAllocation = false;
-};
+// Forward declare ExternalMemoryInfo (defined in utils.hpp)
+struct ExternalMemoryInfo;
 
 // Dedicated allocation info for external memory
 struct DedicatedAllocationInfo {
@@ -289,6 +274,10 @@ public:
     void deallocate(Allocation&& alloc);
 
     // Cross-GPU: Export/Import
+    // NOTE: exportMemory only supports dedicated allocations (created via
+    // allocateDedicatedExportable). Sub-allocated blocks are NOT supported
+    // for cross-GPU export because Vulkan external memory import requires
+    // dedicated allocations for reliable cross-device import.
     std::optional<ExternalMemoryInfo> exportMemory(const Allocation& alloc,
                                                    ExternalHandleType type);
     

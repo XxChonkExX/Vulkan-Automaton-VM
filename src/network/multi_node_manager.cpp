@@ -452,19 +452,9 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
 
     if (localPools_.empty()) return std::nullopt;
 
-    // Ensure the allocation is registered so peers can address it
-    uint64_t allocId = 0;
-    if (auto existing = findAllocIdByBuffer(alloc.buffer)) {
-        allocId = *existing;
-    } else {
-        Allocation copy = alloc;
-        allocId = registerAllocation(std::move(copy));
-    }
-
     RemoteAllocationDesc netDesc;
     netDesc.owner = localNodeId_;
     netDesc.size = alloc.size;
-    netDesc.localAllocId = allocId;
     netDesc.usageFlags = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     netDesc.memoryTypeIndex = 0;
@@ -490,10 +480,78 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
 #endif
 
     // Host-staged fallback
+    std::optional<Allocation> promoted;
     if (!netDesc.hasRdmaAddr) {
         netDesc.hasHostShadow = true;
-        netDesc.handleType = ExternalHandleType::OpaqueFd;
+
+        // Cross-GPU export requires a dedicated allocation. If the source is
+        // sub-allocated from a shared block, promote it to a dedicated
+        // exportable copy (copying the data over) so we can hand out a real
+        // external handle.
+        const Allocation* exportSrc = &alloc;
+        if (alloc.blockIndex != UINT32_MAX) {
+            promoted = localPools_[0].allocateDedicatedExportable(
+                alloc.size,
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                alloc.memoryFlags);
+            if (!promoted) {
+                VVM_LOG_ERROR("exportForRemote: failed to promote sub-allocated allocation to dedicated");
+                return std::nullopt;
+            }
+            bool copied = false;
+            if (alloc.hostPtr && promoted->hostPtr) {
+                std::memcpy(promoted->hostPtr, alloc.hostPtr, static_cast<size_t>(alloc.size));
+                copied = true;
+            } else {
+                copied = runCopy(alloc.buffer, promoted->buffer, 0, 0, alloc.size);
+            }
+            if (!copied) {
+                VVM_LOG_ERROR("exportForRemote: failed to copy data into dedicated allocation");
+                return std::nullopt;
+            }
+            exportSrc = &*promoted;
+            netDesc.dedicatedAllocation = true;
+        }
+
+        // Export the actual handle from the export source
+        // Use the appropriate handle type for the platform
+        #ifdef VVM_PLATFORM_LINUX
+        auto exportInfo = localPools_[0].exportMemory(*exportSrc, vvm::ExternalHandleType::OpaqueFd);
+        if (!exportInfo) {
+            VVM_LOG_ERROR("exportForRemote: failed to export handle for allocation");
+            return std::nullopt;
+        }
+        netDesc.handleType = vvm::ExternalHandleType::OpaqueFd;
+        
+        int fd = exportInfo->handle.get();
+        netDesc.externalHandle.resize(sizeof(int));
+        *reinterpret_cast<int*>(netDesc.externalHandle.data()) = fd;
+        #elif defined(VVM_PLATFORM_WINDOWS)
+        // On Windows, use OpaqueWin32 as default
+        auto exportInfo = localPools_[0].exportMemory(*exportSrc, vvm::ExternalHandleType::OpaqueWin32);
+        if (!exportInfo) {
+            VVM_LOG_ERROR("exportForRemote: failed to export handle for allocation");
+            return std::nullopt;
+        }
+        netDesc.handleType = vvm::ExternalHandleType::OpaqueWin32;
+        
+        HANDLE handle = exportInfo->handle.get();
+        netDesc.externalHandle.resize(sizeof(HANDLE));
+        *reinterpret_cast<HANDLE*>(netDesc.externalHandle.data()) = handle;
+        #endif
     }
+
+    // Register the allocation (or its promoted dedicated copy) so peers can
+    // address it and remote read-back sees the exported data.
+    uint64_t allocId = 0;
+    if (promoted) {
+        allocId = registerAllocation(std::move(*promoted));
+    } else if (auto existing = findAllocIdByBuffer(alloc.buffer)) {
+        allocId = *existing;
+    } else {
+        allocId = registerAllocation(Allocation(alloc));  // copy for registry
+    }
+    netDesc.localAllocId = allocId;
 
     return netDesc;
 }
@@ -1354,11 +1412,23 @@ std::optional<Allocation> MultiNodePoolManager::createLocalAllocationForImport(
         extInfo.size = desc.size;
         extInfo.memoryTypeIndex = desc.memoryTypeIndex;
 
-        if (desc.handleType == ExternalHandleType::OpaqueFd) {
+        #ifdef VVM_PLATFORM_LINUX
+        if (desc.handleType == vvm::ExternalHandleType::OpaqueFd || desc.handleType == vvm::ExternalHandleType::DmaBuf) {
+            // On Linux, handle is an int (fd) - 4 bytes
             if (desc.externalHandle.size() >= sizeof(int)) {
-                extInfo.fd = *reinterpret_cast<const int*>(desc.externalHandle.data());
+                int fd = *reinterpret_cast<const int*>(desc.externalHandle.data());
+                extInfo.handle = ExternalHandle(fd);
             }
         }
+        #elif defined(VVM_PLATFORM_WINDOWS)
+        if (desc.handleType == vvm::ExternalHandleType::OpaqueWin32 || desc.handleType == vvm::ExternalHandleType::D3D12Heap) {
+            // On Windows, handle is a HANDLE (void*, 8 bytes on 64-bit)
+            if (desc.externalHandle.size() >= sizeof(HANDLE)) {
+                HANDLE handle = *reinterpret_cast<const HANDLE*>(desc.externalHandle.data());
+                extInfo.handle = ExternalHandle(handle);
+            }
+        }
+        #endif
 
         auto imported = localPools_[0].importMemory(extInfo, usage);
         if (imported) {

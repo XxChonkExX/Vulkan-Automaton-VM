@@ -1,3 +1,5 @@
+// Network subsystem implementation
+
 #include "vulkan_vm/network.hpp"
 #include "vulkan_vm/vulkan_vm.hpp"
 #include "vulkan_vm/utils.hpp"
@@ -8,6 +10,12 @@
 #endif
 
 #include <mutex>
+
+#if defined(VVM_PLATFORM_WINDOWS)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
 
 namespace vvm {
 namespace network {
