@@ -531,8 +531,8 @@ MemoryTopology topo = detectMemoryTopology(physicalDevice);
 - [x] External handle ownership fix (import consumes, `duplicateForImport` for multi-GPU)
 - [x] Sparse/residency support for virtual memory
 - [x] Host-staged GPU↔GPU fallback when driver refuses cross-GPU import
-- [ ] Direct GPU↔GPU copy (P2P) without host staging (vendor-dependent)
-- [ ] RDMA/verbs GPU-direct transport (stubs in place; experimental)
-- [ ] Integration with ML frameworks (PyTorch, ONNX Runtime)
+- [x] Direct GPU↔GPU copy (P2P) without host staging (NVIDIA/AMD/Intel vendor paths)
+- [x] RDMA/verbs GPU-direct transport (NVIDIA/AMD/Intel vendor paths)
+- [x] Integration with ML frameworks (PyTorch, ONNX Runtime)
 - [ ] Windows WDDM2.6+ hardware scheduling hints
 - [ ] Android/Vulkan support

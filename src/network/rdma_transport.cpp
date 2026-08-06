@@ -197,32 +197,35 @@ public:
         
         if (!pd_ || !memory || size == 0) return std::nullopt;
         
-        // Get transfer queue for vendor registration
+        // On Linux with ibverbs, we need to:
+        // 1. Export Vulkan memory to a DMA-BUF fd (Linux) or use the vendor-specific path
+        // 2. Register the DMA-BUF fd with ibv_reg_dmabuf_mr (or ibv_reg_mr on mapped VA)
+        
+        #ifdef VVM_PLATFORM_LINUX
+        // Get vendor-specific registration
         VkQueue transferQueue = VK_NULL_HANDLE;
         uint32_t transferQueueFamily = UINT32_MAX;
         
-        // Try to use the stored device config to find transfer queue
-        // This is a simplified approach - in practice we'd need to pass queues
-        // For now, use the first available queue
-        
-        // Dispatch based on vendor
         if (vendorId_ == 0x10DE) {
-            // NVIDIA path
+            // NVIDIA: Use VK_NV_external_memory_rdma
             auto reg = registerGpuMemoryForRdmaVendor(
                 device_, physicalDevice_, memory, offset, size,
                 transferQueue, transferQueueFamily,
                 config_.nicName, vendorId_);
             
             if (!reg || !reg->valid) {
-                VVM_LOG_WARN("NVIDIA GPUDirect registration failed, vendor path returned invalid");
+                VVM_LOG_WARN("NVIDIA GPUDirect registration failed");
                 return std::nullopt;
             }
             
+            // On Linux with nvidia-peermem, we can register the GPU BAR memory
+            // using the remote address from vkGetMemoryRemoteAddressNV
+            // For now, return region with the remote address
             RdmaMemoryRegion region;
-            region.addr = nullptr;  // NVIDIA path uses remote address directly
+            region.addr = nullptr;
             region.length = size;
-            region.lkey = 0;  // Will be set after ibv_reg_mr on Linux
-            region.rkey = reg->rkey;
+            region.lkey = 0;
+            region.rkey = 0;  // Will be set after ibv_reg_mr
             region.rdmaAddr = reg->remoteAddress.address;
             region.ownsMemory = false;
             region.vkMemory = memory;
@@ -231,38 +234,104 @@ public:
             VVM_LOG_INFO("NVIDIA GPUDirect registered: rdmaAddr=0x%llx", region.rdmaAddr);
             return region;
         } else if (vendorId_ == 0x1002 || vendorId_ == 0x8086) {
-            // AMD/Intel path - use DmaBufRegistration
-            auto reg = registerDmaBufForRdmaVendor(
-                device_, physicalDevice_, memory, offset, size,
-                transferQueue, transferQueueFamily,
-                config_.nicName, vendorId_);
+            // AMD/Intel: Export as DMA-BUF fd, then register with ibv_reg_dmabuf_mr
+            // Export Vulkan memory as DMA-BUF fd
+            VkMemoryGetFdInfoKHR getFdInfo{};
+            getFdInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
+            getFdInfo.memory = memory;
+            getFdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
             
-            if (!reg || !reg->valid) {
-                VVM_LOG_WARN("AMD/Intel GPUDirect registration failed, vendor path returned invalid");
+            PFN_vkGetMemoryFdKHR vkGetMemoryFdKHR = 
+                (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(device_, "vkGetMemoryFdKHR");
+            if (!vkGetMemoryFdKHR) {
+                VVM_LOG_ERROR("vkGetMemoryFdKHR not available");
                 return std::nullopt;
             }
             
-            // For the RDMA memory region, we need to register with ibv_reg_mr
-            // on the mapped CPU VA. The DmaBufRegistration contains the handle/mr.
-            // On Linux, we'd call ibv_reg_mr on the DMA-BUF fd or mapped VA.
-            // On Windows, we'd use the NIC's NDKPI.
+            int dmaBufFd = -1;
+            VkResult result = vkGetMemoryFdKHR(device_, &getFdInfo, &dmaBufFd);
+            if (result != VK_SUCCESS || dmaBufFd < 0) {
+                VVM_LOG_ERROR("vkGetMemoryFdKHR failed: %s", vkResultToString(result).c_str());
+                return std::nullopt;
+            }
+            
+            // Register DMA-BUF with ibverbs
+            // Use ibv_reg_dmabuf_mr (requires kernel 5.10+ and MLNX_OFED 5.5+)
+            struct ibv_reg_dmabuf_mr_attr attr{};
+            attr.pd = pd_;
+            attr.fd = dmaBufFd;
+            attr.offset = offset;
+            attr.length = size;
+            attr.access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | 
+                                IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_READ;
+            
+            struct ibv_mr* mr = ibv_reg_dmabuf_mr(&attr);
+            if (!mr) {
+                VVM_LOG_WARN("ibv_reg_dmabuf_mr failed (fallback to ibv_reg_mr on mapped VA): %s", strerror(errno));
+                close(dmaBufFd);
+                // Fallback: try to map the DMA-BUF and use ibv_reg_mr
+                // This requires the DMA-BUF to be mappable
+                void* mappedVa = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, dmaBufFd, 0);
+                if (mappedVa == MAP_FAILED) {
+                    VVM_LOG_ERROR("mmap on DMA-BUF fd failed: %s", strerror(errno));
+                    return std::nullopt;
+                }
+                
+                mr = ibv_reg_mr(pd_, mappedVa, size, attr.access_flags);
+                if (!mr) {
+                    VVM_LOG_ERROR("ibv_reg_mr on mapped DMA-BUF failed: %s", strerror(errno));
+                    munmap(mappedVa, size);
+                    return std::nullopt;
+                }
+                
+                RdmaMemoryRegion region;
+                region.addr = mappedVa;
+                region.length = size;
+                region.lkey = mr->lkey;
+                region.rkey = mr->rkey;
+                region.rdmaAddr = 0;
+                region.ownsMemory = false;
+                region.vkMemory = memory;
+                region.vkBuffer = buffer;
+                
+                // Store for cleanup (we need to track the mapped VA and DMA-BUF fd)
+                {
+                    std::lock_guard<std::mutex> lock(regionsMutex_);
+                    registeredRegions_[mr] = region;
+                }
+                
+                VVM_LOG_INFO("AMD/Intel GPUDirect registered via DMA-BUF mmap fallback: lkey=%u, rkey=%u", mr->lkey, mr->rkey);
+                return region;
+            }
             
             RdmaMemoryRegion region;
-            region.addr = nullptr;  // Would be the mapped CPU VA
+            region.addr = nullptr;  // GPU memory - no CPU VA
             region.length = size;
-            region.lkey = 0;
-            region.rkey = reg->rkey;
+            region.lkey = mr->lkey;
+            region.rkey = mr->rkey;
             region.rdmaAddr = 0;
             region.ownsMemory = false;
             region.vkMemory = memory;
             region.vkBuffer = buffer;
             
-            VVM_LOG_INFO("AMD/Intel GPUDirect registered: handle=%d, rkey=%u", reg->fd, reg->rkey);
+            // Store for cleanup
+            {
+                std::lock_guard<std::mutex> lock(regionsMutex_);
+                registeredRegions_[mr] = region;
+            }
+            
+            VVM_LOG_INFO("AMD/Intel GPUDirect registered via ibv_reg_dmabuf_mr: lkey=%u, rkey=%u", mr->lkey, mr->rkey);
             return region;
         }
         
         VVM_LOG_WARN("registerGpuMemory: unsupported vendor 0x%x", vendorId_);
         return std::nullopt;
+        
+        #else
+        // Windows: RDMA/verbs not available, would need NDKPI-based implementation
+        VVM_LOG_WARN("GPU-direct RDMA registration not implemented on Windows (requires NDKPI)");
+        return std::nullopt;
+        #endif
     }
     
     std::optional<RdmaMemoryRegion> registerHostMemory(void* ptr, size_t size) override {

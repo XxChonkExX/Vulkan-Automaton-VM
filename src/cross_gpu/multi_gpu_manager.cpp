@@ -8,6 +8,72 @@
 namespace vvm {
 
 // ============================================================================
+// Vendor-specific P2P copy optimization
+// ============================================================================
+
+struct VendorP2PCaps {
+    bool supportsDirectP2P = false;
+    VkExternalMemoryHandleTypeFlagBits optimalExportHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    VkExternalMemoryHandleTypeFlagBits optimalImportHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    bool requiresDedicatedAllocation = true;
+    std::string notes;
+};
+
+static VendorP2PCaps getVendorP2PCaps(uint32_t srcVendorId, uint32_t dstVendorId) {
+    VendorP2PCaps caps;
+    
+    // NVIDIA (0x10DE) -> Any
+    if (srcVendorId == 0x10DE) {
+        caps.supportsDirectP2P = true;
+        #ifdef VVM_PLATFORM_WINDOWS
+        caps.optimalExportHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
+        caps.optimalImportHandleType = (dstVendorId == 0x10DE) 
+            ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT
+            : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+        #else
+        caps.optimalExportHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        caps.optimalImportHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        #endif
+        caps.notes = "NVIDIA source: D3D12_HEAP (Win) / DMA-BUF (Linux) export";
+    }
+    // AMD (0x1002) -> Any
+    else if (srcVendorId == 0x1002) {
+        caps.supportsDirectP2P = true;
+        #ifdef VVM_PLATFORM_WINDOWS
+        caps.optimalExportHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+        caps.optimalImportHandleType = (dstVendorId == 0x10DE)
+            ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT
+            : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+        #else
+        caps.optimalExportHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        caps.optimalImportHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        #endif
+        caps.notes = "AMD source: OPAQUE_WIN32 (Win) / DMA-BUF (Linux) export";
+    }
+    // Intel (0x8086) -> Any
+    else if (srcVendorId == 0x8086) {
+        caps.supportsDirectP2P = true;
+        #ifdef VVM_PLATFORM_WINDOWS
+        caps.optimalExportHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+        caps.optimalImportHandleType = (dstVendorId == 0x10DE)
+            ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT
+            : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+        #else
+        caps.optimalExportHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        caps.optimalImportHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        #endif
+        caps.notes = "Intel source: OPAQUE_WIN32 (Win) / DMA-BUF (Linux) export";
+    }
+    // Unknown vendor - try standard path
+    else {
+        caps.supportsDirectP2P = false;
+        caps.notes = "Unknown vendor, using fallback";
+    }
+    
+    return caps;
+}
+
+// ============================================================================
 // MultiGPUPoolManager Implementation
 // ============================================================================
 
@@ -240,17 +306,27 @@ bool MultiGPUPoolManager::copyDeviceToDevice(
     if (size == VK_WHOLE_SIZE) {
         size = std::min(src.size, dst.size);
     }
-    VkDeviceSize srcEnd = srcOffset + size;
-    VkDeviceSize dstEnd = dstOffset + size;
     if (srcOffset + size > src.size || dstOffset + size > dst.size) {
         VVM_LOG_ERROR("copyDeviceToDevice: range exceeds allocation size");
         return false;
     }
 
-    // 1. Export source memory from src device.
-    auto pairCaps = getCrossVendorCaps(instances_[srcDeviceIndex].config.physicalDevice,
-                                       instances_[dstDeviceIndex].config.physicalDevice);
-    auto exportInfo = srcPool.exportMemory(src, pairCaps.recommendedType);
+    // Get vendor-specific P2P capabilities
+    auto srcVendorProps = getVendorProperties(instances_[srcDeviceIndex].config.physicalDevice);
+    auto dstVendorProps = getVendorProperties(instances_[dstDeviceIndex].config.physicalDevice);
+    auto p2pCaps = getVendorP2PCaps(srcVendorProps.vendorID, dstVendorProps.vendorID);
+    
+    if (!p2pCaps.supportsDirectP2P) {
+        VVM_LOG_WARN("copyDeviceToDevice: vendor P2P not supported, falling back to host-staged");
+        return copyDeviceToDeviceHostStaged(srcDeviceIndex, dstDeviceIndex,
+                                            src, dst, srcOffset, dstOffset, size, fence);
+    }
+
+    VVM_LOG_INFO("copyDeviceToDevice: using vendor P2P path: {}", p2pCaps.notes);
+
+    // 1. Export source memory from src device using vendor-optimal handle type.
+    auto exportInfo = srcPool.exportMemory(src, 
+        static_cast<ExternalHandleType>(p2pCaps.optimalExportHandleType));
     if (!exportInfo) {
         VVM_LOG_WARN("copyDeviceToDevice: exportMemory failed, "
                      "falling back to host-staged peer copy");
@@ -258,9 +334,9 @@ bool MultiGPUPoolManager::copyDeviceToDevice(
                                             src, dst, srcOffset, dstOffset, size, fence);
     }
 
-    // 2. Import (alias) on the dst device.
+    // 2. Import (alias) on the dst device using vendor-optimal import handle type.
     auto importInfo = duplicateForImport(*exportInfo);
-    importInfo.type = pairCaps.recommendedType;
+    importInfo.type = static_cast<ExternalHandleType>(p2pCaps.optimalImportHandleType);
     auto remote = dstPool.importMemory(std::move(importInfo),
                                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                        VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -274,7 +350,7 @@ bool MultiGPUPoolManager::copyDeviceToDevice(
     // 3. Copy remote-alias -> dst allocation on the dst device's queue.
     auto& dev = dstPool.getDeviceConfig();
     VkQueue queue = dev.transferQueue != VK_NULL_HANDLE ? dev.transferQueue
-                   : dev.graphicsQueue;
+                       : dev.graphicsQueue;
     if (queue == VK_NULL_HANDLE) {
         VVM_LOG_ERROR("copyDeviceToDevice: dst device has no transfer/graphics queue");
         dstPool.deallocate(std::move(*remote));
