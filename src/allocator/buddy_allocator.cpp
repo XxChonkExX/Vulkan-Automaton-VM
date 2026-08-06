@@ -49,6 +49,10 @@ BuddyAllocator::BuddyAllocator(VkDeviceSize blockSize, VkDeviceSize minSize)
     }
     
     root_ = createNode(0, blockSize_, 0);
+    if (!root_) {
+        // Mark as invalid - allocate() will return nullopt
+        maxLevel_ = -1;
+    }
 }
 
 BuddyAllocator::~BuddyAllocator() {
@@ -56,9 +60,12 @@ BuddyAllocator::~BuddyAllocator() {
 }
 
 BuddyNode* BuddyAllocator::createNode(VkDeviceSize offset, VkDeviceSize size, int level) {
-    // Use unique_ptr internally but expose raw pointer for tree structure
-    // The node is owned by the tree and will be deleted in destroyNode
-    BuddyNode* node = new BuddyNode();
+    // Use nothrow new to avoid exceptions, return nullptr on OOM
+    BuddyNode* node = new (std::nothrow) BuddyNode();
+    if (!node) {
+        VVM_LOG_ERROR("BuddyAllocator: failed to allocate BuddyNode (out of memory)");
+        return nullptr;
+    }
     node->offset = offset;
     node->size = size;
     node->free = true;
@@ -115,6 +122,10 @@ BuddyNode* BuddyAllocator::findFree(BuddyNode* node, VkDeviceSize size) {
     // and we have not hit maxLevel_.
     if (node->level < maxLevel_ && (node->size / 2) >= size) {
         split(node);
+        // If split failed (OOM), this node is still a leaf - use it if it fits
+        if (node->left == nullptr) {
+            return node;
+        }
         // Prefer left child (deterministic, good locality)
         BuddyNode* result = findFree(node->left, size);
         if (result) {
@@ -135,6 +146,22 @@ void BuddyAllocator::split(BuddyNode* node) {
     const VkDeviceSize halfSize = node->size / 2;
     node->left  = createNode(node->offset,            halfSize, node->level + 1);
     node->right = createNode(node->offset + halfSize, halfSize, node->level + 1);
+    
+    // Check if node creation failed
+    if (!node->left || !node->right) {
+        // Clean up any partial allocation
+        if (node->left) {
+            delete node->left;
+            node->left = nullptr;
+        }
+        if (node->right) {
+            delete node->right;
+            node->right = nullptr;
+        }
+        VVM_LOG_ERROR("BuddyAllocator: failed to split node (out of memory)");
+        return;
+    }
+    
     node->left->parent  = node;
     node->right->parent = node;
 
@@ -167,6 +194,12 @@ void BuddyAllocator::merge(BuddyNode* node) {
 }
 
 std::optional<VkDeviceSize> BuddyAllocator::allocate(VkDeviceSize size) {
+    // Check if allocator was initialized properly
+    if (maxLevel_ < 0 || !root_) {
+        VVM_LOG_ERROR("BuddyAllocator: allocator not properly initialized (OOM during construction)");
+        return std::nullopt;
+    }
+    
     if (size == 0) {
         return std::nullopt;
     }
@@ -191,6 +224,11 @@ std::optional<VkDeviceSize> BuddyAllocator::allocate(VkDeviceSize size) {
 }
 
 void BuddyAllocator::deallocate(VkDeviceSize offset, VkDeviceSize size) {
+    if (maxLevel_ < 0 || !root_) {
+        VVM_LOG_ERROR("BuddyAllocator: cannot deallocate from uninitialized allocator");
+        return;
+    }
+    
     auto it = allocatedNodes_.find(offset);
     if (it == allocatedNodes_.end()) {
         VVM_LOG_WARN("deallocate: offset %llu not found (double-free or invalid)", offset);

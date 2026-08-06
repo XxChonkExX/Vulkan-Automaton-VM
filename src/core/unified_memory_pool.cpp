@@ -104,49 +104,51 @@ UnifiedMemoryPool::UnifiedMemoryPool(UnifiedMemoryPool&& other) noexcept
 }
 
 UnifiedMemoryPool& UnifiedMemoryPool::operator=(UnifiedMemoryPool&& other) noexcept {
-    if (this != &other) {
-        // Cleanup current
-        if (device_) {
-            for (auto& alloc : dedicatedAllocations_) {
-                if (alloc.buffer) vkDestroyBuffer(device_, alloc.buffer, nullptr);
-                if (alloc.memory) vkFreeMemory(device_, alloc.memory, nullptr);
-            }
-            dedicatedAllocations_.clear();
-            
-            for (auto& block : blocks_) {
-                if (block.memory) {
-                    vkFreeMemory(device_, block.memory, nullptr);
-                }
-            }
-            if (transferCmdPool_) {
-                vkDestroyCommandPool(device_, transferCmdPool_, nullptr);
+    if (this == &other) {
+        return *this;
+    }
+    
+    // Lock both mutexes to avoid deadlock (self-assignment already handled above)
+    std::lock(mutex_, other.mutex_);
+    std::lock_guard<std::mutex> lock_this(mutex_, std::adopt_lock);
+    std::lock_guard<std::mutex> lock_other(other.mutex_, std::adopt_lock);
+    
+    // Cleanup current
+    if (device_) {
+        for (auto& alloc : dedicatedAllocations_) {
+            if (alloc.buffer) vkDestroyBuffer(device_, alloc.buffer, nullptr);
+            if (alloc.memory) vkFreeMemory(device_, alloc.memory, nullptr);
+        }
+        dedicatedAllocations_.clear();
+        
+        for (auto& block : blocks_) {
+            if (block.memory) {
+                vkFreeMemory(device_, block.memory, nullptr);
             }
         }
-        
-        // Lock both mutexes to avoid deadlock
-        std::lock(mutex_, other.mutex_);
-        std::lock_guard<std::mutex> lock_this(mutex_, std::adopt_lock);
-        std::lock_guard<std::mutex> lock_other(other.mutex_, std::adopt_lock);
-        
-        deviceConfig_ = std::move(other.deviceConfig_);
-        config_ = std::move(other.config_);
-        device_ = other.device_;
-        blocks_ = std::move(other.blocks_);
-        dedicatedAllocations_ = std::move(other.dedicatedAllocations_);
-        deviceLocalMemoryType_ = other.deviceLocalMemoryType_;
-        hostVisibleMemoryType_ = other.hostVisibleMemoryType_;
-        deviceLocalHeapIndex_ = other.deviceLocalHeapIndex_;
-        memoryBudgetAvailable_ = other.memoryBudgetAvailable_;
-        transferCmdPool_ = other.transferCmdPool_;
-        debugUtilsEnabled_ = other.debugUtilsEnabled_;
-        fnSetDebugName_ = other.fnSetDebugName_;
-        offloadManager_ = std::move(other.offloadManager_);
-        // mutex_ is not moved - keep our own
-        
-        other.device_ = VK_NULL_HANDLE;
-        other.transferCmdPool_ = VK_NULL_HANDLE;
-        other.fnSetDebugName_ = nullptr;
+        if (transferCmdPool_) {
+            vkDestroyCommandPool(device_, transferCmdPool_, nullptr);
+        }
     }
+    
+    deviceConfig_ = std::move(other.deviceConfig_);
+    config_ = std::move(other.config_);
+    device_ = other.device_;
+    blocks_ = std::move(other.blocks_);
+    dedicatedAllocations_ = std::move(other.dedicatedAllocations_);
+    deviceLocalMemoryType_ = other.deviceLocalMemoryType_;
+    hostVisibleMemoryType_ = other.hostVisibleMemoryType_;
+    deviceLocalHeapIndex_ = other.deviceLocalHeapIndex_;
+    memoryBudgetAvailable_ = other.memoryBudgetAvailable_;
+    transferCmdPool_ = other.transferCmdPool_;
+    debugUtilsEnabled_ = other.debugUtilsEnabled_;
+    fnSetDebugName_ = other.fnSetDebugName_;
+    offloadManager_ = std::move(other.offloadManager_);
+    // mutex_ is not moved - keep our own
+    
+    other.device_ = VK_NULL_HANDLE;
+    other.transferCmdPool_ = VK_NULL_HANDLE;
+    other.fnSetDebugName_ = nullptr;
     return *this;
 }
 
@@ -323,6 +325,7 @@ VkMemoryPropertyFlags UnifiedMemoryPool::usageToFlags(MemoryUsage usage) const {
 }
 
 bool UnifiedMemoryPool::wouldExceedBudget(VkDeviceSize additionalBytes) const {
+    std::lock_guard<std::mutex> lock(mutex_);
     VkDeviceSize currentPool = 0;
     for (const auto& block : blocks_) currentPool += block.size;
     for (const auto& alloc : dedicatedAllocations_) currentPool += alloc.size;
@@ -512,6 +515,8 @@ std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
 // This is required by the Vulkan spec for reliable external memory import.
 std::optional<Allocation> UnifiedMemoryPool::allocateDedicatedExportable(
     VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags flags) {
+    
+    std::lock_guard<std::mutex> lock(mutex_);
     
     size = alignUp(size, config_.minAlignment);
     

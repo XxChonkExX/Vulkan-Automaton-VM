@@ -221,8 +221,10 @@ struct DedicatedAllocationInfo {
 
 struct OffloadConfig {
     VkDeviceSize hostShadowSize = 4 * 1024 * 1024 * 1024;  // 4GB host shadow
-    bool useMadvise = false;                                // unsafe on vkMapMemory memory; kept only for future user-mmap regions
-    bool useMprotect = false;                               // unsafe on vkMapMemory memory; enables page-fault detection only
+    [[deprecated("unsafe on vkMapMemory memory; use only on user-allocated mmap regions")]]
+    bool useMadvise = false;
+    [[deprecated("unsafe on vkMapMemory memory; use only on user-allocated mmap regions")]]
+    bool useMprotect = false;
     VkQueue transferQueue = VK_NULL_HANDLE;
     uint32_t transferQueueFamily = UINT32_MAX;
     // Mapping lifetime management

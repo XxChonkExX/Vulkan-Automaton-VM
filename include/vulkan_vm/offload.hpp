@@ -46,13 +46,18 @@ public:
     // These helpers exist for potential use on user-allocated mmap'd regions
     // only, and are NOT called by the standard offload/reload flow. Calling
     // madvise() on Vulkan driver-owned mappings can corrupt GPU-side data.
+    [[deprecated("unsafe on vkMapMemory memory; use only on user-allocated mmap regions")]]
     void adviseDontNeed(VkDeviceSize offset, VkDeviceSize size);
+    [[deprecated("unsafe on vkMapMemory memory; use only on user-allocated mmap regions")]]
     void adviseWillNeed(VkDeviceSize offset, VkDeviceSize size);
+    [[deprecated("unsafe on vkMapMemory memory; use only on user-allocated mmap regions")]]
     void adviseFree(VkDeviceSize offset, VkDeviceSize size);  // MADV_FREE
     
     // Protect/unprotect (mprotect). Linux ONLY -- unsafe on memory mapped
     // via vkMapMemory, may SIGSEGV the driver. NOT called by offload/reload.
+    [[deprecated("unsafe on vkMapMemory memory; use only on user-allocated mmap regions")]]
     void protectRegion(VkDeviceSize offset, VkDeviceSize size);   // PROT_NONE
+    [[deprecated("unsafe on vkMapMemory memory; use only on user-allocated mmap regions")]]
     void unprotectRegion(VkDeviceSize offset, VkDeviceSize size); // PROT_READ|WRITE
     
     // Get buffer for copy operations

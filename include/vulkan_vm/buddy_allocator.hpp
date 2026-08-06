@@ -34,6 +34,7 @@ public:
     VkDeviceSize getLargestFree() const;
     float getFragmentation() const;
     size_t getAllocationCount() const { return allocatedNodes_.size(); }
+    bool isValid() const { return maxLevel_ >= 0 && root_ != nullptr; }
     
 private:
     struct AllocatedNode {

@@ -530,6 +530,13 @@ bool deserializeAllocationDesc(const uint8_t*& p, const uint8_t* end, RemoteAllo
 // ============================================================================
 
 struct TcpTransport::Impl {
+    // Connection info with last activity tracking
+    struct ConnectionInfo {
+        SocketType socket = kInvalidSocket;
+        std::chrono::steady_clock::time_point lastActivity;
+        bool isServerSide = false;
+    };
+    
     // ----- server -----
     SocketType listener = kInvalidSocket;
     std::atomic<bool> running{false};
@@ -543,12 +550,17 @@ struct TcpTransport::Impl {
     std::atomic<uint64_t> nextConnId{1};
     uint32_t nextSeq_ = 0;
     std::mutex connsMutex;
-    std::unordered_map<uint64_t, SocketType> conns;
+    std::unordered_map<uint64_t, ConnectionInfo> conns;
     std::mutex ioMutex;  // serializes request/response exchanges
 
     // TLS
     std::unique_ptr<TlsContext> tlsContext;
     TlsConfig tlsConfig;
+    
+    // Connection idle timeout
+    std::chrono::milliseconds connectionIdleTimeout{300000};  // 5 min default
+    std::thread cleanupThread;
+    std::atomic<bool> stopCleanup_{false};
 
     ~Impl() { stop(); }
 
@@ -589,17 +601,19 @@ struct TcpTransport::Impl {
 
     void stop() {
         running = false;
+        stopCleanup_ = true;
         if (listener != kInvalidSocket) {
             closeSocket(listener);
             listener = kInvalidSocket;
         }
         {
             std::lock_guard<std::mutex> lock(connsMutex);
-            for (auto& [id, s] : conns) {
-                if (s != kInvalidSocket) closeSocket(s);
+            for (auto& [id, conn] : conns) {
+                if (conn.socket != kInvalidSocket) closeSocket(conn.socket);
             }
         }
         if (acceptThread.joinable()) acceptThread.join();
+        if (cleanupThread.joinable()) cleanupThread.join();
         {
             std::lock_guard<std::mutex> lock(serveThreadsMutex);
             for (auto& t : serveThreads) {
@@ -623,9 +637,12 @@ TcpTransport::~TcpTransport() {
     if (impl_) impl_->stop();
 }
 
-bool TcpTransport::start(const std::string& listenHost, uint16_t port, RequestHandler handler) {
+bool TcpTransport::start(const std::string& listenHost, uint16_t port, RequestHandler handler,
+                           std::chrono::milliseconds idleTimeout) {
     ensureSocketsInit();
     if (impl_->running) return false;
+    
+    impl_->connectionIdleTimeout = idleTimeout;
 
     SocketType sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock == kInvalidSocket) {
@@ -695,6 +712,10 @@ bool TcpTransport::start(const std::string& listenHost, uint16_t port, RequestHa
         }
     }
 
+    // Start connection cleanup thread
+    impl_->stopCleanup_ = false;
+    impl_->cleanupThread = std::thread([this]() { this->cleanupLoop(); });
+
     impl_->acceptThread = std::thread([this]() { acceptLoop(); });
     VVM_LOG_INFO("TcpTransport listening on {}:{}", listenHost, impl_->boundPort);
     return true;
@@ -755,7 +776,7 @@ void TcpTransport::acceptLoop() {
         uint64_t id = impl_->nextConnId++;
         {
             std::lock_guard<std::mutex> lock(impl_->connsMutex);
-            impl_->conns[id] = client;
+            impl_->conns[id] = {client, std::chrono::steady_clock::now(), true};
         }
         {
             std::lock_guard<std::mutex> lock(impl_->serveThreadsMutex);
@@ -783,6 +804,15 @@ void TcpTransport::serveConnection(uint64_t connId, uintptr_t sRaw) {
     std::vector<uint8_t> header(kHeaderSize);
     std::vector<uint8_t> drain(static_cast<size_t>(kStreamSliceSize));
     while (impl_->running) {
+        // Update last activity timestamp
+        {
+            std::lock_guard<std::mutex> lock(impl_->connsMutex);
+            auto it = impl_->conns.find(connId);
+            if (it != impl_->conns.end()) {
+                it->second.lastActivity = std::chrono::steady_clock::now();
+            }
+        }
+
         if (!impl_->readAllTls(s, header.data(), header.size())) break;
 
         NetHeader nh{};
@@ -964,7 +994,7 @@ std::optional<TcpTransport::ConnId> TcpTransport::connect(const std::string& hos
     uint64_t id = impl_->nextConnId++;
     {
         std::lock_guard<std::mutex> lock(impl_->connsMutex);
-        impl_->conns[id] = s;
+        impl_->conns[id] = {s, std::chrono::steady_clock::now(), false};
     }
     VVM_LOG_INFO("Connected to {}:{} (conn {})", host, port, id);
     return id;
@@ -976,7 +1006,8 @@ std::optional<TcpMessage> TcpTransport::request(ConnId id, const TcpMessage& req
         std::lock_guard<std::mutex> lock(impl_->connsMutex);
         auto it = impl_->conns.find(id);
         if (it == impl_->conns.end()) return std::nullopt;
-        s = it->second;
+        s = it->second.socket;
+        it->second.lastActivity = std::chrono::steady_clock::now();
     }
 
     std::lock_guard<std::mutex> ioLock(impl_->ioMutex);
@@ -1035,7 +1066,7 @@ void TcpTransport::disconnect(ConnId id) {
         std::lock_guard<std::mutex> lock(impl_->connsMutex);
         auto it = impl_->conns.find(id);
         if (it == impl_->conns.end()) return;
-        s = it->second;
+        s = it->second.socket;
         impl_->conns.erase(it);
     }
     closeSocket(s);
@@ -1044,6 +1075,32 @@ void TcpTransport::disconnect(ConnId id) {
 bool TcpTransport::isConnected(ConnId id) const {
     std::lock_guard<std::mutex> lock(impl_->connsMutex);
     return impl_->conns.find(id) != impl_->conns.end();
+}
+
+void TcpTransport::cleanupLoop() {
+    while (!impl_->stopCleanup_) {
+        std::this_thread::sleep_for(std::chrono::seconds(30));
+        
+        if (impl_->stopCleanup_) break;
+        
+        auto now = std::chrono::steady_clock::now();
+        std::vector<uint64_t> toClose;
+        
+        {
+            std::lock_guard<std::mutex> lock(impl_->connsMutex);
+            for (auto& [id, conn] : impl_->conns) {
+                auto idleTime = now - conn.lastActivity;
+                if (idleTime > impl_->connectionIdleTimeout) {
+                    toClose.push_back(id);
+                }
+            }
+        }
+        
+        for (auto id : toClose) {
+            VVM_LOG_INFO("Closing idle connection {}", id);
+            disconnect(id);
+        }
+    }
 }
 
 }  // namespace network

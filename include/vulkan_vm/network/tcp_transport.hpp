@@ -101,7 +101,8 @@ public:
     // ========================================================================
     // Server
     // ========================================================================
-    bool start(const std::string& listenHost, uint16_t port, RequestHandler handler);
+    bool start(const std::string& listenHost, uint16_t port, RequestHandler handler,
+               std::chrono::milliseconds idleTimeout = std::chrono::milliseconds(300000));
     void stop();
     bool isRunning() const;
     uint16_t getBoundPort() const;
@@ -126,6 +127,7 @@ private:
 
     void acceptLoop();
     void serveConnection(uint64_t connId, uintptr_t socket);
+    void cleanupLoop();
 };
 
 }  // namespace network

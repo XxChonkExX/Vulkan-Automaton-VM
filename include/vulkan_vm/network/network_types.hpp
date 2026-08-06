@@ -37,6 +37,7 @@ struct NetworkConfig {
     std::chrono::milliseconds rpcTimeout{30000};
     std::chrono::milliseconds migrationTimeout{60000};
     std::chrono::milliseconds heartbeatInterval{5000};
+    std::chrono::milliseconds connectionIdleTimeout{300000};  // 5 min default idle timeout
     
     // Security (optional)
     bool useTls = false;
