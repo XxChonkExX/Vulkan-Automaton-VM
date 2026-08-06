@@ -26,6 +26,17 @@ namespace {
 
 constexpr VkDeviceSize kTransferChunk = 4ull * 1024 * 1024;  // 4MB chunks over TCP
 
+// Process-local registry of exported external-memory handles that are still
+// alive. OS handles (FDs/HANDLEs) are process-relative and CANNOT be shipped
+// over TCP, so a same-process peer import consumes the live handle from here,
+// while cross-process/machine peers fall back to host-staged copies.
+std::unordered_map<std::string, vvm::ExternalMemoryInfo> g_pendingExports;
+std::mutex g_pendingExportsMutex;
+
+std::string pendingKey(const NodeId& owner, uint64_t allocId) {
+    return owner.host + ":" + std::to_string(owner.port) + ":" + std::to_string(allocId);
+}
+
 // Build a response message with the given flag.
 TcpMessage makeResponse(uint32_t type, uint32_t flags) {
     TcpMessage resp;
@@ -298,6 +309,18 @@ void MultiNodePoolManager::stop() {
         peerConns_.clear();
     }
 
+    // Release any exported handles this node still owns (closes FDs/HANDLEs).
+    {
+        std::lock_guard<std::mutex> lock(g_pendingExportsMutex);
+        for (auto it = g_pendingExports.begin(); it != g_pendingExports.end();) {
+            if (it->first.rfind(localNodeId_.host + ":" + std::to_string(localNodeId_.port) + ":", 0) == 0) {
+                it = g_pendingExports.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
     running_ = false;
     VVM_LOG_INFO("MultiNodePoolManager stopped");
 }
@@ -481,6 +504,7 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
 
     // Host-staged fallback
     std::optional<Allocation> promoted;
+    std::optional<ExternalMemoryInfo> exportInfo;
     if (!netDesc.hasRdmaAddr) {
         netDesc.hasHostShadow = true;
 
@@ -513,32 +537,26 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
             netDesc.dedicatedAllocation = true;
         }
 
-        // Export the actual handle from the export source
-        // Use the appropriate handle type for the platform
+        // Export the actual handle from the export source. The ExternalMemoryInfo
+        // OWNS the handle; we keep it alive in a process-local registry so a
+        // same-process import can consume it (cross-process hosts stage data).
         #ifdef VVM_PLATFORM_LINUX
-        auto exportInfo = localPools_[0].exportMemory(*exportSrc, vvm::ExternalHandleType::OpaqueFd);
-        if (!exportInfo) {
-            VVM_LOG_ERROR("exportForRemote: failed to export handle for allocation");
-            return std::nullopt;
-        }
-        netDesc.handleType = vvm::ExternalHandleType::OpaqueFd;
-        
-        int fd = exportInfo->handle.get();
-        netDesc.externalHandle.resize(sizeof(int));
-        *reinterpret_cast<int*>(netDesc.externalHandle.data()) = fd;
+        exportInfo = localPools_[0].exportMemory(*exportSrc, vvm::ExternalHandleType::OpaqueFd);
+        netDesc.handleType = exportInfo ? vvm::ExternalHandleType::OpaqueFd
+                                        : netDesc.handleType;
         #elif defined(VVM_PLATFORM_WINDOWS)
-        // On Windows, use OpaqueWin32 as default
-        auto exportInfo = localPools_[0].exportMemory(*exportSrc, vvm::ExternalHandleType::OpaqueWin32);
+        exportInfo = localPools_[0].exportMemory(*exportSrc, vvm::ExternalHandleType::OpaqueWin32);
+        netDesc.handleType = exportInfo ? vvm::ExternalHandleType::OpaqueWin32
+                                        : netDesc.handleType;
+        #endif
         if (!exportInfo) {
             VVM_LOG_ERROR("exportForRemote: failed to export handle for allocation");
             return std::nullopt;
         }
-        netDesc.handleType = vvm::ExternalHandleType::OpaqueWin32;
-        
-        HANDLE handle = exportInfo->handle.get();
-        netDesc.externalHandle.resize(sizeof(HANDLE));
-        *reinterpret_cast<HANDLE*>(netDesc.externalHandle.data()) = handle;
-        #endif
+        // NOTE: the raw handle value must NOT be copied into netDesc.externalHandle.
+        // OS handles are process-relative and TCP cannot transfer them. Instead
+        // the handle lives in g_pendingExports (below) keyed by this node + allocId,
+        // so a same-process peer import can consume it directly.
     }
 
     // Register the allocation (or its promoted dedicated copy) so peers can
@@ -552,6 +570,14 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
         allocId = registerAllocation(Allocation(alloc));  // copy for registry
     }
     netDesc.localAllocId = allocId;
+
+    // Keep the exported handle alive so a same-process peer can import it
+    // zero-copy. Ownership moves to the importing peer (or is closed when the
+    // export is deallocated / the manager stops).
+    if (exportInfo) {
+        std::lock_guard<std::mutex> lock(g_pendingExportsMutex);
+        g_pendingExports[pendingKey(localNodeId_, allocId)] = std::move(*exportInfo);
+    }
 
     return netDesc;
 }
@@ -1060,8 +1086,14 @@ std::optional<Allocation> MultiNodePoolManager::findAllocation(uint64_t localAll
 }
 
 bool MultiNodePoolManager::unregisterAllocation(uint64_t localAllocId) {
-    std::lock_guard<std::mutex> lock(allocsMutex_);
-    return remoteAllocs_.erase(localAllocId) > 0;
+    {
+        std::lock_guard<std::mutex> lock(allocsMutex_);
+        if (remoteAllocs_.erase(localAllocId) == 0) return false;
+    }
+    // Close any pending exported handle for this allocation.
+    std::lock_guard<std::mutex> lock(g_pendingExportsMutex);
+    g_pendingExports.erase(pendingKey(localNodeId_, localAllocId));
+    return true;
 }
 
 std::optional<uint64_t> MultiNodePoolManager::findAllocIdByBuffer(VkBuffer buffer) {
@@ -1399,6 +1431,28 @@ void MultiNodePoolManager::onTcpRequest(TcpMessage& request, TcpMessage& respons
 std::optional<Allocation> MultiNodePoolManager::createLocalAllocationForImport(
     const RemoteAllocationDesc& desc,
     VkBufferUsageFlags usage) {
+
+    // Same-process zero-copy path: if THIS process still owns the exported
+    // handle (registry keyed by owner node + allocId), import it directly.
+    // Consuming moves the handle into the driver (or closes it on failure).
+    {
+        std::lock_guard<std::mutex> lock(g_pendingExportsMutex);
+        auto it = g_pendingExports.find(pendingKey(desc.owner, desc.localAllocId));
+        if (it != g_pendingExports.end()) {
+            ExternalMemoryInfo ext = std::move(it->second);
+            g_pendingExports.erase(it);
+            ext.type = static_cast<vvm::ExternalHandleType>(desc.handleType);
+            ext.size = desc.size;
+            auto imported = localPools_[0].importMemory(std::move(ext), usage);
+            if (imported) {
+                VVM_LOG_INFO("importRemote: zero-copy handle import for allocId=%llu succeeded",
+                             desc.localAllocId);
+                return imported;
+            }
+            VVM_LOG_WARN("importRemote: same-process handle import failed; "
+                         "falling back to host-staged copy");
+        }
+    }
 
     auto alloc = localPools_[0].allocate(desc.size, usage, 0);
     if (!alloc) {

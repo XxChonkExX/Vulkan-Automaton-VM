@@ -216,6 +216,51 @@ static void fillPattern(void* buf, size_t size, uint8_t val) {
     std::memset(buf, val, size);
 }
 
+// Device-side copy (src buffer -> dst buffer) using a transient command pool.
+static bool deviceCopy(VkDevice device, VkQueue queue, VkBuffer src, VkBuffer dst, VkDeviceSize size) {
+    VkCommandPool pooled[1];
+    VkCommandPoolCreateInfo cpci{};
+    cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    cpci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    cpci.queueFamilyIndex = s_dev.transferFamily;
+    if (vkCreateCommandPool(device, &cpci, nullptr, &pooled[0]) != VK_SUCCESS) return false;
+
+    VkCommandBuffer cmd;
+    VkCommandBufferAllocateInfo cbai{};
+    cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cbai.commandPool = pooled[0];
+    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 1;
+    if (vkAllocateCommandBuffers(device, &cbai, &cmd) != VK_SUCCESS) {
+        vkDestroyCommandPool(device, pooled[0], nullptr);
+        return false;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VkBufferCopy copy{};
+    copy.size = size;
+    vkBeginCommandBuffer(cmd, &beginInfo);
+    vkCmdCopyBuffer(cmd, src, dst, 1, &copy);
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+        vkFreeCommandBuffers(device, pooled[0], 1, &cmd);
+        vkDestroyCommandPool(device, pooled[0], nullptr);
+        return false;
+    }
+
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    bool ok = vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS;
+    if (ok) ok = vkQueueWaitIdle(queue) == VK_SUCCESS;
+
+    vkFreeCommandBuffers(device, pooled[0], 1, &cmd);
+    vkDestroyCommandPool(device, pooled[0], nullptr);
+    return ok;
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -367,6 +412,59 @@ int main() {
                 }
             }
             mgrB->deallocateRemote(*exportedB2);
+        }
+    }
+
+    // ---- Zero-copy handle import: B exports, A imports on the SAME device ----
+    std::cout << "\n--- Zero-copy handle import (same-host loopback) ---\n";
+
+    auto srcB3 = mgrB->getLocalPool().allocate(
+        kTestSize,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (!srcB3 || !srcB3->hostPtr) {
+        std::cerr << "FAIL: allocate source3 on B\n";
+        ++failures;
+    } else {
+        fillPattern(srcB3->hostPtr, kTestSize, 0xEF);
+        auto exportedB3 = mgrB->exportForRemote(*srcB3, false, false);
+        if (!exportedB3) {
+            std::cerr << "FAIL: exportForRemote (B3)\n";
+            ++failures;
+        } else {
+            // The exported handle was promoted into a dedicated copy on B.
+            // If A's import truly shares that memory, A must observe the
+            // pattern (0xEF) written into the promoted copy at export time.
+            auto importOnA = mgrA->importRemote(
+                *exportedB3,
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            if (!importOnA) {
+                std::cerr << "FAIL: importRemote (zero-copy)\n";
+                ++failures;
+            } else {
+                auto aRead = mgrA->getLocalPool().allocate(
+                    kTestSize,
+                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                if (!aRead || !aRead->hostPtr) {
+                    std::cerr << "FAIL: allocate host-visible read-back on A\n";
+                    ++failures;
+                } else {
+                    bool copied = deviceCopy(s_dev.device, s_dev.transferQueue,
+                                             importOnA->buffer, aRead->buffer, kTestSize);
+                    const bool shared = copied && verifyPattern(aRead->hostPtr, kTestSize, 0xEF);
+                    std::cout << "  Zero-copy import: "
+                              << (shared ? "PASS (A reads B's exported memory)"
+                                         : "FAIL (import did not share memory)")
+                              << "\n";
+                    if (!shared) ++failures;
+                    mgrA->getLocalPool().deallocate(std::move(*aRead));
+                }
+                mgrA->getLocalPool().deallocate(std::move(*importOnA));
+            }
+            mgrB->deallocateRemote(*exportedB3);
         }
     }
 

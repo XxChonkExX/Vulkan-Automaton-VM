@@ -33,6 +33,7 @@ public:
     void deallocate(VkDeviceSize offset, VkDeviceSize size);
     VkDeviceSize getLargestFree() const;
     float getFragmentation() const;
+    size_t getAllocationCount() const { return allocatedNodes_.size(); }
     
 private:
     struct AllocatedNode {

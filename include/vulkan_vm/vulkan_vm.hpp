@@ -40,6 +40,46 @@ struct PoolConfig {
     uint32_t maxBlocks = 16;                               // max blocks per pool
     VkMemoryPropertyFlags preferredFlags = 
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+    // Budget: never pre-allocate past this fraction of the heap (0 = disabled).
+    // Checked against VK_EXT_memory_budget when available, otherwise the
+    // static heap size. When the budget would be exceeded, allocate() fails
+    // soft (falls back to offload/host memory) instead of stealing VRAM.
+    float maxHeapFraction = 0.0f;
+    // Hard cap on total pool memory in bytes (0 = no explicit cap).
+    VkDeviceSize maxPoolBytes = 0;
+
+    // Build a config tuned for a physical device (unified/APU vs discrete).
+    static PoolConfig forDevice(VkPhysicalDevice physicalDevice);
+};
+
+// Memory topology classification (OpenUMA-style device awareness).
+enum class MemoryTopology {
+    Discrete,  // separate VRAM + system memory
+    Unified,   // single heap, DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT
+    Hybrid,    // APU with a small dedicated carve-out
+};
+
+// Classify a physical device's memory layout.
+MemoryTopology detectMemoryTopology(VkPhysicalDevice physicalDevice);
+
+// Allocation intent (VMA_MEMORY_USAGE-style). Hides raw property flags.
+enum class MemoryUsage {
+    GpuOnly,          // DEVICE_LOCAL
+    CpuToGpu,         // staging / upload
+    GpuToCpu,         // readback
+    CpuCopy,          // HOST_VISIBLE staging
+    Auto,             // let the pool choose
+};
+
+// Rich allocation descriptor (gpu-allocator-style).
+struct AllocDesc {
+    VkDeviceSize size = 0;
+    VkBufferUsageFlags usage = 0;
+    MemoryUsage memoryUsage = MemoryUsage::Auto;
+    bool exportable = false;    // forces a dedicated exportable allocation
+    bool mapped = false;        // request host-visible + mapped hostPtr
+    const char* name = nullptr; // debug label (VK_EXT_debug_utils)
 };
 
 struct DeviceConfig {
@@ -216,8 +256,10 @@ struct PoolStats {
     VkDeviceSize totalUsed = 0;
     VkDeviceSize totalFree = 0;
     VkDeviceSize largestFreeBlock = 0;
-    uint32_t allocationCount = 0;
+    VkDeviceSize totalCapacity = 0;      // totalPoolSize budget cap in effect
+    uint32_t allocationCount = 0;        // live sub-allocations in buddy blocks
     uint32_t blockCount = 0;
+    uint32_t dedicatedCount = 0;         // dedicated (exportable/imported) allocations
     float fragmentationRatio = 0.0f;  // free / (free + used) in worst block
 };
 
@@ -255,6 +297,10 @@ public:
     std::optional<Allocation> allocate(VkDeviceSize size,
                                        VkBufferUsageFlags usage,
                                        VkMemoryPropertyFlags flags = 0);
+    
+    // Rich allocation descriptor. exportable=true routes to a dedicated
+    // exportable allocation; memoryUsage maps to memory types internally.
+    std::optional<Allocation> allocate(const AllocDesc& desc);
     
     // Allocate a dedicated VkDeviceMemory for a single exportable buffer.
     // Each exportable allocation gets its own dedicated memory (not sub-allocated).
@@ -330,6 +376,12 @@ private:
     // Buddy allocator helpers
     VkDeviceSize alignUp(VkDeviceSize value, VkDeviceSize alignment);
     
+    // Mapping/wiring helpers
+    VkMemoryPropertyFlags usageToFlags(MemoryUsage usage) const;
+    bool wouldExceedBudget(VkDeviceSize additionalBytes) const;
+    void setDebugName(VkObjectType objectType, uint64_t objectHandle,
+                      const char* name) const;
+    
     // Thread safety: all public methods are guarded by this mutex
     mutable std::mutex mutex_;
     
@@ -341,7 +393,11 @@ private:
     std::vector<Allocation> dedicatedAllocations_;
     uint32_t deviceLocalMemoryType_ = UINT32_MAX;
     uint32_t hostVisibleMemoryType_ = UINT32_MAX;
+    uint32_t deviceLocalHeapIndex_ = UINT32_MAX;
+    bool memoryBudgetAvailable_ = false;
     VkCommandPool transferCmdPool_ = VK_NULL_HANDLE;
+    bool debugUtilsEnabled_ = false;
+    PFN_vkSetDebugUtilsObjectNameEXT fnSetDebugName_ = nullptr;
     
     // Offload manager for host swap
     std::unique_ptr<OffloadManager> offloadManager_;

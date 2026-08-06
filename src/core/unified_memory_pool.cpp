@@ -12,6 +12,66 @@ namespace vvm {
 // UnifiedMemoryPool Implementation
 // ============================================================================
 
+MemoryTopology detectMemoryTopology(VkPhysicalDevice physicalDevice) {
+    VkPhysicalDeviceMemoryProperties props;
+    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &props);
+
+    bool hasUnifiedType = false;   // DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT
+    bool hasDevLocal = false;
+    uint32_t devLocalHeaps = 0;
+    for (uint32_t h = 0; h < props.memoryHeapCount; ++h) {
+        const auto& heap = props.memoryHeaps[h];
+        const bool heapDevLocal = (heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+        if (heapDevLocal) devLocalHeaps++;
+        for (uint32_t t = 0; t < props.memoryTypeCount; ++t) {
+            const auto& mt = props.memoryTypes[t];
+            if (mt.heapIndex != h) continue;
+            if (heapDevLocal) hasDevLocal = true;
+            const VkMemoryPropertyFlags f = mt.propertyFlags;
+            if (heapDevLocal &&
+                (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+                (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+                hasUnifiedType = true;
+            }
+        }
+    }
+
+    if (!hasDevLocal) return MemoryTopology::Discrete;
+    if (devLocalHeaps <= 1 && hasUnifiedType) return MemoryTopology::Unified;
+    if (hasUnifiedType) return MemoryTopology::Hybrid;
+    return MemoryTopology::Discrete;
+}
+
+PoolConfig PoolConfig::forDevice(VkPhysicalDevice physicalDevice) {
+    PoolConfig cfg;
+    switch (detectMemoryTopology(physicalDevice)) {
+        case MemoryTopology::Unified:
+            // APU / Strix Halo style: one shared heap. Bigger blocks, fewer of
+            // them; host shadow is largely unnecessary since VRAM is
+            // host-visible. Still cap the fraction so we don't starve the OS.
+            cfg.blockSize = 1024ull * 1024 * 1024;  // 1 GB
+            cfg.maxBlocks = 8;
+            cfg.enableHostVisible = true;
+            cfg.maxHeapFraction = 0.7f;
+            cfg.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            break;
+        case MemoryTopology::Hybrid:
+            cfg.blockSize = 512ull * 1024 * 1024;
+            cfg.maxBlocks = 12;
+            cfg.maxHeapFraction = 0.75f;
+            break;
+        case MemoryTopology::Discrete:
+        default:
+            cfg.blockSize = 512ull * 1024 * 1024;
+            cfg.maxBlocks = 16;
+            cfg.maxHeapFraction = 0.75f;
+            break;
+    }
+    return cfg;
+}
+
 std::optional<UnifiedMemoryPool> UnifiedMemoryPool::create(
     const DeviceConfig& device, const PoolConfig& config) {
     
@@ -30,12 +90,17 @@ UnifiedMemoryPool::UnifiedMemoryPool(UnifiedMemoryPool&& other) noexcept
     , dedicatedAllocations_(std::move(other.dedicatedAllocations_))
     , deviceLocalMemoryType_(other.deviceLocalMemoryType_)
     , hostVisibleMemoryType_(other.hostVisibleMemoryType_)
+    , deviceLocalHeapIndex_(other.deviceLocalHeapIndex_)
+    , memoryBudgetAvailable_(other.memoryBudgetAvailable_)
     , transferCmdPool_(other.transferCmdPool_)
+    , debugUtilsEnabled_(other.debugUtilsEnabled_)
+    , fnSetDebugName_(other.fnSetDebugName_)
     , offloadManager_(std::move(other.offloadManager_))
     , mutex_() {
     
     other.device_ = VK_NULL_HANDLE;
     other.transferCmdPool_ = VK_NULL_HANDLE;
+    other.fnSetDebugName_ = nullptr;
 }
 
 UnifiedMemoryPool& UnifiedMemoryPool::operator=(UnifiedMemoryPool&& other) noexcept {
@@ -70,12 +135,17 @@ UnifiedMemoryPool& UnifiedMemoryPool::operator=(UnifiedMemoryPool&& other) noexc
         dedicatedAllocations_ = std::move(other.dedicatedAllocations_);
         deviceLocalMemoryType_ = other.deviceLocalMemoryType_;
         hostVisibleMemoryType_ = other.hostVisibleMemoryType_;
+        deviceLocalHeapIndex_ = other.deviceLocalHeapIndex_;
+        memoryBudgetAvailable_ = other.memoryBudgetAvailable_;
         transferCmdPool_ = other.transferCmdPool_;
+        debugUtilsEnabled_ = other.debugUtilsEnabled_;
+        fnSetDebugName_ = other.fnSetDebugName_;
         offloadManager_ = std::move(other.offloadManager_);
         // mutex_ is not moved - keep our own
         
         other.device_ = VK_NULL_HANDLE;
         other.transferCmdPool_ = VK_NULL_HANDLE;
+        other.fnSetDebugName_ = nullptr;
     }
     return *this;
 }
@@ -140,6 +210,30 @@ bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig&
                  devLocalResult.heapBudget / (1024*1024),
                  devLocalResult.heapUtilization * 100.0f);
     
+    // Remember which heap the device-local type lives on (for budget checks).
+    {
+        auto memProps = getDeviceMemoryInfo().memProps;
+        if (deviceLocalMemoryType_ < memProps.memoryTypeCount) {
+            deviceLocalHeapIndex_ = memProps.memoryTypes[deviceLocalMemoryType_].heapIndex;
+        }
+    }
+    
+    // Detect VK_EXT_memory_budget for live budget checks.
+    memoryBudgetAvailable_ = checkDeviceExtensionSupport(
+        deviceConfig_.physicalDevice, {VK_EXT_MEMORY_BUDGET_EXTENSION_NAME});
+    if (memoryBudgetAvailable_) {
+        VVM_LOG_INFO("VK_EXT_memory_budget available; budget-aware pool growth enabled");
+    }
+    
+    // VK_EXT_debug_utils: name buffers/memory for RenderDoc/validation.
+    debugUtilsEnabled_ = checkDeviceExtensionSupport(
+        deviceConfig_.physicalDevice, {VK_EXT_DEBUG_UTILS_EXTENSION_NAME});
+    if (debugUtilsEnabled_) {
+        fnSetDebugName_ = (PFN_vkSetDebugUtilsObjectNameEXT)vkGetDeviceProcAddr(
+            device_, "vkSetDebugUtilsObjectNameEXT");
+        if (!fnSetDebugName_) debugUtilsEnabled_ = false;
+    }
+    
     // Host-visible for shadow/offload
     if (config_.enableHostVisible) {
         auto hostVisibleResult = selector.select(
@@ -170,7 +264,14 @@ bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig&
         return false;
     }
     
-    // Pre-allocate first block (pool blocks are never exportable)
+    // Pre-allocate first block (pool blocks are never exportable). Respect the
+    // budget cap: do not steal memory past maxHeapFraction / maxPoolBytes.
+    if (wouldExceedBudget(config_.blockSize)) {
+        VVM_LOG_ERROR("Initial pool block (%llu MB) exceeds configured budget; "
+                      "lower blockSize or raise maxHeapFraction/maxPoolBytes",
+                      config_.blockSize / (1024 * 1024));
+        return false;
+    }
     if (!allocateBlock(config_.blockSize, deviceLocalMemoryType_).has_value()) {
         VVM_LOG_ERROR("Failed to allocate initial memory block");
         return false;
@@ -203,6 +304,81 @@ std::optional<uint32_t> UnifiedMemoryPool::findMemoryType(
     VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred) {
     
     return findMemoryTypeIndex(getDeviceMemoryInfo().memProps, required, preferred);
+}
+
+VkMemoryPropertyFlags UnifiedMemoryPool::usageToFlags(MemoryUsage usage) const {
+    switch (usage) {
+        case MemoryUsage::GpuOnly:
+            return VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        case MemoryUsage::CpuToGpu:   // staging / upload
+            return VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        case MemoryUsage::GpuToCpu:   // readback
+            return VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        case MemoryUsage::CpuCopy:    // HOST_VISIBLE staging
+            return VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        case MemoryUsage::Auto:
+        default:
+            return 0;  // pool default (device-local)
+    }
+}
+
+bool UnifiedMemoryPool::wouldExceedBudget(VkDeviceSize additionalBytes) const {
+    VkDeviceSize currentPool = 0;
+    for (const auto& block : blocks_) currentPool += block.size;
+    for (const auto& alloc : dedicatedAllocations_) currentPool += alloc.size;
+
+    // Hard byte cap.
+    if (config_.maxPoolBytes > 0 && currentPool + additionalBytes > config_.maxPoolBytes) {
+        VVM_LOG_WARN("budget: pool (%llu MB) + %llu MB would exceed maxPoolBytes (%llu MB)",
+                     currentPool / (1024 * 1024), additionalBytes / (1024 * 1024),
+                     config_.maxPoolBytes / (1024 * 1024));
+        return true;
+    }
+
+    // Heap-fraction cap (VK_EXT_memory_budget when available).
+    if (config_.maxHeapFraction > 0.0f) {
+        VkDeviceSize heapBudget = 0;
+        VkDeviceSize heapUsed = 0;
+        VkPhysicalDeviceMemoryProperties2 props2{};
+        props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+        budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+        if (memoryBudgetAvailable_) {
+            props2.pNext = &budget;
+        }
+        vkGetPhysicalDeviceMemoryProperties2(deviceConfig_.physicalDevice, &props2);
+        const auto& memProps = props2.memoryProperties;
+        if (deviceLocalHeapIndex_ < memProps.memoryHeapCount) {
+            if (memoryBudgetAvailable_ && deviceLocalHeapIndex_ < VK_MAX_MEMORY_HEAPS) {
+                heapBudget = budget.heapBudget[deviceLocalHeapIndex_];
+                heapUsed = budget.heapUsage[deviceLocalHeapIndex_];
+            }
+            if (heapBudget == 0) {
+                heapBudget = memProps.memoryHeaps[deviceLocalHeapIndex_].size;
+            }
+        }
+        const VkDeviceSize cap = static_cast<VkDeviceSize>(heapBudget * config_.maxHeapFraction);
+        if (heapUsed + additionalBytes > cap) {
+            VVM_LOG_WARN("budget: heap usage %llu MB + %llu MB would exceed %llu MB (%.0f%% of %llu MB); "
+                         "allocate() failing soft instead of stealing VRAM",
+                         heapUsed / (1024 * 1024), additionalBytes / (1024 * 1024),
+                         cap / (1024 * 1024), config_.maxHeapFraction * 100.0f,
+                         heapBudget / (1024 * 1024));
+            return true;
+        }
+    }
+    return false;
+}
+
+void UnifiedMemoryPool::setDebugName(VkObjectType objectType, uint64_t objectHandle,
+                                     const char* name) const {
+    if (!debugUtilsEnabled_ || !fnSetDebugName_ || !name || objectHandle == 0) return;
+    VkDebugUtilsObjectNameInfoEXT info{};
+    info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
+    info.objectType = objectType;
+    info.objectHandle = objectHandle;
+    info.pObjectName = name;
+    fnSetDebugName_(device_, &info);
 }
 
 bool UnifiedMemoryPool::validateDeviceCapabilities() const {
@@ -374,6 +550,12 @@ std::optional<Allocation> UnifiedMemoryPool::allocateDedicatedExportable(
     VkMemoryRequirements memReq;
     vkGetBufferMemoryRequirements(device_, buffer, &memReq);
     
+    // Budget check: fail soft instead of stealing VRAM past the configured cap.
+    if (wouldExceedBudget(memReq.size)) {
+        vkDestroyBuffer(device_, buffer, nullptr);
+        return std::nullopt;
+    }
+    
     // Step 3: Allocate dedicated memory for this buffer
     VkMemoryDedicatedAllocateInfo dedicatedInfo{};
     dedicatedInfo.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
@@ -425,56 +607,7 @@ std::optional<Allocation> UnifiedMemoryPool::allocateDedicatedExportable(
         return std::nullopt;
     }
     
-    // Step 5: Export handle
-    int exportFd = -1;
-    HANDLE exportHandle = nullptr;
-    VkExternalMemoryHandleTypeFlagBits exportedHandleType = static_cast<VkExternalMemoryHandleTypeFlagBits>(0);
-    
-    #ifdef VVM_PLATFORM_LINUX
-    VkMemoryGetFdInfoKHR fdInfo{};
-    fdInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
-    fdInfo.memory = memory;
-    fdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-    
-    PFN_vkGetMemoryFdKHR vkGetMemoryFdKHR = 
-        (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(device_, "vkGetMemoryFdKHR");
-    if (vkGetMemoryFdKHR) {
-        VkResult res = vkGetMemoryFdKHR(device_, &fdInfo, &exportFd);
-        if (res != VK_SUCCESS) {
-            // Try DMA_BUF
-            fdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-            res = vkGetMemoryFdKHR(device_, &fdInfo, &exportFd);
-            if (res == VK_SUCCESS) {
-                exportedHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-            }
-        } else {
-            exportedHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-        }
-    }
-    #elif defined(VVM_PLATFORM_WINDOWS)
-    VkMemoryGetWin32HandleInfoKHR handleInfo{};
-    handleInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR;
-    handleInfo.memory = memory;
-    handleInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
-    
-    PFN_vkGetMemoryWin32HandleKHR vkGetMemoryWin32HandleKHR = 
-        (PFN_vkGetMemoryWin32HandleKHR)vkGetDeviceProcAddr(device_, "vkGetMemoryWin32HandleKHR");
-    if (vkGetMemoryWin32HandleKHR) {
-        VkResult res = vkGetMemoryWin32HandleKHR(device_, &handleInfo, &exportHandle);
-        if (res != VK_SUCCESS) {
-            // Try D3D12_HEAP
-            handleInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
-            res = vkGetMemoryWin32HandleKHR(device_, &handleInfo, &exportHandle);
-            if (res == VK_SUCCESS) {
-                exportedHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
-            }
-        } else {
-            exportedHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
-        }
-    }
-    #endif
-    
-    // Step 6: Map if host-visible
+    // Step 5: Map if host-visible
     void* hostPtr = nullptr;
     VkMemoryPropertyFlags memFlags;
     getMemoryTypeProperties(memType, memFlags, getDeviceMemoryInfo().memProps);
@@ -491,7 +624,7 @@ std::optional<Allocation> UnifiedMemoryPool::allocateDedicatedExportable(
         }
     }
     
-    // Step 7: Get device address
+    // Step 6: Get device address
     VkDeviceAddress deviceAddress = 0;
     if (config_.enableDeviceAddress) {
         VkBufferDeviceAddressInfo addrInfo{};
@@ -500,7 +633,7 @@ std::optional<Allocation> UnifiedMemoryPool::allocateDedicatedExportable(
         deviceAddress = vkGetBufferDeviceAddress(device_, &addrInfo);
     }
     
-    // Step 8: Create Allocation (blockIndex = UINT32_MAX indicates dedicated)
+    // Step 7: Create Allocation (blockIndex = UINT32_MAX indicates dedicated)
     Allocation alloc;
     alloc.buffer = buffer;
     alloc.memory = memory;
@@ -541,6 +674,11 @@ std::optional<Allocation> UnifiedMemoryPool::allocate(VkDeviceSize size,
         return std::nullopt;
     }
     
+    // Budget check: fail soft instead of stealing VRAM past the configured cap.
+    if (wouldExceedBudget(config_.blockSize)) {
+        return std::nullopt;
+    }
+    
     uint32_t memType = (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) 
         ? (hostVisibleMemoryType_ != UINT32_MAX ? hostVisibleMemoryType_ : deviceLocalMemoryType_)
         : deviceLocalMemoryType_;
@@ -550,6 +688,23 @@ std::optional<Allocation> UnifiedMemoryPool::allocate(VkDeviceSize size,
     }
     
     return subAllocate(size, config_.minAlignment, blocks_.size() - 1, usage);
+}
+
+std::optional<Allocation> UnifiedMemoryPool::allocate(const AllocDesc& desc) {
+    if (desc.exportable) {
+        auto alloc = allocateDedicatedExportable(desc.size, desc.usage,
+                                                 usageToFlags(desc.memoryUsage));
+        if (alloc && desc.name) {
+            setDebugName(VK_OBJECT_TYPE_BUFFER, (uint64_t)alloc->buffer, desc.name);
+            setDebugName(VK_OBJECT_TYPE_DEVICE_MEMORY, (uint64_t)alloc->memory, desc.name);
+        }
+        return alloc;
+    }
+    auto alloc = allocate(desc.size, desc.usage, usageToFlags(desc.memoryUsage));
+    if (alloc && desc.name) {
+        setDebugName(VK_OBJECT_TYPE_BUFFER, (uint64_t)alloc->buffer, desc.name);
+    }
+    return alloc;
 }
 
 std::optional<Allocation> UnifiedMemoryPool::allocateTensor(VkDeviceSize size,
@@ -855,14 +1010,18 @@ void UnifiedMemoryPool::waitMigration(const MigrationOperation& op) {
 PoolStats UnifiedMemoryPool::getStats() const {
     std::lock_guard<std::mutex> lock(mutex_);
     PoolStats stats;
+    stats.dedicatedCount = static_cast<uint32_t>(dedicatedAllocations_.size());
+    stats.totalCapacity = config_.maxPoolBytes;
     for (const auto& block : blocks_) {
         stats.totalAllocated += block.size;
         stats.totalUsed += block.used;
         stats.totalFree += (block.size - block.used);
         stats.blockCount++;
+        stats.totalCapacity += block.size;
         
         if (block.buddy) {
             stats.largestFreeBlock = std::max(stats.largestFreeBlock, block.buddy->getLargestFree());
+            stats.allocationCount += static_cast<uint32_t>(block.buddy->getAllocationCount());
         }
     }
     
