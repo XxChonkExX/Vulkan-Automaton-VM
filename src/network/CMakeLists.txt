@@ -1,6 +1,4 @@
 # Network module CMakeLists.txt
-cmake_minimum_required(VERSION 3.20)
-
 # The core network module (TCP control plane + host-staged migration) builds
 # without any external dependencies. gRPC and RDMA/verbs are optional extras.
 find_package(Protobuf QUIET)
@@ -62,8 +60,10 @@ target_include_directories(vulkan_vm_network PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     ${Vulkan_INCLUDE_DIRS}
     ${VVM_NETWORK_VERBS_INCS}
-    ${WINDOWS_SDK_INCLUDE_PATH}
-    ${WINDOWS_SDK_INCLUDE_PATH_SHARED}
+    ${WINDOWS_SDK_UM}
+    ${WINDOWS_SDK_SHARED}
+    ${WINDOWS_SDK_UCRT}
+    ${MSVC_INCLUDE_PATH}
 )
 
 target_link_libraries(vulkan_vm_network PUBLIC vulkan_vm)
@@ -104,13 +104,4 @@ install(FILES
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/vulkan_vm/network
 )
 
-# Tests
-if(VVM_BUILD_TESTS)
-    enable_testing()
-    # Tests are in the top-level tests/ directory, not here
-endif()
 
-# Examples
-if(VVM_BUILD_EXAMPLES)
-    # Examples are in the top-level examples/ directory, not here
-endif()

@@ -20,7 +20,7 @@ endif()
 # Build configuration
 option(VVM_BUILD_SHARED "Build as shared library" ON)
 option(VVM_BUILD_TESTS "Build tests" ON)
-option(VVM_BUILD_EXAMPLES "Build examples" OFF)
+option(VVM_BUILD_EXAMPLES "Build examples (includes integration tests)" ON)
 option(VVM_ENABLE_VALIDATION "Enable Vulkan validation layers" ON)
 option(VVM_USE_VOLK "Use Volk for Vulkan loading" ON)
 option(VVM_BUILD_NETWORK "Build network/multi-node module" ON)
@@ -40,20 +40,82 @@ endif()
 # Threads for sync primitives
 find_package(Threads REQUIRED)
 
-# Windows SDK include path for windows.h
+# Windows SDK and MSVC include paths
 if(WIN32)
-    # Try to find Windows 10 SDK
+    # Find Windows SDK paths
     set(WIN10_SDK_VERSIONS "10.0.26100.0" "10.0.22621.0" "10.0.19041.0" "10.0.18362.0" "10.0.17763.0")
     foreach(ver ${WIN10_SDK_VERSIONS})
         if(EXISTS "C:/Program Files (x86)/Windows Kits/10/Include/${ver}/um/windows.h")
-            set(WINDOWS_SDK_INCLUDE_PATH "C:/Program Files (x86)/Windows Kits/10/Include/${ver}/um")
-            set(WINDOWS_SDK_INCLUDE_PATH_SHARED "C:/Program Files (x86)/Windows Kits/10/Include/${ver}/shared")
+            set(WINDOWS_SDK_UM     "C:/Program Files (x86)/Windows Kits/10/Include/${ver}/um")
+            set(WINDOWS_SDK_SHARED "C:/Program Files (x86)/Windows Kits/10/Include/${ver}/shared")
+            set(WINDOWS_SDK_UCRT   "C:/Program Files (x86)/Windows Kits/10/Include/${ver}/ucrt")
             message(STATUS "Found Windows SDK ${ver}")
             break()
         endif()
     endforeach()
-    if(NOT WINDOWS_SDK_INCLUDE_PATH)
-        message(WARNING "Windows SDK not found in standard locations")
+    if(NOT WINDOWS_SDK_UM)
+        if(DEFINED ENV{WindowsSdkDir})
+            set(WINDOWS_SDK_UM     "$ENV{WindowsSdkDir}um")
+            set(WINDOWS_SDK_SHARED "$ENV{WindowsSdkDir}shared")
+            set(WINDOWS_SDK_UCRT   "$ENV{WindowsSdkDir}ucrt")
+            message(STATUS "Using Windows SDK from WindowsSdkDir environment variable")
+        else()
+            message(WARNING "Windows SDK not found - build may fail without proper include paths")
+        endif()
+    endif()
+
+    # Find Windows SDK library path (for ws2_32.lib, kernel32.lib, etc.)
+    foreach(ver ${WIN10_SDK_VERSIONS})
+        if(EXISTS "C:/Program Files (x86)/Windows Kits/10/Lib/${ver}/um/x64/ws2_32.lib")
+            set(WINDOWS_SDK_LIB_PATH "C:/Program Files (x86)/Windows Kits/10/Lib/${ver}/um/x64")
+            set(WINDOWS_SDK_UCRT_LIB_PATH "C:/Program Files (x86)/Windows Kits/10/Lib/${ver}/ucrt/x64")
+            message(STATUS "Found Windows SDK libraries: ${WINDOWS_SDK_LIB_PATH}")
+            break()
+        elseif(EXISTS "C:/Program Files (x86)/Windows Kits/10/Lib/${ver}/um/x86/ws2_32.lib")
+            set(WINDOWS_SDK_LIB_PATH "C:/Program Files (x86)/Windows Kits/10/Lib/${ver}/um/x86")
+            set(WINDOWS_SDK_UCRT_LIB_PATH "C:/Program Files (x86)/Windows Kits/10/Lib/${ver}/ucrt/x86")
+            message(STATUS "Found Windows SDK libraries: ${WINDOWS_SDK_LIB_PATH}")
+            break()
+        endif()
+    endforeach()
+
+    # Find MSVC library path (needed for vcruntime.lib, msvcprt.lib, etc.)
+    # Try to auto-detect from the compiler path
+    if(CMAKE_CXX_COMPILER)
+        get_filename_component(MSVC_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+        get_filename_component(MSVC_TOOLSET_DIR "${MSVC_BIN_DIR}/../../.." ABSOLUTE)
+        if(EXISTS "${MSVC_TOOLSET_DIR}/include/vcruntime.h")
+            set(MSVC_INCLUDE_PATH "${MSVC_TOOLSET_DIR}/include")
+            # Determine architecture subdirectory
+            if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+                set(MSVC_LIB_ARCH "x64")
+            else()
+                set(MSVC_LIB_ARCH "x86")
+            endif()
+            if(EXISTS "${MSVC_TOOLSET_DIR}/lib/${MSVC_LIB_ARCH}")
+                set(MSVC_LIBRARY_PATH "${MSVC_TOOLSET_DIR}/lib/${MSVC_LIB_ARCH}")
+                message(STATUS "Found MSVC: ${MSVC_TOOLSET_DIR}")
+            endif()
+        endif()
+    endif()
+    if(NOT MSVC_INCLUDE_PATH)
+        # Search common MSVC install locations
+        file(GLOB MSVC_VERSIONS
+            "C:/Program Files/Microsoft Visual Studio/2022/*/VC/Tools/MSVC/*"
+            "C:/Program Files (x86)/Microsoft Visual Studio/2022/*/VC/Tools/MSVC/*"
+            "C:/Program Files/Microsoft Visual Studio/2019/*/VC/Tools/MSVC/*"
+            "C:/Program Files (x86)/Microsoft Visual Studio/2019/*/VC/Tools/MSVC/*"
+        )
+        foreach(dir ${MSVC_VERSIONS})
+            if(EXISTS "${dir}/include/vcruntime.h")
+                set(MSVC_INCLUDE_PATH "${dir}/include")
+                message(STATUS "Found MSVC includes: ${dir}/include")
+                break()
+            endif()
+        endforeach()
+    endif()
+    if(NOT MSVC_INCLUDE_PATH)
+        message(WARNING "MSVC include path not found - build may fail without vcruntime.h")
     endif()
 endif()
 
@@ -87,15 +149,30 @@ add_library(vulkan_vm
     src/utils/error_handling.cpp
 )
 
-target_include_directories(vulkan_vm PRIVATE 
+target_include_directories(vulkan_vm PRIVATE
     ${Vulkan_INCLUDE_DIRS}
-    ${WINDOWS_SDK_INCLUDE_PATH}
-    ${WINDOWS_SDK_INCLUDE_PATH_SHARED}
+    ${WINDOWS_SDK_UM}
+    ${WINDOWS_SDK_SHARED}
+    ${WINDOWS_SDK_UCRT}
+    ${MSVC_INCLUDE_PATH}
 )
 target_link_libraries(vulkan_vm PRIVATE
     ${Vulkan_LIBRARIES}
     Threads::Threads
 )
+
+# Add Windows SDK + MSVC library paths to linker search
+if(WIN32)
+    if(WINDOWS_SDK_LIB_PATH)
+        target_link_directories(vulkan_vm PUBLIC ${WINDOWS_SDK_LIB_PATH})
+    endif()
+    if(WINDOWS_SDK_UCRT_LIB_PATH)
+        target_link_directories(vulkan_vm PUBLIC ${WINDOWS_SDK_UCRT_LIB_PATH})
+    endif()
+    if(MSVC_LIBRARY_PATH)
+        target_link_directories(vulkan_vm PUBLIC ${MSVC_LIBRARY_PATH})
+    endif()
+endif()
 
 if(VVM_USE_VOLK)
     target_link_libraries(vulkan_vm PRIVATE Volk::Volk)
@@ -104,8 +181,6 @@ endif()
 
 target_compile_definitions(vulkan_vm PRIVATE
     VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1
-    VMA_STATIC_VULKAN_FUNCTIONS=0
-    VMA_DYNAMIC_VULKAN_FUNCTIONS=1
 )
 
 if(VVM_BUILD_SHARED)

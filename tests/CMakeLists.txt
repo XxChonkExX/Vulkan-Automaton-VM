@@ -5,14 +5,24 @@ project(VulkanVMTests LANGUAGES CXX)
 # Link directly to the parent target (no install required for in-tree tests)
 # find_package(VulkanVM REQUIRED)  # only for external consumers after install
 
+# Windows SDK + MSVC include paths (needed for windows.h, stddef.h, vcruntime.h, etc.)
+set(TEST_EXTRA_INCLUDES ${Vulkan_INCLUDE_DIRS})
+if(WIN32)
+    list(APPEND TEST_EXTRA_INCLUDES
+        ${WINDOWS_SDK_UM}
+        ${WINDOWS_SDK_SHARED}
+        ${WINDOWS_SDK_UCRT}
+        ${MSVC_INCLUDE_PATH}
+    )
+endif()
+
 # Basic test
 add_executable(basic_test basic_test.cpp)
 target_link_libraries(basic_test PRIVATE vulkan_vm)
 target_include_directories(basic_test PRIVATE
     ${CMAKE_SOURCE_DIR}/include
-    ${Vulkan_INCLUDE_DIRS}
+    ${TEST_EXTRA_INCLUDES}
 )
-
 add_test(NAME basic_test COMMAND basic_test)
 
 # Minimal test for debugging
@@ -20,9 +30,8 @@ add_executable(minimal_test minimal_test.cpp)
 target_link_libraries(minimal_test PRIVATE vulkan_vm)
 target_include_directories(minimal_test PRIVATE
     ${CMAKE_SOURCE_DIR}/include
-    ${Vulkan_INCLUDE_DIRS}
+    ${TEST_EXTRA_INCLUDES}
 )
-
 add_test(NAME minimal_test COMMAND minimal_test)
 
 # CPU-only buddy allocator tests (no Vulkan device required)
@@ -30,9 +39,8 @@ add_executable(buddy_test buddy_test.cpp)
 target_link_libraries(buddy_test PRIVATE vulkan_vm)
 target_include_directories(buddy_test PRIVATE
     ${CMAKE_SOURCE_DIR}/include
-    ${Vulkan_INCLUDE_DIRS}
+    ${TEST_EXTRA_INCLUDES}
 )
-
 add_test(NAME buddy_test COMMAND buddy_test)
 
 # CPU-only external-handle ownership tests (dup/multi-import, consume semantics)
@@ -40,9 +48,8 @@ add_executable(external_handle_test external_handle_test.cpp)
 target_link_libraries(external_handle_test PRIVATE vulkan_vm)
 target_include_directories(external_handle_test PRIVATE
     ${CMAKE_SOURCE_DIR}/include
-    ${Vulkan_INCLUDE_DIRS}
+    ${TEST_EXTRA_INCLUDES}
 )
-
 add_test(NAME external_handle_test COMMAND external_handle_test)
 
 # Multi-GPU test (if multiple GPUs available)
