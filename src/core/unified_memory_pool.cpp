@@ -898,7 +898,27 @@ DeviceMemoryInfo UnifiedMemoryPool::getDeviceMemoryInfo() const {
 
 void UnifiedMemoryPool::defragment() {
     std::lock_guard<std::mutex> lock(mutex_);
-    // TODO: Implement block compaction
+    // The buddy allocator already coalesces adjacent free ranges on every
+    // deallocate, and the pool has no registry of user-owned VkBuffer handles
+    // for sub-allocated memory, so in-place data migration is not possible
+    // here (moving a live sub-allocation would require rebinding user buffers).
+    // What we CAN do safely: release any fully-idle blocks back to the driver.
+    for (int i = static_cast<int>(blocks_.size()) - 1; i >= 0; --i) {
+        if (blocks_.size() <= 1) break;
+        auto& block = blocks_[static_cast<size_t>(i)];
+        if (block.used != 0) continue;
+        if (block.memory) {
+            if (block.hostPtr) {
+                vkUnmapMemory(device_, block.memory);
+            }
+            vkFreeMemory(device_, block.memory, nullptr);
+        }
+        blocks_.erase(blocks_.begin() + i);
+    }
+    VVM_LOG_INFO("defragment: released idle blocks; %zu block(s) remain "
+                 "(sub-allocation compaction requires user-side rebinding "
+                 "and is intentionally not performed)",
+                 blocks_.size());
 }
 
 void UnifiedMemoryPool::trim() {

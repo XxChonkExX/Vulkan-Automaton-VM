@@ -296,7 +296,10 @@ public:
     VkPhysicalDevice getPhysicalDevice() const { return deviceConfig_.physicalDevice; }
 
     // Maintenance
-    void defragment();  // coalesce free ranges, migrate if needed
+    // NOTE: buddy coalescing already merges adjacent free ranges on
+    // deallocate; defragment() releases idle blocks (in-place compaction of
+    // live sub-allocations is not possible without user-buffer rebinding).
+    void defragment();  // release idle blocks; compaction not supported
     void trim();        // release empty blocks back to OS (optional)
 
 private:
