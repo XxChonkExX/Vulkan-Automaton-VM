@@ -151,8 +151,92 @@ auto modelSpace = pool->allocate({ .size = modelSize, .memoryUsage = MemoryUsage
 ```
 
 ---
+ 
+## The Tensor Express (Unified Tensor Transport)
+ 
+Now imagine you don't just want to move **one toy** — you want to move **entire organized collections** of toys with specific shapes, colors, and arrangements. That's what the **Tensor Transport** does for AI tensors.
+ 
+### What Makes Tensors Special?
+ 
+Regular memory copies don't care about **shape** (is it a 2D image? 3D volume? batch of 64 images?) or **layout** (is it NCHW or NHWC? tiled for tensor cores?).
+ 
+The Tensor Transport knows:
+- **Shape**: [Batch, Channels, Height, Width] or [Batch, Height, Width, Channels]
+- **Data Type**: FP32, FP16, BF16, INT8, INT4, FP8
+- **Layout**: NCHW (PyTorch default), NHWC (TensorFlow/TensorRT), Blocked (tiled for tensor cores)
+- **Strides**: How to jump between elements in memory
+ 
+### The Magic: "Just Move It"
+ 
+```cpp
+// "Move this 64MB FP16 tensor from GPU 0 to GPU 1, convert NHWC→NCHW on the way"
+transport->copyWithLayoutConversion(srcTensor, dstTensor, MemoryLayout::Blocked);
+ 
+// "Add up these gradients across 4 GPUs and give everyone the result"
+transport->allReduce({gpu0_grad, gpu1_grad, gpu2_grad, gpu3_grad}, ReduceOp::Sum);
+ 
+// "Send this 200MB model to the other computer, convert FP16→FP8 on the wire"
+transport->sendTensor(hugeModel, "other-computer", [](bool ok) { /* done */ });
+```
+ 
+### The Transport Chooses the Best Road
+ 
+| Road | When It's Used | Speed | CPU Involved? |
+|------|---------------|-------|---------------|
+| **P2P Express** | Same computer, different GPUs | 🚀 Fastest | No |
+| **RDMA Super-Highway** | Different computers, RDMA NICs | 🚀🚀 Fastest | No |
+| **Host-Staged Truck** | When roads are blocked | 🐢 Slow | Yes |
+| **Network Ferry** | Different buildings | 🐢🐢 Slow | Yes |
+ 
+The transport **automatically picks the fastest available road**. You just say "move this tensor" and it figures out the rest.
+ 
+### The Three Musketeers of Collective Ops
+ 
+| Operation | What It Does | Use Case |
+|-----------|-------------|----------|
+| **All-Reduce** | Sum/Avg/Min/Max across all GPUs, everyone gets result | Gradient sync in distributed training |
+| **Broadcast** | One GPU shouts, everyone listens | Broadcast model weights |
+| **All-Gather** | Everyone contributes a piece, everyone gets the whole puzzle | Gather distributed embeddings |
+| **Reduce-Scatter** | Reduce + split pieces | Sharded optimizer states |
+ 
+### Under the Hood (Simplified)
+ 
+```cpp
+// You just say:
+transport->allReduce({gpu0_grad, gpu1_grad, gpu2_grad}, ReduceOp::Sum);
+ 
+// Transport does ring all-reduce:
+// Step 1: Each GPU sends 1/3 of its data to next GPU
+// Step 2: Each GPU adds received chunk to its own
+// Step 3: Repeat until everyone has sum of all 3
+// Step 4: Each GPU broadcasts its 1/3 to others
+// Result: All 3 GPUs have the FULL sum
+```
+ 
+### Cross-Computer: The Network Ferry
+ 
+When GPUs are on different computers, the transport uses the **Network Ferry** (TCP or RDMA):
+ 
+```
+GPU A ──[P2P/RDMA]──→ NIC A ──[4MB chunks over TCP/RDMA]──→ NIC B ──[P2P/RDMA]──→ GPU B
+```
+ 
+**Key insight**: The transport picks the fastest available path automatically. If both computers have RDMA NICs, it uses the Super-Highway. If not, it falls back to the Network Ferry (TCP with 4MB chunks).
+ 
+### What's Still Being Built
+ 
+| Feature | Status | What's Missing |
+|---------|--------|----------------|
+| P2P (same computer) | ✅ Done | — |
+| Host-staged fallback | ✅ Done | — |
+| Ring all-reduce | ✅ Done | — |
+| GPU-Direct RDMA (Linux) | 🔧 In progress | Wire up `ibv_reg_dmabuf_mr` |
+| GPU-Direct RDMA (Windows) | 🔧 Planned | NDKPI implementation |
+| Network send/recv | 🔧 Planned | Wire up TCP/RDMA send |
+ 
+---
 
-## The Network Magic (Multi-Node)
+## The Super-Highway (GPU-Direct RDMA)
 
 Imagine **two computers** each with their own toy boxes. They want to share toys over a network cable.
 

@@ -330,7 +330,173 @@ build_ninja\examples\network_test.exe
 ```
 
 ---
-
+ 
+## Unified Tensor Transport (`vvm::tensor::Transport`)
+ 
+The tensor transport layer provides a **unified abstraction** for tensor movement across devices, machines, and networks. It wraps the underlying memory pools, P2P copies, RDMA, and network transports into a single tensor-aware API.
+ 
+### Key Features
+ 
+| Feature | Description |
+|---------|-------------|
+| **Tensor Metadata** | Shape, dtype (FP32/FP16/BF16/INT8/INT4/FP8), strides, layout (NHWC/NCHW/Blocked) |
+| **Auto Transport Selection** | P2P → RDMA → Host-Staged → Network |
+| **Layout Conversion** | NHWC↔NCHW, blocked/tiling for tensor cores |
+| **Collectives** | Ring all-reduce, broadcast, all-gather, reduce-scatter |
+| **Async Pipeline** | Callback-based, semaphore/fence chaining, overlap compute + transfer |
+ 
+### Quick Start
+ 
+```cpp
+#include <vulkan_vm/tensor_transport.hpp>
+using namespace vvm::tensor;
+ 
+// Configure transport
+TransportConfig config;
+config.preference = TransportConfig::Preference::Auto;  // P2P → RDMA → HostStaged → Network
+config.enableAsyncPipeline = true;
+config.maxInFlightTransfers = 4;
+ 
+// Create transport with your devices
+std::vector<vvm::DeviceConfig> devices = { amdConfig, intelConfig, nvidiaConfig };
+vvm::PoolConfig poolConfig = vvm::PoolConfig::forDevice(devices[0].physicalDevice);
+ 
+auto transport = vvm::tensor::createTensorTransport(config, devices, poolConfig);
+if (!transport->initialize()) { /* handle error */ }
+ 
+// Allocate a tensor on GPU 0
+TensorMetadata meta;
+meta.dtype = DataType::Float16;
+meta.layout = MemoryLayout::ChannelsLast;  // NHWC for tensor cores
+meta.shape = TensorShape::makeChannelsLast({1, 32, 32, 128});  // [N, H, W, C]
+meta.name = "conv_weight";
+ 
+auto tensor = transport->allocateTensor(meta, 0);  // On GPU 0
+ 
+// Distribute across GPUs (master allocates, peers import)
+auto tensors = transport->allocateDistributed(meta, {0, 1, 2});
+ 
+// Copy with automatic layout conversion
+transport->copyWithLayoutConversion(src, dst, MemoryLayout::Blocked);
+ 
+// Ring all-reduce across GPUs
+transport->allReduce({tensor0, tensor1, tensor2}, ReduceOp::Sum, {0, 1, 2});
+ 
+// Async copy with callback
+transport->copyTensorAsync(src, dst, [](bool ok, const std::string& err) {
+    if (ok) std::cout << "Copy done!" << std::endl;
+});
+ 
+// Cleanup
+transport->shutdown();
+```
+ 
+### Tensor Metadata
+ 
+```cpp
+struct TensorMetadata {
+    DataType dtype = DataType::Float32;      // FP32, FP16, BF16, INT8, INT4, FP8_E4M3, FP8_E5M2
+    MemoryLayout layout = MemoryLayout::Contiguous;  // Contiguous, ChannelsLast, Blocked, Strided
+    TensorShape shape;                       // dims + optional strides
+    std::string name;                        // Debug name
+};
+ 
+// Shape with optional custom strides
+TensorShape shape;
+shape.dims = {1, 32, 32, 128};  // [N, H, W, C]
+shape.strides = {32*32*128, 32*128, 128, 1};  // NHWC
+ 
+// Layout presets
+TensorShape::makeContiguous({1, 128, 32, 32});    // NCHW
+TensorShape::makeChannelsLast({1, 32, 32, 128});  // NHWC
+TensorShape::makeBlocked({1, 128, 32, 32}, 32);   // 32x32 tiles
+```
+ 
+### Transport Configuration
+ 
+```cpp
+TransportConfig config;
+config.preference = TransportConfig::Preference::Auto;  // P2P → RDMA → HostStaged → Network
+config.enableAsyncPipeline = true;
+config.maxInFlightTransfers = 4;
+config.hostStagedChunkSize = 4_MiB;
+ 
+// RDMA (GPU-Direct)
+config.preference = TransportConfig::Preference::RDMAOnly;
+config.rdmaNicName = "mlx5_0";
+config.enableGPUDirect = true;
+ 
+// Network (multi-node)
+config.preference = TransportConfig::Preference::NetworkOnly;
+config.networkPort = 51000;
+config.enableTLS = true;
+config.tlsCertPath = "cert.pem";
+config.tlsKeyPath = "key.pem";
+config.tlsCaPath = "ca.pem";
+```
+ 
+### Transport Paths (Auto-Selected)
+ 
+| Priority | Path | Mechanism | Staging? |
+|----------|------|-----------|----------|
+| 1 | **P2P** | `VK_EXTERNAL_MEMORY` + `vkCmdCopyBuffer` | ❌ No |
+| 2 | **RDMA** | GPU-Direct: `ibv_reg_dmabuf_mr` / NDKPI | ❌ No |
+| 3 | **Host-Staged** | 4 MiB chunks via host memory | ✅ Yes |
+| 4 | **Network** | TCP/RDMA multi-node | ✅ Yes |
+ 
+### Collective Operations
+ 
+```cpp
+// Ring all-reduce (Sum, Mean, Min, Max, Product, Band, Bor, Bxor)
+transport->allReduce({t0, t1, t2}, ReduceOp::Sum, {0, 1, 2});
+ 
+// Broadcast from root
+transport->broadcast(rootTensor, {0, 1, 2}, 0);
+ 
+// All-gather (concatenate)
+transport->allGather({t0, t1, t2}, output, {0, 1, 2});
+ 
+// Reduce-scatter
+transport->reduceScatter({t0, t1, t2}, output, ReduceOp::Sum, {0, 1, 2});
+```
+ 
+### Multi-Node Network
+ 
+```cpp
+// Node A (bootstrap)
+TransportConfig netA; netA.listenAddress = "0.0.0.0:51001";
+auto nodeA = createTensorTransport(config, devices, poolConfig);
+nodeA->initialize();
+nodeA->joinCluster("0.0.0.0:51001");
+ 
+// Node B (joins)
+TransportConfig netB; netB.listenAddress = "0.0.0.0:51002";
+netB.seedNodes = {"127.0.0.1:51001"};
+auto nodeB = createTensorTransport(config, devices, poolConfig);
+nodeB->initialize();
+nodeB->joinCluster("127.0.0.1:51001");
+ 
+// Send tensor to remote node
+nodeB->sendTensor(tensor, "nodeA", [](bool ok, const std::string& err) { /* ... */ });
+ 
+// Receive tensor from remote
+nodeA->recvTensor(tensor, "nodeB", [](bool ok, const std::string& err) { /* ... */ });
+```
+ 
+### Current Status
+ 
+| Feature | Status |
+|---------|--------|
+| P2P (local multi-GPU) | ✅ Working |
+| Host-staged fallback | ✅ Working |
+| Ring all-reduce | ✅ Implemented |
+| Async pipeline | ✅ Framework ready |
+| GPU-Direct RDMA (Linux) | 🔧 Interface ready, needs `ibv_reg_dmabuf_mr` wiring |
+| GPU-Direct RDMA (Windows) | 🔧 Needs NDKPI implementation |
+| Network tensor send/recv | 🔧 Placeholder, needs wiring |
+ 
+---
+ 
 ## GPU-Direct RDMA (Vendor Paths)
 
 For NIC-attached GPU memory DMA (bypassing host CPU), VulkanVM provides three vendor-specific registration paths. The `RdmaTransport` (verbs backend) dispatches based on `vendorID`.
