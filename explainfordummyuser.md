@@ -223,6 +223,17 @@ GPU A ──[P2P/RDMA]──→ NIC A ──[4MB chunks over TCP/RDMA]──→ 
  
 **Key insight**: The transport picks the fastest available path automatically. If both computers have RDMA NICs, it uses the Super-Highway. If not, it falls back to the Network Ferry (TCP with 4MB chunks).
  
+**How send/recv actually works today**: `sendTensor` exports your GPU memory and shouts the tensor's name to the other computer (`MsgTensorAnnounce`). `recvTensor` listens for that name, then **pulls** the VRAM over TCP in 4MB chunks straight into the destination GPU. Both tensors must have the same name — it's the "passport" that matches the sender and receiver.
+ 
+```
+// Computer B (the sender)
+transport->sendTensor(sharedTensor, "192.168.1.10:51001#0", done);
+
+// Computer A (the receiver) — make a tensor with the SAME name, then receive:
+auto receiver = nodeA->allocateTensor(meta, 0);   // meta.name == sharedTensor name
+transport->recvTensor(*receiver, "192.168.1.11:51002#0", done);
+```
+ 
 ### What's Still Being Built
  
 | Feature | Status | What's Missing |
@@ -230,9 +241,9 @@ GPU A ──[P2P/RDMA]──→ NIC A ──[4MB chunks over TCP/RDMA]──→ 
 | P2P (same computer) | ✅ Done | — |
 | Host-staged fallback | ✅ Done | — |
 | Ring all-reduce | ✅ Done | — |
+| Network send/recv (GPU⇄GPU over TCP) | ✅ Done | Verified by `tensor_network_test` |
 | GPU-Direct RDMA (Linux) | 🔧 In progress | Wire up `ibv_reg_dmabuf_mr` |
 | GPU-Direct RDMA (Windows) | 🔧 Planned | NDKPI implementation |
-| Network send/recv | 🔧 Planned | Wire up TCP/RDMA send |
  
 ---
 

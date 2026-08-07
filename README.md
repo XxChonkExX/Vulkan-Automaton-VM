@@ -324,9 +324,11 @@ nodeA->migrateFromRemote(*remoteDesc, *localDst, /*useRdma=*/false);
 ```bash
 # Windows
 build_ninja\examples\network_test.exe
+build_ninja\examples\tensor_network_test.exe   # GPU-to-GPU VRAM over TCP
 
 # Linux
 ./build/examples/network_test
+./build/examples/tensor_network_test
 ```
 
 ---
@@ -464,25 +466,36 @@ transport->reduceScatter({t0, t1, t2}, output, ReduceOp::Sum, {0, 1, 2});
  
 ```cpp
 // Node A (bootstrap)
-TransportConfig netA; netA.listenAddress = "0.0.0.0:51001";
+TransportConfig netA; netA.listenAddress = "0.0.0.0"; netA.networkPort = 51001;
 auto nodeA = createTensorTransport(config, devices, poolConfig);
 nodeA->initialize();
 nodeA->joinCluster("0.0.0.0:51001");
  
 // Node B (joins)
-TransportConfig netB; netB.listenAddress = "0.0.0.0:51002";
+TransportConfig netB; netB.listenAddress = "0.0.0.0"; netB.networkPort = 51002;
 netB.seedNodes = {"127.0.0.1:51001"};
 auto nodeB = createTensorTransport(config, devices, poolConfig);
 nodeB->initialize();
 nodeB->joinCluster("127.0.0.1:51001");
  
-// Send tensor to remote node
-nodeB->sendTensor(tensor, "nodeA", [](bool ok, const std::string& err) { /* ... */ });
+// Remote node IDs use "host:port#nodeIndex" format
+std::string nodeAId = "192.168.1.10:51001#0";
+std::string nodeBId = "192.168.1.11:51002#0";
  
-// Receive tensor from remote
-nodeA->recvTensor(tensor, "nodeB", [](bool ok, const std::string& err) { /* ... */ });
+// Send tensor: B exports its VRAM and advertises it to A over TCP
+nodeB->sendTensor(tensor, nodeAId, [](bool ok, const std::string& err) { /* ... */ });
+ 
+// Receive tensor: A waits for the announcement, then pulls B's VRAM over TCP
+nodeA->recvTensor(receiver, nodeBId, [](bool ok, const std::string& err) { /* ... */ });
+// Before recvTensor, `received` must be allocated with the SAME name as `tensor`
 ```
  
+Cross-machine copies are pulled end-to-end: `sendTensor` exports the local
+`VkDeviceMemory` and advertises the descriptor under the tensor's name
+(`MsgTensorAnnounce`); `recvTensor` waits for the peer and streams the VRAM
+over TCP in 4 MiB host-staged chunks (`migrateFromRemote`), falling back to
+GPU-direct RDMA automatically when verbs + GPUDirect are available.
+
 ### Current Status
  
 | Feature | Status |
@@ -493,7 +506,7 @@ nodeA->recvTensor(tensor, "nodeB", [](bool ok, const std::string& err) { /* ... 
 | Async pipeline | ✅ Framework ready |
 | GPU-Direct RDMA (Linux) | 🔧 Interface ready, needs `ibv_reg_dmabuf_mr` wiring |
 | GPU-Direct RDMA (Windows) | 🔧 Needs NDKPI implementation |
-| Network tensor send/recv | 🔧 Placeholder, needs wiring |
+| Network tensor send/recv (TCP GPU⇄GPU) | ✅ Working (`tensor_network_test`) |
  
 ---
  
