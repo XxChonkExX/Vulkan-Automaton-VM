@@ -229,6 +229,13 @@ if(VVM_BUILD_NETWORK)
     target_link_libraries(vulkan_vm PUBLIC vulkan_vm_network)
 endif()
 
+# Tensor Transport module
+option(VVM_BUILD_TENSOR_TRANSPORT "Build tensor transport module" ON)
+if(VVM_BUILD_TENSOR_TRANSPORT AND VVM_BUILD_NETWORK)
+    add_subdirectory(src/tensor)
+    target_link_libraries(vulkan_vm PUBLIC vulkan_vm_tensor)
+endif()
+
 # Install
 install(TARGETS vulkan_vm
     EXPORT VulkanVMTargets
