@@ -1,6 +1,6 @@
 # VulkanVM — Unified Vulkan Memory Pool & Cross-GPU Model Distribution
 
-**VulkanVM** is a cross-vendor, high-performance Vulkan memory management library that solves GPU memory fragmentation, enables zero-copy memory sharing across AMD, NVIDIA, and Intel GPUs, and provides a Hugging Face–style model registry for distributing model weights over TCP. Download once, load into the pool, run local multi-GPU inference.
+**VulkanVM** is a cross-vendor, high-performance Vulkan memory management library that solves GPU memory fragmentation, enables zero-copy memory sharing across AMD, NVIDIA, and Intel GPUs, and provides a Hugging Face–style model registry for distributing model weights over TCP. Download once, load into the pool, run local multi-GPU inference. This is intended to be a toolbox for the community. Please feel free to contribute, branch, borrow and bug report. Especially bug report!
 
 ---
 
@@ -1119,11 +1119,11 @@ MemoryTopology topo = detectMemoryTopology(physicalDevice);
   - ONNX Runtime integration: `vulkanvm_onnx` with `VulkanVMExecutionProvider`, NumPy interop, ModelHub for ONNX models
   - Documentation: comprehensive README, explainfordummyuser.md, API references
   - Build system: CMake with proper ABI definition propagation, Windows SDK/MSVC path detection, cross-platform support
-- **Deepseek** — co-author of multi-node network module (Spark-style TCP transport, TLS, host-staged push/pull migration, cluster registration, two-node loopback test)
-- **GLM** — review and refinements
-- **Grok** — code audit of memory pool, buddy allocator, external memory, network layers (P0 findings)
-- **NVIDIA** — network module framework foundation; supporting Open Source
-- **ChonkE** — project owner
+- **Deepseek** — co-author/secondary coder multi-node network module (Spark-like TCP transport, TLS, host-staged migration, cluster registration, two-node loopback test)
+- **GLM** — review and refinements, tertiary coder and contributor
+- **Grok** — code audit of memory pool, buddy allocator, external memory, network layers (P0 findings), Chief Architect of Shard System, Chief Code Inspector
+- **NVIDIA** — network module framework foundation; supporting Open Source despite being a Mega-Corp! Thank you.
+- **ChonkE** — project owner, 1% contributor
 
 ### Contributing
 1. Fork the repository
