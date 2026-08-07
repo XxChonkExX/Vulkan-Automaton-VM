@@ -170,6 +170,8 @@ add_library(vulkan_vm
     src/offload/host_shadow.cpp
     src/utils/vulkan_utils.cpp
     src/utils/error_handling.cpp
+    src/placement/shard_placer.cpp
+    src/placement/placement_executor.cpp
 )
 
 target_include_directories(vulkan_vm PRIVATE

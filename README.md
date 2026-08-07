@@ -13,12 +13,14 @@
 5. [Host Offload / Demand Paging](#host-offload--demand-paging)
 6. [ModelHub — Model Weight Distribution](#modelhub--model-weight-distribution)
 7. [Multi-Node Network Module](#multi-node-network-module)
-8. [GPU-Direct RDMA (Vendor Paths)](#gpu-direct-rdma-vendor-paths)
-9. [Sparse / Residency Virtual Memory](#sparse--residency-virtual-memory)
-10. [Building](#building)
-11. [Cross-Vendor Compatibility](#cross-vendor-compatibility)
-12. [APU-Specific Tuning](#apu-specific-tuning)
-13. [License & Credits](#license--credits)
+8. [Unified Tensor Transport (`vvm::tensor::Transport`)](#unified-tensor-transport-vvmtensortransport)
+9. [Shard Placement API](#shard-placement-api)
+10. [GPU-Direct RDMA (Vendor Paths)](#gpu-direct-rdma-vendor-paths)
+11. [Sparse / Residency Virtual Memory](#sparse--residency-virtual-memory)
+12. [Building](#building)
+13. [Cross-Vendor Compatibility](#cross-vendor-compatibility)
+14. [APU-Specific Tuning](#apu-specific-tuning)
+15. [License & Credits](#license--credits)
 
 ---
 
@@ -77,6 +79,7 @@ pool->deallocate(std::move(*tensor));
 | **Rich descriptors** | `AllocDesc { size, usage, memoryUsage, exportable, mapped, name }` |
 | **Bindless ready** | Every allocation returns `VkDeviceAddress` for descriptor-free shader access |
 | **Debug names** | `VK_EXT_debug_utils` labels on every buffer/memory (`name` in `AllocDesc`) |
+| **Thread-safe** | All public methods mutex-guarded internally; safe for concurrent access |
 
 ### Allocation Examples
 
@@ -113,8 +116,13 @@ PoolStats stats = pool->getStats();
 // stats.totalAllocated, stats.totalUsed, stats.largestFreeBlock, stats.fragmentationRatio, ...
 ```
 
-### Thread Safety
-All public methods are **mutex-guarded** internally. Call from multiple threads freely.
+### P0 Hardening (Recent)
+
+| Issue | Fix |
+|-------|-----|
+| **UniqueAllocation RAII leak** | Raw ctor now private; force `UniqueAllocation::make()` factory; deleter always set |
+| **OffloadManager thread-safety** | Added `mutex_` + `statsMutex_`; all public methods mutex-guarded; unique lock names for nesting |
+| **Logging format** | All `printf` converted to `fmt`-style `{}` across `unified_memory_pool.cpp`, `host_shadow.cpp`, `rdma_transport.cpp`, `tcp_transport.cpp`, `vulkan_utils.cpp`, `network/multi_node_manager.cpp` |
 
 ---
 
@@ -241,6 +249,7 @@ pool->waitMigration(op);
 Hugging Face–style publish/fetch over TCP with content-addressed chunks (SHA-256, 4 MiB slices), local cache, and resume.
 
 ### Server (Hub)
+
 ```cpp
 using namespace vvm::network;
 ModelHub hub("/data/model-store");
@@ -251,6 +260,7 @@ hub.stop();
 ```
 
 ### Client (Any Machine)
+
 ```cpp
 // Fetch to local cache (~/.cache/vvm/models/...)
 ModelHub::fetch("192.168.1.50:51010", "chonk/llama-3b-q4", "./my-models", "v1");
@@ -261,6 +271,7 @@ auto alloc = pool->allocate({ .size = modelSize, .memoryUsage = MemoryUsage::Gpu
 ```
 
 ### Cache Layout (HF-style)
+
 ```
 ~/.cache/vvm/models/chonk/llama-3b-q4/v1/
   config.json
@@ -270,6 +281,7 @@ auto alloc = pool->allocate({ .size = modelSize, .memoryUsage = MemoryUsage::Gpu
 ```
 
 ### Run the Demo
+
 ```bash
 # Windows
 build_ninja\examples\model_registry_test.exe
@@ -285,9 +297,11 @@ build_ninja\examples\model_registry_test.exe
 `vvm::network::MultiNodePoolManager` provides a **zero-dependency** multi-node cluster over plain TCP (Winsock / BSD sockets). Uses a Spark-inspired wire protocol: versioned 32-byte header + bulk stream transferred in 4 MB slices directly between socket and caller buffer (no intermediate copy).
 
 ### Control-Plane Messages
+
 `MsgRegisterNode`, `MsgGetClusterView`, `MsgAllocate`, `MsgExport`, `MsgImport`, `MsgMigratePull`, `MsgMigratePush`, `MsgHeartbeat`, `MsgLeaveCluster`, `MsgDeallocate`, `MsgModelList`, `MsgModelManifest`, `MsgModelChunk`.
 
 ### TLS Support
+
 Optional OpenSSL-backed TLS 1.2+ (gated by `VVM_NETWORK_HAS_TLS`). Server SNI + client ALPN (`vvm/1.0`).
 
 ```cpp
@@ -321,6 +335,7 @@ nodeA->migrateFromRemote(*remoteDesc, *localDst, /*useRdma=*/false);
 ```
 
 ### Run the Demo
+
 ```bash
 # Windows
 build_ninja\examples\network_test.exe
@@ -332,13 +347,13 @@ build_ninja\examples\tensor_network_test.exe   # GPU-to-GPU VRAM over TCP
 ```
 
 ---
- 
+
 ## Unified Tensor Transport (`vvm::tensor::Transport`)
- 
+
 The tensor transport layer provides a **unified abstraction** for tensor movement across devices, machines, and networks. It wraps the underlying memory pools, P2P copies, RDMA, and network transports into a single tensor-aware API.
- 
+
 ### Key Features
- 
+
 | Feature | Description |
 |---------|-------------|
 | **Tensor Metadata** | Shape, dtype (FP32/FP16/BF16/INT8/INT4/FP8), strides, layout (NHWC/NCHW/Blocked) |
@@ -346,55 +361,55 @@ The tensor transport layer provides a **unified abstraction** for tensor movemen
 | **Layout Conversion** | NHWC↔NCHW, blocked/tiling for tensor cores |
 | **Collectives** | Ring all-reduce, broadcast, all-gather, reduce-scatter |
 | **Async Pipeline** | Callback-based, semaphore/fence chaining, overlap compute + transfer |
- 
+
 ### Quick Start
- 
+
 ```cpp
 #include <vulkan_vm/tensor_transport.hpp>
 using namespace vvm::tensor;
- 
+
 // Configure transport
 TransportConfig config;
 config.preference = TransportConfig::Preference::Auto;  // P2P → RDMA → HostStaged → Network
 config.enableAsyncPipeline = true;
 config.maxInFlightTransfers = 4;
- 
+
 // Create transport with your devices
 std::vector<vvm::DeviceConfig> devices = { amdConfig, intelConfig, nvidiaConfig };
 vvm::PoolConfig poolConfig = vvm::PoolConfig::forDevice(devices[0].physicalDevice);
- 
+
 auto transport = vvm::tensor::createTensorTransport(config, devices, poolConfig);
 if (!transport->initialize()) { /* handle error */ }
- 
+
 // Allocate a tensor on GPU 0
 TensorMetadata meta;
 meta.dtype = DataType::Float16;
 meta.layout = MemoryLayout::ChannelsLast;  // NHWC for tensor cores
 meta.shape = TensorShape::makeChannelsLast({1, 32, 32, 128});  // [N, H, W, C]
 meta.name = "conv_weight";
- 
+
 auto tensor = transport->allocateTensor(meta, 0);  // On GPU 0
- 
+
 // Distribute across GPUs (master allocates, peers import)
 auto tensors = transport->allocateDistributed(meta, {0, 1, 2});
- 
+
 // Copy with automatic layout conversion
 transport->copyWithLayoutConversion(src, dst, MemoryLayout::Blocked);
- 
+
 // Ring all-reduce across GPUs
 transport->allReduce({tensor0, tensor1, tensor2}, ReduceOp::Sum, {0, 1, 2});
- 
+
 // Async copy with callback
 transport->copyTensorAsync(src, dst, [](bool ok, const std::string& err) {
     if (ok) std::cout << "Copy done!" << std::endl;
 });
- 
+
 // Cleanup
 transport->shutdown();
 ```
- 
+
 ### Tensor Metadata
- 
+
 ```cpp
 struct TensorMetadata {
     DataType dtype = DataType::Float32;      // FP32, FP16, BF16, INT8, INT4, FP8_E4M3, FP8_E5M2
@@ -402,32 +417,32 @@ struct TensorMetadata {
     TensorShape shape;                       // dims + optional strides
     std::string name;                        // Debug name
 };
- 
+
 // Shape with optional custom strides
 TensorShape shape;
 shape.dims = {1, 32, 32, 128};  // [N, H, W, C]
 shape.strides = {32*32*128, 32*128, 128, 1};  // NHWC
- 
+
 // Layout presets
 TensorShape::makeContiguous({1, 128, 32, 32});    // NCHW
 TensorShape::makeChannelsLast({1, 32, 32, 128});  // NHWC
 TensorShape::makeBlocked({1, 128, 32, 32}, 32);   // 32x32 tiles
 ```
- 
+
 ### Transport Configuration
- 
+
 ```cpp
 TransportConfig config;
 config.preference = TransportConfig::Preference::Auto;  // P2P → RDMA → HostStaged → Network
 config.enableAsyncPipeline = true;
 config.maxInFlightTransfers = 4;
 config.hostStagedChunkSize = 4_MiB;
- 
+
 // RDMA (GPU-Direct)
 config.preference = TransportConfig::Preference::RDMAOnly;
 config.rdmaNicName = "mlx5_0";
 config.enableGPUDirect = true;
- 
+
 // Network (multi-node)
 config.preference = TransportConfig::Preference::NetworkOnly;
 config.networkPort = 51000;
@@ -436,68 +451,64 @@ config.tlsCertPath = "cert.pem";
 config.tlsKeyPath = "key.pem";
 config.tlsCaPath = "ca.pem";
 ```
- 
+
 ### Transport Paths (Auto-Selected)
- 
+
 | Priority | Path | Mechanism | Staging? |
 |----------|------|-----------|----------|
 | 1 | **P2P** | `VK_EXTERNAL_MEMORY` + `vkCmdCopyBuffer` | ❌ No |
 | 2 | **RDMA** | GPU-Direct: `ibv_reg_dmabuf_mr` / NDKPI | ❌ No |
 | 3 | **Host-Staged** | 4 MiB chunks via host memory | ✅ Yes |
 | 4 | **Network** | TCP/RDMA multi-node | ✅ Yes |
- 
+
 ### Collective Operations
- 
+
 ```cpp
 // Ring all-reduce (Sum, Mean, Min, Max, Product, Band, Bor, Bxor)
 transport->allReduce({t0, t1, t2}, ReduceOp::Sum, {0, 1, 2});
- 
+
 // Broadcast from root
 transport->broadcast(rootTensor, {0, 1, 2}, 0);
- 
+
 // All-gather (concatenate)
 transport->allGather({t0, t1, t2}, output, {0, 1, 2});
- 
+
 // Reduce-scatter
 transport->reduceScatter({t0, t1, t2}, output, ReduceOp::Sum, {0, 1, 2});
 ```
- 
+
 ### Multi-Node Network
- 
+
 ```cpp
 // Node A (bootstrap)
 TransportConfig netA; netA.listenAddress = "0.0.0.0"; netA.networkPort = 51001;
 auto nodeA = createTensorTransport(config, devices, poolConfig);
 nodeA->initialize();
 nodeA->joinCluster("0.0.0.0:51001");
- 
+
 // Node B (joins)
 TransportConfig netB; netB.listenAddress = "0.0.0.0"; netB.networkPort = 51002;
 netB.seedNodes = {"127.0.0.1:51001"};
 auto nodeB = createTensorTransport(config, devices, poolConfig);
 nodeB->initialize();
 nodeB->joinCluster("127.0.0.1:51001");
- 
+
 // Remote node IDs use "host:port#nodeIndex" format
 std::string nodeAId = "192.168.1.10:51001#0";
 std::string nodeBId = "192.168.1.11:51002#0";
- 
+
 // Send tensor: B exports its VRAM and advertises it to A over TCP
 nodeB->sendTensor(tensor, nodeAId, [](bool ok, const std::string& err) { /* ... */ });
- 
+
 // Receive tensor: A waits for the announcement, then pulls B's VRAM over TCP
 nodeA->recvTensor(receiver, nodeBId, [](bool ok, const std::string& err) { /* ... */ });
 // Before recvTensor, `received` must be allocated with the SAME name as `tensor`
 ```
- 
-Cross-machine copies are pulled end-to-end: `sendTensor` exports the local
-`VkDeviceMemory` and advertises the descriptor under the tensor's name
-(`MsgTensorAnnounce`); `recvTensor` waits for the peer and streams the VRAM
-over TCP in 4 MiB host-staged chunks (`migrateFromRemote`), falling back to
-GPU-direct RDMA automatically when verbs + GPUDirect are available.
+
+Cross-machine copies are pulled end-to-end: `sendTensor` exports the local `VkDeviceMemory` and advertises the descriptor under the tensor's name (`MsgTensorAnnounce`); `recvTensor` waits for the peer and streams the VRAM over TCP in 4 MiB host-staged chunks (`migrateFromRemote`), falling back to GPU-direct RDMA automatically when verbs + GPUDirect are available.
 
 ### Current Status
- 
+
 | Feature | Status |
 |---------|--------|
 | P2P (local multi-GPU) | ✅ Working |
@@ -507,14 +518,169 @@ GPU-direct RDMA automatically when verbs + GPUDirect are available.
 | GPU-Direct RDMA (Linux) | 🔧 Interface ready, needs `ibv_reg_dmabuf_mr` wiring |
 | GPU-Direct RDMA (Windows) | 🔧 Needs NDKPI implementation |
 | Network tensor send/recv (TCP GPU⇄GPU) | ✅ Working (`tensor_network_test`) |
- 
+
 ---
- 
+
+## Shard Placement API
+
+New in v0.2: **Capacity-first bin-packing** for distributing model shards across a cluster of GPU nodes. The API computes an optimal placement plan respecting per-node VRAM, host-offload capacity, activation reserves, and user constraints.
+
+### Types & Structures
+
+```cpp
+#include <vulkan_vm/placement.hpp>
+using namespace vvm::placement;
+
+// Per-node capacity (honest accounting)
+struct NodeCapacity {
+    std::string nodeId;
+    VkDeviceSize vramFreeBytes;      // DEVICE_LOCAL available
+    VkDeviceSize hostOffloadBytes;   // host shadow available for offload
+    VkDeviceSize diskCacheBytes;     // disk cache available (cold storage)
+    int32_t gpuCount = 1;            // GPUs on this node
+    int32_t nicCount = 1;            // NICs for RDMA/TCP
+    double bandwidthGbps = 10.0;     // interconnect bandwidth estimate
+    bool hasRdma = false;            // hardware RDMA NIC present
+};
+
+// Cluster view
+struct ClusterCapacity {
+    std::vector<NodeCapacity> nodes;
+    VkDeviceSize reservedActivationBytes = 64_MiB; // per-node KV/act slack
+};
+
+// Model shard specification
+struct ShardSpec {
+    std::string shardId;              // e.g. "layers.0-3.weight"
+    std::string contentHash;          // SHA-256 of chunk set (ModelHub)
+    ShardKind kind = ShardKind::Weights;
+    VkDeviceSize bytes = 0;           // uncompressed size when "hot"
+    int32_t layerBegin = -1;          // optional topology for pipeline parallel
+    int32_t layerEnd = -1;            // inclusive
+    bool mustBeDeviceLocal = false;   // rare; default false → may offload
+    bool mustStayTogether = false;    // if true, all bytes on one node
+};
+
+// Shard placement result
+struct ShardPlacement {
+    std::string shardId;
+    std::string nodeId;
+    MemTier tier = MemTier::DeviceLocal;
+    uint32_t localDeviceIndex = 0;
+};
+
+enum class MemTier { DeviceLocal, HostOffload, DiskCache };
+
+// Placement policy
+struct PlacementPolicy {
+    bool allowHostOffload = true;     // allow spill to HostOffload tier
+    bool allowDiskCache = false;      // allow DiskCache tier (cold)
+    bool preferContiguousLayers = false; // try to keep adjacent layers together
+    enum class PackMode { PackDense, SpreadEven } packMode = PackMode::PackDense;
+    bool failFast = true;             // stop on first error
+    bool transactionalNode = true;    // rollback all on node failure
+    bool revalidateCapacity = true;   // re-check capacity before execute
+    bool bestEffort = false;          // place what fits, return partial
+};
+
+// Full plan
+struct PlacementPlan {
+    std::vector<ShardPlacement> assignments;
+    Status status;                    // ok or error with detail
+};
+
+// Error handling
+enum class ErrorCode { Ok, InvalidManifest, InvalidCluster, InvalidPolicy,
+    EmptyShardList, ZeroCapacityCluster, InsufficientCapacity,
+    UnsatisfiableConstraint, ShardTooLarge, ActivationReserveFailed, ... };
+
+struct ErrorDetail { ErrorCode code; std::string message; std::string shardId; ... };
+
+struct Status {
+    ErrorCode code = ErrorCode::Ok;
+    std::vector<ErrorDetail> details;
+    explicit operator bool() const { return code == ErrorCode::Ok; }
+    void add(ErrorDetail d) { if (!d.message.empty()) { details.push_back(d); } }
+};
+```
+
+### Planning a Model
+
+```cpp
+// 1. Describe the model (from ModelHub manifest)
+ModelManifest model;
+model.modelId = "chonk/llama-3b-q4";
+model.version = "v1";
+model.shards = {
+    ShardSpec{"blk.0-3", "hash1", ShardKind::Weights, 2_GiB, 0, 3},
+    ShardSpec{"blk.4-7", "hash2", ShardKind::Weights, 2_GiB, 4, 7},
+    ShardSpec{"blk.8-11", "hash3", ShardKind::Weights, 2_GiB, 8, 11},
+};
+
+// 2. Describe the cluster
+ClusterCapacity cluster;
+cluster.nodes = {
+    NodeCapacity{"node-a", 8_GiB, 8_GiB, 4_GiB, 1, 1, 1000, true},
+    NodeCapacity{"node-b", 8_GiB, 8_GiB, 4_GiB, 1, 1, 1000, true},
+};
+cluster.reservedActivationBytes = 512_MiB;
+
+// 3. Policy
+PlacementPolicy policy;
+policy.allowHostOffload = true;
+policy.preferContiguousLayers = true;
+policy.packMode = PlacementPolicy::PackMode::PackDense;
+
+// 4. Plan
+PlacementPlan plan = ShardPlacer::plan(model, cluster, policy);
+
+if (plan.status) {
+    for (const auto& a : plan.assignments) {
+        std::cout << a.shardId << " → " << a.nodeId << " [" << a.tier << "]\n";
+    }
+}
+```
+
+### Executing the Plan
+
+```cpp
+// Per-node executor (runs on each node)
+PlacementExecutor executor(nodeManager, modelHub);
+
+ExecuteOptions opt;
+opt.fetchIfMissing = true;    // pull from ModelHub if not cached
+opt.verifyChecksum = true;    // SHA-256 verify after load
+opt.activationReserve = true; // account for KV cache per node
+
+ExecuteResult result = executor.executeLocal(model, plan, opt);
+
+if (result.status) {
+    std::cout << "Completed: " << result.completedShardIds.size()
+              << ", Failed: " << result.failedShardIds.size() << "\n";
+}
+
+// Cluster-wide coordinator (v0 = local only)
+ExecuteResult clusterResult = PlacementExecutor::executeCluster(
+    localManager, modelHub, model, plan, opt);
+```
+
+### Run Unit Tests
+
+```bash
+# 10 pure-logic tests (no Vulkan required)
+./build/tests/placement_test
+```
+
+**Test coverage:** simple fit, host offload, mustBeDeviceLocal constraint, empty cluster, contiguous layers, ShardTooLarge, duplicate shardId, empty shardId, activation reserve, bestEffort mode.
+
+---
+
 ## GPU-Direct RDMA (Vendor Paths)
 
 For NIC-attached GPU memory DMA (bypassing host CPU), VulkanVM provides three vendor-specific registration paths. The `RdmaTransport` (verbs backend) dispatches based on `vendorID`.
 
 ### NVIDIA (`0x10DE`) — `VK_NV_external_memory_rdma`
+
 ```cpp
 // Requires VK_NV_external_memory_rdma + nvidia-peermem kernel module
 PFN_vkGetMemoryRemoteAddressNV vkGetMemoryRemoteAddressNV = ...;
@@ -528,6 +694,7 @@ vkGetMemoryRemoteAddressNV(device, &info, &remoteAddr);
 ```
 
 ### AMD (`0x1002`) — `OPAQUE_WIN32` / `DMA_BUF`
+
 ```cpp
 // Export Vulkan memory as Win32 handle
 VkMemoryGetWin32HandleInfoKHR getInfo{};
@@ -541,11 +708,13 @@ void* cpuVa = MapViewOfFile(win32Handle, FILE_MAP_READ|FILE_MAP_WRITE, 0, 0, siz
 ```
 
 ### Intel (`0x8086`) — Same as AMD
+
 ```cpp
 // Identical flow: OPAQUE_WIN32 handle → MapViewOfFile → ibv_reg_mr
 ```
 
 ### API
+
 ```cpp
 // In rdma_transport.cpp (VerbsRdmaTransport)
 std::optional<RdmaMemoryRegion> registerGpuMemory(
@@ -555,17 +724,17 @@ std::optional<RdmaMemoryRegion> registerGpuMemory(
 registerGpuMemoryForRdmaVendor(device, physDev, memory, offset, size, ... , vendorId);
 registerDmaBufForRdmaVendor(device, physDev, memory, offset, size, ... , vendorId);
 ```
- 
+
 ### Linux SoftRoCE (Software RoCE / `rxe`) — Fallback Path
-For Linux environments without physical RNIC hardware (WSL2, VMs, CI, dev machines),
-VulkanVM supports **SoftRoCE** via the kernel's `rxe` module. This enables the
-verbs/RDMA transport over standard Ethernet (`eth0`) or loopback (`lo`).
+
+For Linux environments without physical RNIC hardware (WSL2, VMs, CI, dev machines), VulkanVM supports **SoftRoCE** via the kernel's `rxe` module. This enables the verbs/RDMA transport over standard Ethernet (`eth0`) or loopback (`lo`).
 
 **Requirements:**
 - Kernel with `CONFIG_RDMA_RXE=y` (built-in, not module)
 - `rdma-core` userspace (`ibverbs`, `rdma_cm`)
 
 **Setup (WSL2 / Ubuntu 24.04 example):**
+
 ```bash
 # 1. Build kernel with RDMA_RXE (or use distro kernel that includes it)
 # 2. Create SoftRoCE links on available netdevs:
@@ -576,7 +745,9 @@ ibv_devices     # should list rxe0, rxe1
 ```
 
 **Verification:**
+
 The `tensor_network_test` example validates the full path:
+
 ```
 === VulkanVM Tensor Network Test ===
 ...
@@ -591,8 +762,7 @@ migrateFromRemote: pulled 16777216 bytes from 127.0.0.1:51012#0
 
 **Status:** ✅ End-to-end verified on WSL2 (custom kernel 6.18.40, `rxe0` + `rxe1`).
 On native Linux with physical RNIC, the same verbs path uses hardware RDMA.
-Without SoftRoCE or hardware RNIC, the network module falls back to
-**host-staged TCP** (no RDMA), which is always available.
+Without SoftRoCE or hardware RNIC, the network module falls back to **host-staged TCP** (no RDMA), which is always available.
 
 ---
 
@@ -619,13 +789,14 @@ sparsePool.commit(reservation, 64_MiB, 64_MiB, memoryFlags);
 sparsePool.uncommit(reservation, 64_MiB, 64_MiB);
 ```
 
-**Tested:** 1 GiB virtual / 32 MiB pages passes all 5 ctest sparse tests.
+**Tested:** 1 GiB virtual / 32 MiB pages passes all sparse tests.
 
 ---
 
 ## Building
 
 ### Windows (PowerShell)
+
 ```powershell
 # Using the Ninja + VS DevCmd method (avoids Windows SDK version issue)
 .\scripts\build.ps1 -Tests -BuildType Release
@@ -634,6 +805,7 @@ cmd /c "call \"C:\Program Files\Microsoft Visual Studio\2022\BuildTools\Common7\
 ```
 
 ### Linux
+
 ```bash
 ./scripts/build.sh --tests
 # Or manually:
@@ -643,6 +815,7 @@ ctest --test-dir build --output-on-failure
 ```
 
 ### Requirements
+
 - CMake 3.20+
 - C++20 compiler (GCC 10+, Clang 12+, MSVC 19.30+)
 - Vulkan SDK 1.3+
@@ -650,6 +823,7 @@ ctest --test-dir build --output-on-failure
 - **Linux RDMA:** Kernel with `CONFIG_RDMA_RXE=y` (built-in) + `rdma-core` userspace for SoftRoCE fallback. Without it, network module uses host-staged TCP.
 
 ### CMake Options
+
 | Option | Default | Description |
 |--------|---------|-------------|
 | `VVM_BUILD_SHARED` | ON | Build as shared library |
@@ -682,20 +856,12 @@ ctest --test-dir build --output-on-failure
 All three support sparse binding + residency.
 
 > **Intel Arc on Windows (`igvk64.dll`) — known driver flakiness:**
-> The Intel Vulkan driver on Windows is notoriously unstable. Real-world reports
-> (including crashes blacklisted by the Khronos validation-layer test suite,
-> IGCIT tracker issues, and DXVK upstream) consistently show
-> `0xC0000005` access violations raised *inside* `igvk64.dll` at
-> device/video-memory teardown, even for spec-correct applications.
-> `multi_gpu_test` on Intel Arc hardware can exit with a non-zero status
-> (`-1073741819`) during teardown *after* every test assertion passes — this is
-> reproduced on the unmodified baseline and is not an application fault.
+> The Intel Vulkan driver on Windows is notoriously unstable. Real-world reports (including crashes blacklisted by the Khronos validation-layer test suite, IGCIT tracker issues, and DXVK upstream) consistently show `0xC0000005` access violations raised *inside* `igvk64.dll` at device/video-memory teardown, even for spec-correct applications.
+> `multi_gpu_test` on Intel Arc hardware can exit with a non-zero status (`-1073741819`) during teardown *after* every test assertion passes — this is reproduced on the unmodified baseline and is not an application fault.
 > Workarounds:
-> - Use a newer/older known-good driver (community reports vary; some users fall
->   back to `32.0.101.69xx`, others need the latest `101.84xx+` line).
+> - Use a newer/older known-good driver (community reports vary; some users fall back to `32.0.101.69xx`, others need the latest `101.84xx+` line).
 > - Prefer NVIDIA/AMD discrete GPUs, or the Linux stack, for CI on Intel Arc.
-> - Treat `multi_gpu_test` teardown crashes on Intel Windows as a driver noise,
->   not a VulkanVM regression.
+> - Treat `multi_gpu_test` teardown crashes on Intel Windows as a driver noise, not a VulkanVM regression.
 
 ---
 
@@ -733,7 +899,7 @@ MemoryTopology topo = detectMemoryTopology(physicalDevice);
 - **Nemotron** — primary coder
 - **Deepseek** — primary coder, co-author of multi-node network module (Spark-style TCP transport, TLS, host-staged push/pull migration, cluster registration, two-node loopback test)
 - **GLM** — primary coder, review and refinements
-- **Grok** — code audit of memory pool, buddy allocator, external memory, network layers
+- **Grok** — code audit of memory pool, buddy allocator, external memory, network layers (P0 findings)
 - **NVIDIA** — network module framework foundation; supporting Open Source
 - **ChonkE** — project owner
 
@@ -767,6 +933,10 @@ MemoryTopology topo = detectMemoryTopology(physicalDevice);
 - [x] Host-staged GPU↔GPU fallback when driver refuses cross-GPU import
 - [x] Direct GPU↔GPU copy (P2P) without host staging (NVIDIA/AMD/Intel vendor paths)
 - [x] RDMA/verbs GPU-direct transport (NVIDIA/AMD/Intel vendor paths)
-- [x] Integration with ML frameworks (PyTorch, ONNX Runtime)
+- [x] Linux SoftRoCE (`rxe`) end-to-end verification on WSL2
+- [x] P0 hardening: UniqueAllocation RAII, Offload thread-safety, Logging format
+- [x] Shard Placement API (capacity-first bin-packing, executor with rollback)
 - [ ] Windows WDDM2.6+ hardware scheduling hints
 - [ ] Android/Vulkan support
+- [ ] GPU-Direct RDMA wiring (`ibv_reg_dmabuf_mr` on Linux, NDKPI on Windows)
+- [ ] PyTorch / ONNX Runtime integration

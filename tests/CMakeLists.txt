@@ -87,3 +87,12 @@ target_include_directories(multi_gpu_test PRIVATE
 # Stress test
 # add_executable(stress_test stress_test.cpp)
 # target_link_libraries(stress_test PRIVATE vulkan_vm)
+
+# Placement API tests (pure logic, no Vulkan device required)
+add_executable(placement_test placement_test.cpp)
+target_link_libraries(placement_test PRIVATE vulkan_vm)
+target_include_directories(placement_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
+add_test(NAME placement_test COMMAND placement_test)

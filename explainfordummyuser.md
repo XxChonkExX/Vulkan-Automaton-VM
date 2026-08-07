@@ -65,6 +65,8 @@ Imagine you have a 512-foot long hallway. You need to give people rooms of diffe
 
 **Why this is magic:** Rooms always merge back perfectly. No weird gaps. No fragmentation. Ever.
 
+---
+
 ### The Three Boxes (Your Hardware)
 
 | Your GPU | Vendor ID | What VulkanVM Calls It | Special Powers |
@@ -151,60 +153,60 @@ auto modelSpace = pool->allocate({ .size = modelSize, .memoryUsage = MemoryUsage
 ```
 
 ---
- 
+
 ## The Tensor Express (Unified Tensor Transport)
- 
+
 Now imagine you don't just want to move **one toy** — you want to move **entire organized collections** of toys with specific shapes, colors, and arrangements. That's what the **Tensor Transport** does for AI tensors.
- 
+
 ### What Makes Tensors Special?
- 
+
 Regular memory copies don't care about **shape** (is it a 2D image? 3D volume? batch of 64 images?) or **layout** (is it NCHW or NHWC? tiled for tensor cores?).
- 
+
 The Tensor Transport knows:
 - **Shape**: [Batch, Channels, Height, Width] or [Batch, Height, Width, Channels]
 - **Data Type**: FP32, FP16, BF16, INT8, INT4, FP8
 - **Layout**: NCHW (PyTorch default), NHWC (TensorFlow/TensorRT), Blocked (tiled for tensor cores)
 - **Strides**: How to jump between elements in memory
- 
+
 ### The Magic: "Just Move It"
- 
+
 ```cpp
 // "Move this 64MB FP16 tensor from GPU 0 to GPU 1, convert NHWC→NCHW on the way"
 transport->copyWithLayoutConversion(srcTensor, dstTensor, MemoryLayout::Blocked);
- 
+
 // "Add up these gradients across 4 GPUs and give everyone the result"
 transport->allReduce({gpu0_grad, gpu1_grad, gpu2_grad, gpu3_grad}, ReduceOp::Sum);
- 
+
 // "Send this 200MB model to the other computer, convert FP16→FP8 on the wire"
 transport->sendTensor(hugeModel, "other-computer", [](bool ok) { /* done */ });
 ```
- 
+
 ### The Transport Chooses the Best Road
- 
+
 | Road | When It's Used | Speed | CPU Involved? |
 |------|---------------|-------|---------------|
 | **P2P Express** | Same computer, different GPUs | 🚀 Fastest | No |
 | **RDMA Super-Highway** | Different computers, RDMA NICs | 🚀🚀 Fastest | No |
 | **Host-Staged Truck** | When roads are blocked | 🐢 Slow | Yes |
 | **Network Ferry** | Different buildings | 🐢🐢 Slow | Yes |
- 
+
 The transport **automatically picks the fastest available road**. You just say "move this tensor" and it figures out the rest.
- 
+
 ### The Three Musketeers of Collective Ops
- 
+
 | Operation | What It Does | Use Case |
 |-----------|-------------|----------|
 | **All-Reduce** | Sum/Avg/Min/Max across all GPUs, everyone gets result | Gradient sync in distributed training |
 | **Broadcast** | One GPU shouts, everyone listens | Broadcast model weights |
 | **All-Gather** | Everyone contributes a piece, everyone gets the whole puzzle | Gather distributed embeddings |
 | **Reduce-Scatter** | Reduce + split pieces | Sharded optimizer states |
- 
+
 ### Under the Hood (Simplified)
- 
+
 ```cpp
 // You just say:
 transport->allReduce({gpu0_grad, gpu1_grad, gpu2_grad}, ReduceOp::Sum);
- 
+
 // Transport does ring all-reduce:
 // Step 1: Each GPU sends 1/3 of its data to next GPU
 // Step 2: Each GPU adds received chunk to its own
@@ -212,30 +214,30 @@ transport->allReduce({gpu0_grad, gpu1_grad, gpu2_grad}, ReduceOp::Sum);
 // Step 4: Each GPU broadcasts its 1/3 to others
 // Result: All 3 GPUs have the FULL sum
 ```
- 
+
 ### Cross-Computer: The Network Ferry
- 
+
 When GPUs are on different computers, the transport uses the **Network Ferry** (TCP or RDMA):
- 
+
 ```
 GPU A ──[P2P/RDMA]──→ NIC A ──[4MB chunks over TCP/RDMA]──→ NIC B ──[P2P/RDMA]──→ GPU B
 ```
- 
-**Key insight**: The transport picks the fastest available path automatically. If both computers have RDMA NICs, it uses the Super-Highway. If not, it falls back to the Network Ferry (TCP with 4MB chunks).
- 
-**How send/recv actually works today**: `sendTensor` exports your GPU memory and shouts the tensor's name to the other computer (`MsgTensorAnnounce`). `recvTensor` listens for that name, then **pulls** the VRAM over TCP in 4MB chunks straight into the destination GPU. Both tensors must have the same name — it's the "passport" that matches the sender and receiver.
- 
-```
-// Computer B (the sender)
-transport->sendTensor(sharedTensor, "192.168.1.10:51001#0", done);
 
-// Computer A (the receiver) — make a tensor with the SAME name, then receive:
-auto receiver = nodeA->allocateTensor(meta, 0);   // meta.name == sharedTensor name
-transport->recvTensor(*receiver, "192.168.1.11:51002#0", done);
+**Key insight**: The transport picks the fastest available path automatically. If both computers have RDMA NICs, it uses the Super-Highway. If not, it falls back to the Network Ferry (TCP with 4MB chunks).
+
+**How send/recv actually works today**: `sendTensor` exports your GPU memory and shouts the tensor's name to the other computer (`MsgTensorAnnounce`). `recvTensor` listens for that name, then **pulls** the VRAM over TCP in 4MB chunks straight into the destination GPU. Both tensors must have the same name — it's the "passport" that matches the sender and receiver.
+
 ```
- 
+ // Computer B (the sender)
+ transport->sendTensor(sharedTensor, "192.168.1.10:51001#0", done);
+
+ // Computer A (the receiver) — make a tensor with the SAME name, then receive:
+ auto receiver = nodeA->allocateTensor(meta, 0);   // meta.name == sharedTensor name
+ transport->recvTensor(*receiver, "192.168.1.11:51002#0", done);
+```
+
 ### What's Still Being Built
- 
+
 | Feature | Status | What's Missing |
 |---------|--------|----------------|
 | P2P (same computer) | ✅ Done | — |
@@ -244,26 +246,6 @@ transport->recvTensor(*receiver, "192.168.1.11:51002#0", done);
 | Network send/recv (GPU⇄GPU over TCP) | ✅ Done | Verified by `tensor_network_test` |
 | GPU-Direct RDMA (Linux) | 🔧 In progress | Wire up `ibv_reg_dmabuf_mr` |
 | GPU-Direct RDMA (Windows) | 🔧 Planned | NDKPI implementation |
- 
----
-
-## The Super-Highway (GPU-Direct RDMA)
-
-Imagine **two computers** each with their own toy boxes. They want to share toys over a network cable.
-
-**VulkanVM builds a private highway between them:**
-
-```
-Computer A (Red Box) ←── 4 MB chunks over TCP ──→ Computer B (Green Box)
-```
-
-**No extra software needed.** Just standard internet plumbing (TCP sockets). Optional: TLS encryption (like HTTPS) if you want privacy.
-
-**What they can do:**
-- Computer B asks Computer A: "Please make me a 16 MB toy" → A makes it, B gets a handle
-- Computer B pushes data TO Computer A: "Here, hold this" (streamed in 4 MB pieces)
-- Computer A pulls data FROM Computer B: "Send me that toy" (streamed in 4 MB pieces)
-- Both see each other's toy boxes in a shared directory
 
 ---
 
@@ -278,6 +260,116 @@ For **really fast sharing** (bypassing the CPU entirely), VulkanVM speaks the NI
 | **Intel** | Same as AMD — Windows handle → `MapViewOfFile` → NIC DMA |
 
 This means: **GPU A writes, NIC reads directly from GPU A's memory, sends over wire, NIC writes directly into GPU B's memory.** CPU never touches the data. Used by supercomputers and AI clusters.
+
+---
+
+### Linux SoftRoCE (Software RoCE / `rxe`) — The "No Hardware Needed" Mode
+
+**What if you don't have a fancy $10,000 NIC?** VulkanVM has a backup plan: **SoftRoCE** — it pretends your regular Ethernet cable (or even loopback `lo`) is an RDMA network card.
+
+**It works on:** WSL2, VMs, CI runners, any Linux box with a kernel built with `CONFIG_RDMA_RXE=y`.
+
+**Setup (WSL2 / Ubuntu 24.04):**
+```bash
+# 1. Build kernel with RDMA_RXE (or use distro kernel that includes it)
+# 2. Create SoftRoCE links:
+sudo rdma link add rxe0 type rxe netdev eth0   # primary interface
+sudo rdma link add rxe1 type rxe netdev lo     # loopback for localhost tests
+rdma link show  # verify ACTIVE state
+ibv_devices     # should list rxe0, rxe1
+```
+
+**Result:** The `tensor_network_test` example passes with **real RDMA verbs over software**:
+```
+VerbsRdmaTransport initialized on device 'rxe0', RDMA listener port 51012
+exportForRemote: RDMA host shadow registered for alloc 1
+migrateFromRemote: pulled 16777216 bytes from 127.0.0.1:51012#0
+  sendTensor: PASS
+  recvTensor: PASS
+  VRAM content verify on A: PASS
+```
+
+**Status:** ✅ End-to-end verified on WSL2 (custom kernel 6.18.40, `rxe0` + `rxe1`).
+On native Linux with physical RNIC, the same code uses hardware RDMA.
+Without SoftRoCE or hardware RNIC, it falls back to **host-staged TCP** (always works).
+
+---
+
+## The Shard Planner (New!) — "Who Sits Where?"
+
+When you have a **huge model** (like Llama-70B) and a **cluster of GPUs**, you need to decide: which shard goes on which GPU? The **Shard Placement API** solves this automatically.
+
+### What It Does
+
+Imagine you have:
+- Node A: 8 GB VRAM, 8 GB host offload
+- Node B: 8 GB VRAM, 8 GB host offload
+- Model: 3 shards × 2 GB each (layers 0-3, 4-7, 8-11)
+
+The planner figures out the optimal seating chart:
+
+```cpp
+// 1. Describe the model
+ModelManifest model;
+model.shards = {
+    ShardSpec{"blk.0-3", "hash1", ShardKind::Weights, 2_GiB, 0, 3},
+    ShardSpec{"blk.4-7", "hash2", ShardKind::Weights, 2_GiB, 4, 7},
+    ShardSpec{"blk.8-11", "hash3", ShardKind::Weights, 2_GiB, 8, 11},
+};
+
+// 2. Describe the cluster
+ClusterCapacity cluster;
+cluster.nodes = {
+    NodeCapacity{"node-a", 8_GiB, 8_GiB, 4_GiB, 1, 1, 1000, true},
+    NodeCapacity{"node-b", 8_GiB, 8_GiB, 4_GiB, 1, 1, 1000, true},
+};
+cluster.reservedActivationBytes = 512_MiB;  // slack for KV cache
+
+// 3. Policy
+PlacementPolicy policy;
+policy.allowHostOffload = true;    // spill to RAM if VRAM full
+policy.preferContiguousLayers = true; // keep adjacent layers together
+policy.packMode = PackDense;       // fill node-a first
+
+// 4. Get the plan
+PlacementPlan plan = ShardPlacer::plan(model, cluster, policy);
+// plan.assignments = [ {blk.0-3 → node-a, DeviceLocal}, {blk.4-7 → node-a, DeviceLocal}, {blk.8-11 → node-b, DeviceLocal} ]
+```
+
+### Smart Features
+
+| Feature | What It Means |
+|---------|---------------|
+| **Capacity-first** | Only places shards where they actually fit |
+| **Host offload spill** | If VRAM full, automatically uses host RAM |
+| **Contiguous layers** | Tries to keep layer 0-3 and 4-7 on same node |
+| **Activation reserve** | Reserves per-node slack for KV cache |
+| **Constraints** | `mustBeDeviceLocal` = "no offload allowed for this shard" |
+| **Validation** | Catches duplicate shard IDs, empty clusters, oversized shards |
+| **Best effort** | `bestEffort=true` places what fits, returns partial plan |
+
+### Executing the Plan
+
+```cpp
+// On each node, run the executor
+PlacementExecutor executor(nodeManager, modelHub);
+
+ExecuteOptions opt;
+opt.fetchIfMissing = true;   // pull from ModelHub if not cached
+opt.verifyChecksum = true;   // SHA-256 verify after load
+
+ExecuteResult result = executor.executeLocal(model, plan, opt);
+// Idempotent: re-running skips already-loaded shards with same hash
+// Transactional: if any shard fails, rolls back all on that node
+```
+
+### Test It
+
+```bash
+./build/tests/placement_test
+# 10 pure-logic tests: simple fit, host offload, constraints, empty cluster,
+# contiguous layers, ShardTooLarge, duplicate/empty shardId, activation reserve, bestEffort
+```
 
 ---
 
@@ -311,6 +403,7 @@ magicRoom.commit(deed, 64_GiB, 64_GiB, memoryFlags);
 ✅ **Yes!** Vulkan via MoltenVK translation layer.
 
 ### Your Hardware
+
 | GPU Type | Works? | Notes |
 |----------|--------|-------|
 | RTX 4090 / 7900 XTX (24 GB) | ✅ Excellent | 512 MB blocks, 8-16 blocks |
@@ -355,7 +448,7 @@ magicRoom.commit(deed, 64_GiB, 64_GiB, memoryFlags);
 
 ## TL;DR For Your Boss
 
-> **Vulkan Automaton** — A self-managing Vulkan memory pool that eliminates fragmentation on AMD APUs, enables zero-copy memory sharing across NVIDIA/AMD/Intel GPUs, provides demand-paged host offload, and includes a Hugging Face–style model registry for distributing weights over TCP. One header, one library, zero system changes.
+> **Vulkan Automaton** — A self-managing Vulkan memory pool that eliminates fragmentation on AMD APUs, enables zero-copy memory sharing across NVIDIA/AMD/Intel GPUs, provides demand-paged host offload, includes a Hugging Face–style model registry for distributing weights over TCP, and now adds **capacity-first shard placement** for multi-node model distribution. One header, one library, zero system changes.
 
 ---
 
@@ -368,6 +461,10 @@ magicRoom.commit(deed, 64_GiB, 64_GiB, memoryFlags);
 - ✅ **Cross-GPU fallback** — when driver refuses direct import, auto-falls back to 4 MB chunked host-staged copy
 - ✅ **Vendor-specific RDMA** — NVIDIA/AMD/Intel GPU-direct registration paths implemented
 - ✅ **Sparse virtual memory** — 1 TB virtual / 32 MB pages working and tested
+- ✅ **P0 Audit fixes** — UniqueAllocation RAII (private ctor, `make()` factory), OffloadManager mutex-guarded, all logging converted to `fmt` style `{}`
+- ✅ **SoftRoCE end-to-end** — Linux `rxe` module verified on WSL2 (kernel 6.18.40, `rxe0`/`rxe1`)
+- ✅ **Shard Placement API** — capacity-first bin-packing with executor + rollback, 10 unit tests
+- ✅ **ABI fix** — `VVM_NETWORK_HAS_VERBS` propagated as PUBLIC CMake definition to prevent `std::optional` layout mismatch
 
 ---
 
@@ -381,9 +478,9 @@ It either works or returns `std::nullopt`. No system modification. No risk. Test
 
 ## Need Help?
 
-- **README.md** — Full API reference, building, cross-vendor matrix
-- **examples/** — Working demos: `network_test`, `model_registry_test`, `tensor_compute`, `offload_test`, `multi_gpu_test`
-- **tests/** — Unit tests for buddy allocator, external handles, sparse, basic pool
+- **README.md** — Full API reference, building, cross-vendor matrix, shard placement API
+- **examples/** — Working demos: `network_test`, `model_registry_test`, `tensor_compute`, `offload_test`, `multi_gpu_test`, `tensor_network_test`
+- **tests/** — Unit tests for buddy allocator, external handles, sparse, basic pool, **placement_test**
 - **GitHub Issues** — Bug reports, feature requests
 
 *Built with ❤️ by the Automaton team — making GPUs play nice since 2024.*
