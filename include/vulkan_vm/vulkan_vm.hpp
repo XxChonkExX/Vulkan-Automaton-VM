@@ -125,7 +125,9 @@ class UnifiedMemoryPool;
 
 // RAII wrapper for Allocation - automatically returns to pool on destruction.
 // Usage: auto alloc = pool->allocate(...); UniqueAllocation ua(pool, std::move(alloc));
-// Note: Not thread-safe; pool operations must be externally synchronized.
+// Note: UniqueAllocation itself is not thread-safe; pool operations are
+// thread-safe (internally mutex-guarded). Treat the returned Allocation as
+// single-threaded after the call returns.
 class UniqueAllocation {
 public:
     using Deleter = void(*)(UnifiedMemoryPool*, Allocation&&);
@@ -280,11 +282,10 @@ struct DeviceMemoryInfo {
 // Core Interface
 // ============================================================================
 //
-// Thread Safety: UnifiedMemoryPool is NOT thread-safe. All public methods
-// must be externally synchronized by the caller. Concurrent calls to
-// allocate/deallocate/exportMemory/importMemory/offloadToHost/reloadToDevice
-// from multiple threads will result in data races. Use a mutex or other
-// synchronization primitive if multi-threaded access is required.
+// Thread Safety: Public methods of UnifiedMemoryPool are guarded by an internal
+// mutex. Concurrent calls from multiple threads are safe. Note that returned
+// Allocation objects / UniqueAllocation are not themselves thread-safe; treat
+// them as owned by a single thread after the call returns.
 
 class UnifiedMemoryPool {
 public:

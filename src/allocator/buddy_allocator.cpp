@@ -235,6 +235,12 @@ void BuddyAllocator::deallocate(VkDeviceSize offset, VkDeviceSize size) {
         return;
     }
     
+    // Validate size matches (allow size==0 as "unknown" from caller)
+    if (size != 0 && it->second.size != size) {
+        VVM_LOG_WARN("deallocate: size mismatch for offset %llu - stored %llu vs passed %llu",
+                     offset, it->second.size, size);
+    }
+    
     BuddyNode* node = it->second.node;
     
     // Double-free validation: node must not be free already
