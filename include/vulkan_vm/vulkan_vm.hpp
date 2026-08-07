@@ -123,6 +123,9 @@ struct Allocation {
 // Forward declaration for RAII wrapper
 class UnifiedMemoryPool;
 
+// Forward declaration of deleter function (defined after UnifiedMemoryPool is fully defined)
+inline void uniqueAllocationDeleter(UnifiedMemoryPool* pool, Allocation&& alloc);
+
 // RAII wrapper for Allocation - automatically returns to pool on destruction.
 // Usage: auto alloc = pool->allocate(...); UniqueAllocation ua(pool, std::move(alloc));
 // Note: UniqueAllocation itself is not thread-safe; pool operations are
@@ -135,7 +138,7 @@ public:
     UniqueAllocation() = default;
     // NOTE: Use make() factory instead of constructor for proper deleter setup
     UniqueAllocation(UnifiedMemoryPool* pool, Allocation&& alloc)
-        : pool_(pool), alloc_(std::move(alloc)), deleter_(nullptr) {}
+        : pool_(pool), alloc_(std::move(alloc)), deleter_(&uniqueAllocationDeleter) {}
     
     UniqueAllocation(UniqueAllocation&& other) noexcept
         : pool_(other.pool_), alloc_(std::move(other.alloc_)), deleter_(other.deleter_) {
@@ -524,8 +527,9 @@ struct Result {
 
 } // namespace vvm
 
-// Inline implementation of UniqueAllocation::make (requires UnifiedMemoryPool to be fully defined)
 namespace vvm {
+
+// Deleter function definition (UnifiedMemoryPool is now fully defined)
 inline void uniqueAllocationDeleter(UnifiedMemoryPool* pool, Allocation&& alloc) {
     if (pool && alloc.buffer != VK_NULL_HANDLE) {
         pool->deallocate(std::move(alloc));
@@ -539,7 +543,8 @@ inline UniqueAllocation UniqueAllocation::make(UnifiedMemoryPool* pool, Allocati
     ua.deleter_ = &uniqueAllocationDeleter;
     return ua;
 }
-}
+
+} // namespace vvm
 
 #include "vulkan_vm/offload.hpp"
 #include "vulkan_vm/network.hpp"
