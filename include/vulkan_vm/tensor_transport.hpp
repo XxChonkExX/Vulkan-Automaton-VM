@@ -90,6 +90,10 @@ struct TensorMetadata {
     TensorShape shape;
     std::string name;           // Debug name, used for matching send/recv
     uint64_t contentHash = 0;   // Optional: for verification
+    
+    size_t bytes() const {
+        return shape.byteSize(dtype);
+    }
 };
 
 // ============================================================================
