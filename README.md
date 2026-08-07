@@ -555,6 +555,44 @@ std::optional<RdmaMemoryRegion> registerGpuMemory(
 registerGpuMemoryForRdmaVendor(device, physDev, memory, offset, size, ... , vendorId);
 registerDmaBufForRdmaVendor(device, physDev, memory, offset, size, ... , vendorId);
 ```
+ 
+### Linux SoftRoCE (Software RoCE / `rxe`) — Fallback Path
+For Linux environments without physical RNIC hardware (WSL2, VMs, CI, dev machines),
+VulkanVM supports **SoftRoCE** via the kernel's `rxe` module. This enables the
+verbs/RDMA transport over standard Ethernet (`eth0`) or loopback (`lo`).
+
+**Requirements:**
+- Kernel with `CONFIG_RDMA_RXE=y` (built-in, not module)
+- `rdma-core` userspace (`ibverbs`, `rdma_cm`)
+
+**Setup (WSL2 / Ubuntu 24.04 example):**
+```bash
+# 1. Build kernel with RDMA_RXE (or use distro kernel that includes it)
+# 2. Create SoftRoCE links on available netdevs:
+sudo rdma link add rxe0 type rxe netdev eth0   # primary interface
+sudo rdma link add rxe1 type rxe netdev lo     # loopback for localhost tests
+rdma link show  # verify ACTIVE state
+ibv_devices     # should list rxe0, rxe1
+```
+
+**Verification:**
+The `tensor_network_test` example validates the full path:
+```
+=== VulkanVM Tensor Network Test ===
+...
+VerbsRdmaTransport initialized on device 'rxe0', RDMA listener port 51012
+...
+exportForRemote: RDMA host shadow registered for alloc 1
+migrateFromRemote: pulled 16777216 bytes from 127.0.0.1:51012#0
+  sendTensor: PASS
+  recvTensor: PASS
+  VRAM content verify on A: PASS
+```
+
+**Status:** ✅ End-to-end verified on WSL2 (custom kernel 6.18.40, `rxe0` + `rxe1`).
+On native Linux with physical RNIC, the same verbs path uses hardware RDMA.
+Without SoftRoCE or hardware RNIC, the network module falls back to
+**host-staged TCP** (no RDMA), which is always available.
 
 ---
 
@@ -609,6 +647,7 @@ ctest --test-dir build --output-on-failure
 - C++20 compiler (GCC 10+, Clang 12+, MSVC 19.30+)
 - Vulkan SDK 1.3+
 - Optional: Volk (dynamic Vulkan loading), OpenSSL (TLS), gRPC/Protobuf (control plane), ibverbs/rdma_cm (RDMA)
+- **Linux RDMA:** Kernel with `CONFIG_RDMA_RXE=y` (built-in) + `rdma-core` userspace for SoftRoCE fallback. Without it, network module uses host-staged TCP.
 
 ### CMake Options
 | Option | Default | Description |
