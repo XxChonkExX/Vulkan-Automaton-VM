@@ -1,4 +1,4 @@
-#include "vulkan_vm/allocator.hpp"
+#include "vulkan_vm/buddy_allocator.hpp"
 #include "vulkan_vm/vulkan_vm.hpp"
 #include "vulkan_vm/utils.hpp"
 
