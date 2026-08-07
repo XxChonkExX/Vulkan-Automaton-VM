@@ -164,6 +164,8 @@ public:
     
     // Copy with layout conversion
     virtual bool copyTensor(const TensorHandle& src, const TensorHandle& dst) = 0;
+    virtual bool copyTensorPartial(const TensorHandle& src, const TensorHandle& dst,
+                                   size_t srcOffset, size_t dstOffset, size_t size) = 0;
     virtual bool copyWithLayoutConversion(const TensorHandle& src, const TensorHandle& dst, MemoryLayout targetLayout) = 0;
     virtual bool copyTensorAsync(const TensorHandle& src, const TensorHandle& dst, CompletionCallback cb) = 0;
     

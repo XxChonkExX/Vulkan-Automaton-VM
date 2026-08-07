@@ -18,6 +18,7 @@
 #include <chrono>
 #include <vector>
 #include <unordered_map>
+#include <filesystem>
 
 namespace vvm {
 namespace network {
@@ -33,6 +34,10 @@ uint16_t parseTcpPort(const std::string& listen) {
     } catch (...) {
         return 0;
     }
+}
+
+bool isPeermemLoaded() {
+    return std::filesystem::exists("/sys/module/nvidia_peermem");
 }
 
 } // namespace
@@ -213,8 +218,7 @@ public:
 
         if (vendorId_ == 0x10DE) {
             // NVIDIA: VK_NV_external_memory_rdma gives the remote address.
-            // A usable local MR additionally requires nvidia-peermem registration,
-            // which is not wired yet; the returned region carries rdmaAddr only.
+            // Try to register with nvidia-peermem for a functional local MR.
             VkQueue transferQueue = VK_NULL_HANDLE;
             uint32_t transferQueueFamily = UINT32_MAX;
             auto reg = registerGpuMemoryForRdmaVendor(
@@ -225,16 +229,57 @@ public:
                 return std::nullopt;
             }
 
+            // Try to register the GPU memory with peermem for a local MR
+            // This requires nvidia-peermem kernel module
+            struct ibv_mr* mr = nullptr;
+            if (isPeermemLoaded()) {
+                // The remote address from VK_NV_external_memory_rdma IS the PCI BAR address
+                // We can try to register it with ibv_reg_mr
+                VkMemoryGetRemoteAddressInfoNV info{};
+                info.sType = VK_STRUCTURE_TYPE_MEMORY_GET_REMOTE_ADDRESS_INFO_NV;
+                info.memory = memory;
+                info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_RDMA_ADDRESS_BIT_NV;
+                
+                PFN_vkGetMemoryRemoteAddressNV vkGetMemoryRemoteAddressNV =
+                    (PFN_vkGetMemoryRemoteAddressNV)vkGetDeviceProcAddr(device_, "vkGetMemoryRemoteAddressNV");
+                
+                VkRemoteAddressNV remoteAddr;
+                VkResult result = vkGetMemoryRemoteAddressNV(device_, &info, &remoteAddr);
+                if (result == VK_SUCCESS) {
+                    // The remote address IS the PCI BAR address
+                    // Try to register it with ibv_reg_mr
+                    const int accessFlags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                                            IBV_ACCESS_REMOTE_READ;
+                    
+                    // The remote address IS the PCI BAR virtual address
+                    void* barAddr = remoteAddr;
+                    mr = ibv_reg_mr(pd_, barAddr, size, accessFlags);
+                    if (mr) {
+                        VVM_LOG_INFO("NVIDIA GPUDirect registered with peermem: lkey=%u, rkey=%u",
+                                     mr->lkey, mr->rkey);
+                    } else {
+                        VVM_LOG_WARN("ibv_reg_mr on peermem BAR failed: %s", strerror(errno));
+                    }
+                }
+            }
+
             RdmaMemoryRegion region;
-            region.addr = nullptr;
+            region.addr = nullptr;  // No local CPU mapping for GPU-direct
             region.length = size;
-            region.lkey = 0;
-            region.rkey = 0;  // Set once an ibv_mr has been registered.
+            region.lkey = mr ? mr->lkey : 0;
+            region.rkey = mr ? mr->rkey : 0;
             region.rdmaAddr = reinterpret_cast<uint64_t>(reg->remoteAddress);
             region.ownsMemory = false;
             region.vkMemory = memory;
             region.vkBuffer = buffer;
-            VVM_LOG_INFO("NVIDIA GPUDirect registered: rdmaAddr=0x%llx", region.rdmaAddr);
+            
+            if (mr) {
+                std::lock_guard<std::mutex> lock(regionsMutex_);
+                registeredRegions_[mr] = region;
+            }
+            
+            VVM_LOG_INFO("NVIDIA GPUDirect registered: rdmaAddr=0x%llx, lkey=%u, rkey=%u",
+                         region.rdmaAddr, region.lkey, region.rkey);
             return region;
         } else if (vendorId_ == 0x1002 || vendorId_ == 0x8086) {
             // AMD/Intel: export a DMA-BUF then register it with ibv_reg_dmabuf_mr.
