@@ -1,308 +1,97 @@
 #include "vulkan_vm/network/gpu_direct_registration.hpp"
-#include "vulkan_vm/vulkan_vm.hpp"
 #include "vulkan_vm/utils.hpp"
 
-#include <vector>
-#include <memory>
-#include <algorithm>
+#include <infiniband/verbs.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <cstring>
 
 namespace vvm {
 namespace network {
 
 // ============================================================================
-// Helper: Find memory type index for imported memory (cross-device)
-// ============================================================================
-static std::optional<uint32_t> findImportMemoryTypeIndex(
-    VkPhysicalDevice physicalDevice,
-    VkMemoryPropertyFlags requiredFlags,
-    VkExternalMemoryHandleTypeFlagBits handleType) {
-    
-    VkPhysicalDeviceMemoryProperties memProps;
-    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
-    
-    VkPhysicalDeviceExternalBufferInfo extInfo{};
-    extInfo.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO;
-    extInfo.handleType = handleType;
-    extInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-    
-    VkExternalBufferProperties extProps{};
-    extProps.sType = VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES;
-    vkGetPhysicalDeviceExternalBufferProperties(physicalDevice, &extInfo, &extProps);
-    
-    VkExternalMemoryHandleTypeFlags compatibleHandleTypes = extProps.externalMemoryProperties.compatibleHandleTypes;
-    if ((compatibleHandleTypes & handleType) == 0) {
-        VVM_LOG_WARN("findImportMemoryTypeIndex: handle type %u not supported on destination device", handleType);
-        return std::nullopt;
-    }
-    
-    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
-        if ((memProps.memoryTypes[i].propertyFlags & requiredFlags) == requiredFlags) {
-            return i;
-        }
-    }
-    
-    VVM_LOG_WARN("findImportMemoryTypeIndex: no memory type with required flags 0x%x", requiredFlags);
-    return std::nullopt;
-}
-
-// ============================================================================
-// Helper: Allocate and map host staging buffer for fallback
-// ============================================================================
-static std::optional<std::pair<VkBuffer, void*>> createHostStagingBuffer(
-    VkDevice device,
-    VkPhysicalDevice physicalDevice,
-    VkDeviceSize size,
-    VkQueue transferQueue,
-    uint32_t transferQueueFamily) {
-    
-    VkBufferCreateInfo bufInfo{};
-    bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufInfo.size = size;
-    bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    
-    VkBuffer buffer;
-    if (vkCreateBuffer(device, &bufInfo, nullptr, &buffer) != VK_SUCCESS) {
-        return std::nullopt;
-    }
-    
-    VkMemoryRequirements memReq;
-    vkGetBufferMemoryRequirements(device, buffer, &memReq);
-    
-    VkPhysicalDeviceMemoryProperties memProps;
-    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
-    
-    uint32_t memType = UINT32_MAX;
-    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
-        if ((memReq.memoryTypeBits & (1u << i)) &&
-            (memProps.memoryTypes[i].propertyFlags & 
-             (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
-             (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
-            memType = i;
-            break;
-        }
-    }
-    
-    if (memType == UINT32_MAX) {
-        vkDestroyBuffer(device, buffer, nullptr);
-        return std::nullopt;
-    }
-    
-    VkMemoryAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.allocationSize = memReq.size;
-    allocInfo.memoryTypeIndex = memType;
-    
-    VkDeviceMemory memory;
-    if (vkAllocateMemory(device, &allocInfo, nullptr, &memory) != VK_SUCCESS) {
-        vkDestroyBuffer(device, buffer, nullptr);
-        return std::nullopt;
-    }
-    
-    if (vkBindBufferMemory(device, buffer, memory, 0) != VK_SUCCESS) {
-        vkFreeMemory(device, memory, nullptr);
-        vkDestroyBuffer(device, buffer, nullptr);
-        return std::nullopt;
-    }
-    
-    void* mappedPtr = nullptr;
-    if (vkMapMemory(device, memory, 0, size, 0, &mappedPtr) != VK_SUCCESS) {
-        vkFreeMemory(device, memory, nullptr);
-        vkDestroyBuffer(device, buffer, nullptr);
-        return std::nullopt;
-    }
-    
-    return std::make_pair(buffer, mappedPtr);
-}
-
-// ============================================================================
-// NVIDIA GPUDirect RDMA Registration
+// NVIDIA GPUDirect Registration (VK_NV_external_memory_rdma + nvidia-peermem)
 // ============================================================================
 
-std::optional<GpuDirectRegistration> registerGpuMemoryForRdmaNvidia(
+std::optional<GpuDirectRegistration> registerGpuMemoryForRdma(
     VkDevice device,
     VkPhysicalDevice physicalDevice,
     VkDeviceMemory memory,
     VkDeviceSize offset,
     VkDeviceSize size,
     const std::string& nicName) {
-    
-    (void)nicName;  // Not used for NVIDIA path
-    
-    PFN_vkGetMemoryRemoteAddressNV vkGetMemoryRemoteAddressNV = 
+
+    GpuDirectRegistration reg;
+
+    // Get the remote address via VK_NV_external_memory_rdma
+    PFN_vkGetMemoryRemoteAddressNV vkGetMemoryRemoteAddressNV =
         (PFN_vkGetMemoryRemoteAddressNV)vkGetDeviceProcAddr(device, "vkGetMemoryRemoteAddressNV");
-    
     if (!vkGetMemoryRemoteAddressNV) {
-        VVM_LOG_ERROR("NVIDIA GPUDirect: VK_NV_external_memory_rdma not supported on device");
+        VVM_LOG_ERROR("vkGetMemoryRemoteAddressNV not available");
         return std::nullopt;
     }
-    
+
     VkMemoryGetRemoteAddressInfoNV info{};
     info.sType = VK_STRUCTURE_TYPE_MEMORY_GET_REMOTE_ADDRESS_INFO_NV;
     info.memory = memory;
     info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_RDMA_ADDRESS_BIT_NV;
-    
-    VkRemoteAddressNV remoteAddr{};
-    VkResult result = vkGetMemoryRemoteAddressNV(device, &info, &remoteAddr);
+
+    VkResult result = vkGetMemoryRemoteAddressNV(device, &info, &reg.remoteAddress);
     if (result != VK_SUCCESS) {
-        VVM_LOG_ERROR("NVIDIA GPUDirect: vkGetMemoryRemoteAddressNV failed: %s", vkResultToString(result).c_str());
+        VVM_LOG_ERROR("vkGetMemoryRemoteAddressNV failed: %s", vkResultToString(result).c_str());
         return std::nullopt;
     }
-    
-    GpuDirectRegistration reg;
-    reg.remoteAddress = remoteAddr;
-    reg.rkey = 0;  // Will be set by ibv_reg_mr on Linux, or via Windows NDKPI
-    reg.mr = nullptr;
+
+    // For a functional ibv_mr, we need to register the BAR mapping.
+    // This requires nvidia-peermem kernel module which provides ibv_reg_mr
+    // on the GPU's PCI BAR. The remote address IS the PCI BAR address.
+    // We can try to register it directly if we have the BAR mapping.
+
+    // Note: The proper flow is:
+    // 1. Get remote address (done above)
+    // 2. If nvidia-peermem is loaded, the GPU BAR is in /proc/bus/pci/...
+    //    and ibv_reg_mr can register it.
+    // 3. Alternatively, use ibv_reg_dmabuf_mr on a DMA-BUF export if available.
+
     reg.valid = true;
-    
-    VVM_LOG_INFO("NVIDIA GPUDirect registration: remoteAddr=0x%llx",
-                 static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(remoteAddr)));
+    reg.rkey = 0; // Set if/when we register an MR
+    VVM_LOG_INFO("NVIDIA GPUDirect: remote address obtained (0x{})",
+                 reinterpret_cast<uint64_t>(reg.remoteAddress));
 
     return reg;
 }
 
-void unregisterGpuMemoryForRdmaNvidia(const GpuDirectRegistration& reg) {
-    // The NVIDIA path currently only carries the remote address tag
-    // (VK_NV_external_memory_rdma); any ibv_mr for the local peer is registered
-    // and torn down by the verbs transport itself.
-    (void)reg;
+void unregisterVendorGpuMemory(const GpuDirectRegistration& reg, uint32_t vendorId) {
+    if (vendorId == 0x10DE && reg.mr) {
+        ibv_dereg_mr(reg.mr);
+    }
 }
 
 // ============================================================================
-// AMD GPU-Direct Registration (Windows)
+// DMA-BUF Registration (AMD/Intel path)
 // ============================================================================
 
-#ifdef VVM_PLATFORM_WINDOWS
-#include <windows.h>
-#include <winternl.h>
-
-// Map a Win32 handle (from VkExportMemoryWin32HandleInfoKHR) to CPU VA
-static void* mapWin32HandleForDma(HANDLE handle, size_t size) {
-    // Use MapViewOfFile to get a CPU-visible mapping of the GPU memory
-    // This requires the handle to have FILE_MAP_READ | FILE_MAP_WRITE
-    HANDLE mapHandle = nullptr;
-    if (!DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &mapHandle,
-                         FILE_MAP_READ | FILE_MAP_WRITE, FALSE, 0)) {
-        VVM_LOG_ERROR("AMD GPUDirect: DuplicateHandle failed: %lu", GetLastError());
-        return nullptr;
-    }
-    
-    void* ptr = MapViewOfFile(mapHandle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, size);
-    CloseHandle(mapHandle);
-    
-    if (!ptr) {
-        VVM_LOG_ERROR("AMD GPUDirect: MapViewOfFile failed: %lu", GetLastError());
-    }
-    return ptr;
-}
-
-static void unmapWin32HandleForDma(void* ptr) {
-    if (ptr) UnmapViewOfFile(ptr);
-}
-#endif
-
-std::optional<DmaBufRegistration> registerDmaBufForRdmaAmd(
-    VkDevice device,
-    VkPhysicalDevice physicalDevice,
-    VkDeviceMemory memory,
-    VkDeviceSize offset,
-    VkDeviceSize size,
-    VkQueue transferQueue,
-    uint32_t transferQueueFamily,
+std::optional<DmaBufRegistration> registerDmaBufForRdma(
+    int dmaBufFd,
+    size_t size,
     const std::string& nicName) {
 
-    (void)nicName;
-#ifdef VVM_PLATFORM_WINDOWS
-    // Step 1: Export as OPAQUE_WIN32 handle
-    VkMemoryGetWin32HandleInfoKHR getHandleInfo{};
-    getHandleInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR;
-    getHandleInfo.memory = memory;
-    getHandleInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT_KHR;
-    
-    PFN_vkGetMemoryWin32HandleKHR vkGetMemoryWin32HandleKHR = 
-        (PFN_vkGetMemoryWin32HandleKHR)vkGetDeviceProcAddr(device, "vkGetMemoryWin32HandleKHR");
-    if (!vkGetMemoryWin32HandleKHR) {
-        VVM_LOG_ERROR("AMD GPUDirect: vkGetMemoryWin32HandleKHR not available");
-        return std::nullopt;
-    }
-    
-    HANDLE win32Handle = nullptr;
-    VkResult result = vkGetMemoryWin32HandleKHR(device, &getHandleInfo, &win32Handle);
-    if (result != VK_SUCCESS || !win32Handle) {
-        VVM_LOG_ERROR("AMD GPUDirect: vkGetMemoryWin32HandleKHR failed: %s", vkResultToString(result).c_str());
-        return std::nullopt;
-    }
-    
-    // Step 2: Map the handle to CPU VA (on Windows, MapViewOfFile)
-    void* cpuVa = mapWin32HandleForDma(win32Handle, static_cast<size_t>(size));
-    if (!cpuVa) {
-        CloseHandle(win32Handle);
-        return std::nullopt;
-    }
-    
+    // This needs a PD which should come from the transport context.
+    // For now, this is a stub - the actual registration happens in
+    // VerbsRdmaTransport::registerGpuMemory where we have the PD.
     DmaBufRegistration reg;
-    reg.fd = reinterpret_cast<intptr_t>(win32Handle);  // Store handle in fd field on Windows
-    reg.mr = nullptr;  // Will be set by Windows NDKPI equivalent
-    reg.rkey = 0;
-    reg.valid = true;
-    
-    VVM_LOG_INFO("AMD GPUDirect registration: handle=%p, mapped CPU VA=%p, size=%llu",
-                 win32Handle, cpuVa, static_cast<unsigned long long>(size));
-    
+    reg.fd = dmaBufFd;
+    reg.valid = false;
     return reg;
-#else
-    (void)device;
-    (void)physicalDevice;
-    (void)memory;
-    (void)offset;
-    (void)size;
-    (void)transferQueue;
-    (void)transferQueueFamily;
-    VVM_LOG_WARN("AMD GPUDirect: DMA-BUF path not implemented on this platform yet");
-    return std::nullopt;
-#endif
 }
 
-void unregisterDmaBufForRdmaAmd(const DmaBufRegistration& reg) {
-#ifdef VVM_PLATFORM_WINDOWS
-    if (reg.fd != -1) {
-        HANDLE handle = reinterpret_cast<HANDLE>(reg.fd);
-        // Note: we don't CloseHandle here because the Vulkan export handle 
-        // is owned by the caller (ExternalMemoryInfo RAII wrapper)
-        (void)handle;
-    }
-#else
-    (void)reg;
-#endif
+void unregisterDmaBufForRdma(const DmaBufRegistration& reg) {
+    if (reg.mr) ibv_dereg_mr(reg.mr);
+    if (reg.fd >= 0) close(reg.fd);
 }
 
 // ============================================================================
-// Intel GPU-Direct Registration (Windows)
-// ============================================================================
-
-std::optional<DmaBufRegistration> registerDmaBufForRdmaIntel(
-    VkDevice device,
-    VkPhysicalDevice physicalDevice,
-    VkDeviceMemory memory,
-    VkDeviceSize offset,
-    VkDeviceSize size,
-    VkQueue transferQueue,
-    uint32_t transferQueueFamily,
-    const std::string& nicName) {
-    
-    // Intel Arc on Windows also exports as OPAQUE_WIN32 handle
-    // Same implementation as AMD
-    return registerDmaBufForRdmaAmd(device, physicalDevice, memory, offset, size,
-                                    transferQueue, transferQueueFamily, nicName);
-}
-
-void unregisterDmaBufForRdmaIntel(const DmaBufRegistration& reg) {
-    unregisterDmaBufForRdmaAmd(reg);
-}
-
-// ============================================================================
-// Unified Vendor Dispatcher
+// Vendor-specific dispatch
 // ============================================================================
 
 std::optional<GpuDirectRegistration> registerGpuMemoryForRdmaVendor(
@@ -315,18 +104,20 @@ std::optional<GpuDirectRegistration> registerGpuMemoryForRdmaVendor(
     uint32_t transferQueueFamily,
     const std::string& nicName,
     uint32_t vendorId) {
-    
+
     switch (vendorId) {
-        case 0x10DE:  // NVIDIA
-            return registerGpuMemoryForRdmaNvidia(device, physicalDevice, memory, offset, size, nicName);
-        case 0x1002:  // AMD
-        case 0x8086:  // Intel
-            // AMD/Intel GPUs do not expose VK_NV_external_memory_rdma. Their
-            // GPU-direct RDMA path uses registerDmaBufForRdmaVendor() instead.
-            VVM_LOG_WARN("registerGpuMemoryForRdmaVendor: vendor 0x%x has no VK_NV remote address; use DMA-BUF path", vendorId);
+        case 0x10DE: // NVIDIA
+            return registerGpuMemoryForRdma(device, physicalDevice, memory, offset, size, nicName);
+
+        case 0x1002: // AMD
+        case 0x8086: // Intel
+            // AMD/Intel use DMA-BUF path, which is handled in VerbsRdmaTransport
+            // directly since it needs the PD from the verbs context.
+            VVM_LOG_WARN("AMD/Intel GPUDirect: use DMA-BUF path in VerbsRdmaTransport");
             return std::nullopt;
+
         default:
-            VVM_LOG_WARN("registerGpuMemoryForRdmaVendor: unknown vendor 0x%x", vendorId);
+            VVM_LOG_WARN("Unknown GPU vendor 0x%x for GPUDirect", vendorId);
             return std::nullopt;
     }
 }
@@ -341,50 +132,40 @@ std::optional<DmaBufRegistration> registerDmaBufForRdmaVendor(
     uint32_t transferQueueFamily,
     const std::string& nicName,
     uint32_t vendorId) {
-    
-    switch (vendorId) {
-        case 0x10DE:  // NVIDIA
-            // NVIDIA uses GpuDirectRegistration, not DmaBufRegistration
-            VVM_LOG_WARN("NVIDIA uses registerGpuMemoryForRdmaVendor, not DmaBuf path");
-            return std::nullopt;
-        case 0x1002:  // AMD
-            return registerDmaBufForRdmaAmd(device, physicalDevice, memory, offset, size,
-                                           transferQueue, transferQueueFamily, nicName);
-        case 0x8086:  // Intel
-            return registerDmaBufForRdmaIntel(device, physicalDevice, memory, offset, size,
-                                             transferQueue, transferQueueFamily, nicName);
-        default:
-            VVM_LOG_WARN("registerDmaBufForRdmaVendor: unknown vendor 0x%x, trying AMD path", vendorId);
-            return registerDmaBufForRdmaAmd(device, physicalDevice, memory, offset, size,
-                                           transferQueue, transferQueueFamily, nicName);
-    }
-}
 
-void unregisterVendorGpuMemory(const GpuDirectRegistration& reg, uint32_t vendorId) {
-    switch (vendorId) {
-        case 0x10DE:
-            unregisterGpuMemoryForRdmaNvidia(reg);
-            break;
-        case 0x1002:
-            // AMD uses DmaBufRegistration path
-            break;
-        case 0x8086:
-            // Intel uses DmaBufRegistration path
-            break;
+    // AMD/Intel: export as DMA-BUF
+    if (vendorId == 0x1002 || vendorId == 0x8086) {
+        VkMemoryGetFdInfoKHR getFdInfo{};
+        getFdInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
+        getFdInfo.memory = memory;
+        getFdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+
+        PFN_vkGetMemoryFdKHR vkGetMemoryFdKHR =
+            (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(device, "vkGetMemoryFdKHR");
+        if (!vkGetMemoryFdKHR) {
+            VVM_LOG_ERROR("vkGetMemoryFdKHR not available");
+            return std::nullopt;
+        }
+
+        int dmaBufFd = -1;
+        VkResult result = vkGetMemoryFdKHR(device, &getFdInfo, &dmaBufFd);
+        if (result != VK_SUCCESS || dmaBufFd < 0) {
+            VVM_LOG_ERROR("vkGetMemoryFdKHR failed: %s", vkResultToString(result).c_str());
+            return std::nullopt;
+        }
+
+        DmaBufRegistration reg;
+        reg.fd = dmaBufFd;
+        reg.valid = true; // The MR will be created in the transport with its PD
+        return reg;
     }
+
+    return std::nullopt;
 }
 
 void unregisterVendorDmaBuf(const DmaBufRegistration& reg, uint32_t vendorId) {
-    switch (vendorId) {
-        case 0x10DE:
-            break;
-        case 0x1002:
-            unregisterDmaBufForRdmaAmd(reg);
-            break;
-        case 0x8086:
-            unregisterDmaBufForRdmaIntel(reg);
-            break;
-    }
+    if (reg.mr) ibv_dereg_mr(reg.mr);
+    if (reg.fd >= 0) close(reg.fd);
 }
 
 } // namespace network

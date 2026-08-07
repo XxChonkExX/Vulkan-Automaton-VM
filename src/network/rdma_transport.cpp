@@ -211,8 +211,6 @@ public:
 
         if (!pd_ || !memory || size == 0) return std::nullopt;
 
-        // The block section below is guarded because it is Linux/verbs only.
-        // On Windows this transport is not even compiled (see CMakeLists).
         if (vendorId_ == 0x10DE) {
             // NVIDIA: VK_NV_external_memory_rdma gives the remote address.
             // A usable local MR additionally requires nvidia-peermem registration,
@@ -266,16 +264,17 @@ public:
             if (!mr) {
                 VVM_LOG_WARN("ibv_reg_dmabuf_mr failed (%s), falling back to mmap+ibv_reg_mr",
                              strerror(errno));
-                close(dmaBufFd);
                 void* mappedVa = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, dmaBufFd, 0);
                 if (mappedVa == MAP_FAILED) {
                     VVM_LOG_ERROR("mmap on DMA-BUF fd failed: %s", strerror(errno));
+                    close(dmaBufFd);
                     return std::nullopt;
                 }
                 mr = ibv_reg_mr(pd_, mappedVa, size, accessFlags);
                 if (!mr) {
                     VVM_LOG_ERROR("ibv_reg_mr on mapped DMA-BUF failed: %s", strerror(errno));
                     munmap(mappedVa, size);
+                    close(dmaBufFd);
                     return std::nullopt;
                 }
                 RdmaMemoryRegion region;
@@ -301,7 +300,7 @@ public:
             region.length = size;
             region.lkey = mr->lkey;
             region.rkey = mr->rkey;
-            region.rdmaAddr = 0;  // remote DMA address needs a vendor query; see README.
+            region.rdmaAddr = 0;  // remote DMA address needs a vendor query
             region.ownsMemory = false;
             region.vkMemory = memory;
             region.vkBuffer = buffer;
@@ -607,7 +606,15 @@ public:
     }
 
     bool supportsGpuDirect() const override {
-        return false;  // see registerGpuMemory; no functional GPU-direct keys yet.
+        // Check if we have the capability for GPU-direct
+        if (vendorId_ == 0x10DE) {
+            // NVIDIA needs VK_NV_external_memory_rdma + nvidia-peermem
+            return false; // Not fully wired yet
+        } else if (vendorId_ == 0x1002 || vendorId_ == 0x8086) {
+            // AMD/Intel: ibv_reg_dmabuf_mr is available on modern kernels
+            return true;
+        }
+        return false;
     }
 
     bool supportsRdmaWrite() const override { return true; }
