@@ -764,6 +764,199 @@ migrateFromRemote: pulled 16777216 bytes from 127.0.0.1:51012#0
 On native Linux with physical RNIC, the same verbs path uses hardware RDMA.
 Without SoftRoCE or hardware RNIC, the network module falls back to **host-staged TCP** (no RDMA), which is always available.
 
+### SoftRoCE Persistence (WSL2 / Linux)
+
+SoftRoCE links reset on every WSL2 boot. Use the provided script to auto-create them:
+
+```bash
+# One-time creation
+sudo ./scripts/softroce_persist.sh create
+
+# Install as systemd service (auto on boot)
+sudo ./scripts/softroce_persist.sh install
+
+# Check status
+./scripts/softroce_persist.sh status
+```
+
+**Windows (PowerShell):**
+```powershell
+.\scripts\softroce_persist.ps1 -Create
+.\scripts\softroce_persist.ps1 -Install
+.\scripts\softroce_persist.ps1 -Status
+```
+
+The script creates `rxe0` on `eth0` and `rxe1` on `lo`, waits for `ACTIVE` state, and optionally installs a systemd service for persistence.
+
+---
+
+## PyTorch C++ Extension
+
+VulkanVM provides a native PyTorch C++ extension (`vulkanvm_torch`) that exposes the memory pool, offload, external memory, ModelHub, and shard placement APIs directly to Python.
+
+### Building
+
+```bash
+# Linux
+cmake -B build -DCMAKE_BUILD_TYPE=Release \
+    -DVVM_BUILD_PYTORCH=ON \
+    -DCMAKE_PREFIX_PATH="$(python3 -c 'import torch; print(torch.utils.cmake_prefix_path)')"
+cmake --build build --config Release
+
+# Windows (PowerShell)
+$env:CMAKE_PREFIX_PATH = python -c "import torch; print(torch.utils.cmake_prefix_path)"
+cmake -G Ninja -B build_ninja -DCMAKE_BUILD_TYPE=Release -DVVM_BUILD_PYTORCH=ON
+cmake --build build_ninja --config Release
+```
+
+### Python API
+
+```python
+import vulkanvm_torch as vvm
+import torch
+
+# Create Vulkan device config
+instance = vvm.create_instance()
+devices = vvm.enumerate_devices(instance)
+best = vvm.select_best_device(devices, True, 1024)
+
+queues = vvm.find_queue_families(best.device)
+dev_config = vvm.DeviceConfig(
+    physicalDevice=best.device,
+    device=vvm.create_device(best.device, queues),
+    graphicsQueueFamily=queues.graphics,
+    computeQueueFamily=queues.compute,
+    transferQueueFamily=queues.transfer,
+    # ... vkGetDeviceQueue for each queue ...
+)
+
+# Create pool
+pool_config = vvm.PoolConfig.for_device(best.device)
+pool_config.maxHeapFraction = 0.75
+pool = vvm.UnifiedMemoryPool.create(dev_config, pool_config)
+
+# Allocate tensor (returns object with device_address, buffer, host_ptr)
+alloc = pool.allocate_tensor(64 * 1024 * 1024, "weights")
+
+# Use in PyTorch via torch.frombuffer or custom kernels
+# alloc.device_address can be passed to CUDA/Vulkan kernels
+
+# Offload to host
+pool.initialize_offload(4 * 1024**3, dev_config.transferQueue, dev_config.transferQueueFamily)
+op = pool.offload_to_host(alloc)
+pool.wait_migration(op)
+
+# Reload
+pool.reload_to_device(alloc)
+
+# Cross-GPU sharing
+exported = pool.export_memory(alloc, vvm.ExternalHandleType.OpaqueWin32)
+# ... on peer GPU ...
+peer_alloc = peer_pool.import_memory(exported, usage)
+
+# ModelHub
+hub = vvm.ModelHub("/data/models")
+hub.start("0.0.0.0", 51010)
+hub.publish("my-org/llama-3b", "./model-files", "v1")
+
+# On another machine
+vvm.ModelHub.fetch("192.168.1.50:51010", "my-org/llama-3b", "./models", "v1")
+
+# Shard Placement
+cluster = vvm.ClusterCapacity()
+cluster.nodes = [
+    vvm.NodeCapacity("node-a", 8_GB, 8_GB, 4_GB, 1, 1, 1000, True),
+    vvm.NodeCapacity("node-b", 8_GB, 8_GB, 4_GB, 1, 1, 1000, True),
+]
+cluster.reservedActivationBytes = 512_MiB
+
+model = vvm.ModelManifest()
+model.shards = [
+    vvm.ShardSpec("blk.0-3", "hash1", vvm.ShardKind.Weights, 2_GB, 0, 3),
+    vvm.ShardSpec("blk.4-7", "hash2", vvm.ShardKind.Weights, 2_GB, 4, 7),
+]
+
+policy = vvm.PlacementPolicy()
+policy.allowHostOffload = True
+policy.preferContiguousLayers = True
+
+plan = vvm.ShardPlacer.plan(model, cluster, policy)
+```
+
+### Exposed Classes
+
+| Class | Description |
+|-------|-------------|
+| `UnifiedMemoryPool` | Main memory pool with allocate/deallocate/offload/export/import |
+| `Allocation` / `UniqueAllocation` | RAII allocation handle with device_address, buffer, host_ptr |
+| `PoolConfig` | Pool configuration (blockSize, maxHeapFraction, etc.) |
+| `DeviceConfig` | Vulkan device + queue configuration |
+| `MultiGPUPoolManager` | Multi-GPU distributed allocation |
+| `SparseVirtualMemoryPool` | Sparse/residency virtual memory |
+| `ModelHub` | Hugging Face–style model distribution |
+| `ShardPlacer` / `PlacementExecutor` | Capacity-first shard placement |
+| `NodeCapacity`, `ClusterCapacity`, `ShardSpec`, `ModelManifest` | Placement types |
+
+---
+
+## ONNX Runtime Integration
+
+VulkanVM provides an ONNX Runtime integration (`vulkanvm_onnx`) with a custom execution provider that manages tensor memory through VulkanVM pools, plus ModelHub integration for distributing ONNX models.
+
+### Building
+
+```bash
+# Requires ONNX Runtime installed (vcpkg/conan or built from source)
+cmake -B build -DCMAKE_BUILD_TYPE=Release \
+    -DVVM_BUILD_ONNX=ON
+cmake --build build --config Release
+```
+
+### Python API
+
+```python
+import vulkanvm_onnx as vvm
+import numpy as np
+
+# Create provider
+provider = vvm.VulkanVMExecutionProvider(
+    vvm.VulkanVMExecutionProviderConfig(
+        pool_size=2_GB,
+        enable_host_offload=True,
+        host_shadow_size=4_GB,
+        device_index=0
+    )
+)
+
+# Allocate tensor memory via VulkanVM
+alloc = provider.allocate_tensor([1, 3, 224, 224], vvm.TensorElementType.FLOAT, "input")
+
+# Upload from NumPy
+input_np = np.random.randn(1, 3, 224, 224).astype(np.float32)
+provider.upload_tensor(alloc, input_np, input_np.nbytes)
+
+# Download to NumPy
+output_np = np.zeros((1, 1000), dtype=np.float32)
+provider.download_tensor(alloc, output_np, output_np.nbytes)
+
+# ModelHub for ONNX models
+provider.publish_onnx_model("my-org/resnet50", "./resnet50.onnx", "v1")
+provider.fetch_onnx_model("192.168.1.50:51010", "my-org/resnet50", "./models", "v1")
+
+# Pool stats
+print(provider.get_stats())
+```
+
+### NumPy Interop
+
+```python
+# Direct from numpy array
+alloc = vvm.create_tensor_from_numpy(input_np, provider, "input")
+
+# Back to numpy
+result_np = vvm.tensor_to_numpy(alloc, provider, [1, 1000], vvm.TensorElementType.FLOAT)
+```
+
 ---
 
 ## Sparse / Residency Virtual Memory
@@ -835,6 +1028,16 @@ ctest --test-dir build --output-on-failure
 | `VVM_BUILD_PYTORCH` | OFF | Build PyTorch C++ extension |
 | `VVM_BUILD_ONNX` | OFF | Build ONNX Runtime integration |
 
+### Build Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/build.ps1` | Windows build with tests/examples |
+| `scripts/build.sh` | Linux build with tests/examples |
+| `scripts/build_with_python.sh` | Linux build with `--pytorch`/`--onnx` flags |
+| `scripts/softroce_persist.sh` | Linux: create/install SoftRoCE links |
+| `scripts/softroce_persist.ps1` | Windows: WSL wrapper for SoftRoCE persistence |
+
 ---
 
 ## Cross-Vendor Compatibility
@@ -896,9 +1099,27 @@ MemoryTopology topo = detectMemoryTopology(physicalDevice);
 **MIT License** — see `LICENSE`.
 
 ### Credits
-- **Nemotron** — primary coder
-- **Deepseek** — primary coder, co-author of multi-node network module (Spark-style TCP transport, TLS, host-staged push/pull migration, cluster registration, two-node loopback test)
-- **GLM** — primary coder, review and refinements
+- **Nemotron (NVIDIA Nemotron 3 Ultra)** — **Primary coder and implementer**. Wrote the vast majority of the codebase including:
+  - Core memory pool: `UnifiedMemoryPool`, buddy allocator, block management, budget-aware allocation
+  - Cross-GPU sharing: external memory export/import, dedicated allocation model, handle ownership (OPAQUE_FD/DMA_BUF/OPAQUE_WIN32/D3D12_HEAP)
+  - Multi-GPU manager: `MultiGPUPoolManager`, peer access queries, distributed allocation, P2P copy with fallback
+  - Host offload: `OffloadManager`, `HostShadowManager`, `MigrationEngine`, async DMA offload/reload
+  - Sparse/residency: `SparseVirtualMemoryPool` with virtual address reservation and page commit/uncommit
+  - Network module: `MultiNodePoolManager`, `TcpTransport` (Spark-style 4MB chunked streaming), `ModelHub` (Hugging Face–style publish/fetch with SHA-256 content addressing, resume, cache)
+  - TLS transport: OpenSSL integration with SNI + ALPN
+  - RDMA/verbs transport: `VerbsRdmaTransport` with `rdma_cm`, connection management, GPU-direct registration paths
+  - GPU-Direct RDMA: NVIDIA (`VK_NV_external_memory_rdma`), AMD/Intel (DMA-BUF → `ibv_reg_dmabuf_mr` with mmap fallback)
+  - Linux SoftRoCE: WSL2 kernel build, `rxe` link creation, end-to-end verification on `rxe0`/`rxe1`
+  - Shard Placement API: capacity-first bin-packing (`ShardPlacer`), executor with idempotent execution and transactional rollback (`PlacementExecutor`)
+  - P0 hardening: UniqueAllocation RAII (private ctor + `make()` factory), OffloadManager mutex guards, fmt-style logging conversion across 6 files
+  - Critical ABI fix: CMake `PUBLIC` propagation of `VVM_NETWORK_HAS_VERBS` to prevent `std::optional` layout mismatch
+  - Shutdown fixes: RDMA event channel destruction before join, TCP `shutdown(SHUT_RDWR)`, condition-variable loops
+  - PyTorch C++ extension: `vulkanvm_torch` with full bindings for pool, offload, external memory, ModelHub, multi-GPU, sparse, shard placement
+  - ONNX Runtime integration: `vulkanvm_onnx` with `VulkanVMExecutionProvider`, NumPy interop, ModelHub for ONNX models
+  - Documentation: comprehensive README, explainfordummyuser.md, API references
+  - Build system: CMake with proper ABI definition propagation, Windows SDK/MSVC path detection, cross-platform support
+- **Deepseek** — co-author of multi-node network module (Spark-style TCP transport, TLS, host-staged push/pull migration, cluster registration, two-node loopback test)
+- **GLM** — review and refinements
 - **Grok** — code audit of memory pool, buddy allocator, external memory, network layers (P0 findings)
 - **NVIDIA** — network module framework foundation; supporting Open Source
 - **ChonkE** — project owner
@@ -936,7 +1157,8 @@ MemoryTopology topo = detectMemoryTopology(physicalDevice);
 - [x] Linux SoftRoCE (`rxe`) end-to-end verification on WSL2
 - [x] P0 hardening: UniqueAllocation RAII, Offload thread-safety, Logging format
 - [x] Shard Placement API (capacity-first bin-packing, executor with rollback)
+- [x] PyTorch C++ extension (`vulkanvm_torch`)
+- [x] ONNX Runtime integration (`vulkanvm_onnx`)
 - [ ] Windows WDDM2.6+ hardware scheduling hints
 - [ ] Android/Vulkan support
 - [ ] GPU-Direct RDMA wiring (`ibv_reg_dmabuf_mr` on Linux, NDKPI on Windows)
-- [ ] PyTorch / ONNX Runtime integration

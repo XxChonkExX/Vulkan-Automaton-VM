@@ -465,6 +465,98 @@ magicRoom.commit(deed, 64_GiB, 64_GiB, memoryFlags);
 - ✅ **SoftRoCE end-to-end** — Linux `rxe` module verified on WSL2 (kernel 6.18.40, `rxe0`/`rxe1`)
 - ✅ **Shard Placement API** — capacity-first bin-packing with executor + rollback, 10 unit tests
 - ✅ **ABI fix** — `VVM_NETWORK_HAS_VERBS` propagated as PUBLIC CMake definition to prevent `std::optional` layout mismatch
+- ✅ **PyTorch C++ extension** — `vulkanvm_torch` with full Python bindings for pool, offload, external memory, ModelHub, shard placement
+- ✅ **ONNX Runtime integration** — `vulkanvm_onnx` with `VulkanVMExecutionProvider`, NumPy interop, ModelHub for ONNX models
+- ✅ **SoftRoCE persistence** — `scripts/softroce_persist.sh` (Linux) + `scripts/softroce_persist.ps1` (Windows) for auto-creation on boot
+
+---
+
+## PyTorch & ONNX — Use VulkanVM from Python
+
+### PyTorch (`vulkanvm_torch`)
+
+```python
+import vulkanvm_torch as vvm
+
+# Create pool
+pool = vvm.UnifiedMemoryPool.create(dev_config, pool_config)
+
+# Allocate tensor
+alloc = pool.allocate_tensor(64 * 1024 * 1024, "weights")
+
+# Offload/reload
+pool.initialize_offload(4_GB, transfer_queue, transfer_queue_family)
+op = pool.offload_to_host(alloc)
+pool.wait_migration(op)
+pool.reload_to_device(alloc)
+
+# Cross-GPU share
+exported = pool.export_memory(alloc, vvm.ExternalHandleType.OpaqueWin32)
+peer_alloc = peer_pool.import_memory(exported, usage)
+
+# ModelHub
+hub = vvm.ModelHub("/data/models")
+hub.publish("my-org/llama-3b", "./files", "v1")
+vvm.ModelHub.fetch("server:51010", "my-org/llama-3b", "./models", "v1")
+
+# Shard Placement
+plan = vvm.ShardPlacer.plan(model, cluster, policy)
+```
+
+### ONNX Runtime (`vulkanvm_onnx`)
+
+```python
+import vulkanvm_onnx as vvm
+import numpy as np
+
+provider = vvm.VulkanVMExecutionProvider(
+    vvm.VulkanVMExecutionProviderConfig(pool_size=2_GB, host_shadow_size=4_GB)
+)
+
+alloc = provider.allocate_tensor([1, 3, 224, 224], vvm.TensorElementType.FLOAT, "input")
+provider.upload_tensor(alloc, input_np, input_np.nbytes)
+provider.download_tensor(alloc, output_np, output_np.nbytes)
+
+# Distribute ONNX models via ModelHub
+provider.publish_onnx_model("my-org/resnet50", "./resnet50.onnx", "v1")
+provider.fetch_onnx_model("server:51010", "my-org/resnet50", "./models", "v1")
+
+# NumPy interop
+alloc = vvm.create_tensor_from_numpy(input_np, provider, "input")
+result_np = vvm.tensor_to_numpy(alloc, provider, [1, 1000], vvm.TensorElementType.FLOAT)
+```
+
+### Build
+
+```bash
+# PyTorch
+cmake -B build -DVVM_BUILD_PYTORCH=ON -DCMAKE_PREFIX_PATH=$(python -c "import torch; print(torch.utils.cmake_prefix_path)")
+
+# ONNX
+cmake -B build -DVVM_BUILD_ONNX=ON
+```
+
+---
+
+## SoftRoCE Persistence — Keep RDMA Links Across Reboots
+
+WSL2 shuts down the VM between sessions, so SoftRoCE links (`rxe0`, `rxe1`) disappear. Use the helper scripts:
+
+**Linux:**
+```bash
+sudo ./scripts/softroce_persist.sh create   # Create links now
+sudo ./scripts/softroce_persist.sh install  # Install as systemd service (auto on boot)
+./scripts/softroce_persist.sh status        # Show status
+```
+
+**Windows (PowerShell):**
+```powershell
+.\scripts\softroce_persist.ps1 -Create
+.\scripts\softroce_persist.ps1 -Install
+.\scripts\softroce_persist.ps1 -Status
+```
+
+Creates `rxe0` on `eth0` and `rxe1` on `lo`, waits for `ACTIVE`, optionally installs systemd service.
 
 ---
 
