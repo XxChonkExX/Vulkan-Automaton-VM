@@ -1,9 +1,15 @@
 #pragma once
 
-#include "vulkan_vm/vulkan_vm.hpp"
+#include "vulkan_vm/core.hpp"
 #include "vulkan_vm/network/network_types.hpp"
 #include "vulkan_vm/network/tcp_transport.hpp"
 #include "vulkan_vm/network/rdma_transport.hpp"
+
+#if defined(VVM_NETWORK_HAS_GRPC)
+#include "vulkan_vm/network/cluster_client.hpp"
+#include "vulkan_vm/network/cluster_server.hpp"
+#endif
+
 #include <memory>
 #include <vector>
 #include <optional>
@@ -267,8 +273,24 @@ private:
     void cleanup();
     
     // Network components
+#if defined(VVM_NETWORK_HAS_GRPC)
     std::unique_ptr<ClusterClient> clusterClient_;   // optional gRPC client (when built with gRPC)
     std::unique_ptr<ClusterServer> clusterServer_;   // optional gRPC server (when built with gRPC)
+#else
+    // Minimal stubs when gRPC not available
+    class ClusterClient {
+    public:
+        ClusterClient() = default;
+        virtual ~ClusterClient() = default;
+    };
+    class ClusterServer {
+    public:
+        ClusterServer() = default;
+        virtual ~ClusterServer() = default;
+    };
+    std::unique_ptr<ClusterClient> clusterClient_;
+    std::unique_ptr<ClusterServer> clusterServer_;
+#endif
     std::unique_ptr<RdmaTransport> rdmaTransport_;   // optional verbs transport (when built with libibverbs)
 
 #if defined(VVM_NETWORK_HAS_VERBS)

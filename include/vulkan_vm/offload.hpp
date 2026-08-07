@@ -1,9 +1,29 @@
 #pragma once
 
-#include "vulkan_vm/vulkan_vm.hpp"
+// Offload/Swap - Host shadow buffer, migration engine, offload manager
+// Includes core.hpp for Allocation, MigrationOperation, etc.
+
+#include "vulkan_vm/core.hpp"
 #include <mutex>
 
 namespace vvm {
+
+// ============================================================================
+// Offload Configuration
+// ============================================================================
+
+struct OffloadConfig {
+    VkDeviceSize hostShadowSize = 4 * 1024 * 1024 * 1024;  // 4GB host shadow
+    [[deprecated("unsafe on vkMapMemory memory; use only on user-allocated mmap regions")]]
+    bool useMadvise = false;
+    [[deprecated("unsafe on vkMapMemory memory; use only on user-allocated mmap regions")]]
+    bool useMprotect = false;
+    VkQueue transferQueue = VK_NULL_HANDLE;
+    uint32_t transferQueueFamily = UINT32_MAX;
+    // Mapping lifetime management
+    bool persistentMapping = true;  // Keep mapped for coherent access
+    bool useCoherentMapping = true; // Use HOST_COHERENT for mapped regions
+};
 
 // ============================================================================
 // Host Shadow Buffer (for offload/swap)
@@ -153,6 +173,8 @@ private:
 // Thread Safety: OffloadManager is now thread-safe. All public methods are
 // internally mutex-guarded. The internal MigrationEngine and HostShadowManager
 // are protected by this mutex.
+
+class UnifiedMemoryPool;  // forward
 
 class OffloadManager {
 public:

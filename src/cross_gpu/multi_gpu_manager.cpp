@@ -239,7 +239,7 @@ std::vector<std::optional<Allocation>> MultiGPUPoolManager::allocateDistributed(
     return results;
 }
 
-MultiGPUPoolManager::PeerAccessInfo MultiGPUPoolManager::queryPeerAccess(
+vvm::PeerAccessInfo MultiGPUPoolManager::queryPeerAccess(
     uint32_t srcDeviceIndex, uint32_t dstDeviceIndex) const {
 
     PeerAccessInfo info;

@@ -12,7 +12,7 @@ namespace vvm {
 // UnifiedMemoryPool Implementation
 // ============================================================================
 
-MemoryTopology detectMemoryTopology(VkPhysicalDevice physicalDevice) {
+MemoryTopologyType detectMemoryTopology(VkPhysicalDevice physicalDevice) {
     VkPhysicalDeviceMemoryProperties props;
     vkGetPhysicalDeviceMemoryProperties(physicalDevice, &props);
 
@@ -36,16 +36,16 @@ MemoryTopology detectMemoryTopology(VkPhysicalDevice physicalDevice) {
         }
     }
 
-    if (!hasDevLocal) return MemoryTopology::Discrete;
-    if (devLocalHeaps <= 1 && hasUnifiedType) return MemoryTopology::Unified;
-    if (hasUnifiedType) return MemoryTopology::Hybrid;
-    return MemoryTopology::Discrete;
+    if (!hasDevLocal) return MemoryTopologyType::Discrete;
+    if (devLocalHeaps <= 1 && hasUnifiedType) return MemoryTopologyType::Unified;
+    if (hasUnifiedType) return MemoryTopologyType::Hybrid;
+    return MemoryTopologyType::Discrete;
 }
 
 PoolConfig PoolConfig::forDevice(VkPhysicalDevice physicalDevice) {
     PoolConfig cfg;
     switch (detectMemoryTopology(physicalDevice)) {
-        case MemoryTopology::Unified:
+        case MemoryTopologyType::Unified:
             // APU / Strix Halo style: one shared heap. Bigger blocks, fewer of
             // them; host shadow is largely unnecessary since VRAM is
             // host-visible. Still cap the fraction so we don't starve the OS.
@@ -57,12 +57,12 @@ PoolConfig PoolConfig::forDevice(VkPhysicalDevice physicalDevice) {
                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
             break;
-        case MemoryTopology::Hybrid:
+        case MemoryTopologyType::Hybrid:
             cfg.blockSize = 512ull * 1024 * 1024;
             cfg.maxBlocks = 12;
             cfg.maxHeapFraction = 0.75f;
             break;
-        case MemoryTopology::Discrete:
+        case MemoryTopologyType::Discrete:
         default:
             cfg.blockSize = 512ull * 1024 * 1024;
             cfg.maxBlocks = 16;
@@ -749,15 +749,15 @@ std::optional<Allocation> UnifiedMemoryPool::allocate(const AllocDesc& desc) {
     if (desc.exportable) {
         auto alloc = allocateDedicatedExportable(desc.size, desc.usage,
                                                  usageToFlags(desc.memoryUsage));
-        if (alloc && desc.name) {
-            setDebugName(VK_OBJECT_TYPE_BUFFER, (uint64_t)alloc->buffer, desc.name);
-            setDebugName(VK_OBJECT_TYPE_DEVICE_MEMORY, (uint64_t)alloc->memory, desc.name);
+        if (alloc && !desc.name.empty()) {
+            setDebugName(VK_OBJECT_TYPE_BUFFER, (uint64_t)alloc->buffer, desc.name.c_str());
+            setDebugName(VK_OBJECT_TYPE_DEVICE_MEMORY, (uint64_t)alloc->memory, desc.name.c_str());
         }
         return alloc;
     }
     auto alloc = allocate(desc.size, desc.usage, usageToFlags(desc.memoryUsage));
-    if (alloc && desc.name) {
-        setDebugName(VK_OBJECT_TYPE_BUFFER, (uint64_t)alloc->buffer, desc.name);
+    if (alloc && !desc.name.empty()) {
+        setDebugName(VK_OBJECT_TYPE_BUFFER, (uint64_t)alloc->buffer, desc.name.c_str());
     }
     return alloc;
 }

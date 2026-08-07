@@ -1,7 +1,7 @@
 #include "vulkan_vm/network/multi_node_manager.hpp"
 #include "vulkan_vm/network/tcp_transport.hpp"
 #include "vulkan_vm/network/network_types.hpp"
-#include "vulkan_vm/vulkan_vm.hpp"
+#include "vulkan_vm/core.hpp"
 #include "vulkan_vm/utils.hpp"
 
 #if defined(VVM_NETWORK_HAS_GRPC)
