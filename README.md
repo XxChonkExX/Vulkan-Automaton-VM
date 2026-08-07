@@ -1025,6 +1025,7 @@ ctest --test-dir build --output-on-failure
 | `VVM_ENABLE_VALIDATION` | ON | Enable Vulkan validation layers |
 | `VVM_USE_VOLK` | ON | Use Volk for dynamic Vulkan loading |
 | `VVM_BUILD_NETWORK` | ON | Build network/multi-node module |
+| `VVM_BUILD_TENSOR_TRANSPORT` | ON | Build tensor transport module |
 | `VVM_BUILD_PYTORCH` | OFF | Build PyTorch C++ extension |
 | `VVM_BUILD_ONNX` | OFF | Build ONNX Runtime integration |
 
@@ -1159,6 +1160,8 @@ MemoryTopology topo = detectMemoryTopology(physicalDevice);
 - [x] Shard Placement API (capacity-first bin-packing, executor with rollback)
 - [x] PyTorch C++ extension (`vulkanvm_torch`)
 - [x] ONNX Runtime integration (`vulkanvm_onnx`)
+- [x] Tensor Transport module (`vulkanvm_tensor`) — allocation, copy, collectives, network
 - [ ] Windows WDDM2.6+ hardware scheduling hints
 - [ ] Android/Vulkan support
 - [ ] GPU-Direct RDMA wiring (`ibv_reg_dmabuf_mr` on Linux, NDKPI on Windows)
+- [ ] Tensor Transport: layout conversion shaders, async pipeline, NCCL-style collectives
