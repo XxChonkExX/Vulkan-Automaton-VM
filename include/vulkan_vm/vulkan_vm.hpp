@@ -22,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <functional>
+#include <cassert>
 
 #include "vulkan_vm/buddy_allocator.hpp"
 #include "vulkan_vm/utils.hpp"
@@ -136,7 +137,10 @@ inline void uniqueAllocationDeleter(UnifiedMemoryPool* pool, Allocation&& alloc)
     private:
         UniqueAllocation() = default;
         UniqueAllocation(UnifiedMemoryPool* pool, Allocation&& alloc)
-            : pool_(pool), alloc_(std::move(alloc)), deleter_(&uniqueAllocationDeleter) {}
+            : pool_(pool), alloc_(std::move(alloc)), deleter_(&uniqueAllocationDeleter) {
+            // Runtime check: ensure deleter is never null when constructed properly
+            assert(deleter_ != nullptr && "UniqueAllocation: deleter must not be null");
+        }
         
     public:
         UniqueAllocation(UniqueAllocation&& other) noexcept
@@ -163,6 +167,8 @@ inline void uniqueAllocationDeleter(UnifiedMemoryPool* pool, Allocation&& alloc)
             if (pool_ && alloc_.buffer != VK_NULL_HANDLE && deleter_) {
                 deleter_(pool_, std::move(alloc_));
                 alloc_ = {};
+            } else if (pool_ && alloc_.buffer != VK_NULL_HANDLE && !deleter_) {
+                VVM_LOG_ERROR("UniqueAllocation: null deleter with live allocation - possible misuse (use make() factory)");
             }
         }
         
