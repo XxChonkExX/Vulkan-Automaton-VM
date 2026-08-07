@@ -477,6 +477,25 @@ transport->allGather({t0, t1, t2}, output, {0, 1, 2});
 transport->reduceScatter({t0, t1, t2}, output, ReduceOp::Sum, {0, 1, 2});
 ```
 
+### Layout Conversion (Compute Shaders)
+
+Tensor transport supports automatic layout conversion via Vulkan compute shaders:
+
+```cpp
+// Convert NHWC to NCHW (or vice versa) on-the-fly during copy
+transport->copyWithLayoutConversion(srcTensor, dstTensor, MemoryLayout::Contiguous);
+// or
+transport->copyWithLayoutConversion(srcTensor, dstTensor, MemoryLayout::ChannelsLast);
+
+// Supported layouts:
+// - MemoryLayout::Contiguous (NCHW)
+// - MemoryLayout::ChannelsLast (NHWC)
+// - MemoryLayout::Blocked (tiled for tensor cores)
+// - MemoryLayout::Strided (custom strides)
+```
+
+Layout conversion happens on the GPU via Vulkan compute shaders, avoiding host round-trips. The transport automatically selects the optimal shader based on source and target layouts.
+
 ### Multi-Node Network
 
 ```cpp
@@ -514,10 +533,14 @@ Cross-machine copies are pulled end-to-end: `sendTensor` exports the local `VkDe
 | P2P (local multi-GPU) | ✅ Working |
 | Host-staged fallback | ✅ Working |
 | Ring all-reduce | ✅ Implemented |
-| Async pipeline | ✅ Framework ready |
-| GPU-Direct RDMA (Linux) | 🔧 Interface ready, needs `ibv_reg_dmabuf_mr` wiring |
+| Async pipeline | 🔧 Framework ready |
+| GPU-Direct RDMA (Linux) | ✅ NVIDIA (peermem), AMD/Intel (DMA-BUF) |
 | GPU-Direct RDMA (Windows) | 🔧 Needs NDKPI implementation |
 | Network tensor send/recv (TCP GPU⇄GPU) | ✅ Working (`tensor_network_test`) |
+| Layout conversion (NHWC↔NCHW) | ✅ Compute shaders |
+| allGather collective | ✅ Implemented |
+| reduceScatter collective | ✅ Implemented |
+| Tensor slice copy (partial) | ✅ Implemented |
 
 ---
 

@@ -244,9 +244,12 @@ GPU A ──[P2P/RDMA]──→ NIC A ──[4MB chunks over TCP/RDMA]──→ 
 | Host-staged fallback | ✅ Done | — |
 | Ring all-reduce | ✅ Done | — |
 | Network send/recv (GPU⇄GPU over TCP) | ✅ Done | Verified by `tensor_network_test` |
-| GPU-Direct RDMA (Linux) | 🔧 In progress | Wire up `ibv_reg_dmabuf_mr` |
+| GPU-Direct RDMA (Linux) | ✅ Done | NVIDIA (peermem), AMD/Intel (DMA-BUF) |
 | GPU-Direct RDMA (Windows) | 🔧 Planned | NDKPI implementation |
-| Layout conversion shaders | 🔧 In progress | NHWC↔NCHW, blocked for tensor cores |
+| Layout conversion shaders | ✅ Done | NHWC↔NCHW via compute shaders |
+| allGather / reduceScatter | ✅ Done | Ring-based implementations |
+| Async pipeline | 🔧 Framework ready | Callback chaining, overlap compute+transfer |
+| Layout conversion (blocked/Strided) | 🔧 Planned | Blocked for tensor cores, Strided |
 | Async pipeline | 🔧 Framework ready | Callback chaining, overlap compute+transfer |
 | NCCL-style collectives | 🔧 Planned | Better all-gather, reduce-scatter |
 
@@ -474,6 +477,10 @@ magicRoom.commit(deed, 64_GiB, 64_GiB, memoryFlags);
 - ✅ **Tensor Transport module** — `vulkanvm_tensor` with allocation, copy, layout conversion, all-reduce, send/recv, collectives
 - ✅ **Modular headers** — core, cross_gpu, offload, network, tensor, placement, sparse split from monolithic header
 - ✅ **Modular CMake** — tensor transport optional module, PyTorch/ONNX as separate modules
+- ✅ **NVIDIA peermem GPU-direct RDMA** — PCI BAR registration via nvidia-peermem kernel module
+- ✅ **Layout conversion shaders** — NHWC↔NCHW via Vulkan compute shaders with push constants
+- ✅ **allGather / reduceScatter collectives** — ring-based implementations for distributed training
+- ✅ **Tensor slice copy** — partial tensor copy with offsets for allGather/reduceScatter support
 
 ---
 
