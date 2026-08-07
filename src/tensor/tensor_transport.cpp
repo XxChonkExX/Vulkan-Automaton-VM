@@ -113,19 +113,11 @@ public:
         }
         poolManager_ = std::move(poolOpt);
         
-        // Initialize network transport if needed
+        // Initialize network transport (owns the optional RDMA transport)
         if (config_.preference == TransportConfig::Preference::NetworkOnly ||
             config_.preference == TransportConfig::Preference::Auto) {
             if (!initNetworkTransport()) {
                 VVM_LOG_WARN("Network transport initialization failed");
-            }
-        }
-        
-        // Initialize RDMA transport if needed
-        if (config_.preference == TransportConfig::Preference::RDMAOnly ||
-            config_.preference == TransportConfig::Preference::Auto) {
-            if (!initRDMATransport()) {
-                VVM_LOG_WARN("RDMA transport initialization failed");
             }
         }
         
@@ -152,11 +144,6 @@ public:
         if (networkManager_) {
             networkManager_->stop();
             networkManager_.reset();
-        }
-        
-        if (rdmaTransport_) {
-            rdmaTransport_->shutdown();
-            rdmaTransport_.reset();
         }
         
         poolManager_.reset();
@@ -539,7 +526,7 @@ bool joinCluster(const std::string& clusterAddress) override {
 
         // Export the local VRAM so the peer can pull it, then advertise it
         // under the tensor's name. The peer pulls with recvTensor().
-        bool rdmaOk = rdmaTransport_ && rdmaTransport_->supportsGpuDirect();
+        bool rdmaOk = networkManager_ && networkManager_->rdmaAvailable();
         auto desc = networkManager_->exportForRemote(tensor.asAllocation(), rdmaOk, !rdmaOk);
         if (!desc) {
             if (callback) callback(false, "exportForRemote failed");
@@ -612,9 +599,9 @@ bool joinCluster(const std::string& clusterAddress) override {
     // Introspection
     // ========================================================================
     
-    std::string getActiveTransport() const override {
+std::string getActiveTransport() const override {
         // Determine which transport is actually being used
-        if (rdmaTransport_ && rdmaTransport_->isReady()) return "RDMA";
+        if (networkManager_ && networkManager_->rdmaAvailable()) return "RDMA";
         if (networkManager_ && networkManager_->isRunning()) return "Network";
         // Check if P2P is available
         if (poolManager_ && poolManager_->getInstances().size() > 1) {
@@ -623,15 +610,15 @@ bool joinCluster(const std::string& clusterAddress) override {
         }
         return "HostStaged";
     }
-    
+
     bool supportsP2P(uint32_t src, uint32_t dst) const override {
         if (!poolManager_) return false;
         auto peer = poolManager_->queryPeerAccess(src, dst);
         return peer.canDirectCopy;
     }
-    
+
     bool supportsRDMA() const override {
-        return rdmaTransport_ && rdmaTransport_->isReady();
+        return networkManager_ && networkManager_->rdmaAvailable();
     }
     
     std::string getTransportStats() const override {
@@ -658,8 +645,9 @@ private:
         vvm::network::NetworkConfig netConfig;
         netConfig.listenAddress = config_.listenAddress + ":" + std::to_string(config_.networkPort);
         netConfig.seedNodes = config_.seedNodes;
-        netConfig.enableRdma = false;
-        netConfig.enableGpuDirect = false;
+        netConfig.enableRdma = true;                 // allow verbs RDMA when compiled in
+        netConfig.nicName = config_.rdmaNicName;
+        netConfig.enableGpuDirect = config_.enableGPUDirect;
         netConfig.enableHostStagedFallback = true;
         netConfig.useTls = config_.enableTLS;
         netConfig.tlsCertPath = config_.tlsCertPath;
@@ -672,30 +660,6 @@ private:
         if (!netOpt) return false;
         networkManager_ = std::move(netOpt);
         return true;
-    }
-    
-    bool initRDMATransport() {
-#ifdef VVM_NETWORK_HAS_VERBS
-        if (devices_.empty()) return false;
-        
-        vvm::network::NetworkConfig netConfig;
-        netConfig.nicName = config_.rdmaNicName;
-        netConfig.enableRdma = true;
-        netConfig.enableGpuDirect = config_.enableGPUDirect;
-        
-        auto rdmaOpt = vvm::network::RdmaTransport::create(
-            netConfig, devices_[0].physicalDevice, devices_[0].device);
-        
-        if (!rdmaOpt) return false;
-        
-        rdmaTransport_ = std::move(rdmaOpt);
-        
-        if (rdmaTransport_ && rdmaTransport_->initialize()) {
-            return true;
-        }
-        rdmaTransport_.reset();
-#endif
-        return false;
     }
     
     bool copyChunk(uint32_t srcIdx, uint32_t dstIdx, VkDeviceSize offset, VkDeviceSize size) {
@@ -739,7 +703,6 @@ private:
     
     std::optional<vvm::MultiGPUPoolManager> poolManager_;
     std::optional<vvm::network::MultiNodePoolManager> networkManager_;
-    std::unique_ptr<vvm::network::RdmaTransport> rdmaTransport_;
     
     bool initialized_ = false;
     

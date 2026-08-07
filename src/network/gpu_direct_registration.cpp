@@ -156,18 +156,17 @@ std::optional<GpuDirectRegistration> registerGpuMemoryForRdmaNvidia(
     reg.mr = nullptr;
     reg.valid = true;
     
-    VVM_LOG_INFO("NVIDIA GPUDirect registration: remoteAddr=0x%llx", 
-                 static_cast<unsigned long long>(remoteAddr.address));
-    
+    VVM_LOG_INFO("NVIDIA GPUDirect registration: remoteAddr=0x%llx",
+                 static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(remoteAddr)));
+
     return reg;
 }
 
 void unregisterGpuMemoryForRdmaNvidia(const GpuDirectRegistration& reg) {
-    if (reg.mr) {
-        // ibv_dereg_mr(reg.mr);  // Linux
-        // Or Windows NDKPI deregistration
-        reg.mr = nullptr;
-    }
+    // The NVIDIA path currently only carries the remote address tag
+    // (VK_NV_external_memory_rdma); any ibv_mr for the local peer is registered
+    // and torn down by the verbs transport itself.
+    (void)reg;
 }
 
 // ============================================================================
@@ -212,9 +211,9 @@ std::optional<DmaBufRegistration> registerDmaBufForRdmaAmd(
     VkQueue transferQueue,
     uint32_t transferQueueFamily,
     const std::string& nicName) {
-    
+
     (void)nicName;
-    
+#ifdef VVM_PLATFORM_WINDOWS
     // Step 1: Export as OPAQUE_WIN32 handle
     VkMemoryGetWin32HandleInfoKHR getHandleInfo{};
     getHandleInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR;
@@ -236,21 +235,7 @@ std::optional<DmaBufRegistration> registerDmaBufForRdmaAmd(
     }
     
     // Step 2: Map the handle to CPU VA (on Windows, MapViewOfFile)
-    void* cpuVa = nullptr;
-#ifdef VVM_PLATFORM_WINDOWS
-    cpuVa = mapWin32HandleForDma(win32Handle, static_cast<size_t>(size));
-#else
-    (void)win32Handle;
-    (void)device;
-    (void)physicalDevice;
-    (void)offset;
-    (void)size;
-    (void)transferQueue;
-    (void)transferQueueFamily;
-    VVM_LOG_WARN("AMD GPUDirect: DMA-BUF path not implemented on Linux yet");
-    return std::nullopt;
-#endif
-    
+    void* cpuVa = mapWin32HandleForDma(win32Handle, static_cast<size_t>(size));
     if (!cpuVa) {
         CloseHandle(win32Handle);
         return std::nullopt;
@@ -258,7 +243,7 @@ std::optional<DmaBufRegistration> registerDmaBufForRdmaAmd(
     
     DmaBufRegistration reg;
     reg.fd = reinterpret_cast<intptr_t>(win32Handle);  // Store handle in fd field on Windows
-    reg.mr = nullptr;  // Will be set by ibv_reg_mr on Linux, or Windows NDKPI equivalent
+    reg.mr = nullptr;  // Will be set by Windows NDKPI equivalent
     reg.rkey = 0;
     reg.valid = true;
     
@@ -266,19 +251,29 @@ std::optional<DmaBufRegistration> registerDmaBufForRdmaAmd(
                  win32Handle, cpuVa, static_cast<unsigned long long>(size));
     
     return reg;
+#else
+    (void)device;
+    (void)physicalDevice;
+    (void)memory;
+    (void)offset;
+    (void)size;
+    (void)transferQueue;
+    (void)transferQueueFamily;
+    VVM_LOG_WARN("AMD GPUDirect: DMA-BUF path not implemented on this platform yet");
+    return std::nullopt;
+#endif
 }
 
 void unregisterDmaBufForRdmaAmd(const DmaBufRegistration& reg) {
-    if (reg.mr) {
-        // ibv_dereg_mr(reg.mr);  // Linux
-        reg.mr = nullptr;
-    }
 #ifdef VVM_PLATFORM_WINDOWS
     if (reg.fd != -1) {
         HANDLE handle = reinterpret_cast<HANDLE>(reg.fd);
         // Note: we don't CloseHandle here because the Vulkan export handle 
         // is owned by the caller (ExternalMemoryInfo RAII wrapper)
+        (void)handle;
     }
+#else
+    (void)reg;
 #endif
 }
 
@@ -325,12 +320,14 @@ std::optional<GpuDirectRegistration> registerGpuMemoryForRdmaVendor(
         case 0x10DE:  // NVIDIA
             return registerGpuMemoryForRdmaNvidia(device, physicalDevice, memory, offset, size, nicName);
         case 0x1002:  // AMD
-            return registerGpuMemoryForRdmaNvidia(device, physicalDevice, memory, offset, size, nicName);
         case 0x8086:  // Intel
-            return registerGpuMemoryForRdmaNvidia(device, physicalDevice, memory, offset, size, nicName);
+            // AMD/Intel GPUs do not expose VK_NV_external_memory_rdma. Their
+            // GPU-direct RDMA path uses registerDmaBufForRdmaVendor() instead.
+            VVM_LOG_WARN("registerGpuMemoryForRdmaVendor: vendor 0x%x has no VK_NV remote address; use DMA-BUF path", vendorId);
+            return std::nullopt;
         default:
-            VVM_LOG_WARN("registerGpuMemoryForRdmaVendor: unknown vendor 0x%x, trying NVIDIA path", vendorId);
-            return registerGpuMemoryForRdmaNvidia(device, physicalDevice, memory, offset, size, nicName);
+            VVM_LOG_WARN("registerGpuMemoryForRdmaVendor: unknown vendor 0x%x", vendorId);
+            return std::nullopt;
     }
 }
 

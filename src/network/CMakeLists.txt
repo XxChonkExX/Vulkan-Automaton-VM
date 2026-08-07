@@ -1,6 +1,7 @@
 # Network module CMakeLists.txt
 # The core network module (TCP control plane + host-staged migration) builds
 # without any external dependencies. gRPC and RDMA/verbs are optional extras.
+list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake)
 find_package(Protobuf QUIET)
 find_package(gRPC QUIET)
 find_package(ibverbs QUIET)
@@ -13,10 +14,14 @@ set(NETWORK_CORE_SRCS
     model_registry.cpp
 )
 
-set(NETWORK_DEFS
+set(NETWORK_PRIV_DEFS
     VVM_NETWORK_EXPORTS
     VVM_BUILD_SHARED=${VVM_BUILD_SHARED}
 )
+
+# These alter the layout of public classes (guarded members in the headers),
+# so every TU that includes the network headers must see the same value.
+set(NETWORK_ABI_DEFS)
 
 # gRPC control plane (optional): cluster client/server
 if(Protobuf_FOUND AND gRPC_FOUND)
@@ -25,7 +30,7 @@ if(Protobuf_FOUND AND gRPC_FOUND)
         cluster_client.cpp
         cluster_server.cpp
     )
-    list(APPEND NETWORK_DEFS VVM_NETWORK_HAS_GRPC=1)
+    list(APPEND NETWORK_ABI_DEFS VVM_NETWORK_HAS_GRPC=1)
     set(VVM_NETWORK_GRPC_LIBS ${Protobuf_LIBRARIES} ${gRPC_LIBRARIES} gRPC::grpc++)
 else()
     message(STATUS "VulkanVM network: gRPC control plane disabled (TCP only)")
@@ -38,7 +43,7 @@ if(IBVERBS_FOUND AND RDMA_CM_FOUND)
         rdma_transport.cpp
         gpu_direct_registration.cpp
     )
-    list(APPEND NETWORK_DEFS VVM_NETWORK_HAS_VERBS=1)
+    list(APPEND NETWORK_ABI_DEFS VVM_NETWORK_HAS_VERBS=1)
     set(VVM_NETWORK_VERBS_LIBS ${IBVERBS_LIBRARIES} ${RDMA_CM_LIBRARIES})
     set(VVM_NETWORK_VERBS_INCS ${IBVERBS_INCLUDE_DIRS} ${RDMA_CM_INCLUDE_DIRS})
 else()
@@ -48,7 +53,7 @@ endif()
 # TLS support via OpenSSL
 if(OPENSSL_FOUND)
     message(STATUS "VulkanVM network: TLS support enabled via OpenSSL")
-    list(APPEND NETWORK_DEFS VVM_NETWORK_HAS_TLS=1)
+    list(APPEND NETWORK_ABI_DEFS VVM_NETWORK_HAS_TLS=1)
     set(VVM_NETWORK_TLS_LIBS ${OPENSSL_LIBRARIES})
 else()
     message(STATUS "VulkanVM network: TLS support disabled (OpenSSL not found)")
@@ -80,7 +85,18 @@ if(WIN32)
     target_compile_definitions(vulkan_vm_network PRIVATE _WINSOCKAPI_)
 endif()
 
-target_compile_definitions(vulkan_vm_network PRIVATE ${NETWORK_DEFS})
+target_compile_definitions(vulkan_vm_network
+    PRIVATE ${NETWORK_PRIV_DEFS}
+    PUBLIC ${NETWORK_ABI_DEFS}
+)
+
+# Consumer targets include the network headers too; the verbs/grpc/tls macros
+# change public class layout (e.g. MultiNodePoolManager members are guarded by
+# VVM_NETWORK_HAS_VERBS), so the include dirs and ABI-affecting defines must be
+# visible to any TU that uses the headers.
+target_include_directories(vulkan_vm_network PUBLIC
+    ${VVM_NETWORK_VERBS_INCS}
+)
 
 # Install
 install(TARGETS vulkan_vm_network
@@ -96,6 +112,7 @@ install(FILES
     include/vulkan_vm/network/tcp_transport.hpp
     include/vulkan_vm/network/multi_node_manager.hpp
     include/vulkan_vm/network/rdma_transport.hpp
+    include/vulkan_vm/network/gpu_direct_registration.hpp
     include/vulkan_vm/network/cluster_client.hpp
     include/vulkan_vm/network/cluster_server.hpp
     include/vulkan_vm/network/model_registry.hpp

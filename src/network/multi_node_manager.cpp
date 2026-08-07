@@ -209,12 +209,16 @@ bool MultiNodePoolManager::initialize() {
 #endif
 
 #if defined(VVM_NETWORK_HAS_VERBS)
-    rdmaTransport_ = RdmaTransport::create(networkConfig_,
-                                           localDeviceConfigs_[0].physicalDevice,
-                                           localDeviceConfigs_[0].device);
-    if (!rdmaTransport_ || !rdmaTransport_->initialize()) {
-        VVM_LOG_WARN("RDMA transport initialization failed, using host-staged fallback only");
-        rdmaTransport_.reset();
+    if (networkConfig_.enableRdma) {
+        rdmaTransport_ = RdmaTransport::create(networkConfig_,
+                                               localDeviceConfigs_[0].physicalDevice,
+                                               localDeviceConfigs_[0].device);
+        if (!rdmaTransport_ || !rdmaTransport_->initialize()) {
+            VVM_LOG_WARN("RDMA transport initialization failed, using host-staged fallback only");
+            rdmaTransport_.reset();
+        }
+    } else {
+        VVM_LOG_INFO("RDMA transport disabled (enableRdma=false)");
     }
 #endif
 
@@ -247,7 +251,10 @@ void MultiNodePoolManager::cleanup() {
     if (clusterClient_) clusterClient_->disconnect();
 #endif
 #if defined(VVM_NETWORK_HAS_VERBS)
-    if (rdmaTransport_) rdmaTransport_->shutdown();
+    if (rdmaTransport_) {
+        releaseAllRdmaExports();
+        rdmaTransport_->shutdown();
+    }
 #endif
 
     // Destroy local pools
@@ -297,6 +304,7 @@ void MultiNodePoolManager::stop() {
     leaveCluster();
 
     stopHeartbeat_ = true;
+    heartbeatCV_.notify_all();
     if (heartbeatThread_.joinable()) heartbeatThread_.join();
 
     if (tcpTransport_) {
@@ -320,6 +328,19 @@ void MultiNodePoolManager::stop() {
             }
         }
     }
+
+#if defined(VVM_NETWORK_HAS_VERBS)
+    if (rdmaTransport_) {
+        releaseAllRdmaExports();
+        {
+            std::lock_guard<std::mutex> lock(rdmaConnectionsMutex_);
+            for (auto& [key, conn] : rdmaConnections_) {
+                rdmaTransport_->disconnect(conn);
+            }
+            rdmaConnections_.clear();
+        }
+    }
+#endif
 
     running_ = false;
     VVM_LOG_INFO("MultiNodePoolManager stopped");
@@ -488,13 +509,44 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
 
     // GPU-direct path (only when verbs + GPUDirect are available)
 #if defined(VVM_NETWORK_HAS_VERBS)
+    std::optional<RdmaExport> pendingRdmaExport;
     if (enableRdma && rdmaTransport_ && !forceHostShadow) {
+        // 1) True GPU-direct, only when the vendor produces a usable
+        //    (remote-address, rkey) pair for the GPU memory itself.
         uint64_t rdmaAddr = 0;
         uint32_t rkey = 0;
-        if (registerMemoryForRdma(alloc, rdmaAddr, rkey)) {
+        if (registerMemoryForRdma(alloc, rdmaAddr, rkey) && rdmaAddr != 0 && rkey != 0) {
             netDesc.hasRdmaAddr = true;
             netDesc.rdmaAddr = rdmaAddr;
             netDesc.rkey = rkey;
+            VVM_LOG_INFO("exportForRemote: GPU-direct RDMA for alloc size {} (addr=0x%llx)",
+                         alloc.size, static_cast<unsigned long long>(rdmaAddr));
+        } else {
+            // 2) Host shadow: copy the data into host memory ONCE, register that
+            // buffer as an RDMA MR and publish (addr, rkey). Peers then pull or
+            // push the data straight over RDMA; the TCP control path stays as a
+            // fallback keyed on localAllocId (the owner keeps a GPU allocation
+            // registered even in this mode).
+            auto shadow = createStaging(alloc.size);
+            bool copied = false;
+            if (shadow) copied = copyDeviceToHost(alloc, 0, *shadow, alloc.size);
+            if (copied) {
+                if (auto region = rdmaTransport_->registerHostMemory(
+                        shadow->hostPtr, static_cast<size_t>(alloc.size))) {
+                    RdmaExport exp;
+                    exp.region = *region;
+                    exp.hostShadow = std::move(*shadow);
+                    exp.size = alloc.size;
+                    netDesc.hasRdmaAddr = true;
+                    netDesc.rdmaAddr = reinterpret_cast<uint64_t>(region->addr);
+                    netDesc.rkey = region->rkey;
+                    netDesc.hasHostShadow = true;
+                    pendingRdmaExport = std::move(exp);
+                }
+            }
+            if (shadow && !pendingRdmaExport) {
+                localPools_[0].deallocate(std::move(*shadow));
+            }
         }
     }
 #else
@@ -593,6 +645,15 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
         g_pendingExports[pendingKey(localNodeId_, allocId)] = std::move(*exportInfo);
     }
 
+#if defined(VVM_NETWORK_HAS_VERBS)
+    if (pendingRdmaExport) {
+        std::lock_guard<std::mutex> lock(rdmaShadowMutex_);
+        rdmaShadowExports_[pendingKey(localNodeId_, allocId)] = std::move(*pendingRdmaExport);
+        VVM_LOG_INFO("exportForRemote: RDMA host shadow registered for alloc {} (addr=0x%llx, rkey=%u)",
+                     allocId, static_cast<unsigned long long>(netDesc.rdmaAddr), netDesc.rkey);
+    }
+#endif
+
     return netDesc;
 }
 
@@ -630,7 +691,53 @@ std::optional<NetworkMigrationOperation> MultiNodePoolManager::migrateFromRemote
 
 #if defined(VVM_NETWORK_HAS_VERBS)
     if (source.canUseRdma() && useRdma && rdmaTransport_) {
-        VVM_LOG_WARN("GPU-direct RDMA read not implemented, using host-staged path");
+        auto conn = ensureRdmaConnection(source.owner);
+        if (conn) {
+            bool ok = false;
+            // Direct GPU pull: only when the destination GPU provides a usable
+            // local MR (addr + lkey). Currently only host-shadow is registered.
+            auto destRegion = rdmaTransport_->registerGpuMemory(
+                destination.memory, destination.offset, destination.size, destination.buffer);
+            if (destRegion && destRegion->lkey != 0 && destRegion->addr != nullptr) {
+                ok = rdmaTransport_->rdmaRead(*conn, *destRegion, source.rdmaAddr,
+                                              source.rkey, source.size, timeoutNs);
+            }
+            // Host-staged pull over RDMA.
+            if (!ok) {
+                auto staging = createStaging(source.size);
+                if (staging) {
+                    auto stagingRegion = rdmaTransport_->registerHostMemory(
+                        staging->hostPtr, static_cast<size_t>(source.size));
+                    if (stagingRegion) {
+                        ok = rdmaTransport_->rdmaRead(*conn, *stagingRegion, source.rdmaAddr,
+                                                      source.rkey, source.size, timeoutNs);
+                        if (ok) ok = copyHostToDevice(*staging, destination, 0, source.size);
+                    }
+                }
+            }
+            if (ok) {
+                NetworkMigrationOperation op;
+                op.operationId = nextMigrationId_++;
+                op.source = source;
+                op.destinationAllocId = destination.deviceAddress;
+                op.useRdma = true;
+                op.timeoutNs = timeoutNs;
+                op.bytesTransferred = source.size;
+                op.completed = true;
+                {
+                    std::lock_guard<std::mutex> lock(statsMutex_);
+                    networkStats_.bytesReceivedRdma += source.size;
+                    networkStats_.completedMigrations++;
+                }
+                VVM_LOG_INFO("migrateFromRemote: pulled {} bytes from {} over RDMA", source.size, source.owner.toString());
+                return op;
+            }
+            VVM_LOG_WARN("migrateFromRemote: RDMA read to {} failed, falling back to host-staged TCP",
+                         source.owner.toString());
+        } else {
+            VVM_LOG_WARN("migrateFromRemote: RDMA connect to {} failed, falling back to host-staged TCP",
+                         source.owner.toString());
+        }
     }
 #else
     (void)useRdma;
@@ -713,7 +820,55 @@ std::optional<NetworkMigrationOperation> MultiNodePoolManager::migrateToRemote(
 
 #if defined(VVM_NETWORK_HAS_VERBS)
     if (destination.canUseRdma() && useRdma && rdmaTransport_) {
-        VVM_LOG_WARN("GPU-direct RDMA write not implemented, using host-staged path");
+        auto conn = ensureRdmaConnection(destination.owner);
+        if (conn) {
+            bool ok = false;
+            // Direct GPU push when the source GPU has a usable local MR.
+            auto srcRegion = rdmaTransport_->registerGpuMemory(
+                source.memory, source.offset, source.size, source.buffer);
+            if (srcRegion && srcRegion->lkey != 0 && srcRegion->addr != nullptr) {
+                ok = rdmaTransport_->rdmaWrite(*conn, *srcRegion, destination.rdmaAddr,
+                                               destination.rkey, source.size, timeoutNs);
+            }
+            // Host-staged push over RDMA.
+            if (!ok) {
+                auto staging = createStaging(source.size);
+                if (staging) {
+                    if (!copyDeviceToHost(source, 0, *staging, source.size)) {
+                        VVM_LOG_ERROR("migrateToRemote: device -> staging copy failed before RDMA write");
+                    } else {
+                        auto stagingRegion = rdmaTransport_->registerHostMemory(
+                            staging->hostPtr, static_cast<size_t>(source.size));
+                        if (stagingRegion) {
+                            ok = rdmaTransport_->rdmaWrite(*conn, *stagingRegion, destination.rdmaAddr,
+                                                           destination.rkey, source.size, timeoutNs);
+                        }
+                    }
+                }
+            }
+            if (ok) {
+                NetworkMigrationOperation op;
+                op.operationId = nextMigrationId_++;
+                op.source = destination;
+                op.destinationAllocId = source.deviceAddress;
+                op.useRdma = true;
+                op.timeoutNs = timeoutNs;
+                op.bytesTransferred = source.size;
+                op.completed = true;
+                {
+                    std::lock_guard<std::mutex> lock(statsMutex_);
+                    networkStats_.bytesSentRdma += source.size;
+                    networkStats_.completedMigrations++;
+                }
+                VVM_LOG_INFO("migrateToRemote: pushed {} bytes to {} over RDMA", source.size, destination.owner.toString());
+                return op;
+            }
+            VVM_LOG_WARN("migrateToRemote: RDMA write to {} failed, falling back to host-staged TCP",
+                         destination.owner.toString());
+        } else {
+            VVM_LOG_WARN("migrateToRemote: RDMA connect to {} failed, falling back to host-staged TCP",
+                         destination.owner.toString());
+        }
     }
 #else
     (void)useRdma;
@@ -1184,6 +1339,9 @@ bool MultiNodePoolManager::unregisterAllocation(uint64_t localAllocId) {
         std::lock_guard<std::mutex> lock(allocsMutex_);
         if (remoteAllocs_.erase(localAllocId) == 0) return false;
     }
+#if defined(VVM_NETWORK_HAS_VERBS)
+    releaseRdmaExport(localAllocId);
+#endif
     // Close any pending exported handle for this allocation.
     std::lock_guard<std::mutex> lock(g_pendingExportsMutex);
     g_pendingExports.erase(pendingKey(localNodeId_, localAllocId));
@@ -1222,8 +1380,11 @@ TcpTransport::ConnId MultiNodePoolManager::getPeerConnection(const std::string& 
 
 void MultiNodePoolManager::heartbeatLoop() {
     while (!stopHeartbeat_) {
-        std::this_thread::sleep_for(networkConfig_.heartbeatInterval);
-
+        {
+            std::unique_lock<std::mutex> lock(heartbeatMutex_);
+            heartbeatCV_.wait_for(lock, networkConfig_.heartbeatInterval,
+                                  [this] { return stopHeartbeat_.load(); });
+        }
         if (stopHeartbeat_ || !tcpTransport_) break;
 
         auto body = serializeNodeId(localNodeId_);
@@ -1599,7 +1760,63 @@ bool MultiNodePoolManager::registerMemoryForRdma(const Allocation& alloc, uint64
 }
 
 void MultiNodePoolManager::unregisterMemoryForRdma(const Allocation& alloc) {
-    (void)alloc;
+    if (auto id = findAllocIdByBuffer(alloc.buffer)) {
+        releaseRdmaExport(*id);
+    }
+}
+
+void MultiNodePoolManager::releaseRdmaExport(uint64_t localAllocId) {
+    RdmaExport exp;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lock(rdmaShadowMutex_);
+        auto it = rdmaShadowExports_.find(pendingKey(localNodeId_, localAllocId));
+        if (it != rdmaShadowExports_.end()) {
+            exp = std::move(it->second);
+            rdmaShadowExports_.erase(it);
+            found = true;
+        }
+    }
+    if (!found) return;
+    if (rdmaTransport_) rdmaTransport_->unregisterMemory(exp.region);
+    if (!localPools_.empty()) localPools_[0].deallocate(std::move(exp.hostShadow));
+    VVM_LOG_INFO("releaseRdmaExport: freed RDMA host shadow for alloc {}", localAllocId);
+}
+
+void MultiNodePoolManager::releaseAllRdmaExports() {
+    std::vector<RdmaExport> items;
+    {
+        std::lock_guard<std::mutex> lock(rdmaShadowMutex_);
+        for (auto& [key, exp] : rdmaShadowExports_) {
+            items.push_back(std::move(exp));
+        }
+        rdmaShadowExports_.clear();
+    }
+    for (auto& exp : items) {
+        if (rdmaTransport_) rdmaTransport_->unregisterMemory(exp.region);
+        if (!localPools_.empty()) localPools_[0].deallocate(std::move(exp.hostShadow));
+    }
+}
+
+std::optional<RdmaConnection> MultiNodePoolManager::ensureRdmaConnection(const NodeId& peer) {
+    if (!rdmaTransport_) return std::nullopt;
+    std::string key = peer.toString();
+    {
+        std::lock_guard<std::mutex> lock(rdmaConnectionsMutex_);
+        auto it = rdmaConnections_.find(key);
+        if (it != rdmaConnections_.end() && it->second.connected) return it->second;
+    }
+    auto conn = rdmaTransport_->connect(peer.host, peer.port + kRdmaPortOffset, peer.nodeIndex);
+    if (!conn) {
+        VVM_LOG_WARN("ensureRdmaConnection: failed to establish RDMA to {}", key);
+        return std::nullopt;
+    }
+    {
+        std::lock_guard<std::mutex> lock(rdmaConnectionsMutex_);
+        rdmaConnections_[key] = *conn;
+    }
+    VVM_LOG_INFO("ensureRdmaConnection: established RDMA to {}", key);
+    return conn;
 }
 #else
 bool MultiNodePoolManager::registerMemoryForRdma(const Allocation& alloc, uint64_t& outRdmaAddr, uint32_t& outRkey) {
@@ -1611,6 +1828,18 @@ bool MultiNodePoolManager::registerMemoryForRdma(const Allocation& alloc, uint64
 
 void MultiNodePoolManager::unregisterMemoryForRdma(const Allocation& alloc) {
     (void)alloc;
+}
+
+void MultiNodePoolManager::releaseRdmaExport(uint64_t localAllocId) {
+    (void)localAllocId;
+}
+
+void MultiNodePoolManager::releaseAllRdmaExports() {
+}
+
+std::optional<RdmaConnection> MultiNodePoolManager::ensureRdmaConnection(const NodeId& peer) {
+    (void)peer;
+    return std::nullopt;
 }
 #endif
 

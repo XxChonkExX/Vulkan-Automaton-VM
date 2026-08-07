@@ -3,6 +3,7 @@
 #include "vulkan_vm/utils.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -24,6 +25,7 @@ using SocketType = SOCKET;
 static constexpr SocketType kInvalidSocket = INVALID_SOCKET;
 static constexpr int kSocketError = SOCKET_ERROR;
 inline void closeSocket(SocketType s) { closesocket(s); }
+inline void socketShutdown(SocketType s) { shutdown(s, SD_BOTH); }
 inline int socketRecv(SocketType s, char* buf, int len) { return recv(s, buf, len, 0); }
 inline int socketSend(SocketType s, const char* buf, int len) { return send(s, buf, len, 0); }
 using SockLenType = int;
@@ -41,6 +43,7 @@ using SocketType = int;
 static constexpr SocketType kInvalidSocket = -1;
 static constexpr int kSocketError = -1;
 inline void closeSocket(SocketType s) { close(s); }
+inline void socketShutdown(SocketType s) { shutdown(s, SHUT_RDWR); }
 inline int socketRecv(SocketType s, char* buf, int len) { return static_cast<int>(recv(s, buf, len, 0)); }
 inline int socketSend(SocketType s, const char* buf, int len) { return static_cast<int>(send(s, buf, len, 0)); }
 using SockLenType = socklen_t;
@@ -57,6 +60,7 @@ using SocketType = int;
 static constexpr SocketType kInvalidSocket = -1;
 static constexpr int kSocketError = -1;
 inline void closeSocket(SocketType s) { close(s); }
+inline void socketShutdown(SocketType s) { shutdown(s, SHUT_RDWR); }
 inline int socketRecv(SocketType s, char* buf, int len) { return static_cast<int>(recv(s, buf, len, 0)); }
 inline int socketSend(SocketType s, const char* buf, int len) { return static_cast<int>(send(s, buf, len, 0)); }
 using SockLenType = socklen_t;
@@ -561,6 +565,8 @@ struct TcpTransport::Impl {
     std::chrono::milliseconds connectionIdleTimeout{300000};  // 5 min default
     std::thread cleanupThread;
     std::atomic<bool> stopCleanup_{false};
+    std::mutex cleanupMutex;
+    std::condition_variable cleanupCV;
 
     ~Impl() { stop(); }
 
@@ -602,14 +608,19 @@ struct TcpTransport::Impl {
     void stop() {
         running = false;
         stopCleanup_ = true;
+        cleanupCV.notify_all();
         if (listener != kInvalidSocket) {
+            socketShutdown(listener);
             closeSocket(listener);
             listener = kInvalidSocket;
         }
         {
             std::lock_guard<std::mutex> lock(connsMutex);
             for (auto& [id, conn] : conns) {
-                if (conn.socket != kInvalidSocket) closeSocket(conn.socket);
+                if (conn.socket != kInvalidSocket) {
+                    socketShutdown(conn.socket);
+                    closeSocket(conn.socket);
+                }
             }
         }
         if (acceptThread.joinable()) acceptThread.join();
@@ -1079,8 +1090,11 @@ bool TcpTransport::isConnected(ConnId id) const {
 
 void TcpTransport::cleanupLoop() {
     while (!impl_->stopCleanup_) {
-        std::this_thread::sleep_for(std::chrono::seconds(30));
-        
+        {
+            std::unique_lock<std::mutex> lock(impl_->cleanupMutex);
+            impl_->cleanupCV.wait_for(lock, std::chrono::seconds(30),
+                                      [this] { return impl_->stopCleanup_.load(); });
+        }
         if (impl_->stopCleanup_) break;
         
         auto now = std::chrono::steady_clock::now();

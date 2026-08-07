@@ -1,7 +1,7 @@
 #pragma once
 
-#include "vulkan_vm/vulkan_vm.hpp"
 #include "vulkan_vm/network/network_types.hpp"
+#include "vulkan_vm/network/gpu_direct_registration.hpp"
 #include <memory>
 #include <vector>
 #include <optional>
@@ -11,6 +11,12 @@
 
 namespace vvm {
 namespace network {
+
+// RDMA listener port convention: each node derives its RDMA listener port from
+// its TCP control-plane port (+ this offset). This keeps RDMA and TCP control
+// on different port numbers while letting several nodes share one host in
+// loopback tests without port collisions.
+constexpr uint32_t kRdmaPortOffset = 1;
 
 // ============================================================================
 // RDMA Transport Interface
@@ -65,6 +71,7 @@ public:
     // Non-copyable, movable
     RdmaTransport(const RdmaTransport&) = delete;
     RdmaTransport& operator=(const RdmaTransport&) = delete;
+    RdmaTransport() = default;
     RdmaTransport(RdmaTransport&&) noexcept = default;
     RdmaTransport& operator=(RdmaTransport&&) noexcept = default;
     
@@ -179,76 +186,6 @@ public:
     virtual uint32_t getLocalPort() const = 0;
     virtual std::string getDeviceGuid() const = 0;
 };
-
-// ============================================================================
-// GPU-direct memory registration helper (NVIDIA path)
-// ============================================================================
-
-struct GpuDirectRegistration {
-    VkRemoteAddressNV remoteAddress = {0};
-    uint32_t rkey = 0;
-    struct ibv_mr* mr = nullptr;  // verbs memory region
-    bool valid = false;
-};
-
-// Register VkDeviceMemory for NVIDIA GPUDirect RDMA
-std::optional<GpuDirectRegistration> registerGpuMemoryForRdma(
-    VkDevice device,
-    VkPhysicalDevice physicalDevice,
-    VkDeviceMemory memory,
-    VkDeviceSize offset,
-    VkDeviceSize size,
-    const std::string& nicName = "");
-
-// ============================================================================
-// DMA-BUF registration helper (AMD/Intel path)
-// ============================================================================
-
-struct DmaBufRegistration {
-    int fd = -1;
-    struct ibv_mr* mr = nullptr;
-    uint32_t rkey = 0;
-    bool valid = false;
-};
-
-// Register DMA-BUF fd for RDMA
-std::optional<DmaBufRegistration> registerDmaBufForRdma(
-    int dmaBufFd,
-    size_t size,
-    const std::string& nicName = "");
-
-void unregisterDmaBufForRdma(const DmaBufRegistration& reg);
-
-// ============================================================================
-// Vendor-specific GPU-direct registration
-// ============================================================================
-
-// Vendor-agnostic dispatch: returns the appropriate registration struct
-// based on GPU vendor ID.
-std::optional<GpuDirectRegistration> registerGpuMemoryForRdmaVendor(
-    VkDevice device,
-    VkPhysicalDevice physicalDevice,
-    VkDeviceMemory memory,
-    VkDeviceSize offset,
-    VkDeviceSize size,
-    VkQueue transferQueue,
-    uint32_t transferQueueFamily,
-    const std::string& nicName,
-    uint32_t vendorId);
-
-std::optional<DmaBufRegistration> registerDmaBufForRdmaVendor(
-    VkDevice device,
-    VkPhysicalDevice physicalDevice,
-    VkDeviceMemory memory,
-    VkDeviceSize offset,
-    VkDeviceSize size,
-    VkQueue transferQueue,
-    uint32_t transferQueueFamily,
-    const std::string& nicName,
-    uint32_t vendorId);
-
-void unregisterVendorGpuMemory(const GpuDirectRegistration& reg, uint32_t vendorId);
-void unregisterVendorDmaBuf(const DmaBufRegistration& reg, uint32_t vendorId);
 
 } // namespace network
 } // namespace vvm

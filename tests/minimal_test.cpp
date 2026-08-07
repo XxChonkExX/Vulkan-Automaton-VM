@@ -39,7 +39,11 @@ int main() {
     // Check required extensions
     std::vector<const char*> requiredExts = {
         VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
+#if defined(VVM_PLATFORM_WINDOWS)
         VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
+#else
+        VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+#endif
         VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
         VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
     };

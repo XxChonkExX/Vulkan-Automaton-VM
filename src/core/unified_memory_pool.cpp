@@ -925,7 +925,9 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
     
     // Step 4: Build import chain with the ACTUAL buffer in VkMemoryDedicatedAllocateInfo
     VkImportMemoryFdInfoKHR importFdInfo{};
+#ifdef VVM_PLATFORM_WINDOWS
     VkImportMemoryWin32HandleInfoKHR importWin32Info{};
+#endif
     
     VkMemoryAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;

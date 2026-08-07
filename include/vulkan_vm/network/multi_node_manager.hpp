@@ -3,6 +3,7 @@
 #include "vulkan_vm/vulkan_vm.hpp"
 #include "vulkan_vm/network/network_types.hpp"
 #include "vulkan_vm/network/tcp_transport.hpp"
+#include "vulkan_vm/network/rdma_transport.hpp"
 #include <memory>
 #include <vector>
 #include <optional>
@@ -247,6 +248,11 @@ public:
     // Get network config
     const NetworkConfig& getNetworkConfig() const { return networkConfig_; }
     
+    // True when a usable RDMA transport is active (verbs built in + live NIC).
+    bool rdmaAvailable() const {
+        return rdmaTransport_ != nullptr && rdmaTransport_->isReady();
+    }
+    
 private:
     friend class ClusterClient;
     friend class ClusterServer;
@@ -264,6 +270,23 @@ private:
     std::unique_ptr<ClusterClient> clusterClient_;   // optional gRPC client (when built with gRPC)
     std::unique_ptr<ClusterServer> clusterServer_;   // optional gRPC server (when built with gRPC)
     std::unique_ptr<RdmaTransport> rdmaTransport_;   // optional verbs transport (when built with libibverbs)
+
+#if defined(VVM_NETWORK_HAS_VERBS)
+    // One in-flight RDMA "host shadow" export: a host staging buffer holding a
+    // copy of the exported data, kept RDMA-addressable by a registered MR.
+    struct RdmaExport {
+        RdmaMemoryRegion region;   // verbs MR over hostShadow.hostPtr
+        Allocation hostShadow;     // host copy of the exported data
+        VkDeviceSize size = 0;
+    };
+    // Key = pendingKey(localNodeId_, allocId).
+    std::unordered_map<std::string, RdmaExport> rdmaShadowExports_;
+    mutable std::mutex rdmaShadowMutex_;
+
+    // Persistent RDMA connections: peer.toString() -> connection.
+    std::unordered_map<std::string, RdmaConnection> rdmaConnections_;
+    mutable std::mutex rdmaConnectionsMutex_;
+#endif
 
     // TCP host-staged control + data plane (always available)
     std::unique_ptr<TcpTransport> tcpTransport_;
@@ -288,6 +311,8 @@ private:
     // Heartbeat
     std::thread heartbeatThread_;
     std::atomic<bool> stopHeartbeat_{false};
+    mutable std::mutex heartbeatMutex_;
+    mutable std::condition_variable heartbeatCV_;
 
     // Pending remote tensor announcements: key = "sourceNode|name" -> descriptor
     std::unordered_map<std::string, RemoteAllocationDesc> pendingRemoteTensors_;
@@ -311,10 +336,7 @@ private:
     std::unordered_map<uint64_t, ActiveMigration> activeMigrations_;
     mutable std::mutex migrationsMutex_;
     uint64_t nextMigrationId_ = 1;
-    
-    // Migration callback type
-    using MigrationCallback = std::function<void(const NetworkMigrationOperation&)>;
-    
+
     // Cluster state
     std::vector<NodeInfo> clusterView_;
     mutable std::mutex clusterViewMutex_;
@@ -331,6 +353,13 @@ private:
     
     bool registerMemoryForRdma(const Allocation& alloc, uint64_t& outRdmaAddr, uint32_t& outRkey);
     void unregisterMemoryForRdma(const Allocation& alloc);
+
+    // Release the host-shadow export (MR + staging) for a local allocation id.
+    void releaseRdmaExport(uint64_t localAllocId);
+    // Return (and cache) an established RDMA connection to the peer node.
+    std::optional<RdmaConnection> ensureRdmaConnection(const NodeId& peer);
+    // Tear down all host-shadow exports (stop()/cleanup()).
+    void releaseAllRdmaExports();
     
     // Host-staged fallback
     std::optional<NetworkMigrationOperation> migrateHostStaged(

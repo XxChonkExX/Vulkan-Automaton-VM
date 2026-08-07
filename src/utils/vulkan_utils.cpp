@@ -184,9 +184,7 @@ std::vector<DeviceScore> enumerateDevices(VkInstance instance) {
 std::optional<DeviceScore> selectBestDevice(const std::vector<DeviceScore>& devices,
                                              bool preferDiscrete,
                                              uint32_t minHeapSizeMB) {
-    for (const auto& dev : devices) {
-        if (preferDiscrete && !dev.discrete) continue;
-        
+    auto fitsHeap = [&](const DeviceScore& dev) {
         bool hasHeap = false;
         for (uint32_t i = 0; i < dev.memProps.memoryHeapCount; ++i) {
             if ((dev.memProps.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) &&
@@ -195,9 +193,17 @@ std::optional<DeviceScore> selectBestDevice(const std::vector<DeviceScore>& devi
                 break;
             }
         }
-        if (minHeapSizeMB > 0 && !hasHeap) continue;
-        
-        return dev;
+        return minHeapSizeMB == 0 || hasHeap;
+    };
+
+    for (const auto& dev : devices) {
+        if (preferDiscrete && !dev.discrete) continue;
+        if (fitsHeap(dev)) return dev;
+    }
+    if (preferDiscrete) {
+        for (const auto& dev : devices) {
+            if (fitsHeap(dev)) return dev;
+        }
     }
     return std::nullopt;
 }
