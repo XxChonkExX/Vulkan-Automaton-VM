@@ -246,6 +246,9 @@ GPU A ──[P2P/RDMA]──→ NIC A ──[4MB chunks over TCP/RDMA]──→ 
 | Network send/recv (GPU⇄GPU over TCP) | ✅ Done | Verified by `tensor_network_test` |
 | GPU-Direct RDMA (Linux) | 🔧 In progress | Wire up `ibv_reg_dmabuf_mr` |
 | GPU-Direct RDMA (Windows) | 🔧 Planned | NDKPI implementation |
+| Layout conversion shaders | 🔧 In progress | NHWC↔NCHW, blocked for tensor cores |
+| Async pipeline | 🔧 Framework ready | Callback chaining, overlap compute+transfer |
+| NCCL-style collectives | 🔧 Planned | Better all-gather, reduce-scatter |
 
 ---
 
@@ -468,6 +471,9 @@ magicRoom.commit(deed, 64_GiB, 64_GiB, memoryFlags);
 - ✅ **PyTorch C++ extension** — `vulkanvm_torch` with full Python bindings for pool, offload, external memory, ModelHub, shard placement
 - ✅ **ONNX Runtime integration** — `vulkanvm_onnx` with `VulkanVMExecutionProvider`, NumPy interop, ModelHub for ONNX models
 - ✅ **SoftRoCE persistence** — `scripts/softroce_persist.sh` (Linux) + `scripts/softroce_persist.ps1` (Windows) for auto-creation on boot
+- ✅ **Tensor Transport module** — `vulkanvm_tensor` with allocation, copy, layout conversion, all-reduce, send/recv, collectives
+- ✅ **Modular headers** — core, cross_gpu, offload, network, tensor, placement, sparse split from monolithic header
+- ✅ **Modular CMake** — tensor transport optional module, PyTorch/ONNX as separate modules
 
 ---
 
@@ -534,6 +540,9 @@ cmake -B build -DVVM_BUILD_PYTORCH=ON -DCMAKE_PREFIX_PATH=$(python -c "import to
 
 # ONNX
 cmake -B build -DVVM_BUILD_ONNX=ON
+
+# Tensor Transport (enabled by default)
+cmake -B build -DVVM_BUILD_TENSOR_TRANSPORT=ON
 ```
 
 ---
