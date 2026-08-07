@@ -560,14 +560,6 @@ Creates `rxe0` on `eth0` and `rxe1` on `lo`, waits for `ACTIVE`, optionally inst
 
 ---
 
-## Bottom Line
-
-**Install it. Link it. Call `UnifiedMemoryPool::create()`.**
-
-It either works or returns `std::nullopt`. No system modification. No risk. Test on your Strix Halo first — that's where it shines brightest.
-
----
-
 ## Need Help?
 
 - **README.md** — Full API reference, building, cross-vendor matrix, shard placement API
