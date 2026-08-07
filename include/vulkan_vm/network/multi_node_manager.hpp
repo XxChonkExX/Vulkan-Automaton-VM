@@ -10,6 +10,7 @@
 #include <string>
 #include <functional>
 #include <mutex>
+#include <condition_variable>
 #include <unordered_map>
 #include <atomic>
 #include <thread>
@@ -189,6 +190,25 @@ public:
     
     // Look up a registered (remote-visible) allocation by its local id.
     std::optional<Allocation> getRegisteredAllocation(uint64_t localAllocId) const;
+
+    // ========================================================================
+    // Remote tensor announcement (GPU-to-GPU VRAM share over TCP)
+    // ========================================================================
+
+    // Advertise a tensor (by name) to a specific peer. The peer receives a
+    // RemoteAllocationDesc it can use to pull the VRAM with migrateFromRemote.
+    bool announceRemoteTensor(
+        const NodeId& target,
+        const std::string& name,
+        const RemoteAllocationDesc& desc);
+
+    // Wait until a peer announces a tensor with the given name; returns its
+    // descriptor. Blocks up to timeoutNs. The tensor then stays in the peer's
+    // VRAM and can be pulled with migrateFromRemote().
+    std::optional<RemoteAllocationDesc> waitRemoteTensor(
+        const NodeId& source,
+        const std::string& name,
+        uint64_t timeoutNs = UINT64_MAX);
     
     // Manual cluster operations
     bool registerWithCluster();
@@ -268,6 +288,11 @@ private:
     // Heartbeat
     std::thread heartbeatThread_;
     std::atomic<bool> stopHeartbeat_{false};
+
+    // Pending remote tensor announcements: key = "sourceNode|name" -> descriptor
+    std::unordered_map<std::string, RemoteAllocationDesc> pendingRemoteTensors_;
+    mutable std::mutex remoteTensorsMutex_;
+    std::condition_variable remoteTensorsCV_;
     
     // Local pools (one per GPU)
     std::vector<UnifiedMemoryPool> localPools_;

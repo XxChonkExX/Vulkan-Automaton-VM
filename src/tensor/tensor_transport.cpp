@@ -29,7 +29,8 @@ std::unique_ptr<Tensor> Tensor::create(
     uint32_t device_index,
     VkDeviceMemory memory,
     VkDeviceSize offset,
-    VkDeviceSize size
+    VkDeviceSize size,
+    uint32_t block_index
 ) {
     auto tensor = std::unique_ptr<Tensor>(new Tensor());
     tensor->meta_ = meta;
@@ -40,6 +41,7 @@ std::unique_ptr<Tensor> Tensor::create(
     tensor->memory_ = memory;
     tensor->offset_ = offset;
     tensor->size_ = size;
+    tensor->block_index_ = block_index;
     tensor->pinned_ = false;
     return tensor;
 }
@@ -205,7 +207,8 @@ public:
             static_cast<uint32_t>(deviceIndex),
             alloc->memory,
             alloc->offset,
-            alloc->size
+            alloc->size,
+            alloc->blockIndex
         );
     }
     
@@ -275,7 +278,8 @@ public:
                 peerIdx,
                 peerAlloc->memory,
                 peerAlloc->offset,
-                peerAlloc->size
+                peerAlloc->size,
+                peerAlloc->blockIndex
             ));
         }
         
@@ -310,7 +314,7 @@ public:
         alloc.size = tensor->size();
         alloc.deviceAddress = tensor->deviceAddress();
         alloc.hostPtr = tensor->hostPtr();
-        alloc.blockIndex = UINT32_MAX; // Dedicated
+        alloc.blockIndex = tensor->blockIndex();
         
         pool.deallocate(std::move(alloc));
     }
@@ -506,32 +510,84 @@ public:
     // Multi-Node Network
     // ========================================================================
     
-    bool joinCluster(const std::string& clusterAddress) override {
+bool joinCluster(const std::string& clusterAddress) override {
         if (!networkManager_) return false;
         return networkManager_->start(); // Simplified
     }
-    
+
     void leaveCluster() override {
         if (networkManager_) {
             networkManager_->stop();
         }
     }
-    
+
     bool sendTensor(
         const Tensor& tensor,
         const std::string& remoteNodeId,
         AsyncCallback callback
     ) override {
-        // Network send would use MultiNodePoolManager
-        return false; // Placeholder
+        if (!networkManager_ || !networkManager_->isRunning()) {
+            if (callback) callback(false, "Network transport not running");
+            return false;
+        }
+
+        auto target = vvm::network::NodeId::fromString(remoteNodeId);
+        if (target.host.empty() || target.port == 0) {
+            if (callback) callback(false, "Invalid remote node id: " + remoteNodeId);
+            return false;
+        }
+
+        // Export the local VRAM so the peer can pull it, then advertise it
+        // under the tensor's name. The peer pulls with recvTensor().
+        bool rdmaOk = rdmaTransport_ && rdmaTransport_->supportsGpuDirect();
+        auto desc = networkManager_->exportForRemote(tensor.asAllocation(), rdmaOk, !rdmaOk);
+        if (!desc) {
+            if (callback) callback(false, "exportForRemote failed");
+            return false;
+        }
+        desc->allocationName = tensor.meta().name;
+
+        if (!networkManager_->announceRemoteTensor(target, tensor.meta().name, *desc)) {
+            if (callback) callback(false, "announceRemoteTensor failed");
+            return false;
+        }
+        if (callback) callback(true, "");
+        return true;
     }
-    
+
     bool recvTensor(
         Tensor& tensor,
         const std::string& remoteNodeId,
         AsyncCallback callback
     ) override {
-        return false; // Placeholder
+        if (!networkManager_ || !networkManager_->isRunning()) {
+            if (callback) callback(false, "Network transport not running");
+            return false;
+        }
+        auto source = vvm::network::NodeId::fromString(remoteNodeId);
+        if (source.host.empty() || source.port == 0) {
+            if (callback) callback(false, "Invalid remote node id: " + remoteNodeId);
+            return false;
+        }
+
+        // Wait for the peer to advertise the tensor, then pull its VRAM into
+        // our local buffer over TCP (GPU-to-GPU VRAM share, cross-vendor).
+        constexpr uint64_t kRecvTimeoutNs = 30ull * 1000 * 1000 * 1000;  // 30s
+        auto desc = networkManager_->waitRemoteTensor(source, tensor.meta().name, kRecvTimeoutNs);
+        if (!desc) {
+            if (callback) callback(false, "waitRemoteTensor timed out");
+            return false;
+        }
+
+        auto dst = tensor.asAllocation();
+        bool rdmaOk = desc->canUseRdma() && config_.preference != TransportConfig::Preference::NetworkOnly;
+        auto op = networkManager_->migrateFromRemote(*desc, dst, rdmaOk, kRecvTimeoutNs);
+        if (!op || !op->completed) {
+            if (callback) callback(false, op ? op->errorMessage : "migrateFromRemote failed");
+            return false;
+        }
+        if (callback) callback(true, "");
+        return true;
     }
     
     // ========================================================================
@@ -598,10 +654,10 @@ private:
     
     bool initNetworkTransport() {
         if (devices_.empty()) return false;
-        
+
         vvm::network::NetworkConfig netConfig;
-        netConfig.listenAddress = "0.0.0.0:" + std::to_string(config_.networkPort);
-        netConfig.seedNodes = {}; // Will be set by joinCluster
+        netConfig.listenAddress = config_.listenAddress + ":" + std::to_string(config_.networkPort);
+        netConfig.seedNodes = config_.seedNodes;
         netConfig.enableRdma = false;
         netConfig.enableGpuDirect = false;
         netConfig.enableHostStagedFallback = true;

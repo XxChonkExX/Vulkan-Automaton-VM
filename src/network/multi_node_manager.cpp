@@ -828,6 +828,72 @@ void MultiNodePoolManager::migrateFromRemoteAsync(
 }
 
 // ============================================================================
+// Remote tensor announcement (GPU-to-GPU VRAM share over TCP)
+// ============================================================================
+
+static std::string remoteTensorKey(const NodeId& node, const std::string& name) {
+    return node.toString() + "|" + name;
+}
+
+bool MultiNodePoolManager::announceRemoteTensor(
+    const NodeId& target,
+    const std::string& name,
+    const RemoteAllocationDesc& desc) {
+
+    std::vector<uint8_t> body;
+    detail::putStr(body, name);
+    auto bytes = serializeAllocationDesc(desc);
+    body.insert(body.end(), bytes.begin(), bytes.end());
+
+    TcpMessage req;
+    req.type = MsgTensorAnnounce;
+    req.flags = TcpFlagsRequest;
+    req.body = std::move(body);
+
+    auto conn = getPeerConnection(target.host, target.port);
+    if (conn == 0) {
+        VVM_LOG_ERROR("announceRemoteTensor: no connection to {}", target.toString());
+        return false;
+    }
+
+    auto resp = tcpTransport_->request(conn, req, nullptr);
+    if (!resp || resp->flags == TcpFlagsError) {
+        VVM_LOG_ERROR("announceRemoteTensor: peer {} rejected announcement '{}'",
+                      target.toString(), name);
+        return false;
+    }
+    VVM_LOG_INFO("announceRemoteTensor: announced '{}' ({} bytes) to {}", name, desc.size, target.toString());
+    return true;
+}
+
+std::optional<RemoteAllocationDesc> MultiNodePoolManager::waitRemoteTensor(
+    const NodeId& source,
+    const std::string& name,
+    uint64_t timeoutNs) {
+
+    const std::string key = remoteTensorKey(source, name);
+    std::unique_lock<std::mutex> lock(remoteTensorsMutex_);
+
+    auto pred = [&] { return pendingRemoteTensors_.count(key) > 0; };
+    if (timeoutNs == UINT64_MAX) {
+        remoteTensorsCV_.wait(lock, pred);
+    } else {
+        auto timeout = std::chrono::nanoseconds(timeoutNs);
+        if (!remoteTensorsCV_.wait_for(lock, timeout, pred)) {
+            VVM_LOG_ERROR("waitRemoteTensor: timed out waiting for '{}' from {}", name, source.toString());
+            return std::nullopt;
+        }
+    }
+
+    auto it = pendingRemoteTensors_.find(key);
+    if (it == pendingRemoteTensors_.end()) return std::nullopt;
+    RemoteAllocationDesc desc = it->second;
+    pendingRemoteTensors_.erase(it);
+    VVM_LOG_INFO("waitRemoteTensor: got '{}' ({} bytes) from {}", name, desc.size, source.toString());
+    return desc;
+}
+
+// ============================================================================
 // Cluster management
 // ============================================================================
 
@@ -1440,6 +1506,24 @@ void MultiNodePoolManager::onTcpRequest(TcpMessage& request, TcpMessage& respons
             } else {
                 VVM_LOG_WARN("Deallocate: unknown allocation {}", localAllocId);
             }
+            response = makeResponse(request.type, TcpFlagsResponse);
+            detail::putU8(response.body, 1);
+            break;
+        }
+        case MsgTensorAnnounce: {
+            std::string name;
+            RemoteAllocationDesc desc;
+            if (!detail::getStr(p, end, name) ||
+                !deserializeAllocationDesc(p, end, desc)) {
+                response = makeResponse(request.type, TcpFlagsError);
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(remoteTensorsMutex_);
+                pendingRemoteTensors_[remoteTensorKey(desc.owner, name)] = desc;
+            }
+            remoteTensorsCV_.notify_all();
+            VVM_LOG_INFO("TensorAnnounce: stored '{}' ({} bytes) from {}", name, desc.size, desc.owner.toString());
             response = makeResponse(request.type, TcpFlagsResponse);
             detail::putU8(response.body, 1);
             break;

@@ -164,6 +164,7 @@ public:
     VkDeviceMemory memory() const { return memory_; }
     VkDeviceSize offset() const { return offset_; }
     VkDeviceSize size() const { return size_; }
+    uint32_t blockIndex() const { return block_index_; }
     bool isValid() const { return buffer_ != VK_NULL_HANDLE; }
     
     // Conversion to Allocation for Vulkan operations (const)
@@ -175,7 +176,7 @@ public:
         alloc.size = size_;
         alloc.deviceAddress = device_address_;
         alloc.hostPtr = host_ptr_;
-        alloc.blockIndex = UINT32_MAX; // Dedicated allocation
+        alloc.blockIndex = block_index_;
         return alloc;
     }
     
@@ -188,7 +189,7 @@ public:
         alloc.size = size_;
         alloc.deviceAddress = device_address_;
         alloc.hostPtr = host_ptr_;
-        alloc.blockIndex = UINT32_MAX;
+        alloc.blockIndex = block_index_;
         return alloc;
     }
     
@@ -201,7 +202,7 @@ public:
         alloc.size = size_;
         alloc.deviceAddress = device_address_;
         alloc.hostPtr = host_ptr_;
-        alloc.blockIndex = UINT32_MAX;
+        alloc.blockIndex = block_index_;
         return alloc;
     }
     
@@ -214,7 +215,8 @@ public:
         uint32_t device_index,
         VkDeviceMemory memory = VK_NULL_HANDLE,
         VkDeviceSize offset = 0,
-        VkDeviceSize size = 0
+        VkDeviceSize size = 0,
+        uint32_t block_index = UINT32_MAX
     );
     
     // Layout conversion (returns new tensor with converted layout)
@@ -234,6 +236,7 @@ private:
     VkDeviceMemory memory_ = VK_NULL_HANDLE;
     VkDeviceSize offset_ = 0;
     VkDeviceSize size_ = 0;
+    uint32_t block_index_ = UINT32_MAX;
     bool pinned_ = false;
 };
 
@@ -268,7 +271,9 @@ struct TransportConfig {
     
     // Network (if NetworkOnly or fallback)
     std::string networkInterface = "";    // NIC name (empty = auto)
+    std::string listenAddress = "0.0.0.0";  // host to bind the listener on
     uint16_t networkPort = 51000;         // Base port
+    std::vector<std::string> seedNodes;   // initial cluster contacts (host:port)
     bool enableTLS = false;
     std::string tlsCertPath = "";
     std::string tlsKeyPath = "";

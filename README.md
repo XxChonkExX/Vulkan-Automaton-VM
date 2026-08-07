@@ -629,6 +629,22 @@ ctest --test-dir build --output-on-failure
 
 All three support sparse binding + residency.
 
+> **Intel Arc on Windows (`igvk64.dll`) — known driver flakiness:**
+> The Intel Vulkan driver on Windows is notoriously unstable. Real-world reports
+> (including crashes blacklisted by the Khronos validation-layer test suite,
+> IGCIT tracker issues, and DXVK upstream) consistently show
+> `0xC0000005` access violations raised *inside* `igvk64.dll` at
+> device/video-memory teardown, even for spec-correct applications.
+> `multi_gpu_test` on Intel Arc hardware can exit with a non-zero status
+> (`-1073741819`) during teardown *after* every test assertion passes — this is
+> reproduced on the unmodified baseline and is not an application fault.
+> Workarounds:
+> - Use a newer/older known-good driver (community reports vary; some users fall
+>   back to `32.0.101.69xx`, others need the latest `101.84xx+` line).
+> - Prefer NVIDIA/AMD discrete GPUs, or the Linux stack, for CI on Intel Arc.
+> - Treat `multi_gpu_test` teardown crashes on Intel Windows as a driver noise,
+>   not a VulkanVM regression.
+
 ---
 
 ## APU-Specific Tuning (Strix Halo 395 / Unified Memory)

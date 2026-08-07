@@ -21,6 +21,11 @@ add_executable(network_test network_test.cpp)
 target_link_libraries(network_test PRIVATE vulkan_vm vulkan_vm_network)
 target_include_directories(network_test PRIVATE ${EXAMPLE_EXTRA_INCLUDES})
 
+# Tensor network test (GPU-to-GPU VRAM share cross-vendor over TCP)
+add_executable(tensor_network_test tensor_network_test.cpp)
+target_link_libraries(tensor_network_test PRIVATE vulkan_vm vulkan_vm_network)
+target_include_directories(tensor_network_test PRIVATE ${EXAMPLE_EXTRA_INCLUDES})
+
 # Offload/reload verification test (device <-> host shadow round-trip)
 add_executable(offload_test offload_test.cpp)
 target_link_libraries(offload_test PRIVATE vulkan_vm)

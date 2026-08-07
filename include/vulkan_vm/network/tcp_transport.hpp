@@ -34,10 +34,13 @@ enum : uint32_t {
     MsgHeartbeat      = 8,
     MsgLeaveCluster   = 9,
     MsgDeallocate     = 10,  // request: free an allocation by id on its owner
-    // Model registry messages (Hugging Face–style weight distribution)
+    // Model registry messages (Hugging Face style weight distribution)
     MsgModelList      = 11,  // request list of published models
     MsgModelManifest  = 12,  // request/response with model manifest
     MsgModelChunk     = 13,  // request chunk; response carries streamed chunk data
+    // Remote tensor announcement: sender advertises a tensor by name to a
+    // peer; the peer stores the descriptor and can later pull the VRAM.
+    MsgTensorAnnounce = 14,
 };
 
 enum : uint32_t {
