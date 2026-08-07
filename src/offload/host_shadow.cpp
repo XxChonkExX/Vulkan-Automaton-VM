@@ -554,17 +554,18 @@ OffloadManager::~OffloadManager() {
 }
 
 std::optional<MigrationOperation> OffloadManager::offload(Allocation& alloc) {
-    VVM_LOG_INFO("offload: alloc=%p, size=%llu, offset=%llu", 
+    std::lock_guard<std::mutex> lock(mutex_);
+    VVM_LOG_INFO("offload: alloc={}, size={}, offset={}", 
                   &alloc, alloc.size, alloc.offset);
     
     // Allocate region in host shadow
     auto shadowOffset = shadowManager_->allocateRegion(alloc.size);
     if (!shadowOffset) {
-        VVM_LOG_ERROR("Failed to allocate shadow region for offload (size=%llu)", alloc.size);
+        VVM_LOG_ERROR("Failed to allocate shadow region for offload (size={})", alloc.size);
         return std::nullopt;
     }
     
-    VVM_LOG_INFO("Allocated shadow region at offset %llu for size %llu", *shadowOffset, alloc.size);
+    VVM_LOG_INFO("Allocated shadow region at offset {} for size {}", *shadowOffset, alloc.size);
     
     // NOTE: We deliberately do NOT call mprotect(PROT_NONE) on the shadow
     // region. mprotect on memory mapped via vkMapMemory is undefined
@@ -582,12 +583,12 @@ std::optional<MigrationOperation> OffloadManager::offload(Allocation& alloc) {
     req.toHost = true;
     req.hostShadowBuffer = shadowManager_->getBuffer();
     
-    VVM_LOG_INFO("Submitting migration to host: srcOffset=%llu, dstOffset=%llu, size=%llu, hostShadowBuffer=%p", 
+    VVM_LOG_INFO("Submitting migration to host: srcOffset={}, dstOffset={}, size={}, hostShadowBuffer={}", 
                   alloc.offset, *shadowOffset, alloc.size, shadowManager_->getBuffer());
     
     auto op = migrationEngine_->submitMigration(req);
     if (op) {
-        VVM_LOG_INFO("Migration submitted successfully, op=%p", &*op);
+        VVM_LOG_INFO("Migration submitted successfully, op={}", &*op);
         // Mark allocation as offloaded and track the shadow offset for reload.
         alloc.shadowOffset = *shadowOffset;
         alloc.savedHostPtr = alloc.hostPtr;   // remember the pool mapping
@@ -607,6 +608,7 @@ std::optional<MigrationOperation> OffloadManager::offload(Allocation& alloc) {
 }
 
 std::optional<MigrationOperation> OffloadManager::reload(Allocation& alloc) {
+    std::lock_guard<std::mutex> lock(mutex_);
     // Use the tracked shadow offset from the matching offload.
     if (alloc.shadowOffset == static_cast<VkDeviceSize>(-1)) {
         VVM_LOG_ERROR("reload: allocation is not currently offloaded (no shadow offset)");
@@ -650,7 +652,8 @@ std::optional<MigrationOperation> OffloadManager::reload(Allocation& alloc) {
 }
 
 bool OffloadManager::offloadSync(Allocation& alloc, uint64_t timeoutNs) {
-    VVM_LOG_DEBUG("offloadSync called: alloc=%p, size=%llu, timeout=%llu", 
+    std::lock_guard<std::mutex> lock(mutex_);
+    VVM_LOG_DEBUG("offloadSync called: alloc={}, size={}, timeout={}", 
                   &alloc, alloc.size, timeoutNs);
     
     auto op = offload(alloc);
@@ -670,13 +673,14 @@ bool OffloadManager::offloadSync(Allocation& alloc, uint64_t timeoutNs) {
         migrationEngine_->waitMigration(*op);
     }
     
-    std::lock_guard<std::mutex> lock(statsMutex_);
+    std::lock_guard<std::mutex> statsLock(statsMutex_);
     stats_.activeMigrations--;
     stats_.completedMigrations++;
     return true;
 }
 
 bool OffloadManager::reloadSync(Allocation& alloc, uint64_t timeoutNs) {
+    std::lock_guard<std::mutex> lock(mutex_);
     auto op = reload(alloc);
     if (!op) return false;
     
@@ -686,28 +690,31 @@ bool OffloadManager::reloadSync(Allocation& alloc, uint64_t timeoutNs) {
         migrationEngine_->waitMigration(*op);
     }
     
-    std::lock_guard<std::mutex> lock(statsMutex_);
+    std::lock_guard<std::mutex> statsLock(statsMutex_);
     stats_.activeMigrations--;
     stats_.completedMigrations++;
     return true;
 }
 
 void OffloadManager::waitAll() {
+    std::lock_guard<std::mutex> lock(mutex_);
     migrationEngine_->waitIdle();
     
-    std::lock_guard<std::mutex> lock(statsMutex_);
+    std::lock_guard<std::mutex> statsLock(statsMutex_);
     stats_.activeMigrations = 0;
 }
 
 OffloadManager::Stats OffloadManager::getStats() const {
-    std::lock_guard<std::mutex> lock(statsMutex_);
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> statsLock(statsMutex_);
     Stats s = stats_;
     s.activeMigrations = migrationEngine_->getPendingCount();
     return s;
 }
 
 void OffloadManager::resetStats() {
-    std::lock_guard<std::mutex> lock(statsMutex_);
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> statsLock(statsMutex_);
     stats_ = {};
 }
 

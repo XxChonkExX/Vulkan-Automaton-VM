@@ -127,69 +127,68 @@ class UnifiedMemoryPool;
 inline void uniqueAllocationDeleter(UnifiedMemoryPool* pool, Allocation&& alloc);
 
 // RAII wrapper for Allocation - automatically returns to pool on destruction.
-// Usage: auto alloc = pool->allocate(...); UniqueAllocation ua(pool, std::move(alloc));
-// Note: UniqueAllocation itself is not thread-safe; pool operations are
-// thread-safe (internally mutex-guarded). Treat the returned Allocation as
-// single-threaded after the call returns.
-class UniqueAllocation {
-public:
-    using Deleter = void(*)(UnifiedMemoryPool*, Allocation&&);
-    
-    UniqueAllocation() = default;
-    // NOTE: Use make() factory instead of constructor for proper deleter setup
-    UniqueAllocation(UnifiedMemoryPool* pool, Allocation&& alloc)
-        : pool_(pool), alloc_(std::move(alloc)), deleter_(&uniqueAllocationDeleter) {}
-    
-    UniqueAllocation(UniqueAllocation&& other) noexcept
-        : pool_(other.pool_), alloc_(std::move(other.alloc_)), deleter_(other.deleter_) {
-        other.pool_ = nullptr;
-        other.deleter_ = nullptr;
-    }
-    
-    UniqueAllocation& operator=(UniqueAllocation&& other) noexcept {
-        if (this != &other) {
-            reset();
-            pool_ = other.pool_;
-            alloc_ = std::move(other.alloc_);
-            deleter_ = other.deleter_;
+    // Usage: auto alloc = pool->allocate(...); auto ua = UniqueAllocation::make(pool, std::move(alloc));
+    // Only create via UniqueAllocation::make() to ensure proper deleter setup.
+    class UniqueAllocation {
+    public:
+        using Deleter = void(*)(UnifiedMemoryPool*, Allocation&&);
+        
+    private:
+        UniqueAllocation() = default;
+        UniqueAllocation(UnifiedMemoryPool* pool, Allocation&& alloc)
+            : pool_(pool), alloc_(std::move(alloc)), deleter_(&uniqueAllocationDeleter) {}
+        
+    public:
+        UniqueAllocation(UniqueAllocation&& other) noexcept
+            : pool_(other.pool_), alloc_(std::move(other.alloc_)), deleter_(other.deleter_) {
             other.pool_ = nullptr;
             other.deleter_ = nullptr;
         }
-        return *this;
-    }
-    
-    ~UniqueAllocation() { reset(); }
-    
-    void reset() {
-        if (pool_ && alloc_.buffer != VK_NULL_HANDLE && deleter_) {
-            deleter_(pool_, std::move(alloc_));
-            alloc_ = {};
+        
+        UniqueAllocation& operator=(UniqueAllocation&& other) noexcept {
+            if (this != &other) {
+                reset();
+                pool_ = other.pool_;
+                alloc_ = std::move(other.alloc_);
+                deleter_ = other.deleter_;
+                other.pool_ = nullptr;
+                other.deleter_ = nullptr;
+            }
+            return *this;
         }
-    }
-    
-    Allocation* get() { return alloc_.buffer != VK_NULL_HANDLE ? &alloc_ : nullptr; }
-    const Allocation* get() const { return alloc_.buffer != VK_NULL_HANDLE ? &alloc_ : nullptr; }
-    Allocation* operator->() { return get(); }
-    const Allocation* operator->() const { return get(); }
-    explicit operator bool() const { return alloc_.buffer != VK_NULL_HANDLE; }
-    
-    // Release ownership without deallocating
-    Allocation release() {
-        Allocation tmp = std::move(alloc_);
-        alloc_ = {};
-        pool_ = nullptr;
-        deleter_ = nullptr;
-        return tmp;
-    }
-    
-    // Factory to create with proper deleter
-    static UniqueAllocation make(UnifiedMemoryPool* pool, Allocation&& alloc);
-    
-private:
-    UnifiedMemoryPool* pool_ = nullptr;
-    Allocation alloc_;
-    Deleter deleter_ = nullptr;
-};
+        
+        ~UniqueAllocation() { reset(); }
+        
+        void reset() {
+            if (pool_ && alloc_.buffer != VK_NULL_HANDLE && deleter_) {
+                deleter_(pool_, std::move(alloc_));
+                alloc_ = {};
+            }
+        }
+        
+        Allocation* get() { return alloc_.buffer != VK_NULL_HANDLE ? &alloc_ : nullptr; }
+        const Allocation* get() const { return alloc_.buffer != VK_NULL_HANDLE ? &alloc_ : nullptr; }
+        Allocation* operator->() { return get(); }
+        const Allocation* operator->() const { return get(); }
+        explicit operator bool() const { return alloc_.buffer != VK_NULL_HANDLE; }
+        
+        // Release ownership without deallocating
+        Allocation release() {
+            Allocation tmp = std::move(alloc_);
+            alloc_ = {};
+            pool_ = nullptr;
+            deleter_ = nullptr;
+            return tmp;
+        }
+        
+        // Factory to create with proper deleter (only way to construct)
+        static UniqueAllocation make(UnifiedMemoryPool* pool, Allocation&& alloc);
+        
+    private:
+        UnifiedMemoryPool* pool_ = nullptr;
+        Allocation alloc_;
+        Deleter deleter_ = nullptr;
+    };
 
 struct BlockInfo {
     VkDeviceMemory memory = VK_NULL_HANDLE;

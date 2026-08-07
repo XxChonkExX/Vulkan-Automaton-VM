@@ -207,7 +207,7 @@ bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig&
         return false;
     }
     deviceLocalMemoryType_ = devLocalResult.memoryTypeIndex;
-    VVM_LOG_INFO("Selected DEVICE_LOCAL memory type %u (heap budget: %llu MB, utilization: %.1f%%)",
+    VVM_LOG_INFO("Selected DEVICE_LOCAL memory type {} (heap budget: {} MB, utilization: {} percent)",
                  deviceLocalMemoryType_,
                  devLocalResult.heapBudget / (1024*1024),
                  devLocalResult.heapUtilization * 100.0f);
@@ -245,8 +245,8 @@ bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig&
         );
         if (hostVisibleResult.memoryTypeIndex != UINT32_MAX) {
             hostVisibleMemoryType_ = hostVisibleResult.memoryTypeIndex;
-            VVM_LOG_INFO("Selected HOST_VISIBLE memory type %u (heap budget: %llu MB)",
-                         hostVisibleMemoryType_,
+VVM_LOG_INFO("Selected HOST_VISIBLE memory type {} (heap budget: {} MB)",
+                 hostVisibleMemoryType_,
                          hostVisibleResult.heapBudget / (1024*1024));
         } else {
             VVM_LOG_WARN("No suitable HOST_VISIBLE memory type found");
@@ -269,7 +269,7 @@ bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig&
     // Pre-allocate first block (pool blocks are never exportable). Respect the
     // budget cap: do not steal memory past maxHeapFraction / maxPoolBytes.
     if (wouldExceedBudget(config_.blockSize)) {
-        VVM_LOG_ERROR("Initial pool block (%llu MB) exceeds configured budget; "
+        VVM_LOG_ERROR("Initial pool block ({} MB) exceeds configured budget; "
                       "lower blockSize or raise maxHeapFraction/maxPoolBytes",
                       config_.blockSize / (1024 * 1024));
         return false;
@@ -293,11 +293,11 @@ bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig&
             : deviceConfig_.graphicsQueueFamily;
         
         offloadManager_ = std::make_unique<OffloadManager>(this, offloadConfig);
-        VVM_LOG_INFO("OffloadManager created with host shadow size: %llu MB", 
+        VVM_LOG_INFO("OffloadManager created with host shadow size: {} MB", 
                      offloadConfig.hostShadowSize / (1024*1024));
     }
     
-    VVM_LOG_INFO("UnifiedMemoryPool initialized successfully (blockSize=%llu MB, alignment=%llu KB)",
+    VVM_LOG_INFO("UnifiedMemoryPool initialized successfully (blockSize={} MB, alignment={} KB)",
                  config_.blockSize / (1024*1024), config_.minAlignment / 1024);
     return true;
 }
@@ -332,7 +332,7 @@ bool UnifiedMemoryPool::wouldExceedBudget(VkDeviceSize additionalBytes) const {
 
     // Hard byte cap.
     if (config_.maxPoolBytes > 0 && currentPool + additionalBytes > config_.maxPoolBytes) {
-        VVM_LOG_WARN("budget: pool (%llu MB) + %llu MB would exceed maxPoolBytes (%llu MB)",
+        VVM_LOG_WARN("budget: pool ({} MB) + {} MB would exceed maxPoolBytes ({} MB)",
                      currentPool / (1024 * 1024), additionalBytes / (1024 * 1024),
                      config_.maxPoolBytes / (1024 * 1024));
         return true;
@@ -362,7 +362,8 @@ bool UnifiedMemoryPool::wouldExceedBudget(VkDeviceSize additionalBytes) const {
         }
         const VkDeviceSize cap = static_cast<VkDeviceSize>(heapBudget * config_.maxHeapFraction);
         if (heapUsed + additionalBytes > cap) {
-            VVM_LOG_WARN("budget: heap usage %llu MB + %llu MB would exceed %llu MB (%.0f%% of %llu MB); "
+            VVM_LOG_WARN("budget: heap usage {} MB + {} MB would exceed {} MB ({:.0f}% of {} MB); "
+                 "allocate() failing soft instead of stealing VRAM",
                          "allocate() failing soft instead of stealing VRAM",
                          heapUsed / (1024 * 1024), additionalBytes / (1024 * 1024),
                          cap / (1024 * 1024), config_.maxHeapFraction * 100.0f,
@@ -472,7 +473,7 @@ std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
     VkDeviceMemory memory;
     VkResult result = vkAllocateMemory(device_, &allocInfo, nullptr, &memory);
     if (result != VK_SUCCESS) {
-        VVM_LOG_ERROR("vkAllocateMemory failed: %s (size=%llu, type=%u)", 
+        VVM_LOG_ERROR("vkAllocateMemory failed: {} (size={}, type={})", 
                       vkResultToString(result).c_str(), size, memoryTypeIndex);
         return std::nullopt;
     }
@@ -488,7 +489,7 @@ std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
     if (isHostVisible) {
         result = vkMapMemory(device_, memory, 0, VK_WHOLE_SIZE, 0, &hostPtr);
         if (result != VK_SUCCESS) {
-            VVM_LOG_WARN("vkMapMemory failed: %s", vkResultToString(result).c_str());
+            VVM_LOG_WARN("vkMapMemory failed: {}", vkResultToString(result).c_str());
             hostPtr = nullptr;
             isHostVisible = false;
         }
@@ -560,7 +561,7 @@ static VkExternalMemoryHandleTypeFlags getExportHandleTypes(VkPhysicalDevice phy
         VkResult result = vkCreateBuffer(device_, &bufferInfo, nullptr, &buffer);
         VVM_LOG_INFO("allocateDedicatedExportable: vkCreateBuffer result={}", result);
         if (result != VK_SUCCESS) {
-            VVM_LOG_ERROR("vkCreateBuffer failed for dedicated exportable: %s", vkResultToString(result).c_str());
+            VVM_LOG_ERROR("vkCreateBuffer failed for dedicated exportable: {}", vkResultToString(result).c_str());
             return std::nullopt;
         }
         
@@ -626,7 +627,7 @@ VkMemoryDedicatedAllocateInfo dedicatedInfo{};
         result = vkAllocateMemory(device_, &allocInfo, nullptr, &memory);
         VVM_LOG_INFO("allocateDedicatedExportable: vkAllocateMemory result={}", result);
         if (result != VK_SUCCESS) {
-            VVM_LOG_ERROR("vkAllocateMemory failed for dedicated exportable: %s", vkResultToString(result).c_str());
+            VVM_LOG_ERROR("vkAllocateMemory failed for dedicated exportable: {}", vkResultToString(result).c_str());
             vkDestroyBuffer(device_, buffer, nullptr);
             return std::nullopt;
         }
@@ -642,7 +643,7 @@ VkMemoryDedicatedAllocateInfo dedicatedInfo{};
         result = vkBindBufferMemory2(device_, 1, &bindInfo);
         VVM_LOG_INFO("allocateDedicatedExportable: vkBindBufferMemory2 result={}", result);
         if (result != VK_SUCCESS) {
-            VVM_LOG_ERROR("vkBindBufferMemory2 failed for dedicated exportable: %s", vkResultToString(result).c_str());
+            VVM_LOG_ERROR("vkBindBufferMemory2 failed for dedicated exportable: {}", vkResultToString(result).c_str());
             vkFreeMemory(device_, memory, nullptr);
             vkDestroyBuffer(device_, buffer, nullptr);
             return std::nullopt;
@@ -666,7 +667,7 @@ VVM_LOG_INFO("allocateDedicatedExportable: bind succeeded");
         result = vkMapMemory(device_, memory, 0, VK_WHOLE_SIZE, 0, &hostPtr);
         VVM_LOG_INFO("allocateDedicatedExportable: vkMapMemory result={}", result);
         if (result != VK_SUCCESS) {
-            VVM_LOG_ERROR("vkMapMemory failed for dedicated exportable: %s (will not be mappable)", 
+            VVM_LOG_ERROR("vkMapMemory failed for dedicated exportable: {} (will not be mappable)", 
                           vkResultToString(result).c_str());
             hostPtr = nullptr;
             // Don't clear isHostVisible - the memory type IS host-visible, just mapping failed
@@ -901,7 +902,7 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
         return std::nullopt;
     }
     uint32_t memoryTypeIndex = *memTypeOpt;
-    VVM_LOG_INFO("Import: re-selected memory type index %u on destination device", memoryTypeIndex);
+    VVM_LOG_INFO("Import: re-selected memory type index {} on destination device", memoryTypeIndex);
     
     // Step 3: Create buffer FIRST with VkExternalMemoryBufferCreateInfo
     // This is required for imported external memory
@@ -919,7 +920,7 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
     VkBuffer buffer;
     VkResult result = vkCreateBuffer(device_, &bufferInfo, nullptr, &buffer);
     if (result != VK_SUCCESS) {
-        VVM_LOG_ERROR("Failed to create buffer for imported memory: %s", vkResultToString(result).c_str());
+        VVM_LOG_ERROR("Failed to create buffer for imported memory: {}", vkResultToString(result).c_str());
         return std::nullopt;
     }
     
@@ -988,7 +989,7 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
     VkDeviceMemory memory;
     VkResult allocResult = vkAllocateMemory(device_, &allocInfo, nullptr, &memory);
     if (allocResult != VK_SUCCESS) {
-        VVM_LOG_ERROR("Failed to allocate memory for import: %s (VkResult=%d) [memTypeIndex=%u size=%llu handleType=%u]",
+        VVM_LOG_ERROR("Failed to allocate memory for import: {} (VkResult={}) [memTypeIndex={} size={} handleType={}]",
                       vkResultToString(allocResult).c_str(), static_cast<int>(allocResult),
                       memoryTypeIndex, static_cast<unsigned long long>(info.size),
                       static_cast<unsigned>(importHandleType));
@@ -1250,7 +1251,7 @@ std::optional<Allocation> UnifiedMemoryPool::subAllocate(VkDeviceSize size,
                                                           VkBufferUsageFlags usage) {
     auto& block = blocks_[blockIndex];
     if (!block.buddy) {
-        VVM_LOG_ERROR("Block %u has no buddy allocator", blockIndex);
+        VVM_LOG_ERROR("Block {} has no buddy allocator", blockIndex);
         return std::nullopt;
     }
     
@@ -1279,7 +1280,7 @@ std::optional<Allocation> UnifiedMemoryPool::subAllocate(VkDeviceSize size,
     VkBuffer buffer;
     VkResult result = vkCreateBuffer(device_, &bufferInfo, nullptr, &buffer);
     if (result != VK_SUCCESS) {
-        VVM_LOG_ERROR("vkCreateBuffer failed: %s", vkResultToString(result).c_str());
+        VVM_LOG_ERROR("vkCreateBuffer failed: {}", vkResultToString(result).c_str());
         block.buddy->deallocate(offset, size);
         return std::nullopt;
     }
@@ -1296,7 +1297,7 @@ std::optional<Allocation> UnifiedMemoryPool::subAllocate(VkDeviceSize size,
     
     result = vkBindBufferMemory2(device_, 1, &bindInfo);
     if (result != VK_SUCCESS) {
-        VVM_LOG_ERROR("vkBindBufferMemory2 failed: %s", vkResultToString(result).c_str());
+        VVM_LOG_ERROR("vkBindBufferMemory2 failed: {}", vkResultToString(result).c_str());
         vkDestroyBuffer(device_, buffer, nullptr);
         block.buddy->deallocate(offset, size);
         return std::nullopt;
@@ -1362,7 +1363,7 @@ VkDeviceSize UnifiedMemoryPool::alignUp(VkDeviceSize value, VkDeviceSize alignme
     // Validate power-of-2 alignment (required for bitwise rounding)
     if (alignment == 0) return value;
     if ((alignment & (alignment - 1)) != 0) {
-        VVM_LOG_ERROR("alignUp: non-power-of-2 alignment %llu; rounding up to next pow2", alignment);
+        VVM_LOG_ERROR("alignUp: non-power-of-2 alignment {}; rounding up to next pow2", alignment);
         // Round alignment up to next power-of-2 to maintain correctness
         alignment--;
         alignment |= alignment >> 1;

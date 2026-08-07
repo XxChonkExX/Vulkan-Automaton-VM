@@ -150,9 +150,9 @@ private:
 // High-Level Offload Manager
 // ============================================================================
 
-// Thread Safety: OffloadManager is NOT thread-safe. All methods must be
-// externally synchronized. The internal MigrationEngine and HostShadowManager
-// are also not thread-safe.
+// Thread Safety: OffloadManager is now thread-safe. All public methods are
+// internally mutex-guarded. The internal MigrationEngine and HostShadowManager
+// are protected by this mutex.
 
 class OffloadManager {
 public:
@@ -187,6 +187,9 @@ private:
     OffloadConfig config_;
     std::unique_ptr<HostShadowManager> shadowManager_;
     std::unique_ptr<MigrationEngine> migrationEngine_;
+    
+    // Protects all mutable state
+    mutable std::mutex mutex_;
     
     Stats stats_;
     mutable std::mutex statsMutex_;
