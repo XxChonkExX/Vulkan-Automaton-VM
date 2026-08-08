@@ -201,6 +201,10 @@ The transport **automatically picks the fastest available road**. You just say "
 | **All-Gather** | Everyone contributes a piece, everyone gets the whole puzzle | Gather distributed embeddings |
 | **Reduce-Scatter** | Reduce + split pieces | Sharded optimizer states |
 
+### "While You Were Waiting" (Async Pipeline)
+
+Every operation has an **async twin** (`copyTensorAsync`, `allReduceAsync`, ...) that runs on a background worker thread. You fire it off with a callback, keep computing on the CPU, and the callback rings when the GPU work is done — no more sitting and staring at the progress bar. When the async pipeline is disabled, operations just run inline (synchronously), so callbacks always behave the same.
+
 ### Under the Hood (Simplified)
 
 ```cpp
@@ -248,9 +252,8 @@ GPU A ──[P2P/RDMA]──→ NIC A ──[4MB chunks over TCP/RDMA]──→ 
 | GPU-Direct RDMA (Windows) | 🔧 Planned | NDKPI implementation |
 | Layout conversion shaders | ✅ Done | NHWC↔NCHW via compute shaders |
 | allGather / reduceScatter | ✅ Done | Ring-based implementations |
-| Async pipeline | 🔧 Framework ready | Callback chaining, overlap compute+transfer |
+| Async pipeline | ✅ Done | Worker thread, async collectives with completion callbacks |
 | Layout conversion (blocked/Strided) | 🔧 Planned | Blocked for tensor cores, Strided |
-| Async pipeline | 🔧 Framework ready | Callback chaining, overlap compute+transfer |
 | NCCL-style collectives | 🔧 Planned | Better all-gather, reduce-scatter |
 
 ---

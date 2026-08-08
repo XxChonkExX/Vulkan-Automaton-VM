@@ -360,7 +360,7 @@ The tensor transport layer provides a **unified abstraction** for tensor movemen
 | **Auto Transport Selection** | P2P → RDMA → Host-Staged → Network |
 | **Layout Conversion** | NHWC↔NCHW, blocked/tiling for tensor cores |
 | **Collectives** | Ring all-reduce, broadcast, all-gather, reduce-scatter |
-| **Async Pipeline** | Callback-based, semaphore/fence chaining, overlap compute + transfer |
+| **Async Pipeline** | Worker thread, callback-based `AsyncOperation` queue, overlap compute + transfer |
 
 ### Quick Start
 
@@ -403,6 +403,15 @@ transport->allReduce({tensor0, tensor1, tensor2}, ReduceOp::Sum, {0, 1, 2});
 transport->copyTensorAsync(src, dst, [](bool ok, const std::string& err) {
     if (ok) std::cout << "Copy done!" << std::endl;
 });
+
+// Async collectives with completion callback
+transport->allReduceAsync({tensor0, tensor1, tensor2}, ReduceOp::Sum, {0, 1, 2},
+    [](bool ok, const std::string& err) {
+        if (ok) std::cout << "all-reduce done!" << std::endl;
+    });
+
+// Wait for all queued async operations to finish
+transport->flushAsync();
 
 // Cleanup
 transport->shutdown();
@@ -475,7 +484,29 @@ transport->allGather({t0, t1, t2}, output, {0, 1, 2});
 
 // Reduce-scatter
 transport->reduceScatter({t0, t1, t2}, output, ReduceOp::Sum, {0, 1, 2});
+
+// Every collective has an async variant (enqueued on the pipeline)
+transport->allReduceAsync({t0, t1, t2}, ReduceOp::Sum, {0, 1, 2}, cb);
+transport->allGatherAsync({t0, t1}, out, {0, 1}, cb);
+transport->reduceScatterAsync({t0, t1, t2}, out, ReduceOp::Sum, {0, 1, 2}, cb);
+transport->broadcastAsync(root, {0, 1, 2}, 0, cb);
 ```
+
+### Async Pipeline
+
+Tensor transport runs operations on a dedicated worker thread. Async calls (`copyTensorAsync`, `allReduceAsync`, `broadcastAsync`, `allGatherAsync`, `reduceScatterAsync`) enqueue an `AsyncOperation` and return immediately; the completion callback fires when the work finishes. Low-level `enqueueAsync`/`flushAsync` give direct access:
+
+```cpp
+// Enqueue an arbitrary operation on the pipeline
+transport->enqueueAsync([]() {
+    // ... any expensive work ...
+});
+
+// Block until all queued operations complete
+transport->flushAsync();
+```
+
+When `config.enableAsyncPipeline` is `false` (or no worker thread can run), operations run **inline** synchronously so callbacks still fire correctly. Callbacks receive `(bool ok, const std::string& error)` exactly like the sync methods' result.
 
 ### Layout Conversion (Compute Shaders)
 
@@ -533,7 +564,7 @@ Cross-machine copies are pulled end-to-end: `sendTensor` exports the local `VkDe
 | P2P (local multi-GPU) | ✅ Working |
 | Host-staged fallback | ✅ Working |
 | Ring all-reduce | ✅ Implemented |
-| Async pipeline | 🔧 Framework ready |
+| Async pipeline | ✅ Implemented (worker thread + async collectives) |
 | GPU-Direct RDMA (Linux) | ✅ NVIDIA (peermem), AMD/Intel (DMA-BUF) |
 | GPU-Direct RDMA (Windows) | 🔧 Needs NDKPI implementation |
 | Network tensor send/recv (TCP GPU⇄GPU) | ✅ Working (`tensor_network_test`) |
@@ -1184,7 +1215,10 @@ MemoryTopology topo = detectMemoryTopology(physicalDevice);
 - [x] PyTorch C++ extension (`vulkanvm_torch`)
 - [x] ONNX Runtime integration (`vulkanvm_onnx`)
 - [x] Tensor Transport module (`vulkanvm_tensor`) — allocation, copy, collectives, network
+- [x] Tensor Transport: layout conversion shaders (NHWC↔NCHW)
+- [x] Tensor Transport: async pipeline + async collectives (`copyTensorAsync`, `allReduceAsync`, ...)
+- [x] GPU-Direct RDMA wiring (`ibv_reg_dmabuf_mr` on Linux, NVIDIA peermem)
 - [ ] Windows WDDM2.6+ hardware scheduling hints
 - [ ] Android/Vulkan support
-- [ ] GPU-Direct RDMA wiring (`ibv_reg_dmabuf_mr` on Linux, NDKPI on Windows)
-- [ ] Tensor Transport: layout conversion shaders, async pipeline, NCCL-style collectives
+- [ ] GPU-Direct RDMA NDKPI implementation (Windows)
+- [ ] Tensor Transport: NCCL-style production collectives
