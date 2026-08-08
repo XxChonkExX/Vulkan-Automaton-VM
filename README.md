@@ -1271,9 +1271,9 @@ MemoryTopology topo = detectMemoryTopology(physicalDevice);
 
 - **XxChonkExX** — Project Owner, System Architect & Principal Engineer (architecture, specs, integration, validation)
 - **NVIDIA** — Network module framework foundation; open-source support|
-- **Khronos Group - Vulkan
+- Khronos Group - Vulkan
 - **Community** — Issues, testing, and feedback
-- **LLMs: NVIDIA Nemotron, DeepSeek, Grok, and GLM
+- LLMs: NVIDIA Nemotron, DeepSeek, Grok, and GLM
 ### Contributing
 
 1. Fork the repository
