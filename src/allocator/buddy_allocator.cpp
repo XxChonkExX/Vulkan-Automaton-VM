@@ -1,3 +1,4 @@
+#define NOMINMAX
 #include "vulkan_vm/buddy_allocator.hpp"
 #include "vulkan_vm/utils.hpp"
 

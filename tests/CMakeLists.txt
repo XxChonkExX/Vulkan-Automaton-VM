@@ -105,3 +105,38 @@ target_include_directories(tensor_collective_test PRIVATE
     ${TEST_EXTRA_INCLUDES}
 )
 add_test(NAME tensor_collective_test COMMAND tensor_collective_test)
+
+# Windows-only ND fake provider + loopback test
+if(WIN32)
+    # Fake ND provider DLL (implements IND2 SPI on host RAM)
+    add_library(ndfake_provider SHARED
+        ndfake/ndfake_provider.cpp
+    )
+    target_include_directories(ndfake_provider PRIVATE
+        ${CMAKE_SOURCE_DIR}/third_party/ndk
+        ${TEST_EXTRA_INCLUDES}
+    )
+    target_compile_definitions(ndfake_provider PRIVATE NDFAKE_BUILD)
+    target_link_libraries(ndfake_provider PRIVATE ws2_32)
+
+    # Loopback test: exercises NdkRdmaTransport via fake provider
+    # Requires VVM_ND_PROVIDER_DLL env var pointing to ndfake_provider.dll at runtime
+    add_executable(ndk_transport_test
+        ndfake/ndk_transport_test.cpp
+    )
+    target_link_libraries(ndk_transport_test PRIVATE
+        vulkan_vm_network
+        ${CMAKE_DL_LIBS}
+    )
+    target_include_directories(ndk_transport_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${TEST_EXTRA_INCLUDES}
+    )
+    # Copy fake provider DLL next to test exe for runtime loading
+    add_custom_command(TARGET ndk_transport_test POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:ndfake_provider>
+            $<TARGET_FILE_DIR:ndk_transport_test>/
+    )
+    add_test(NAME ndk_transport_test COMMAND ndk_transport_test)
+endif()

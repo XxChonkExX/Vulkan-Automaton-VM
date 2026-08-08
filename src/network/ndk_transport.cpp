@@ -30,6 +30,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -604,6 +605,60 @@ private:
                                   IND2Provider** ppProvider,
                                   IND2Adapter** ppAdapter,
                                   HMODULE* pLib) {
+        // Test override: load a user-specified ND provider DLL directly (e.g., the
+        // in-tree fake provider). This bypasses WSC catalog enumeration entirely.
+        const char* fakeDllPath = std::getenv("VVM_ND_PROVIDER_DLL");
+        if (fakeDllPath && *fakeDllPath) {
+            HMODULE hLib = LoadLibraryA(fakeDllPath);
+            if (!hLib) return HRESULT_FROM_WIN32(GetLastError());
+            using GetClsidFn = HRESULT(WINAPI*)(CLSID*);
+            auto pfnGetClsid = reinterpret_cast<GetClsidFn>(GetProcAddress(hLib, "NDFakeGetProviderClsid"));
+            GUID providerGuid{};
+            if (!pfnGetClsid || FAILED(pfnGetClsid(&providerGuid))) {
+                FreeLibrary(hLib);
+                return ND_DEVICE_NOT_READY;
+            }
+            auto pfnGetClassObject = reinterpret_cast<DllGetClassObjectFn>(
+                GetProcAddress(hLib, "DllGetClassObject"));
+            if (!pfnGetClassObject) {
+                FreeLibrary(hLib);
+                return ND_DEVICE_NOT_READY;
+            }
+            IND2Provider* pProvider = nullptr;
+            HRESULT hr = pfnGetClassObject(providerGuid, IID_IND2Provider,
+                                            reinterpret_cast<void**>(&pProvider));
+            if (FAILED(hr) || !pProvider) {
+                FreeLibrary(hLib);
+                return ND_DEVICE_NOT_READY;
+            }
+            // Resolve local address 127.0.0.1 and open adapter (same flow as WSC path)
+            sockaddr_in local{};
+            local.sin_family = AF_INET;
+            local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            local.sin_port = 0;
+            UINT64 adapterId = 0;
+            hr = pProvider->ResolveAddress(reinterpret_cast<const sockaddr*>(&local),
+                                            static_cast<ULONG>(sizeof(local)), &adapterId);
+            if (FAILED(hr)) {
+                pProvider->Release();
+                FreeLibrary(hLib);
+                return hr;
+            }
+            IND2Adapter* pAdapter = nullptr;
+            hr = pProvider->OpenAdapter(IID_IND2Adapter, adapterId,
+                                        reinterpret_cast<void**>(&pAdapter));
+            if (FAILED(hr) || !pAdapter) {
+                pProvider->Release();
+                FreeLibrary(hLib);
+                return hr;
+            }
+            *ppProvider = pProvider;
+            *ppAdapter = pAdapter;
+            *pLib = hLib;
+            VVM_LOG_INFO("ND: loaded test provider from {}", fakeDllPath);
+            return S_OK;
+        }
+
         WSAPROTOCOL_INFO* pInfos = nullptr;
         DWORD len = 0;
         if (WSCEnumProtocols(nullptr, nullptr, &len, nullptr) == SOCKET_ERROR) {
