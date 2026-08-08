@@ -1267,31 +1267,13 @@ MemoryTopology topo = detectMemoryTopology(physicalDevice);
 
 **MIT License** — see `LICENSE`.
 
-### Project Governance & AI-Assisted Engineering
-
-VulkanVM is **designed, architected, and maintained by XxChonkExX (Project Owner)**.
-
-To achieve rigorous safety standards and cross-platform hardware compliance rapidly, this project embraces **Advanced AI-Assisted Engineering**. LLMs (including NVIDIA Nemotron, DeepSeek, Grok, and GLM) are utilized under strict human supervision as:
-
-- **Specialized compilers** — AI-assisted synthesis from explicit technical specifications
-- **Static analysis auditors** — Multi-model cross-auditing (memory safety, threading, ABI)
-- **Test-harness generators** — Fake provider loopback, property-based test scaffolding
-
-| Phase | Responsibility |
-|-------|----------------|
-| Architecture & Core Design | 100% human-designed (topology, memory-pool mechanics, protocol specs) |
-| Code Generation & Implementation | AI-assisted synthesis based on explicit specs provided by the owner |
-| Audit & Verification | Multi-model cross-auditing + native local test validation (NDKPI fake loopback) |
-| Integration & Release | Human-vetted, structurally integrated, performance-tested |
-
-**We view LLMs as high-velocity engineering tools. Every single line of code in this repository has been human-vetted, structurally integrated, and tested for performance.**
-
 ### Contributors
 
 - **XxChonkExX** — Project Owner, System Architect & Principal Engineer (architecture, specs, integration, validation)
-- **NVIDIA** — Network module framework foundation; open-source support
+- **NVIDIA** — Network module framework foundation; open-source support|
+- Khronos Group - Vulkan
 - **Community** — Issues, testing, and feedback
-
+- LLMs: NVIDIA Nemotron, DeepSeek, Grok, and GLM
 ### Contributing
 
 1. Fork the repository
