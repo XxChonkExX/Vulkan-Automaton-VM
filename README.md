@@ -1289,7 +1289,8 @@ To achieve rigorous safety standards and cross-platform hardware compliance rapi
 ### Contributors
 
 - **XxChonkExX** — Project Owner, System Architect & Principal Engineer (architecture, specs, integration, validation)
-- **NVIDIA** — Network module framework foundation; open-source support
+- **NVIDIA** — Network module framework foundation; open-source support|
+- **Khronos Group - Vulkan
 - **Community** — Issues, testing, and feedback
 
 ### Contributing
