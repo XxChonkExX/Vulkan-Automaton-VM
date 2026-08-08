@@ -238,6 +238,29 @@ if(VVM_BUILD_TENSOR_TRANSPORT AND VVM_BUILD_NETWORK)
     target_link_libraries(vulkan_vm PUBLIC vulkan_vm_tensor)
 endif()
 
+# Shader compilation for tensor transport
+if(VVM_BUILD_TENSOR_TRANSPORT)
+    find_program(GLSLANG_VALIDATOR glslangValidator
+        PATHS "$ENV{VULKAN_SDK}/Bin" "C:/VulkanSDK/*/Bin"
+        DOC "glslangValidator for SPIR-V compilation")
+    
+    if(GLSLANG_VALIDATOR)
+        # Compile layout conversion shader
+        add_custom_command(
+            OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/shaders/layout_conversion.spv
+            COMMAND ${GLSLANG_VALIDATOR} -V ${CMAKE_CURRENT_SOURCE_DIR}/shaders/layout_conversion.comp
+                        -o ${CMAKE_CURRENT_BINARY_DIR}/shaders/layout_conversion.spv
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/layout_conversion.comp
+            COMMENT "Compiling layout conversion shader to SPIR-V"
+            VERBATIM
+        )
+        add_custom_target(compile_shaders ALL DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/shaders/layout_conversion.spv)
+        message(STATUS "Shader compilation enabled with glslangValidator: ${GLSLANG_VALIDATOR}")
+    else()
+        message(WARNING "glslangValidator not found - layout conversion shaders will not be compiled. Install Vulkan SDK with glslangValidator for full tensor transport functionality.")
+    endif()
+endif()
+
 # Install
 install(TARGETS vulkan_vm
     EXPORT VulkanVMTargets

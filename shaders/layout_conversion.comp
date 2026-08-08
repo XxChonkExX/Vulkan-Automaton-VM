@@ -1,0 +1,144 @@
+// Layout conversion compute shader
+// Supports NHWC <-> NCHW, Blocked, Strided layouts
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint N;
+    uint H;
+    uint W;
+    uint C;
+    uint layoutMode;  // 0=NHWC_to_NCHW, 1=NCHW_to_NHWC, 2=Blocked_to_Contiguous, 3=Strided_to_Contiguous
+    uint blockSize;   // for blocked layout
+    uint4 strides;    // for strided layout (N_stride, H_stride, W_stride, C_stride)
+} pc;
+
+layout(set = 0, binding = 0) buffer SrcBuffer {
+    half src[];
+};
+
+layout(set = 0, binding = 1) buffer DstBuffer {
+    half dst[];
+};
+
+uint linearIndexToNHWC(uint idx, out uint n, out uint h, out uint w, out uint c) {
+    c = idx % pc.C;
+    uint hw = idx / pc.C;
+    w = hw % pc.W;
+    h = (hw / pc.W) % pc.H;
+    n = hw / (pc.W * pc.H);
+}
+
+uint linearIndexToNCHW(uint idx, out uint n, out uint c, out uint h, out uint w) {
+    w = idx % pc.W;
+    uint cw = idx / pc.W;
+    h = cw % pc.H;
+    c = (cw / pc.H) % pc.C;
+    n = cw / (pc.H * pc.C);
+}
+
+uint nhwcIndex(uint n, uint h, uint w, uint c) {
+    return ((n * pc.H + h) * pc.W + w) * pc.C + c;
+}
+
+uint nchwIndex(uint n, uint c, uint h, uint w) {
+    return ((n * pc.C + c) * pc.H + h) * pc.W + w;
+}
+
+void main() {
+    uint globalIdx = gl_GlobalInvocationID.x;
+    uint totalElements = pc.N * pc.H * pc.W * pc.C;
+    
+    if (globalIdx >= totalElements) return;
+    
+    // The source is always assumed to be linear (contiguous) in the source buffer
+    // The destination layout is determined by pc.layoutMode
+    
+    uint n, h, w, c;
+    
+    // Compute source coordinates from linear index (source is always linear in src buffer)
+    uint srcIdx = gl_GlobalInvocationID.x;
+    
+    if (pc.layoutMode == 0) { // NHWC to NCHW
+        // Source is NHWC (linear in src buffer is NHWC order)
+        // Destination is NCHW
+        uint n, h, w, c;
+        c = srcIdx % pc.C;
+        uint hw = srcIdx / pc.C;
+        w = hw % pc.W;
+        h = (hw / pc.W) % pc.H;
+        n = hw / (pc.W * pc.H);
+        
+        uint dstIdx = nchwIndex(n, c, h, w);
+        dst[dstIdx] = src[srcIdx];
+    }
+    else if (pc.layoutMode == 1) { // NCHW to NHWC
+        // Source is NCHW (linear in src buffer is NCHW order)
+        // Destination is NHWC
+        uint n, c, h, w;
+        uint srcIdx = gl_GlobalInvocationID.x;
+        uint w_coord = srcIdx % pc.W;
+        uint cw = srcIdx / pc.W;
+        uint h_coord = cw % pc.H;
+        uint c_coord = (cw / pc.H) % pc.C;
+        n = cw / (pc.H * pc.C);
+        
+        uint dstIdx = nhwcIndex(n, h_coord, w_coord, c_coord);
+        dst[dstIdx] = src[srcIdx];
+    }
+    else if (pc.layoutMode == 2) { // Blocked to Contiguous
+        // Source is blocked layout, destination is contiguous (NHWC)
+        // Blocked layout: [N, blocksH, blocksW, blocksC, blockH, blockW, blockC]
+        // For simplicity, assume block size divides dimensions evenly
+        uint blockSize = pc.blockSize;
+        uint elementsPerBlock = pc.blockSize * pc.blockSize * pc.blockSize;
+        
+        uint blockIdx = gl_GlobalInvocationID.x / (pc.blockSize * pc.blockSize * pc.blockSize);
+        uint elemInBlock = gl_GlobalInvocationID.x % (pc.blockSize * pc.blockSize * pc.blockSize);
+        
+        uint blocksH = (pc.H + pc.blockSize - 1) / pc.blockSize;
+        uint blocksW = (pc.W + pc.blockSize - 1) / pc.blockSize;
+        uint blocksC = (pc.C + pc.blockSize - 1) / pc.blockSize;
+        
+        uint blockCIdx = blockIdx % ((pc.C + pc.blockSize - 1) / pc.blockSize);
+        uint blockHW = blockIdx / ((pc.C + pc.blockSize - 1) / pc.blockSize);
+        uint blockWIdx = blockIdx % ((pc.W + pc.blockSize - 1) / pc.blockSize);
+        uint blockHIdx = blockIdx / ((pc.W + pc.blockSize - 1) / pc.blockSize);
+        
+        uint cInBlock = elemInBlock % pc.blockSize;
+        uint hwInBlock = elemInBlock / pc.blockSize;
+        uint wInBlock = hwInBlock % pc.blockSize;
+        uint hInBlock = hwInBlock / pc.blockSize;
+        
+        uint c = blockIdx * pc.blockSize + cInBlock;
+        uint h = blockHIdx * pc.blockSize + hInBlock;
+        uint w = blockWIdx * pc.blockSize + wInBlock;
+        uint n = 0;
+        
+        // Clamp
+        if (h >= pc.H) h = pc.H - 1;
+        if (w >= pc.W) w = pc.W - 1;
+        if (c >= pc.C) c = pc.C - 1;
+        
+        uint dstIdx = ((n * pc.H + h) * pc.W + w) * pc.C + c; // NHWC output
+        dst[dstIdx] = src[gl_GlobalInvocationID.x];
+    }
+    else if (pc.layoutMode == 3) { // Strided to Contiguous
+        // Strided source to contiguous destination
+        uint srcIdx = gl_GlobalInvocationID.x;
+        uint n = srcIdx / (pc.H * pc.W * pc.C);
+        uint residual = srcIdx % (pc.H * pc.W * pc.C);
+        uint h = residual / (pc.W * pc.C);
+        uint w = (residual % (pc.W * pc.C)) / pc.C;
+        uint c = residual % pc.C;
+        
+        uint dstIdx = n * pc.strides.x + 
+                      (srcIdx % (pc.H * pc.W * pc.C) / (pc.W * pc.C)) * pc.strides.y + 
+                      (srcIdx % (pc.W * pc.C) / pc.C) * pc.strides.z + 
+                      (srcIdx % pc.C) * pc.strides.w;
+        
+        dst[dstIdx] = src[gl_GlobalInvocationID.x];
+    }
+}
