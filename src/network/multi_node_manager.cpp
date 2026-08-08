@@ -663,10 +663,39 @@ std::optional<Allocation> MultiNodePoolManager::importRemote(
 
 #if defined(VVM_NETWORK_HAS_VERBS)
     if (desc.canUseRdma() && rdmaTransport_) {
-        VVM_LOG_DEBUG("GPU-direct import not fully implemented, using host-staged");
+        // GPU-direct import: register local GPU memory and RDMA read from remote
+        auto localAlloc = pool_.allocate(desc.size, usage, 
+                                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (!localAlloc) {
+            VVM_LOG_WARN("importRemote: failed to allocate local GPU memory, falling back to host-staged");
+        } else {
+            auto conn = ensureRdmaConnection(desc.owner);
+            if (conn) {
+                auto destRegion = rdmaTransport_->registerGpuMemory(
+                    localAlloc->memory, localAlloc->offset, localAlloc->size, localAlloc->buffer);
+                if (destRegion && destRegion->lkey != 0) {
+                    VVM_LOG_DEBUG("importRemote: GPU-direct RDMA read for allocId={}", desc.localAllocId);
+                    bool ok = rdmaTransport_->rdmaRead(
+                        *conn, *destRegion, desc.rdmaAddr, desc.rkey, desc.size, 
+                        std::chrono::milliseconds(30000).count());
+                    if (ok) {
+                        VVM_LOG_INFO("importRemote: GPU-direct import succeeded for allocId={}", desc.localAllocId);
+                        return localAlloc;
+                    } else {
+                        VVM_LOG_WARN("importRemote: GPU-direct RDMA read failed, falling back to host-staged");
+                    }
+                } else {
+                    VVM_LOG_WARN("importRemote: failed to register local GPU memory for RDMA, falling back to host-staged");
+                }
+            } else {
+                VVM_LOG_WARN("importRemote: failed to establish RDMA connection to {}, falling back to host-staged", desc.owner.toString());
+            }
+        }
     }
 #endif
 
+    // Fallback: host-staged import
+    VVM_LOG_DEBUG("importRemote: using host-staged fallback for allocId={}", desc.localAllocId);
     return createLocalAllocationForImport(desc, usage);
 }
 
