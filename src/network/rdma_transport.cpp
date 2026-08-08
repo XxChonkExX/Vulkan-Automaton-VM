@@ -255,10 +255,10 @@ public:
                     void* barAddr = remoteAddr;
                     mr = ibv_reg_mr(pd_, barAddr, size, accessFlags);
                     if (mr) {
-                        VVM_LOG_INFO("NVIDIA GPUDirect registered with peermem: lkey=%u, rkey=%u",
+                        VVM_LOG_INFO("NVIDIA GPUDirect registered with peermem: lkey={}, rkey={}",
                                      mr->lkey, mr->rkey);
                     } else {
-                        VVM_LOG_WARN("ibv_reg_mr on peermem BAR failed: %s", strerror(errno));
+                        VVM_LOG_WARN("ibv_reg_mr on peermem BAR failed: {}", strerror(errno));
                     }
                 }
             }
@@ -278,7 +278,7 @@ public:
                 registeredRegions_[mr] = region;
             }
             
-            VVM_LOG_INFO("NVIDIA GPUDirect registered: rdmaAddr=0x%llx, lkey=%u, rkey=%u",
+            VVM_LOG_INFO("NVIDIA GPUDirect registered: rdmaAddr={:#x}, lkey={}, rkey={}",
                          region.rdmaAddr, region.lkey, region.rkey);
             return region;
         } else if (vendorId_ == 0x1002 || vendorId_ == 0x8086) {
@@ -298,7 +298,7 @@ public:
             int dmaBufFd = -1;
             VkResult result = vkGetMemoryFdKHR(device_, &getFdInfo, &dmaBufFd);
             if (result != VK_SUCCESS || dmaBufFd < 0) {
-                VVM_LOG_ERROR("vkGetMemoryFdKHR failed: %s", vkResultToString(result).c_str());
+                VVM_LOG_ERROR("vkGetMemoryFdKHR failed: {}", vkResultToString(result));
                 return std::nullopt;
             }
 
@@ -307,17 +307,17 @@ public:
 
             struct ibv_mr* mr = ibv_reg_dmabuf_mr(pd_, offset, size, 0 /* iova */, dmaBufFd, accessFlags);
             if (!mr) {
-                VVM_LOG_WARN("ibv_reg_dmabuf_mr failed (%s), falling back to mmap+ibv_reg_mr",
+                VVM_LOG_WARN("ibv_reg_dmabuf_mr failed ({}), falling back to mmap+ibv_reg_mr",
                              strerror(errno));
                 void* mappedVa = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, dmaBufFd, 0);
                 if (mappedVa == MAP_FAILED) {
-                    VVM_LOG_ERROR("mmap on DMA-BUF fd failed: %s", strerror(errno));
+                    VVM_LOG_ERROR("mmap on DMA-BUF fd failed: {}", strerror(errno));
                     close(dmaBufFd);
                     return std::nullopt;
                 }
                 mr = ibv_reg_mr(pd_, mappedVa, size, accessFlags);
                 if (!mr) {
-                    VVM_LOG_ERROR("ibv_reg_mr on mapped DMA-BUF failed: %s", strerror(errno));
+                    VVM_LOG_ERROR("ibv_reg_mr on mapped DMA-BUF failed: {}", strerror(errno));
                     munmap(mappedVa, size);
                     close(dmaBufFd);
                     return std::nullopt;
@@ -335,7 +335,7 @@ public:
                     std::lock_guard<std::mutex> lock(regionsMutex_);
                     registeredRegions_[mr] = region;
                 }
-                VVM_LOG_INFO("AMD/Intel GPUDirect via DMA-BUF mmap fallback: lkey=%u, rkey=%u",
+                VVM_LOG_INFO("AMD/Intel GPUDirect via DMA-BUF mmap fallback: lkey={}, rkey={}",
                              mr->lkey, mr->rkey);
                 return region;
             }
@@ -353,12 +353,12 @@ public:
                 std::lock_guard<std::mutex> lock(regionsMutex_);
                 registeredRegions_[mr] = region;
             }
-            VVM_LOG_INFO("AMD/Intel GPUDirect via ibv_reg_dmabuf_mr: lkey=%u, rkey=%u",
+            VVM_LOG_INFO("AMD/Intel GPUDirect via ibv_reg_dmabuf_mr: lkey={}, rkey={}",
                          mr->lkey, mr->rkey);
             return region;
         }
 
-        VVM_LOG_WARN("registerGpuMemory: unsupported vendor 0x%x", vendorId_);
+        VVM_LOG_WARN("registerGpuMemory: unsupported vendor {:#x}", vendorId_);
         return std::nullopt;
     }
 

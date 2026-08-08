@@ -72,7 +72,7 @@ std::optional<GpuDirectRegistration> registerGpuMemoryForRdma(
 
     VkResult result = vkGetMemoryRemoteAddressNV(device, &info, &reg.remoteAddress);
     if (result != VK_SUCCESS) {
-        VVM_LOG_ERROR("vkGetMemoryRemoteAddressNV failed: %s", vkResultToString(result).c_str());
+        VVM_LOG_ERROR("vkGetMemoryRemoteAddressNV failed: {}", vkResultToString(result));
         return std::nullopt;
     }
 
@@ -89,7 +89,7 @@ std::optional<GpuDirectRegistration> registerGpuMemoryForRdma(
             // Note: This requires the PD from the verbs context, which we don't have here
             // The actual MR registration happens in VerbsRdmaTransport::registerGpuMemory
             // where we have the PD. We just provide the remote address here.
-            VVM_LOG_INFO("Found GPU PCI BAR at 0x%llx", *barAddr);
+            VVM_LOG_INFO("Found GPU PCI BAR at {:#x}", *barAddr);
         }
     } else {
         VVM_LOG_WARN("nvidia-peermem kernel module not loaded. GPU-direct RDMA will not have local MR.");
@@ -137,7 +137,7 @@ std::optional<GpuDirectRegistration> registerGpuMemoryForRdmaVendor(
             return std::nullopt;
 
         default:
-            VVM_LOG_WARN("Unknown GPU vendor 0x%x for GPUDirect", vendorId);
+            VVM_LOG_WARN("Unknown GPU vendor {:#x} for GPUDirect", vendorId);
             return std::nullopt;
     }
 }

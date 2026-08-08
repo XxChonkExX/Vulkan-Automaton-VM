@@ -519,7 +519,7 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
             netDesc.hasRdmaAddr = true;
             netDesc.rdmaAddr = rdmaAddr;
             netDesc.rkey = rkey;
-            VVM_LOG_INFO("exportForRemote: GPU-direct RDMA for alloc size {} (addr=0x%llx)",
+            VVM_LOG_INFO("exportForRemote: GPU-direct RDMA for alloc size {} (addr={:#x})",
                          alloc.size, static_cast<unsigned long long>(rdmaAddr));
         } else {
             // 2) Host shadow: copy the data into host memory ONCE, register that
@@ -649,8 +649,8 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
     if (pendingRdmaExport) {
         std::lock_guard<std::mutex> lock(rdmaShadowMutex_);
         rdmaShadowExports_[pendingKey(localNodeId_, allocId)] = std::move(*pendingRdmaExport);
-        VVM_LOG_INFO("exportForRemote: RDMA host shadow registered for alloc {} (addr=0x%llx, rkey=%u)",
-                     allocId, static_cast<unsigned long long>(netDesc.rdmaAddr), netDesc.rkey);
+VVM_LOG_INFO("exportForRemote: RDMA host shadow registered for alloc {} (addr={:#x}, rkey={})",
+                         allocId, static_cast<unsigned long long>(netDesc.rdmaAddr), netDesc.rkey);
     }
 #endif
 
@@ -1238,7 +1238,7 @@ bool MultiNodePoolManager::runCopy(VkBuffer srcBuffer, VkBuffer dstBuffer,
                                    VkDeviceSize srcOffset, VkDeviceSize dstOffset,
                                    VkDeviceSize size) {
     if (copyCmdPool_ == VK_NULL_HANDLE || srcBuffer == VK_NULL_HANDLE || dstBuffer == VK_NULL_HANDLE) {
-        VVM_LOG_ERROR("runCopy: invalid copy context (pool=%p src=%p dst=%p)",
+        VVM_LOG_ERROR("runCopy: invalid copy context (pool={} src={} dst={})",
                       copyCmdPool_, srcBuffer, dstBuffer);
         return false;
     }
@@ -1717,8 +1717,8 @@ std::optional<Allocation> MultiNodePoolManager::createLocalAllocationForImport(
             ext.size = desc.size;
             auto imported = localPools_[0].importMemory(std::move(ext), usage);
             if (imported) {
-                VVM_LOG_INFO("importRemote: zero-copy handle import for allocId=%llu succeeded",
-                             desc.localAllocId);
+VVM_LOG_INFO("importRemote: zero-copy handle import for allocId={} succeeded",
+                         desc.localAllocId);
                 return imported;
             }
             VVM_LOG_WARN("importRemote: same-process handle import failed; "
@@ -1738,9 +1738,7 @@ std::optional<Allocation> MultiNodePoolManager::createLocalAllocationForImport(
     // Cross-machine peers must use host-staged copies. Reject any network-received
     // handle values to prevent FD/HANDLE injection attacks.
     if (!desc.externalHandle.empty()) {
-        VVM_LOG_WARN("importRemote: rejecting %zu-byte external handle received over network "
-                     "(OS handles are process-relative and cannot be transferred via TCP; "
-                     "use host-staged migration instead)",
+        VVM_LOG_WARN("importRemote: rejecting {} byte external handle received over network (OS handles are process-relative and cannot be transferred via TCP; use host-staged migration instead)",
                      desc.externalHandle.size());
     }
 

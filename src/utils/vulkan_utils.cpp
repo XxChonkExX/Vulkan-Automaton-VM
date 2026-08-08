@@ -110,7 +110,7 @@ std::optional<uint32_t> findImportMemoryTypeIndex(VkPhysicalDevice dstPhysicalDe
     // Check if the handle type is supported at all
     VkExternalMemoryHandleTypeFlags compatibleHandleTypes = extProps.externalMemoryProperties.compatibleHandleTypes;
     if ((compatibleHandleTypes & handleType) == 0) {
-        VVM_LOG_WARN("findImportMemoryTypeIndex: handle type %u not supported on destination device",
+        VVM_LOG_WARN("findImportMemoryTypeIndex: handle type {} not supported on destination device",
                      handleType);
         return std::nullopt;
     }
@@ -126,7 +126,7 @@ std::optional<uint32_t> findImportMemoryTypeIndex(VkPhysicalDevice dstPhysicalDe
         }
     }
     
-    VVM_LOG_WARN("findImportMemoryTypeIndex: no memory type with required flags 0x%x",
+    VVM_LOG_WARN("findImportMemoryTypeIndex: no memory type with required flags {:#x}",
                  requiredFlags);
     return std::nullopt;
 }

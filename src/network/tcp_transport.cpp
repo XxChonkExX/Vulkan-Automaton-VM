@@ -782,14 +782,14 @@ void TcpTransport::acceptLoop() {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
             }
-            VVM_LOG_ERROR("acceptLoop: fatal error %d, stopping accept loop", err);
+            VVM_LOG_ERROR("acceptLoop: fatal error {}, stopping accept loop", err);
             break;
 #else
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
             }
-            VVM_LOG_ERROR("acceptLoop: fatal error %d ({}), stopping accept loop", errno, strerror(errno));
+            VVM_LOG_ERROR("acceptLoop: fatal error {} ({}), stopping accept loop", errno, strerror(errno));
             break;
 #endif
         }
