@@ -50,6 +50,16 @@ else()
     message(STATUS "VulkanVM network: RDMA/verbs transport disabled (host-staged TCP only)")
 endif()
 
+# Windows: Network Direct (ND) transport. NDKPI is the kernel-mode contract
+# RNIC miniports implement; the user-mode consumer this library talks to is the
+# ND SPI (IND2*, headers vendored under third_party/ndk).
+if(WIN32)
+    message(STATUS "VulkanVM network: ND (Network Direct) transport enabled on Windows")
+    list(APPEND NETWORK_CORE_SRCS ndk_transport.cpp)
+    list(APPEND NETWORK_ABI_DEFS VVM_NETWORK_HAS_NDKPI=1)
+    set(VVM_NETWORK_NDK_INCS ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/ndk)
+endif()
+
 # TLS support via OpenSSL
 if(OPENSSL_FOUND)
     message(STATUS "VulkanVM network: TLS support enabled via OpenSSL")
@@ -65,6 +75,7 @@ target_include_directories(vulkan_vm_network PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     ${Vulkan_INCLUDE_DIRS}
     ${VVM_NETWORK_VERBS_INCS}
+    ${VVM_NETWORK_NDK_INCS}
     ${WINDOWS_SDK_UM}
     ${WINDOWS_SDK_SHARED}
     ${WINDOWS_SDK_UCRT}
@@ -79,9 +90,10 @@ target_link_libraries(vulkan_vm_network PRIVATE
     ${VVM_NETWORK_TLS_LIBS}
 )
 
-# Winsock is required by the TCP transport on Windows.
+# Winsock is required by the TCP transport on Windows. The ND transport also
+# uses iphlpapi helpers.
 if(WIN32)
-    target_link_libraries(vulkan_vm_network PRIVATE ws2_32)
+    target_link_libraries(vulkan_vm_network PRIVATE ws2_32 iphlpapi)
     target_compile_definitions(vulkan_vm_network PRIVATE _WINSOCKAPI_)
 endif()
 
