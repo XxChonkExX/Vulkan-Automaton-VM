@@ -1,60 +1,83 @@
 #pragma once
 
 #include <vulkan/vulkan.h>
-#include <unordered_map>
-#include <memory>
+#include <vector>
 #include <optional>
+#include <unordered_map>
+#include <cstdint>
+#include <cassert>
 
 namespace vvm {
 
-// ============================================================================
-// Buddy Allocator (power-of-2, for large tensor allocations)
-// ============================================================================
-
-struct BuddyNode {
-    VkDeviceSize offset;
-    VkDeviceSize size;
-    bool free;
-    BuddyNode* left = nullptr;
-    BuddyNode* right = nullptr;
-    BuddyNode* parent = nullptr;
-    int level;  // 0 = root (block size), maxLevel = min allocation
-};
-
 class BuddyAllocator {
 public:
+    // blockSize and minSize MUST be powers of two, blockSize >= minSize.
+    // Recommended defaults for general use: minSize = 4 * 1024 (or 64 * 1024 for tensors).
     BuddyAllocator(VkDeviceSize blockSize, VkDeviceSize minSize);
-    ~BuddyAllocator();
-    
+    ~BuddyAllocator() = default;
+
     BuddyAllocator(const BuddyAllocator&) = delete;
     BuddyAllocator& operator=(const BuddyAllocator&) = delete;
-    
+
+    // Returns offset into the block, or nullopt on failure / OOM of metadata.
     std::optional<VkDeviceSize> allocate(VkDeviceSize size);
-    void deallocate(VkDeviceSize offset, VkDeviceSize size);
+
+    // size may be 0 ("unknown"); if non-zero it is validated against the recorded size.
+    void deallocate(VkDeviceSize offset, VkDeviceSize size = 0);
+
     VkDeviceSize getLargestFree() const;
     float getFragmentation() const;
-    size_t getAllocationCount() const { return allocatedNodes_.size(); }
-    bool isValid() const { return maxLevel_ >= 0 && root_ != nullptr; }
-    
+    size_t getAllocationCount() const { return allocated_.size(); }
+    bool isValid() const { return maxOrder_ >= 0; }
+
+    VkDeviceSize blockSize() const { return blockSize_; }
+    VkDeviceSize minSize()  const { return minSize_; }
+    int maxOrder()          const { return maxOrder_; }
+
 private:
-    struct AllocatedNode {
-        BuddyNode* node;
-        VkDeviceSize size;
+    static bool isPowerOfTwo(VkDeviceSize v) {
+        return v != 0 && (v & (v - 1)) == 0;
+    }
+    static VkDeviceSize nextPowerOfTwo(VkDeviceSize v) {
+        if (v == 0) return 1;
+        --v;
+        v |= v >> 1;  v |= v >> 2;  v |= v >> 4;
+        v |= v >> 8;  v |= v >> 16; v |= v >> 32;
+        return v + 1;
+    }
+
+    // Order 0 = minSize, order maxOrder_ = blockSize.
+    int sizeToOrder(VkDeviceSize size) const;
+    VkDeviceSize orderToSize(int order) const {
+        return minSize_ << order;
+    }
+
+    // Push a free block of the given order onto its free list.
+    void pushFree(int order, VkDeviceSize offset);
+    // Pop any free block of exactly this order (or nullopt).
+    std::optional<VkDeviceSize> popFree(int order);
+
+    // Split a block of `order` down until we obtain a block of `targetOrder`.
+    // Returns the offset of the resulting target-sized block, or nullopt.
+    std::optional<VkDeviceSize> splitTo(int order, int targetOrder);
+
+    // Try to coalesce starting from a just-freed block.
+    void coalesce(int order, VkDeviceSize offset);
+
+    VkDeviceSize blockSize_ = 0;
+    VkDeviceSize minSize_   = 0;
+    int          maxOrder_  = -1;   // -1 = invalid
+
+    // freeLists_[order] holds offsets of free blocks of size (minSize << order)
+    std::vector<std::vector<VkDeviceSize>> freeLists_;
+
+    // Validation / size recovery only. Not on the hot path for performance-critical
+    // code that already knows the size. Can be disabled with a compile flag later.
+    struct AllocInfo {
+        int order;
+        VkDeviceSize size;          // power-of-two size actually granted
     };
-    
-    BuddyNode* root_ = nullptr;
-    VkDeviceSize blockSize_;
-    VkDeviceSize minSize_;
-    int maxLevel_;
-    std::unordered_map<VkDeviceSize, AllocatedNode> allocatedNodes_;
-    
-    BuddyNode* createNode(VkDeviceSize offset, VkDeviceSize size, int level);
-    void destroyNode(BuddyNode* node);
-    BuddyNode* findFree(BuddyNode* node, VkDeviceSize size);
-    void split(BuddyNode* node);
-    void merge(BuddyNode* node);
-    BuddyNode* getBuddy(BuddyNode* node);
-    int getLevelForSize(VkDeviceSize size) const;
+    std::unordered_map<VkDeviceSize, AllocInfo> allocated_;
 };
 
 } // namespace vvm

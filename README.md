@@ -73,6 +73,7 @@ pool->deallocate(std::move(*tensor));
 |----------|-------------|
 | **Persistent blocks** | Pre-allocates large blocks (default 512 MB) at startup; sub-allocates with a buddy allocator |
 | **Zero fragmentation** | Memory is **never returned to the OS** — blocks stay resident; buddy allocator guarantees power-of-2 alignment and coalescing on free |
+| **Hardened buddy** | Free-list-per-order classic buddy (iterative split/coalesce, no per-node heap churn); configurable `minSize` (default `PoolConfig::minAlignment`), power-of-2 `blockSize`/`minSize` enforced |
 | **Budget-aware** | `maxHeapFraction` (e.g., 0.75) + `VK_EXT_memory_budget` prevent starving the system |
 | **Topology-aware** | `detectMemoryTopology()` classifies Discrete / Unified / Hybrid; `PoolConfig::forDevice()` picks tuned defaults |
 | **Intent API** | `MemoryUsage { GpuOnly, CpuToGpu, GpuToCpu, CpuCopy, Auto }` hides raw `VkMemoryPropertyFlags` |
@@ -295,6 +296,8 @@ build_ninja\examples\model_registry_test.exe
 ## Multi-Node Network Module
 
 `vvm::network::MultiNodePoolManager` provides a **zero-dependency** multi-node cluster over plain TCP (Winsock / BSD sockets). Uses a Spark-inspired wire protocol: versioned 32-byte header + bulk stream transferred in 4 MB slices directly between socket and caller buffer (no intermediate copy).
+
+**Protocol hardening:** every inbound message is length-checked against hard caps (`kMaxBodySize` = 1 GiB, `kMaxStreamSize` = 16 GiB) on both the server and client receive paths. Headers that exceed a cap are rejected and the connection dropped, preventing malformed or hostile peers from triggering unbounded allocations. TLS 1.2+ (OpenSSL) is supported for non-localhost clusters, and `NetworkConfig::validate()` rejects invalid MTU/listen settings.
 
 ### Control-Plane Messages
 
