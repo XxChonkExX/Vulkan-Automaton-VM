@@ -101,6 +101,9 @@ UnifiedMemoryPool::UnifiedMemoryPool(UnifiedMemoryPool&& other) noexcept
     other.device_ = VK_NULL_HANDLE;
     other.transferCmdPool_ = VK_NULL_HANDLE;
     other.fnSetDebugName_ = nullptr;
+    other.blocks_.clear();
+    other.dedicatedAllocations_.clear();
+    other.offloadManager_.reset();
 }
 
 UnifiedMemoryPool& UnifiedMemoryPool::operator=(UnifiedMemoryPool&& other) noexcept {
@@ -149,6 +152,9 @@ UnifiedMemoryPool& UnifiedMemoryPool::operator=(UnifiedMemoryPool&& other) noexc
     other.device_ = VK_NULL_HANDLE;
     other.transferCmdPool_ = VK_NULL_HANDLE;
     other.fnSetDebugName_ = nullptr;
+    other.blocks_.clear();
+    other.dedicatedAllocations_.clear();
+    other.offloadManager_.reset();
     return *this;
 }
 
@@ -362,9 +368,7 @@ bool UnifiedMemoryPool::wouldExceedBudget(VkDeviceSize additionalBytes) const {
         }
         const VkDeviceSize cap = static_cast<VkDeviceSize>(heapBudget * config_.maxHeapFraction);
         if (heapUsed + additionalBytes > cap) {
-            VVM_LOG_WARN("budget: heap usage {} MB + {} MB would exceed {} MB ({:.0f}% of {} MB); "
-                 "allocate() failing soft instead of stealing VRAM",
-                         "allocate() failing soft instead of stealing VRAM",
+            VVM_LOG_WARN("budget: heap usage {} MB + {} MB would exceed {} MB ({:.0f}% of {} MB); allocate() failing soft instead of stealing VRAM",
                          heapUsed / (1024 * 1024), additionalBytes / (1024 * 1024),
                          cap / (1024 * 1024), config_.maxHeapFraction * 100.0f,
                          heapBudget / (1024 * 1024));
@@ -1218,9 +1222,7 @@ void UnifiedMemoryPool::defragment() {
         }
         blocks_.erase(blocks_.begin() + i);
     }
-    VVM_LOG_INFO("defragment: released idle blocks; %zu block(s) remain "
-                 "(sub-allocation compaction requires user-side rebinding "
-                 "and is intentionally not performed)",
+    VVM_LOG_INFO("defragment: released idle blocks; {} block(s) remain (sub-allocation compaction requires user-side rebinding and is intentionally not performed)",
                  blocks_.size());
 }
 

@@ -43,8 +43,7 @@ Result makeResult(VkResult vkResult, const char* operation) {
 void checkVk(VkResult result, const char* operation) {
     if (result != VK_SUCCESS) {
         auto err = makeResult(result, operation);
-        VVM_LOG_ERROR("%s", err.message.c_str());
-        // In production, might throw or use expected<T>
+        VVM_LOG_ERROR("{}", err.message);
     }
 }
 
@@ -71,16 +70,16 @@ bool validatePoolConfig(const PoolConfig& config) {
 // ============================================================================
 
 void printMemoryTypes(const VkPhysicalDeviceMemoryProperties& props) {
-    VVM_LOG_INFO("Memory Heaps (%u):", props.memoryHeapCount);
+    VVM_LOG_INFO("Memory Heaps ({}):", props.memoryHeapCount);
     for (uint32_t i = 0; i < props.memoryHeapCount; ++i) {
         const auto& heap = props.memoryHeaps[i];
-        VVM_LOG_INFO("  Heap %u: %zu MB, flags: 0x%x", i, heap.size / (1024*1024), heap.flags);
+        VVM_LOG_INFO("  Heap {}: {} MB, flags: {:#x}", i, heap.size / (1024*1024), heap.flags);
     }
     
-    VVM_LOG_INFO("Memory Types (%u):", props.memoryTypeCount);
+    VVM_LOG_INFO("Memory Types ({}):", props.memoryTypeCount);
     for (uint32_t i = 0; i < props.memoryTypeCount; ++i) {
         const auto& type = props.memoryTypes[i];
-        VVM_LOG_INFO("  Type %u: heap=%u, flags=0x%x", i, type.heapIndex, type.propertyFlags);
+        VVM_LOG_INFO("  Type {}: heap={}, flags={:#x}", i, type.heapIndex, type.propertyFlags);
     }
 }
 
@@ -91,10 +90,10 @@ void printQueueFamilies(VkPhysicalDevice physicalDevice) {
     std::vector<VkQueueFamilyProperties> families(count);
     vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &count, families.data());
     
-    VVM_LOG_INFO("Queue Families (%u):", count);
+    VVM_LOG_INFO("Queue Families ({}):", count);
     for (uint32_t i = 0; i < count; ++i) {
         const auto& fam = families[i];
-        VVM_LOG_INFO("  Family %u: count=%u, flags=0x%x", i, fam.queueCount, fam.queueFlags);
+        VVM_LOG_INFO("  Family {}: count={}, flags={:#x}", i, fam.queueCount, fam.queueFlags);
     }
 }
 
@@ -102,15 +101,15 @@ void printDeviceProperties(VkPhysicalDevice physicalDevice) {
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(physicalDevice, &props);
     
-    VVM_LOG_INFO("Device: %s", props.deviceName);
-    VVM_LOG_INFO("  Type: %u, API: %u.%u.%u, Driver: %u", 
+    VVM_LOG_INFO("Device: {}", props.deviceName);
+    VVM_LOG_INFO("  Type: {}, API: {}.{}.{}, Driver: {}", 
                  props.deviceType,
                  VK_API_VERSION_MAJOR(props.apiVersion),
                  VK_API_VERSION_MINOR(props.apiVersion),
                  VK_API_VERSION_PATCH(props.apiVersion),
                  props.driverVersion);
-    VVM_LOG_INFO("  Vendor: 0x%04x, Device: 0x%04x", props.vendorID, props.deviceID);
-    VVM_LOG_INFO("  Limits: maxMemAlloc=%zu MB, bufferAlignment=%u",
+    VVM_LOG_INFO("  Vendor: {:#04x}, Device: {:#04x}", props.vendorID, props.deviceID);
+    VVM_LOG_INFO("  Limits: maxMemAlloc={} MB, bufferAlignment={}",
                  props.limits.maxMemoryAllocationCount / (1024*1024),
                  props.limits.minUniformBufferOffsetAlignment);
 }
