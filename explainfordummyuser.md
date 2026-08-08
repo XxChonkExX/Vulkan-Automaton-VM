@@ -461,4 +461,4 @@ transport->allReduce({t0, t1, t2}, ReduceOp::Sum, {0, 1, 2});
 - **tests/** — Unit tests for buddy allocator, external handles, sparse, placement
 - **GitHub Issues** — Bug reports, feature requests
 
-*VulkanVM — Making GPUs play nice since 2024.*
+*VulkanVM — Making GPUs play nice since 2026.*
