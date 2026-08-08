@@ -309,13 +309,14 @@ inline UniqueQueryPool makeUniqueQueryPool(VkDevice device, VkQueryPool pool) {
 // ============================================================================
 
 enum class ExternalHandleType {
-    OpaqueFd,      // Linux: VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT
-    OpaqueWin32,   // Windows: VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
-    D3D12Heap,     // Windows: VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT
-    DmaBuf         // Linux: VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+    OpaqueFd,              // Linux: VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT
+    OpaqueWin32,           // Windows: VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
+    D3D12Heap,             // Windows: VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT
+    DmaBuf,                // Linux: VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+    AndroidHardwareBuffer  // Android: VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID
 };
 
-// RAII wrapper for external memory handles (FD on Linux, HANDLE on Windows)
+// RAII wrapper for external memory handles (FD on Linux, HANDLE on Windows, AHardwareBuffer on Android)
 class ExternalHandle {
 public:
     ExternalHandle() = default;
@@ -349,15 +350,32 @@ public:
     HANDLE get() const { return handle_; }
     explicit operator bool() const { return handle_ != nullptr; }
     HANDLE release() { HANDLE h = handle_; handle_ = nullptr; return h; }
-    #endif
     
-private:
-    #ifdef VVM_PLATFORM_LINUX
-    int fd_ = -1;
-    #elif defined(VVM_PLATFORM_WINDOWS)
-    HANDLE handle_ = nullptr;
-    #endif
-};
+    #elif defined(VVM_PLATFORM_ANDROID)
+    // Android: AHardwareBuffer handle
+    ExternalHandle(AHardwareBuffer* buffer) : hardwareBuffer_(buffer) {}
+    ~ExternalHandle() { if (hardwareBuffer_) AHardwareBuffer_release(hardwareBuffer_); }
+    
+    ExternalHandle(ExternalHandle&& other) noexcept : hardwareBuffer_(other.hardwareBuffer_) { other.hardwareBuffer_ = nullptr; }
+    ExternalHandle& operator=(ExternalHandle&& other) noexcept {
+        if (this != &other) { if (hardwareBuffer_) AHardwareBuffer_release(hardwareBuffer_); hardwareBuffer_ = other.hardwareBuffer_; other.hardwareBuffer_ = nullptr; }
+        return *this;
+    }
+    
+    AHardwareBuffer* get() const { return hardwareBuffer_; }
+    explicit operator bool() const { return hardwareBuffer_ != nullptr; }
+    AHardwareBuffer* release() { AHardwareBuffer* h = hardwareBuffer_; hardwareBuffer_ = nullptr; return h; }
+#endif
+    
+    private:
+        #ifdef VVM_PLATFORM_LINUX
+        int fd_ = -1;
+        #elif defined(VVM_PLATFORM_WINDOWS)
+        HANDLE handle_ = nullptr;
+        #elif defined(VVM_PLATFORM_ANDROID)
+        AHardwareBuffer* hardwareBuffer_ = nullptr;
+        #endif
+    };
 
 // ============================================================================
 // External Memory Info
@@ -427,6 +445,12 @@ inline ExternalMemoryInfo duplicateForImport(const ExternalMemoryInfo& src) {
                             DUPLICATE_SAME_ACCESS)) {
             copy.handle = ExternalHandle(dupHandle);
         }
+    }
+#elif defined(VVM_PLATFORM_ANDROID)
+    if (src.handle) {
+        // AHardwareBuffer doesn't need explicit duplication - it's reference counted
+        // Just retain a new reference
+        copy.handle = src.handle;
     }
 #endif
     return copy;

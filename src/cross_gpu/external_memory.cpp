@@ -4,6 +4,11 @@
 
 #include <algorithm>
 
+#ifdef VVM_PLATFORM_ANDROID
+#include <android/hardware_buffer.h>
+#include <android/native_window.h>
+#endif
+
 namespace vvm {
 
 // ============================================================================
@@ -29,6 +34,9 @@ ExternalMemoryCaps queryExternalMemoryCaps(VkPhysicalDevice physicalDevice) {
 #endif
         {VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, "HOST_ALLOCATION"},
         {VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT, "HOST_MAPPED_FOREIGN"},
+#ifdef VVM_PLATFORM_ANDROID
+        {VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID, "ANDROID_HARDWARE_BUFFER"},
+#endif
     };
     
     for (const auto& ht : handleTypes) {
@@ -60,6 +68,10 @@ ExternalMemoryCaps queryExternalMemoryCaps(VkPhysicalDevice physicalDevice) {
 #ifdef VK_USE_PLATFORM_FUCHSIA
                 case VK_EXTERNAL_MEMORY_HANDLE_TYPE_ZIRCON_HANDLE_BIT_FUCHSIA:
                     caps.supportsZirconHandle = true; break;
+#endif
+#ifdef VVM_PLATFORM_ANDROID
+                case VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID:
+                    caps.supportsAndroidHardwareBuffer = true; break;
 #endif
             }
         }
