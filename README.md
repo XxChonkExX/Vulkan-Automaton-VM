@@ -566,15 +566,17 @@ Cross-machine copies are pulled end-to-end: `sendTensor` exports the local `VkDe
 |---------|--------|
 | P2P (local multi-GPU) | ✅ Working |
 | Host-staged fallback | ✅ Working |
-| Ring all-reduce | ✅ Implemented |
+| Ring all-reduce | ✅ Implemented (CPU fallback for all dtypes) |
 | Async pipeline | ✅ Implemented (worker thread + async collectives) |
 | GPU-Direct RDMA (Linux) | ✅ NVIDIA (peermem), AMD/Intel (DMA-BUF) |
-| GPU-Direct RDMA (Windows) | 🔧 Needs NDKPI implementation |
+| GPU-Direct RDMA (Windows) | ✅ **NDKPI transport (`NdkRdmaTransport`)** + fake provider test harness |
 | Network tensor send/recv (TCP GPU⇄GPU) | ✅ Working (`tensor_network_test`) |
 | Layout conversion (NHWC↔NCHW) | ✅ Compute shaders |
 | allGather collective | ✅ Implemented |
 | reduceScatter collective | ✅ Implemented |
 | Tensor slice copy (partial) | ✅ Implemented |
+| **Collective dtypes** | **FP32, FP16, BF16, FP8_E4M3, FP8_E5M2, Int4 (packed), Int8, UInt8, Int32, Int64, Bool** |
+| **Collective ops** | **Sum, Mean, Min, Max, Product, Band, Bor, Bxor** |
 
 ---
 
@@ -846,6 +848,101 @@ The script creates `rxe0` on `eth0` and `rxe1` on `lo`, waits for `ACTIVE` state
 
 ---
 
+## Windows Network Direct (NDKPI) Transport
+
+On Windows, VulkanVM implements **GPU-Direct RDMA via the Network Direct Kernel Provider Interface (NDKPI)** using the user-mode Network Direct SPI (`IND2Provider`, `IND2Adapter`, `IND2CompletionQueue`, `IND2QueuePair`, `IND2Connector`, `IND2Listener`, `IND2MemoryRegion`).
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Application                                        │
+│   (vvm::network::RdmaTransport::create → NdkRdmaTransport)                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          NDKPI User-Mode Stack                               │
+│   ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐        │
+│   │ IND2Provider│──│ IND2Adapter │──│ IND2QueuePair│  │ IND2Completion│    │
+│   │ (enumerate, │  │ (CreateQP,  │  │ (Read/Write, │  │  Queue        │    │
+│   │  Resolve,   │  │  CreateMR,  │  │  Flush)     │  │  (GetResults) │    │
+│   │  OpenAdapter)│  │  CreateCQ)  │  │             │  │             │    │
+│   └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘        │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                     │
+                    ┌────────────────┴────────────────┐
+                    ▼                                 ▼
+          ┌─────────────────────┐            ┌─────────────────────┐
+          │  Real RNIC Provider │            │  Fake Provider      │
+          │  (e.g., mlx5nd2)    │            │  (tests/ndfake/)    │
+          │  Hardware RDMA      │            │  In-process loopback│
+          └─────────────────────┘            └─────────────────────┘
+```
+
+### Implementation Files
+
+| File | Description |
+|------|-------------|
+| `src/network/ndk_transport.cpp` | `NdkRdmaTransport` — full `RdmaTransport` implementation using IND2 SPI |
+| `third_party/ndk/*.h` | Vendored ND SPI headers (`ndspi.h`, `nddef.h`, `ndstatus.h`) |
+| `tests/ndfake/ndfake_provider.{h,cpp}` | In-process fake ND provider for CI/testing |
+| `tests/ndfake/ndk_transport_test.cpp` | Loopback test (connect, register, write, read, verify) |
+
+### Usage
+
+```cpp
+// Standard transport creation — auto-selects ND on Windows
+NetworkConfig cfg;
+cfg.listenAddress = "0.0.0.0:51000";
+cfg.enableRdma = true;
+
+VkInstance instance = ...;
+VkPhysicalDevice physDev = ...;
+VkDevice device = ...;
+
+auto transport = RdmaTransport::create(cfg, physDev, device);
+if (transport && transport->initialize()) {
+    // Use rdmaWrite / rdmaRead / registerHostMemory as usual
+}
+```
+
+The transport requires the **vendor's ND provider** (e.g., NVIDIA `mlx5nd2.sys`) installed in the Winsock catalog (LSP). Without it, the transport falls back to host-staged TCP.
+
+### Test Harness (Fake Provider)
+
+For development/CI without RNIC hardware, a **fake provider DLL** implements the full IND2 SPI on host RAM:
+
+```powershell
+# Build (Windows, Ninja + MSVC via vcvars64)
+.\scripts\build.ps1 -Tests -BuildType Release
+
+# Run with fake provider
+set VVM_ND_PROVIDER_DLL=D:\VulkanVM\build_win\tests\ndfake_provider.dll
+.\build_win\tests\ndk_transport_test.exe
+```
+
+The fake provider:
+- Registers memory regions in a global map (lkey == rkey = unique token)
+- Implements `Read`/`Write` as `memcpy` between registered host buffers
+- Posts synchronous completions to the CQ (`GetResults` pops them)
+- Simulates listener/acceptor loop via condition variables
+- Supports `CancelOverlappedRequests` for clean shutdown
+
+This exercises the **entire NDKPI consumer path** end-to-end: bootstrap → adapter query → CQ → QP → register → connect/accept → Write/Read → completions.
+
+### Vendor ND Providers
+
+| Vendor | ND Provider | Notes |
+|--------|-------------|-------|
+| NVIDIA | `mlx5nd2` | Mellanox ConnectX-4/5/6, requires WinOF-2 |
+| AMD | *TBD* | Currently no public Windows ND provider |
+| Intel | *TBD* | Requires vendor NIC with NDKPI support |
+
+> **Note:** Unlike Linux verbs (ibverbs/rdma_cm) which are open and kernel-independent, Windows NDKPI requires a **vendor-supplied ND provider** (kernel miniport + user-mode SPI DLL). VulkanVM cannot provide GPU-Direct RDMA on Windows without the vendor's ND stack installed.
+
+---
+
 ## PyTorch C++ Extension
 
 VulkanVM provides a native PyTorch C++ extension (`vulkanvm_torch`) that exposes the memory pool, offload, external memory, ModelHub, and shard placement APIs directly to Python.
@@ -1068,8 +1165,10 @@ ctest --test-dir build --output-on-failure
 - CMake 3.20+
 - C++20 compiler (GCC 10+, Clang 12+, MSVC 19.30+)
 - Vulkan SDK 1.3+
+- **Windows SDK 10.0.26100+** (for NDKPI headers: `ws2spi.h`, `ndspi.h`)
 - Optional: Volk (dynamic Vulkan loading), OpenSSL (TLS), gRPC/Protobuf (control plane), ibverbs/rdma_cm (RDMA)
 - **Linux RDMA:** Kernel with `CONFIG_RDMA_RXE=y` (built-in) + `rdma-core` userspace for SoftRoCE fallback. Without it, network module uses host-staged TCP.
+- **Windows NDKPI:** Vendor ND provider (e.g., NVIDIA `mlx5nd2` via WinOF-2) OR WDK 10.0.28000+ for kernel provider development
 
 ### CMake Options
 
@@ -1094,6 +1193,19 @@ ctest --test-dir build --output-on-failure
 | `scripts/build_with_python.sh` | Linux build with `--pytorch`/`--onnx` flags |
 | `scripts/softroce_persist.sh` | Linux: create/install SoftRoCE links |
 | `scripts/softroce_persist.ps1` | Windows: WSL wrapper for SoftRoCE persistence |
+
+### Key Test Targets
+
+| Target | Description | Platform |
+|--------|-------------|----------|
+| `basic_test` | Core pool/buffer allocator | Linux/Windows |
+| `buddy_test` | Buddy allocator logic | Linux/Windows |
+| `tensor_collective_test` | Tensor collectives (allReduce, broadcast, allGather, reduceScatter) | Linux |
+| `ndk_transport_test` | **ND fake provider loopback** (connect/register/write/read) | **Windows** |
+| `network_test` | Multi-node TCP cluster (2-node loopback) | Linux/Windows |
+| `tensor_network_test` | GPU↔GPU tensor send/recv over TCP | Linux |
+| `placement_test` | Shard placement logic (10 pure-logic tests) | Linux/Windows |
+| `multi_gpu_test` | Multi-GPU P2P + offload (requires 2+ GPUs) | Linux/Windows |
 
 ---
 
@@ -1220,7 +1332,9 @@ MemoryTopology topo = detectMemoryTopology(physicalDevice);
 - [x] Tensor Transport: layout conversion shaders (NHWC↔NCHW)
 - [x] Tensor Transport: async pipeline + async collectives (`copyTensorAsync`, `allReduceAsync`, ...)
 - [x] GPU-Direct RDMA wiring (`ibv_reg_dmabuf_mr` on Linux, NVIDIA peermem)
+- [x] **Windows Network Direct (NDKPI) transport** — `NdkRdmaTransport` with IND2 SPI, fake provider test harness
+- [x] **Tensor collectives** — Ring all-reduce, broadcast, all-gather, reduce-scatter with CPU fallback (FP32/FP16/BF16/FP8/INT4/INT8/INT32/BOOL)
 - [ ] Windows WDDM2.6+ hardware scheduling hints
 - [ ] Android/Vulkan support
-- [ ] GPU-Direct RDMA NDKPI implementation (Windows)
+- [ ] Kernel NDKPI provider skeleton (Windows)
 - [ ] Tensor Transport: NCCL-style production collectives
