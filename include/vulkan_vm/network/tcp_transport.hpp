@@ -120,6 +120,26 @@ public:
     // Synchronous request/response exchange.
     std::optional<TcpMessage> request(ConnId id, const TcpMessage& req, const StreamIO* streamIO = nullptr);
 
+    // ========================================================================
+    // Connection Pool (TCP Stream Striping) - for high-throughput large transfers
+    // ========================================================================
+    // Creates a pool of parallel connections to a remote endpoint for striped
+    // stream transfers. Returns true if poolSize connections were established.
+    bool createConnectionPool(const std::string& host, uint16_t port, size_t poolSize = 4);
+    
+    // Striped stream write: distributes data across pool connections.
+    // Use for large outbound transfers (model weights, tensor data).
+    bool writeStreamStriped(const std::string& host, uint16_t port, 
+                            const void* src, uint64_t len, size_t poolSize = 4);
+    
+    // Striped stream read: distributes reads across pool connections.
+    // Use for large inbound transfers.
+    bool readStreamStriped(const std::string& host, uint16_t port,
+                           void* dst, uint64_t len, size_t poolSize = 4);
+    
+    // Shutdown a specific connection pool
+    void shutdownConnectionPool(const std::string& host, uint16_t port);
+    
     // TLS support
     bool enableTls(const TlsConfig& tlsConfig);
     bool isTlsEnabled() const;

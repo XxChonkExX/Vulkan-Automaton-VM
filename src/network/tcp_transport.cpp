@@ -578,6 +578,208 @@ struct TcpTransport::Impl {
     std::mutex cleanupMutex;
     std::condition_variable cleanupCV;
 
+    // ============================================================================
+    // Connection Pool for Parallel Stream Transfers (TCP Stream Striping)
+    // ============================================================================
+    struct ConnectionPool {
+        struct PooledConnection {
+            SocketType socket = kInvalidSocket;
+            std::atomic<bool> inUse{false};
+            std::string remoteHost;
+            uint16_t remotePort = 0;
+            
+            PooledConnection() = default;
+            PooledConnection(const PooledConnection&) = delete;
+            PooledConnection& operator=(const PooledConnection&) = delete;
+            PooledConnection(PooledConnection&& other) noexcept
+                : socket(other.socket), inUse(other.inUse.load()),
+                  remoteHost(std::move(other.remoteHost)), remotePort(other.remotePort) {
+                other.socket = kInvalidSocket;
+                other.inUse.store(false);
+                other.remotePort = 0;
+            }
+            PooledConnection& operator=(PooledConnection&& other) noexcept {
+                if (this != &other) {
+                    socket = other.socket;
+                    inUse.store(other.inUse.load());
+                    remoteHost = std::move(other.remoteHost);
+                    remotePort = other.remotePort;
+                    other.socket = kInvalidSocket;
+                    other.inUse.store(false);
+                    other.remotePort = 0;
+                }
+                return *this;
+            }
+        };
+        
+        std::string remoteHost;
+        uint16_t remotePort = 0;
+        size_t poolSize = 4;
+        std::vector<PooledConnection> connections;
+        std::mutex mutex;
+        
+        ConnectionPool() = default;
+        ConnectionPool(const std::string& host, uint16_t port, size_t size)
+            : remoteHost(host), remotePort(port), poolSize(size) {}
+        
+        bool initialize() {
+            connections.reserve(poolSize);
+            for (size_t i = 0; i < poolSize; ++i) {
+                SocketType sock = socket(AF_INET, SOCK_STREAM, 0);
+                if (sock == kInvalidSocket) {
+                    VVM_LOG_ERROR("ConnectionPool: socket() failed for connection {}/{}", i + 1, poolSize);
+                    return false;
+                }
+                
+                sockaddr_in addr{};
+                addr.sin_family = AF_INET;
+                addr.sin_port = htons(remotePort);
+                if (inet_pton(AF_INET, remoteHost.c_str(), &addr.sin_addr) != 1) {
+                    VVM_LOG_ERROR("ConnectionPool: invalid remote host {}", remoteHost);
+                    closeSocket(sock);
+                    return false;
+                }
+                
+                if (::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == kSocketError) {
+                    int err = WSAGetLastError();
+                    if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS) {
+                        VVM_LOG_ERROR("ConnectionPool: connect() failed for {}:{}: {}", remoteHost, remotePort, err);
+                        closeSocket(sock);
+                        return false;
+                    }
+                }
+                
+                // Set non-blocking for async operation
+                SetNonBlocking(sock);
+                
+                PooledConnection pc;
+                pc.socket = sock;
+                pc.remoteHost = remoteHost;
+                pc.remotePort = remotePort;
+                connections.push_back(std::move(pc));
+            }
+            return connections.size() == poolSize;
+        }
+        
+        static bool SetNonBlocking(SocketType sock) {
+#ifdef VVM_PLATFORM_WINDOWS
+            unsigned long mode = 1;
+            return ioctlsocket(sock, FIONBIO, &mode) == 0;
+#else
+            int flags = fcntl(sock, F_GETFL, 0);
+            if (flags == -1) return false;
+            return fcntl(sock, F_SETFL, flags | O_NONBLOCK) == 0;
+#endif
+        }
+        
+        // Acquire a free connection (round-robin with skip if busy)
+        SocketType acquire() {
+            std::lock_guard<std::mutex> lock(mutex);
+            for (auto& pc : connections) {
+                if (!pc.inUse.exchange(true)) {
+                    return pc.socket;
+                }
+            }
+            return kInvalidSocket; // all busy
+        }
+        
+        void release(SocketType s) {
+            std::lock_guard<std::mutex> lock(mutex);
+            for (auto& pc : connections) {
+                if (pc.socket == s) {
+                    pc.inUse.store(false);
+                    break;
+                }
+            }
+        }
+        
+        void shutdown() {
+            for (auto& pc : connections) {
+                if (pc.socket != kInvalidSocket) {
+                    socketShutdown(pc.socket);
+                    closeSocket(pc.socket);
+                    pc.socket = kInvalidSocket;
+                }
+            }
+        }
+        
+        size_t activeCount() const {
+            size_t count = 0;
+            for (const auto& pc : connections) {
+                if (pc.socket != kInvalidSocket) count++;
+            }
+            return count;
+        }
+    };
+    
+    // Pool registry for multiple remote endpoints
+    std::unordered_map<std::string, std::unique_ptr<ConnectionPool>> connectionPools;
+    std::mutex poolsMutex;
+    
+    // Create or get a connection pool for a remote endpoint
+    ConnectionPool* getOrCreatePool(const std::string& host, uint16_t port, size_t poolSize) {
+        std::string key = host + ":" + std::to_string(port);
+        std::lock_guard<std::mutex> lock(poolsMutex);
+        auto it = connectionPools.find(key);
+        if (it != connectionPools.end()) return it->second.get();
+        auto pool = std::make_unique<ConnectionPool>(host, port, poolSize);
+        if (!pool->initialize()) return nullptr;
+        ConnectionPool* ptr = pool.get();
+        connectionPools.emplace(std::move(key), std::move(pool));
+        return ptr;
+    }
+    
+    // Striped write: distribute data across pool connections
+    bool writeStreamSlicesStriped(const std::string& host, uint16_t port, const void* src, uint64_t len, size_t poolSize = 4) {
+        ConnectionPool* pool = getOrCreatePool(host, port, poolSize);
+        if (!pool || pool->activeCount() == 0) return false;
+        
+        const uint8_t* p = static_cast<const uint8_t*>(src);
+        uint64_t remaining = len;
+        const uint64_t stripeSize = kStreamSliceSize; // 4MB per stripe
+        
+        while (remaining > 0) {
+            uint64_t chunk = remaining < stripeSize ? remaining : stripeSize;
+            SocketType s = pool->acquire();
+            if (s == kInvalidSocket) {
+                // All connections busy - wait for one
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+            bool ok = writeAllTls(s, p, static_cast<size_t>(chunk));
+            pool->release(s);
+            if (!ok) return false;
+            p += chunk;
+            remaining -= chunk;
+        }
+        return true;
+    }
+    
+    // Striped read: distribute reads across pool connections
+    bool readStreamSlicesStriped(const std::string& host, uint16_t port, void* dst, uint64_t len, size_t poolSize = 4) {
+        ConnectionPool* pool = getOrCreatePool(host, port, poolSize);
+        if (!pool || pool->activeCount() == 0) return false;
+        
+        uint8_t* p = static_cast<uint8_t*>(dst);
+        uint64_t remaining = len;
+        const uint64_t stripeSize = kStreamSliceSize;
+        
+        while (remaining > 0) {
+            uint64_t chunk = remaining < stripeSize ? remaining : stripeSize;
+            SocketType s = pool->acquire();
+            if (s == kInvalidSocket) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+            bool ok = readAllTls(s, p, static_cast<size_t>(chunk));
+            pool->release(s);
+            if (!ok) return false;
+            p += chunk;
+            remaining -= chunk;
+        }
+        return true;
+    }
+
     ~Impl() { stop(); }
 
     // TLS-aware read/write
@@ -649,6 +851,11 @@ struct TcpTransport::Impl {
         if (tlsContext) {
             tlsContext->cleanup();
         }
+        // Shutdown connection pools
+        for (auto& [key, pool] : connectionPools) {
+            pool->shutdown();
+        }
+        connectionPools.clear();
     }
 };
 
@@ -766,6 +973,30 @@ bool TcpTransport::enableTls(const TlsConfig& tlsConfig) {
 
 bool TcpTransport::isTlsEnabled() const {
     return impl_->tlsContext && impl_->tlsContext->enabled;
+}
+
+bool TcpTransport::createConnectionPool(const std::string& host, uint16_t port, size_t poolSize) {
+    return impl_->getOrCreatePool(host, port, poolSize) != nullptr;
+}
+
+bool TcpTransport::writeStreamStriped(const std::string& host, uint16_t port,
+                                      const void* src, uint64_t len, size_t poolSize) {
+    return impl_->writeStreamSlicesStriped(host, port, src, len, poolSize);
+}
+
+bool TcpTransport::readStreamStriped(const std::string& host, uint16_t port,
+                                     void* dst, uint64_t len, size_t poolSize) {
+    return impl_->readStreamSlicesStriped(host, port, dst, len, poolSize);
+}
+
+void TcpTransport::shutdownConnectionPool(const std::string& host, uint16_t port) {
+    std::string key = host + ":" + std::to_string(port);
+    std::lock_guard<std::mutex> lock(impl_->poolsMutex);
+    auto it = impl_->connectionPools.find(key);
+    if (it != impl_->connectionPools.end()) {
+        it->second->shutdown();
+        impl_->connectionPools.erase(it);
+    }
 }
 
 void TcpTransport::acceptLoop() {
