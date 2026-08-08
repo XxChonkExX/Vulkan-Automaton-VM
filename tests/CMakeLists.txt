@@ -96,3 +96,12 @@ target_include_directories(placement_test PRIVATE
     ${TEST_EXTRA_INCLUDES}
 )
 add_test(NAME placement_test COMMAND placement_test)
+
+# Tensor collective operations (requires a Vulkan device; single GPU is enough)
+add_executable(tensor_collective_test tensor_collective_test.cpp)
+target_link_libraries(tensor_collective_test PRIVATE vulkan_vm)
+target_include_directories(tensor_collective_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
+add_test(NAME tensor_collective_test COMMAND tensor_collective_test)
