@@ -84,8 +84,6 @@ public:
     VkBuffer getBuffer() const { return shadowBuffer_.buffer; }
     VkDeviceSize getSize() const { return shadowBuffer_.size; }
     VkDeviceSize getUsed() const { return shadowBuffer_.used; }
-    
-    void defragment();
 
 private:
     VkPhysicalDevice physicalDevice_;

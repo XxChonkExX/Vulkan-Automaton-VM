@@ -2,9 +2,6 @@
 #include "vulkan_vm/utils.hpp"
 
 #include <infiniband/verbs.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <cstring>
 #include <fstream>
 #include <filesystem>
 #include <vector>
@@ -114,29 +111,6 @@ void unregisterVendorGpuMemory(const GpuDirectRegistration& reg, uint32_t vendor
 }
 
 // ============================================================================
-// DMA-BUF Registration (AMD/Intel path)
-// ============================================================================
-
-std::optional<DmaBufRegistration> registerDmaBufForRdma(
-    int dmaBufFd,
-    size_t size,
-    const std::string& nicName) {
-
-    // This needs a PD which should come from the transport context.
-    // For now, this is a stub - the actual registration happens in
-    // VerbsRdmaTransport::registerGpuMemory where we have the PD.
-    DmaBufRegistration reg;
-    reg.fd = dmaBufFd;
-    reg.valid = false;
-    return reg;
-}
-
-void unregisterDmaBufForRdma(const DmaBufRegistration& reg) {
-    if (reg.mr) ibv_dereg_mr(reg.mr);
-    if (reg.fd >= 0) close(reg.fd);
-}
-
-// ============================================================================
 // Vendor-specific dispatch
 // ============================================================================
 
@@ -166,52 +140,6 @@ std::optional<GpuDirectRegistration> registerGpuMemoryForRdmaVendor(
             VVM_LOG_WARN("Unknown GPU vendor 0x%x for GPUDirect", vendorId);
             return std::nullopt;
     }
-}
-
-std::optional<DmaBufRegistration> registerDmaBufForRdmaVendor(
-    VkDevice device,
-    VkPhysicalDevice physicalDevice,
-    VkDeviceMemory memory,
-    VkDeviceSize offset,
-    VkDeviceSize size,
-    VkQueue transferQueue,
-    uint32_t transferQueueFamily,
-    const std::string& nicName,
-    uint32_t vendorId) {
-
-    // AMD/Intel: export as DMA-BUF
-    if (vendorId == 0x1002 || vendorId == 0x8086) {
-        VkMemoryGetFdInfoKHR getFdInfo{};
-        getFdInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
-        getFdInfo.memory = memory;
-        getFdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-
-        PFN_vkGetMemoryFdKHR vkGetMemoryFdKHR =
-            (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(device, "vkGetMemoryFdKHR");
-        if (!vkGetMemoryFdKHR) {
-            VVM_LOG_ERROR("vkGetMemoryFdKHR not available");
-            return std::nullopt;
-        }
-
-        int dmaBufFd = -1;
-        VkResult result = vkGetMemoryFdKHR(device, &getFdInfo, &dmaBufFd);
-        if (result != VK_SUCCESS || dmaBufFd < 0) {
-            VVM_LOG_ERROR("vkGetMemoryFdKHR failed: %s", vkResultToString(result).c_str());
-            return std::nullopt;
-        }
-
-        DmaBufRegistration reg;
-        reg.fd = dmaBufFd;
-        reg.valid = true; // The MR will be created in the transport with its PD
-        return reg;
-    }
-
-    return std::nullopt;
-}
-
-void unregisterVendorDmaBuf(const DmaBufRegistration& reg, uint32_t vendorId) {
-    if (reg.mr) ibv_dereg_mr(reg.mr);
-    if (reg.fd >= 0) close(reg.fd);
 }
 
 } // namespace network

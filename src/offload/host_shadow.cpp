@@ -221,10 +221,6 @@ void HostShadowManager::protectRegion(VkDeviceSize, VkDeviceSize) {}
 void HostShadowManager::unprotectRegion(VkDeviceSize, VkDeviceSize) {}
 #endif
 
-void HostShadowManager::defragment() {
-    // TODO: Implement compaction of host shadow buffer
-}
-
 // ============================================================================
 // MigrationEngine Implementation
 // ============================================================================
