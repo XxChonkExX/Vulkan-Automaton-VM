@@ -779,7 +779,6 @@ std::optional<RdmaMemoryRegion> registerGpuMemory(
 
 // Dispatches to:
 registerGpuMemoryForRdmaVendor(device, physDev, memory, offset, size, ... , vendorId);
-registerDmaBufForRdmaVendor(device, physDev, memory, offset, size, ... , vendorId);
 ```
 
 ### Linux SoftRoCE (Software RoCE / `rxe`) — Fallback Path

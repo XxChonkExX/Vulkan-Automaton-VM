@@ -11,7 +11,6 @@
 #include <optional>
 #include <string>
 #include <cstdint>
-#include <cstddef>
 
 #if defined(VVM_NETWORK_HAS_VERBS)
 #include <infiniband/verbs.h>
@@ -43,25 +42,6 @@ std::optional<GpuDirectRegistration> registerGpuMemoryForRdma(
     const std::string& nicName = "");
 
 // ============================================================================
-// DMA-BUF registration helper (AMD/Intel path)
-// ============================================================================
-
-struct DmaBufRegistration {
-    int fd = -1;
-    struct ibv_mr* mr = nullptr;
-    uint32_t rkey = 0;
-    bool valid = false;
-};
-
-// Register DMA-BUF fd for RDMA
-std::optional<DmaBufRegistration> registerDmaBufForRdma(
-    int dmaBufFd,
-    size_t size,
-    const std::string& nicName = "");
-
-void unregisterDmaBufForRdma(const DmaBufRegistration& reg);
-
-// ============================================================================
 // Vendor-specific GPU-direct registration
 // ============================================================================
 
@@ -78,19 +58,7 @@ std::optional<GpuDirectRegistration> registerGpuMemoryForRdmaVendor(
     const std::string& nicName,
     uint32_t vendorId);
 
-std::optional<DmaBufRegistration> registerDmaBufForRdmaVendor(
-    VkDevice device,
-    VkPhysicalDevice physicalDevice,
-    VkDeviceMemory memory,
-    VkDeviceSize offset,
-    VkDeviceSize size,
-    VkQueue transferQueue,
-    uint32_t transferQueueFamily,
-    const std::string& nicName,
-    uint32_t vendorId);
-
 void unregisterVendorGpuMemory(const GpuDirectRegistration& reg, uint32_t vendorId);
-void unregisterVendorDmaBuf(const DmaBufRegistration& reg, uint32_t vendorId);
 
 } // namespace network
 } // namespace vvm
