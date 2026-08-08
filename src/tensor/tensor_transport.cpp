@@ -6,6 +6,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstring>
+#include <limits>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -16,6 +19,342 @@
 
 namespace vvm {
 namespace tensor {
+
+namespace {
+
+// ============================================================================
+// Host-side reduce primitives (CPU collective fallback path)
+//
+// The collective implementations below stage GPU buffers through host-visible
+// memory when no native compute kernel is available. These helpers translate
+// the on-wire scalar types to/from double so one reduction loop covers every
+// DataType.
+// ============================================================================
+
+bool isIntegralType(DataType dt) {
+    switch (dt) {
+        case DataType::Int8:
+        case DataType::UInt8:
+        case DataType::Int32:
+        case DataType::Int64:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Element width in bytes for the types we de/pack element-wise.
+size_t packedElemSize(DataType dt) {
+    switch (dt) {
+        case DataType::Int4: return 1;  // two 4-bit elements per byte
+        default: return dataTypeSize(dt);
+    }
+}
+
+// Read one logical element. For packed Int4, index tells which nibble.
+double readElem(DataType dt, const uint8_t* base, size_t index) {
+    if (dt == DataType::Int4) {
+        const uint8_t raw = base[index / 2];
+        const int8_t lo = (raw & 0x8u) ? static_cast<int8_t>(raw | 0xF0u)
+                                       : static_cast<int8_t>(raw & 0x0Fu);
+        const int8_t hi = (raw & 0x80u) ? static_cast<int8_t>(raw >> 4)
+                                        : static_cast<int8_t>(raw & 0xF0u);
+        return static_cast<double>(index % 2 ? hi : lo);
+    }
+    const uint8_t* p = base + index * packedElemSize(dt);
+    switch (dt) {
+        case DataType::Float32: {
+            float v;
+            std::memcpy(&v, p, sizeof(v));
+            return static_cast<double>(v);
+        }
+        case DataType::Float16: {
+            uint16_t h;
+            std::memcpy(&h, p, sizeof(h));
+            const uint32_t sign = (h & 0x8000u) << 16;
+            const uint32_t exp = (h >> 10) & 0x1Fu;
+            const uint32_t man = h & 0x3FFu;
+            uint32_t f;
+            if (exp == 31) {
+                f = sign | 0x7F800000u | (man << 13);
+            } else if (exp == 0) {
+                if (man == 0) {
+                    f = sign;
+                } else {
+                    int e = -14;
+                    uint32_t m = man;
+                    while (!(m & 0x400u)) { m <<= 1; --e; }
+                    f = sign | ((e + 127) << 23) | ((m & 0x3FFu) << 13);
+                }
+            } else {
+                f = sign | ((exp - 15 + 127) << 23) | (man << 13);
+            }
+            float out;
+            std::memcpy(&out, &f, sizeof(out));
+            return static_cast<double>(out);
+        }
+        case DataType::BFloat16: {
+            uint16_t h;
+            std::memcpy(&h, p, sizeof(h));
+            const uint32_t f = static_cast<uint32_t>(h) << 16;
+            float out;
+            std::memcpy(&out, &f, sizeof(out));
+            return static_cast<double>(out);
+        }
+        case DataType::Float8_E4M3: {
+            const uint8_t v = *p;
+            const uint32_t sign = (v & 0x80u) << 24;
+            const uint32_t exp = (v >> 3) & 0xFu;
+            const uint32_t man = v & 0x7u;
+            uint32_t f;
+            if (exp == 15) {
+                f = sign | 0x7F800000u | (man << 23);
+            } else if (exp == 0) {
+                if (man == 0) {
+                    f = sign;
+                } else {
+                    int e = -6;
+                    uint32_t m = man | 0x8u;
+                    while (!(m & 0x8u)) { m <<= 1; --e; }
+                    f = sign | ((e + 127) << 23) | ((m & 0x7u) << 20);
+                }
+            } else {
+                f = sign | ((exp - 3 + 127) << 23) | (man << 20);
+            }
+            float out;
+            std::memcpy(&out, &f, sizeof(out));
+            return static_cast<double>(out);
+        }
+        case DataType::Float8_E5M2: {
+            const uint8_t v = *p;
+            const uint32_t sign = (v & 0x80u) << 24;
+            const uint32_t exp = (v >> 2) & 0x1Fu;
+            const uint32_t man = v & 0x3u;
+            uint32_t f;
+            if (exp == 31) {
+                f = sign | 0x7F800000u | (man << 23);
+            } else if (exp == 0) {
+                if (man == 0) {
+                    f = sign;
+                } else {
+                    int e = -14;
+                    uint32_t m = man;
+                    while (!(m & 0x4u)) { m <<= 1; --e; }
+                    f = sign | ((e + 127) << 23) | ((m & 0x3u) << 21);
+                }
+            } else {
+                f = sign | ((exp - 15 + 127) << 23) | (man << 21);
+            }
+            float out;
+            std::memcpy(&out, &f, sizeof(out));
+            return static_cast<double>(out);
+        }
+        case DataType::Bool: {
+            return (static_cast<int8_t>(*p) != 0) ? 1.0 : 0.0;
+        }
+        case DataType::Int8: return static_cast<double>(*reinterpret_cast<const int8_t*>(p));
+        case DataType::UInt8: return static_cast<double>(*reinterpret_cast<const uint8_t*>(p));
+        case DataType::Int32: return static_cast<double>(*reinterpret_cast<const int32_t*>(p));
+        case DataType::Int64: return static_cast<double>(*reinterpret_cast<const int64_t*>(p));
+        default: return 0.0;
+    }
+}
+
+void writeElem(DataType dt, uint8_t* base, size_t index, double v) {
+    if (dt == DataType::Int4) {
+        // Clamp and sign-pack into the nibble: low nibble element 0, high element 1.
+        int8_t n = static_cast<int8_t>(std::lround(v));
+        if (n < -8) n = -8;
+        if (n > 7) n = 7;
+        const uint8_t nib = static_cast<uint8_t>(n & 0x0Fu);
+        uint8_t& cell = base[index / 2];
+        if (index % 2) { cell = static_cast<uint8_t>((cell & 0x0Fu) | (nib << 4)); }
+        else { cell = static_cast<uint8_t>((cell & 0xF0u) | nib); }
+        return;
+    }
+    uint8_t* p = base + index * packedElemSize(dt);
+    switch (dt) {
+        case DataType::Float32: {
+            const float f = static_cast<float>(v);
+            std::memcpy(p, &f, sizeof(f));
+            break;
+        }
+        case DataType::Float16: {
+            const double d = v;
+            const uint32_t sign = (std::signbit(d) ? 1u : 0u) << 31;
+            const double a = std::fabs(d);
+            uint32_t f;
+            uint32_t exp32;
+            uint32_t man32;
+            std::memcpy(&f, &a, sizeof(f));
+            exp32 = (f >> 23) & 0xFFu;
+            man32 = f & 0x7FFFFFu;
+            uint16_t h;
+            if (exp32 == 0xFFu) {
+                h = static_cast<uint16_t>((sign >> 16) | 0x7C00u | (man32 ? 0x200u : 0u));
+            } else {
+                const int32_t e = static_cast<int32_t>(exp32) - 127 + 15;
+                if (e >= 31) {
+                    h = static_cast<uint16_t>((sign >> 16) | 0x7C00u);
+                } else if (e <= 0) {
+                    if (e < -10) {
+                        h = static_cast<uint16_t>(sign >> 16);
+                    } else {
+                        const uint32_t m = man32 | 0x800000u;
+                        const uint32_t shifted = m >> (13 - e);
+                        if (e <= -25) h = static_cast<uint16_t>(sign >> 16);
+                        else if (m & ((1u << (13 - e)) - 1)) {
+                            h = static_cast<uint16_t>((sign >> 16) | (shifted >> 13) | 0x1u);
+                        } else h = static_cast<uint16_t>((sign >> 16) | (shifted >> 13));
+                    }
+                } else {
+                    h = static_cast<uint16_t>((sign >> 16) | (static_cast<uint32_t>(e) << 10) | (man32 >> 13));
+                }
+            }
+            std::memcpy(p, &h, sizeof(h));
+            break;
+        }
+        case DataType::BFloat16: {
+            const float f = static_cast<float>(v);
+            uint32_t bits;
+            std::memcpy(&bits, &f, sizeof(bits));
+            // Round-to-nearest-even by adding half an ULP in the low 16 bits.
+            const uint32_t rounded = bits + 0x7FFFu + ((bits >> 16) & 1u);
+            uint16_t out = static_cast<uint16_t>(rounded >> 16);
+            std::memcpy(p, &out, sizeof(out));
+            break;
+        }
+        case DataType::Float8_E4M3: {
+            const double d = v;
+            const uint32_t sign = (std::signbit(d) ? 1u : 0u) << 31;
+            const double a = std::fabs(d);
+            if (a == 0.0) { *p = static_cast<uint8_t>(sign >> 24); break; }
+            uint32_t f;
+            std::memcpy(&f, &a, sizeof(f));
+            const int32_t e = static_cast<int32_t>((f >> 23) & 0xFFu) - 127;
+            const uint32_t man = f & 0x7FFFFFu;
+            uint8_t out;
+            if (e > 15) { out = 0xFFu; }             // inf (sat max)
+            else if (e >= 3) {
+                const uint32_t m2 = man >> 20;
+                out = static_cast<uint8_t>(sign | ((static_cast<uint32_t>(e + 3)) << 3) | (m2 & 0x7u));
+            } else if (e >= -6) {
+                const int shift = 20 - (e + 6);
+                const uint32_t m = man | 0x800000u;
+                const uint32_t m2 = shift >= 0 ? (m >> shift) : (m << (-shift));
+                const uint32_t r = shift >= 0 ? (m & ((1u << shift) - 1u)) : 0;
+                out = static_cast<uint8_t>(sign | ((m2 >> 3) & 0x7u) | (r ? 1u : 0u));
+            } else {
+                out = static_cast<uint8_t>(sign);
+            }
+            *p = out;
+            break;
+        }
+        case DataType::Float8_E5M2: {
+            const double d = v;
+            const uint32_t sign = (std::signbit(d) ? 1u : 0u) << 31;
+            if (d == 0.0) { *p = static_cast<uint8_t>(sign >> 24); break; }
+            uint32_t f;
+            const double a = std::fabs(d);
+            std::memcpy(&f, &a, sizeof(f));
+            const int32_t e = static_cast<int32_t>((f >> 23) & 0xFFu) - 127;
+            const uint32_t man = f & 0x7FFFFFu;
+            uint8_t out;
+            if (e > 15) {
+                out = static_cast<uint8_t>(0xFFu);  // saturate to inf (E5M2 max)
+            } else if (e >= -14) {
+                out = static_cast<uint8_t>(sign | ((static_cast<uint32_t>(e + 15)) << 2) | ((man >> 21) & 0x3u));
+            } else {
+                const int shift = -14 - e + 21;
+                const uint32_t m = man | 0x800000u;
+                const uint32_t m2 = m >> shift;
+                out = static_cast<uint8_t>(sign | (m2 & 0x3u));
+            }
+            *p = out;
+            break;
+        }
+        case DataType::Bool: {
+            *p = static_cast<uint8_t>(v != 0.0 ? 1 : 0);
+            break;
+        }
+        case DataType::Int8: *reinterpret_cast<int8_t*>(p) = static_cast<int8_t>(std::lround(v)); break;
+        case DataType::UInt8: *reinterpret_cast<uint8_t*>(p) = static_cast<uint8_t>(std::lround(v)); break;
+        case DataType::Int32: *reinterpret_cast<int32_t*>(p) = static_cast<int32_t>(std::llround(v)); break;
+        case DataType::Int64: *reinterpret_cast<int64_t*>(p) = static_cast<int64_t>(std::llround(v)); break;
+        default: break;
+    }
+}
+
+// Accumulate `src` into `dst` element-wise: dst[i] = dst[i] OP src[i].
+// Bitwise ops run over the raw byte representation of integer types.
+bool combineInto(ReduceOp op, DataType dt, uint8_t* dst, const uint8_t* src,
+                 size_t byteCount) {
+    if (op == ReduceOp::Band || op == ReduceOp::Bor || op == ReduceOp::Bxor) {
+        if (!isIntegralType(dt)) {
+            VVM_LOG_WARN("Bitwise reduce ops require an integer tensor type");
+            return false;
+        }
+        for (size_t i = 0; i < byteCount; ++i) {
+            switch (op) {
+                case ReduceOp::Band: dst[i] &= src[i]; break;
+                case ReduceOp::Bor:  dst[i] |= src[i]; break;
+                case ReduceOp::Bxor: dst[i] ^= src[i]; break;
+                default: break;
+            }
+        }
+        return true;
+    }
+
+    const size_t elemWidth = packedElemSize(dt);
+    const size_t count = byteCount / elemWidth;
+    for (size_t i = 0; i < count; ++i) {
+        const double a = readElem(dt, dst, i);
+        const double b = readElem(dt, src, i);
+        double v = a;
+        switch (op) {
+            case ReduceOp::Sum:
+            case ReduceOp::Mean:
+                v = a + b;
+                break;
+            case ReduceOp::Product:
+                v = a * b;
+                break;
+            case ReduceOp::Min:
+                v = (a < b) ? a : b;
+                break;
+            case ReduceOp::Max:
+                v = (a > b) ? a : b;
+                break;
+            default:
+                break;
+        }
+        writeElem(dt, dst, i, v);
+    }
+    return true;
+}
+
+// Initialize the accumulator with the neutral value for `op`.
+void initReduceOp(ReduceOp op, DataType dt, uint8_t* dst, size_t byteCount) {
+    if (op == ReduceOp::Band) {
+        std::fill(dst, dst + byteCount, static_cast<uint8_t>(0xFFu));
+        return;
+    }
+    if (op == ReduceOp::Bor || op == ReduceOp::Bxor) {
+        std::memset(dst, 0, byteCount);
+        return;
+    }
+    const size_t elemWidth = packedElemSize(dt);
+    const size_t count = byteCount / elemWidth;
+    for (size_t i = 0; i < count; ++i) {
+        double v = 0.0;
+        if (op == ReduceOp::Min) v = std::numeric_limits<double>::infinity();
+        else if (op == ReduceOp::Max) v = -std::numeric_limits<double>::infinity();
+        else if (op == ReduceOp::Product) v = 1.0;
+        writeElem(dt, dst, i, v);
+    }
+}
+
+} // namespace
 
 // ============================================================================
 // Tensor Shape Static Methods
@@ -221,7 +560,13 @@ public:
             peerHandle->metadata = results[0]->metadata;
             results.push_back(peerHandle);
         }
-        
+
+        // Keep a per-device view of the distributed tensor so collectives can
+        // address peers by device index.
+        for (size_t i = 0; i < deviceIndices.size(); ++i) {
+            distributedTensors_[deviceIndices[i]] = results[i];
+        }
+
         return results;
     }
     
@@ -631,25 +976,34 @@ public:
     // ========================================================================
     
     bool allReduce(const std::vector<TensorHandle>& tensors, ReduceOp op, const std::vector<uint32_t>& deviceIndices) override {
-        if (!isReady() || tensors.size() != deviceIndices.size() || tensors.size() < 2) {
-            return false;
+        if (!isReady() || tensors.size() < 2 || tensors.size() != deviceIndices.size()) return false;
+
+        for (const auto& t : tensors) {
+            if (!t) return false;
+            if (t->metadata.dtype != tensors[0]->metadata.dtype) {
+                VVM_LOG_ERROR("allReduce: mixed dtypes in one collective group");
+                return false;
+            }
         }
-        
-        // Simple ring all-reduce implementation
-        // In production, this would use NCCL or custom shaders
-        VVM_LOG_INFO("allReduce: implementing ring all-reduce across {} devices", tensors.size());
-        
-        // For now, just do a simple copy from device 0 to all others
-        // Real implementation would do proper ring all-reduce
-        for (size_t i = 1; i < tensors.size(); ++i) {
-            if (!copyTensor(tensors[0], tensors[i])) {
-                VVM_LOG_ERROR("allReduce: copy from device 0 to device {} failed", deviceIndices[i]);
+        const size_t bytes = tensors[0]->metadata.bytes();
+        if (bytes == 0) return true;
+
+        VVM_LOG_INFO("allReduce: {} participants, {} bytes, op {}", tensors.size(), bytes,
+                     static_cast<int>(op));
+
+        std::vector<uint8_t> acc;
+        if (!reduceAllToHost(tensors, op, acc, bytes)) return false;
+
+        // Result is identical on every participant.
+        for (size_t i = 0; i < tensors.size(); ++i) {
+            if (!hostToGpu(tensors[i], 0, acc.data(), bytes)) {
+                VVM_LOG_ERROR("allReduce: write-back to device {} failed", deviceIndices[i]);
                 return false;
             }
         }
         return true;
     }
-    
+
     bool allReduceAsync(const std::vector<TensorHandle>& tensors, ReduceOp op, const std::vector<uint32_t>& deviceIndices, CompletionCallback cb) override {
         enqueueAsync([this, tensors, op, deviceIndices, cb]() {
             bool ok = allReduce(tensors, op, deviceIndices);
@@ -657,24 +1011,38 @@ public:
         });
         return true;
     }
-    
+
     bool broadcast(const TensorHandle& root, const std::vector<uint32_t>& deviceIndices, uint32_t rootIndex) override {
-        if (!isReady() || deviceIndices.empty()) return false;
-        
-        // Find root tensor
-        TensorHandle rootTensor;
+        if (!isReady() || deviceIndices.empty() || !root) return false;
+        if (rootIndex >= deviceIndices.size()) {
+            VVM_LOG_ERROR("broadcast: rootIndex {} out of range", rootIndex);
+            return false;
+        }
+
+        const uint32_t rootDevice = deviceIndices[rootIndex];
+        if (root->allocation.blockIndex != rootDevice) {
+            VVM_LOG_ERROR("broadcast: root tensor lives on device {} but rootIndex maps to device {}",
+                          root->allocation.blockIndex, rootDevice);
+            return false;
+        }
+
+        VVM_LOG_INFO("broadcast: root device {} -> {} participants", rootDevice, deviceIndices.size());
         for (size_t i = 0; i < deviceIndices.size(); ++i) {
-            if (deviceIndices[i] == rootIndex) {
-                // We don't have a direct mapping from device index to tensor
-                // In real implementation, would track this properly
-                VVM_LOG_WARN("broadcast: simplified implementation - copy from device {}", rootIndex);
+            if (i == rootIndex) continue;
+            auto it = distributedTensors_.find(deviceIndices[i]);
+            if (it == distributedTensors_.end() || !it->second) {
+                VVM_LOG_WARN("broadcast: no distributed peer registered for device {} (use allocateDistributed)",
+                             deviceIndices[i]);
+                return false;
+            }
+            if (!copyTensor(root, it->second)) {
+                VVM_LOG_ERROR("broadcast: copy to device {} failed", deviceIndices[i]);
+                return false;
             }
         }
-        
-        // For now, just return success
         return true;
     }
-    
+
     bool broadcastAsync(const TensorHandle& root, const std::vector<uint32_t>& deviceIndices, uint32_t rootIndex, CompletionCallback cb) override {
         enqueueAsync([this, root, deviceIndices, rootIndex, cb]() {
             bool ok = broadcast(root, deviceIndices, rootIndex);
@@ -682,39 +1050,27 @@ public:
         });
         return true;
     }
-    
+
     bool allGather(const std::vector<TensorHandle>& inputs, TensorHandle output, const std::vector<uint32_t>& deviceIndices) override {
         if (!isReady() || inputs.empty() || inputs.size() != deviceIndices.size()) return false;
-        
-        // allGather: concatenate inputs from all devices into output
-        // Each device provides one input tensor, output is concatenation of all
-        VVM_LOG_INFO("allGather: concatenating {} tensors across {} devices", inputs.size(), deviceIndices.size());
-        
-        // All inputs must have the same shape except the concatenation dimension
-        // For simplicity, we'll concatenate along the first dimension (N)
-        // Output shape: [N * num_devices, H, W, C] or similar
-        
-        // For now, just copy all inputs to output on device 0
-        // Real implementation would do proper ring all-gather
-        if (!output) return false;
-        
-        // Calculate total size
-        size_t totalBytes = 0;
-        for (const auto& input : inputs) {
-            if (input->metadata.bytes() != inputs[0]->metadata.bytes()) {
+        for (const auto& in : inputs) {
+            if (!in || in->metadata.bytes() != inputs[0]->metadata.bytes()) {
                 VVM_LOG_ERROR("allGather: all inputs must have the same size");
                 return false;
             }
-            totalBytes += input->metadata.bytes();
         }
-        
+        if (!output) return false;
+
+        const size_t totalBytes = inputs[0]->metadata.bytes() * inputs.size();
         if (output->metadata.bytes() != totalBytes) {
             VVM_LOG_ERROR("allGather: output size ({}) doesn't match total input size ({})",
                           output->metadata.bytes(), totalBytes);
             return false;
         }
-        
-        // Copy each input to the corresponding slice in output
+
+        VVM_LOG_INFO("allGather: {} participants, concatenating into {} bytes",
+                     inputs.size(), totalBytes);
+
         size_t offset = 0;
         for (size_t i = 0; i < inputs.size(); ++i) {
             if (!copyTensorPartial(inputs[i], output, 0, offset, inputs[i]->metadata.bytes())) {
@@ -723,10 +1079,9 @@ public:
             }
             offset += inputs[i]->metadata.bytes();
         }
-        
         return true;
     }
-    
+
     bool allGatherAsync(const std::vector<TensorHandle>& inputs, TensorHandle output, const std::vector<uint32_t>& deviceIndices, CompletionCallback cb) override {
         enqueueAsync([this, inputs, output, deviceIndices, cb]() {
             bool ok = allGather(inputs, output, deviceIndices);
@@ -734,54 +1089,53 @@ public:
         });
         return true;
     }
-    
+
     bool reduceScatter(const std::vector<TensorHandle>& inputs, TensorHandle output, ReduceOp op, const std::vector<uint32_t>& deviceIndices) override {
-        if (!isReady() || inputs.empty() || inputs.size() != deviceIndices.size()) return false;
-        
-        // reduceScatter: reduce inputs across devices and scatter results
-        // Each device gets a slice of the reduced result
-        VVM_LOG_INFO("reduceScatter: reducing {} tensors across {} devices", inputs.size(), deviceIndices.size());
-        
-        // All inputs must have the same size
+        if (!isReady() || inputs.empty() || inputs.size() != deviceIndices.size() || !output) return false;
+
         size_t inputBytes = inputs[0]->metadata.bytes();
         for (const auto& input : inputs) {
-            if (input->metadata.bytes() != inputBytes) {
+            if (!input || input->metadata.bytes() != inputBytes) {
                 VVM_LOG_ERROR("reduceScatter: all inputs must have the same size");
                 return false;
             }
         }
-        
-        // Output size = input size / num_devices
-        size_t outputBytes = inputBytes / inputs.size();
-        if (output->metadata.bytes() != outputBytes) {
-            VVM_LOG_ERROR("reduceScatter: output size ({}) doesn't match expected ({})",
-                          output->metadata.bytes(), outputBytes);
+
+        const size_t chunkSize = inputBytes / inputs.size();
+        if (chunkSize * inputs.size() != inputBytes) {
+            VVM_LOG_ERROR("reduceScatter: input size {} not divisible by {} participants", inputBytes, inputs.size());
             return false;
         }
-        
-        // Ring reduce-scatter algorithm
-        // Step 1: Each device sends its chunk to the next device
-        // Step 2: Each device reduces received chunk with its own
-        // Step 3: Repeat until all chunks are reduced
-        // Step 4: Each device has its final reduced chunk
-        
-        // For simplicity, implement on device 0 (in production, each device would run this)
-        // We'll do the full reduction on device 0 and scatter
-        if (deviceIndices[0] == 0) {
-            // Device 0 does the reduction
-            std::vector<uint8_t> tempBuffer(inputBytes);
-            
-            // For each chunk
-            size_t chunkSize = inputBytes / inputs.size();
-            for (size_t chunk = 0; chunk < inputs.size(); ++chunk) {
-                // Reduce all inputs' chunk into tempBuffer
-                // For now, just copy first input's chunk (real impl would reduce)
-                if (!copyTensorPartial(inputs[0], output, chunk * chunkSize, 0, chunkSize)) {
-                    return false;
-                }
+        if (output->metadata.bytes() != chunkSize) {
+            VVM_LOG_ERROR("reduceScatter: output size ({}) doesn't match chunk size ({})",
+                          output->metadata.bytes(), chunkSize);
+            return false;
+        }
+        if (inputs[0]->metadata.dtype != output->metadata.dtype) {
+            VVM_LOG_ERROR("reduceScatter: output dtype must match inputs");
+            return false;
+        }
+
+        VVM_LOG_INFO("reduceScatter: {} participants, chunk {} bytes", inputs.size(), chunkSize);
+
+        std::vector<uint8_t> acc;
+        if (!reduceAllToHost(inputs, op, acc, inputBytes)) return false;
+
+        // Each participant keeps the chunk of the reduced result that belongs to
+        // its rank in this team. The caller's output device determines its rank.
+        size_t rank = 0;
+        for (size_t i = 0; i < deviceIndices.size(); ++i) {
+            if (deviceIndices[i] == output->allocation.blockIndex) {
+                rank = i;
+                break;
             }
         }
-        
+
+        if (!hostToGpu(output, 0, acc.data() + rank * chunkSize, chunkSize)) {
+            VVM_LOG_ERROR("reduceScatter: write chunk {} to device {} failed",
+                          rank, output->allocation.blockIndex);
+            return false;
+        }
         return true;
     }
     
@@ -993,6 +1347,88 @@ private:
     }
     
     // ========================================================================
+    // Host staging helpers for collectives
+    // ========================================================================
+
+    // Copy `size` bytes at `offset` from a GPU tensor into `out` via a
+    // host-visible staging allocation so CPU-side reduce kernels can see it.
+    bool gpuToHost(const TensorHandle& t, uint8_t* out, VkDeviceSize offset, size_t size) {
+        auto& pool = poolManager_->getPool(t->allocation.blockIndex);
+
+        vvm::AllocDesc desc;
+        desc.size = size;
+        desc.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        desc.memoryUsage = vvm::MemoryUsage::GpuToCpu;
+        desc.exportable = false;
+        desc.mapped = true;
+        desc.name = "collective-read-staging";
+
+        auto stage = pool.allocate(desc);
+        if (!stage || !stage->hostPtr) {
+            VVM_LOG_ERROR("collectives: failed to allocate read-back staging");
+            return false;
+        }
+        bool ok = pool.copyBuffer(t->allocation, *stage, offset, 0, size);
+        if (ok) {
+            std::memcpy(out, stage->hostPtr, size);
+        }
+        pool.deallocate(std::move(*stage));
+        return ok;
+    }
+
+    // Upload `size` bytes into a GPU tensor (offset-relative) through staging.
+    bool hostToGpu(const TensorHandle& t, VkDeviceSize offset, const uint8_t* in, size_t size) {
+        auto& pool = poolManager_->getPool(t->allocation.blockIndex);
+
+        vvm::AllocDesc stage;
+        stage.size = size;
+        stage.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        stage.memoryUsage = vvm::MemoryUsage::CpuToGpu;
+        stage.exportable = false;
+        stage.mapped = true;
+        stage.name = "collective-write-staging";
+
+        auto stageAlloc = pool.allocate(stage);
+        if (!stageAlloc || !stageAlloc->hostPtr) {
+            VVM_LOG_ERROR("collectives: failed to allocate write staging");
+            return false;
+        }
+        std::memcpy(stageAlloc->hostPtr, in, size);
+        bool ok = pool.copyBuffer(*stageAlloc, t->allocation, 0, offset, size);
+        pool.deallocate(std::move(*stageAlloc));
+        return ok;
+    }
+
+    // Read all participants into host memory and apply `op` element-wise.
+    // `acc` receives the full reduced result (per-tensor layout).
+    bool reduceAllToHost(const std::vector<TensorHandle>& tensors, ReduceOp op,
+                         std::vector<uint8_t>& acc, size_t bytes) {
+        acc.resize(bytes);
+        initReduceOp(op, tensors[0]->metadata.dtype, acc.data(), bytes);
+
+        std::vector<uint8_t> buf(bytes);
+        for (size_t i = 0; i < tensors.size(); ++i) {
+            if (!gpuToHost(tensors[i], buf.data(), 0, bytes)) {
+                VVM_LOG_ERROR("collectives: read-back of participant {} failed", i);
+                return false;
+            }
+            if (!combineInto(op, tensors[0]->metadata.dtype, acc.data(), buf.data(), bytes)) {
+                return false;
+            }
+        }
+
+        if (op == ReduceOp::Mean) {
+            const size_t elemWidth = packedElemSize(tensors[0]->metadata.dtype);
+            const size_t count = bytes / elemWidth;
+            for (size_t i = 0; i < count; ++i) {
+                double v = readElem(tensors[0]->metadata.dtype, acc.data(), i);
+                writeElem(tensors[0]->metadata.dtype, acc.data(), i, v / tensors.size());
+            }
+        }
+        return true;
+    }
+
+    // ========================================================================
     // Members
     // ========================================================================
     
@@ -1003,6 +1439,10 @@ private:
     
     std::optional<vvm::MultiGPUPoolManager> poolManager_;
     std::unique_ptr<vvm::network::MultiNodePoolManager> networkManager_;
+
+    // Broadcast targets: device index -> nearest handle (populated by
+    // allocateDistributed).
+    std::unordered_map<uint32_t, TensorHandle> distributedTensors_;
     
     // Async processing
     std::thread asyncThread_;
