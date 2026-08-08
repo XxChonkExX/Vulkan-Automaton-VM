@@ -140,6 +140,41 @@ public:
     // Shutdown a specific connection pool
     void shutdownConnectionPool(const std::string& host, uint16_t port);
     
+    // ========================================================================
+    // Dynamic Stripe Scaling (Mathematical Heuristic Matrix)
+    // ========================================================================
+    // Automatically calculates optimal stripe count based on payload size
+    // and hardware concurrency. Overloads that auto-scale:
+    
+    // Write with auto-scaling: calculates optimal stripes from data size.
+    bool writeStreamStripedAuto(const std::string& host, uint16_t port,
+                                const void* src, uint64_t len);
+    
+    // Read with auto-scaling: calculates optimal stripes from data size.
+    bool readStreamStripedAuto(const std::string& host, uint16_t port,
+                               void* dst, uint64_t len);
+    
+    // Get the calculated optimal stripe count for a given payload size
+    static size_t calculateOptimalStripes(uint64_t dataSize);
+    
+    // ========================================================================
+    // Control Plane & Cluster Orchestration
+    // ========================================================================
+    // Initiates master->worker handshake, then streams tensor data with
+    // dynamic stripe scaling and zero-copy Vulkan memory delivery.
+    // Returns true on successful transfer with commit, false on failure with rollback.
+    bool broadcastTensor(const std::string& host, uint16_t dataPort, uint16_t controlPort,
+                         const void* tensorData, uint64_t tensorSize,
+                         uint64_t targetOffset, uint64_t transactionId);
+    
+    // Worker-side: listens for master handshake, receives tensor directly into
+    // Vulkan pool memory. Blocks until transfer completes or fails.
+    bool ingestTensor(const std::string& host, uint16_t dataPort, uint16_t controlPort,
+                      void* vulkanPoolBase, uint64_t poolCapacity);
+    
+    // Transactional recovery: manually trigger rollback for a failed transaction
+    void triggerRollback(uint64_t transactionId, void* vulkanPoolBase);
+    
     // TLS support
     bool enableTls(const TlsConfig& tlsConfig);
     bool isTlsEnabled() const;

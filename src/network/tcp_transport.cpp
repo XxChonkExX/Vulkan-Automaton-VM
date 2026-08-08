@@ -3,8 +3,10 @@
 #include "vulkan_vm/utils.hpp"
 
 #include <atomic>
+#include <algorithm>
 #include <condition_variable>
 #include <cstring>
+#include <future>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -66,6 +68,88 @@ inline int socketSend(SocketType s, const char* buf, int len) { return static_ca
 using SockLenType = socklen_t;
 #endif
 
+// ============================================================================
+// Helpers: binary put/get (for serialization)
+// ============================================================================
+
+namespace detail {
+
+static inline void putU32(std::vector<uint8_t>& v, uint32_t x) {
+    v.push_back((x >> 24) & 0xff);
+    v.push_back((x >> 16) & 0xff);
+    v.push_back((x >> 8) & 0xff);
+    v.push_back(x & 0xff);
+}
+
+static inline void putU64(std::vector<uint8_t>& v, uint64_t x) {
+    for (int i = 7; i >= 0; --i) v.push_back((x >> (8 * i)) & 0xff);
+}
+
+static inline bool getU32(const uint8_t*& p, const uint8_t* end, uint32_t& out) {
+    if (p + 4 > end) return false;
+    out = (static_cast<uint32_t>(p[0]) << 24) |
+          (static_cast<uint32_t>(p[1]) << 16) |
+          (static_cast<uint32_t>(p[2]) << 8) |
+          static_cast<uint32_t>(p[3]);
+    p += 4;
+    return true;
+}
+
+static inline bool getU64(const uint8_t*& p, const uint8_t* end, uint64_t& out) {
+    if (p + 8 > end) return false;
+    out = (static_cast<uint64_t>(p[0]) << 56) |
+          (static_cast<uint64_t>(p[1]) << 48) |
+          (static_cast<uint64_t>(p[2]) << 40) |
+          (static_cast<uint64_t>(p[3]) << 32) |
+          (static_cast<uint64_t>(p[4]) << 24) |
+          (static_cast<uint64_t>(p[4]) << 16) |
+          (static_cast<uint64_t>(p[5]) << 8) |
+          static_cast<uint64_t>(p[7]);
+    p += 8;
+    return true;
+}
+
+static inline void putStr(std::vector<uint8_t>& v, const std::string& s) {
+    putU32(v, static_cast<uint32_t>(s.size()));
+    v.insert(v.end(), s.begin(), s.end());
+}
+
+static inline bool getStr(const uint8_t*& p, const uint8_t* end, std::string& out) {
+    uint32_t len = 0;
+    if (!getU32(p, end, len)) return false;
+    if (p + len > end) return false;
+    out.assign(reinterpret_cast<const char*>(p), len);
+    p += len;
+    return true;
+}
+
+static inline void putU8(std::vector<uint8_t>& v, uint8_t x) {
+    v.push_back(x);
+}
+
+static inline bool getU8(const uint8_t*& p, const uint8_t* end, uint8_t& out) {
+    if (p == end) return false;
+    out = *p;
+    ++p;
+    return true;
+}
+
+static inline void putBytes(std::vector<uint8_t>& v, const std::vector<uint8_t>& bytes) {
+    putU32(v, static_cast<uint32_t>(bytes.size()));
+    v.insert(v.end(), bytes.begin(), bytes.end());
+}
+
+static inline bool getBytes(const uint8_t*& p, const uint8_t* end, std::vector<uint8_t>& out) {
+    uint32_t len = 0;
+    if (!getU32(p, end, len)) return false;
+    if (p + len > end) return false;
+    out.assign(p, p + len);
+    p += len;
+    return true;
+}
+
+} // namespace detail
+
 namespace vvm {
 namespace network {
 
@@ -79,6 +163,360 @@ constexpr uint64_t kStreamSliceSize = 4ull * 1024 * 1024;  // 4MB slices (Spark-
 // hostile peer cannot cause unbounded allocations via header length fields.
 constexpr uint64_t kMaxBodySize  = 1ull * 1024 * 1024 * 1024;   // 1 GiB
 constexpr uint64_t kMaxStreamSize = 16ull * 1024 * 1024 * 1024;  // 16 GiB
+
+// ============================================================================
+// Dynamic Stripe Scaler & Socket Reassembler (Mathematical Heuristic Matrix)
+// ============================================================================
+namespace stripe_scaler {
+
+// Core Network Constants for Hardware Sharding
+static constexpr uint64_t KIBIBYTE = 1024;
+static constexpr uint64_t MEGABYTE = KIBIBYTE * 1024;
+
+// Hard architectural boundaries for socket pools
+static constexpr size_t MIN_STRIPES = 1;
+static constexpr size_t MAX_STRIPES = 16;
+static constexpr uint64_t OPTIMAL_CHUNK_TARGET = 64 * MEGABYTE;  // 64MB saturation sweet spot
+
+/**
+ * Calculates the optimal number of parallel socket connections to allocate
+ * based dynamically on total tensor weight size and host core availability.
+ */
+size_t CalculateOptimalStripeCount(uint64_t total_tensor_bytes) {
+    // Rule 1: Tiny payloads (under 1MB) get zero concurrency to avoid thread overhead
+    if (total_tensor_bytes < (1 * MEGABYTE)) {
+        return MIN_STRIPES;
+    }
+    // Rule 2: Derive stripes from ideal chunk saturation sizes (64MB blocks)
+    size_t calculated_stripes = static_cast<size_t>(total_tensor_bytes / OPTIMAL_CHUNK_TARGET);
+    if (calculated_stripes < MIN_STRIPES) {
+        calculated_stripes = 2; // Baseline multi-channel for mid-sized chunks
+    }
+    // Rule 3: Cap based on system hardware concurrency to prevent context switching
+    size_t hardware_cores = std::thread::hardware_concurrency();
+    size_t host_cap = (hardware_cores > 0) ? hardware_cores : MAX_STRIPES;
+    size_t final_stripes = calculated_stripes;
+    if (final_stripes > host_cap) final_stripes = host_cap;
+    if (final_stripes > MAX_STRIPES) final_stripes = MAX_STRIPES;
+    return (final_stripes < MIN_STRIPES) ? MIN_STRIPES : final_stripes;
+}
+
+/**
+ * Non-blocking socket helper (cross-platform)
+ */
+bool SetNonBlocking(SocketType sock) {
+#ifdef VVM_PLATFORM_WINDOWS
+    unsigned long mode = 1;
+    return ioctlsocket(sock, FIONBIO, &mode) == 0;
+#else
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags == -1) return false;
+    return fcntl(sock, F_SETFL, flags | O_NONBLOCK) == 0;
+#endif
+}
+
+/**
+ * Receives parallel striped fragments from multiple worker connections
+ * and assembles them directly into the pre-allocated Vulkan memory pool destination.
+ */
+bool AssembleStripedBuffer(const std::vector<SocketType>& sockets,
+                           uint8_t* target_vulkan_pool_ptr,
+                           uint64_t total_size) {
+    if (sockets.empty() || !target_vulkan_pool_ptr || total_size == 0) return false;
+    size_t num_stripes = sockets.size();
+    uint64_t base_chunk_size = total_size / num_stripes;
+    uint64_t remainder = total_size % num_stripes;
+    std::vector<std::future<bool>> receivers;
+    receivers.reserve(num_stripes);
+
+    // Process fragments concurrently
+    for (size_t i = 0; i < num_stripes; ++i) {
+        SocketType sock = sockets[i];
+        uint64_t offset = i * base_chunk_size;
+        uint64_t length = base_chunk_size + (i == num_stripes - 1 ? remainder : 0);
+        uint8_t* write_destination = target_vulkan_pool_ptr + offset;
+
+        receivers.push_back(std::async(std::launch::async, [sock, write_destination, length]() -> bool {
+            if (!SetNonBlocking(sock)) return false;
+
+            uint64_t total_received = 0;
+
+            while (total_received < length) {
+                uint8_t* current_target = write_destination + total_received;
+                uint64_t remaining = length - total_received;
+
+                // Throttle max reads to match standard network MTU/page windows safely
+                size_t read_chunk = static_cast<size_t>((remaining > 4194304) ? 4194304 : remaining);
+#ifdef VVM_PLATFORM_WINDOWS
+                int bytes_read = recv(sock, reinterpret_cast<char*>(current_target), static_cast<int>(read_chunk), 0);
+                if (bytes_read == SOCKET_ERROR) {
+                    int err = WSAGetLastError();
+                    if (err == WSAEWOULDBLOCK) {
+                        std::this_thread::yield(); // Wait for socket buffer population
+                        continue;
+                    }
+                    return false; // Connection dropped or broken
+                }
+#else
+                ssize_t bytes_read = recv(sock, current_target, read_chunk, 0);
+                if (bytes_read == -1) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        std::this_thread::yield();
+                        continue;
+                    }
+                    return false;
+                }
+#endif
+                if (bytes_read == 0) {
+                    return false; // Remote cluster node closed connection prematurely
+                }
+                total_received += static_cast<uint64_t>(bytes_read);
+            }
+            return true;
+        }));
+    }
+
+    // Barrier sync verification
+    bool assembly_success = true;
+    for (auto& worker : receivers) {
+        if (!worker.get()) {
+            assembly_success = false;
+        }
+    }
+    return assembly_success;
+}
+
+} // namespace stripe_scaler
+
+// ============================================================================
+// Control Plane Coordinator (Handshake Protocol)
+// ============================================================================
+namespace control {
+
+#pragma pack(push, 1)
+struct HandshakePacket {
+    uint32_t magic_validation;   // 0x56564D4D ('VVMM')
+    uint32_t command_id;         // 1 = PREPARE, 2 = ACK_READY, 3 = ERROR_ROLLBACK
+    uint64_t total_tensor_bytes; // Size of the incoming payload
+    uint32_t stripe_count;       // Dynamically calculated number of data sockets
+    uint64_t memory_pool_offset; // Target destination offset in Vulkan pool
+    uint64_t transaction_id;     // Unique transaction identifier
+};
+#pragma pack(pop)
+
+static constexpr uint32_t VVM_MAGIC = 0x56564D4D; // 'VVMM'
+static constexpr uint32_t CMD_PREPARE = 1;
+static constexpr uint32_t CMD_ACK_READY = 2;
+static constexpr uint32_t CMD_ERROR_ROLLBACK = 3;
+
+// Blocking send with exact byte count
+bool sendAll(SocketType sock, const void* buf, size_t len) {
+    const char* p = static_cast<const char*>(buf);
+    size_t remaining = len;
+    while (remaining > 0) {
+        int chunk = static_cast<int>((std::min)(remaining, static_cast<size_t>(INT_MAX)));
+        int n = socketSend(sock, p, chunk);
+        if (n <= 0) return false;
+        p += n;
+        remaining -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
+// Blocking recv with exact byte count
+bool recvAll(SocketType sock, void* buf, size_t len) {
+    char* p = static_cast<char*>(buf);
+    size_t remaining = len;
+    while (remaining > 0) {
+        int chunk = static_cast<int>((std::min)(remaining, static_cast<size_t>(INT_MAX)));
+        int n = socketRecv(sock, p, chunk);
+        if (n <= 0) return false;
+        p += n;
+        remaining -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
+/**
+ * SENDER (Master Node): Coordinates with receiver, passes tensor metadata,
+ * and awaits explicit confirmation before releasing striped data streams.
+ */
+bool MasterInitiateHandshake(SocketType control_socket,
+                             uint64_t tensor_size,
+                             uint32_t calculated_stripes,
+                             uint64_t target_pool_offset,
+                             uint64_t transaction_id) {
+    HandshakePacket outbound{};
+    outbound.magic_validation = VVM_MAGIC;
+    outbound.command_id = CMD_PREPARE;
+    outbound.total_tensor_bytes = tensor_size;
+    outbound.stripe_count = calculated_stripes;
+    outbound.memory_pool_offset = target_pool_offset;
+    outbound.transaction_id = transaction_id;
+
+    // Step 1: Send configuration packet over persistent control socket
+    if (!sendAll(control_socket, &outbound, sizeof(HandshakePacket))) {
+        VVM_LOG_ERROR("[Control] Master: Failed to transmit handshake packet");
+        return false;
+    }
+
+    // Step 2: Block and await ACK from worker
+    HandshakePacket inbound{};
+    if (!recvAll(control_socket, &inbound, sizeof(HandshakePacket))) {
+        VVM_LOG_ERROR("[Control] Master: Worker dropped connection or sent invalid ACK size");
+        return false;
+    }
+
+    // Step 3: Validate architectural acknowledgement integrity
+    if (inbound.magic_validation != VVM_MAGIC || inbound.command_id != CMD_ACK_READY) {
+        VVM_LOG_ERROR("[Control] Master: Handshake verification rejected by worker");
+        return false;
+    }
+
+    VVM_LOG_INFO("[Control] Master: Handshake ACK received for Tx={}", transaction_id);
+    return true;
+}
+
+/**
+ * RECEIVER (Worker Node): Listens on control socket, extracts tensor metadata,
+ * verifies capacity rules, and answers with approval ACK.
+ */
+bool WorkerAwaitHandshake(SocketType control_socket,
+                          uint64_t available_vulkan_pool_capacity,
+                          HandshakePacket& out_validated_metadata) {
+    HandshakePacket inbound{};
+    
+    // Blocking read to await instruction from Master
+    if (!recvAll(control_socket, &inbound, sizeof(HandshakePacket))) {
+        VVM_LOG_ERROR("[Control] Worker: Failed to receive handshake packet");
+        return false;
+    }
+
+    // Integrity Rule 1: Confirm packet originated from VulkanVM architecture
+    if (inbound.magic_validation != VVM_MAGIC || inbound.command_id != CMD_PREPARE) {
+        VVM_LOG_ERROR("[Control] Worker: Invalid magic or command ID in handshake");
+        return false;
+    }
+
+    // Integrity Rule 2: Bound check memory constraint availability
+    uint64_t required_space = inbound.memory_pool_offset + inbound.total_tensor_bytes;
+    if (required_space > available_vulkan_pool_capacity) {
+        VVM_LOG_ERROR("[Control] Worker: Out of Memory - target allocation ({}) exceeds pool capacity ({})",
+                      required_space, available_vulkan_pool_capacity);
+        
+        // Send error rollback
+        HandshakePacket error_ack = inbound;
+        error_ack.command_id = CMD_ERROR_ROLLBACK;
+        sendAll(control_socket, &error_ack, sizeof(HandshakePacket));
+        return false;
+    }
+
+    // Step 3: Populate output metadata for worker application
+    out_validated_metadata = inbound;
+
+    // Step 4: Transmit verification ACK back to master
+    HandshakePacket ack_packet = inbound;
+    ack_packet.command_id = CMD_ACK_READY;
+    if (!sendAll(control_socket, &ack_packet, sizeof(HandshakePacket))) {
+        VVM_LOG_ERROR("[Control] Worker: Failed to send ACK to master");
+        return false;
+    }
+
+    VVM_LOG_INFO("[Control] Worker: Handshake validated for Tx={}, stripes={}, size={}",
+                 inbound.transaction_id, inbound.stripe_count, inbound.total_tensor_bytes);
+    return true;
+}
+
+} // namespace control
+
+// ============================================================================
+// Transactional Cluster Recovery Manager (Safety Net)
+// ============================================================================
+namespace recovery {
+
+enum class TransactionState : uint32_t {
+    PENDING = 0,
+    COMMITTED = 1,
+    CORRUPTED_ROLLBACK = 2
+};
+
+struct MemorySliceMetadata {
+    uint64_t offset = 0;
+    uint64_t length = 0;
+    uint8_t* backup_staging_ptr = nullptr; // Optional host snapshot for strict isolation
+};
+
+class ClusterRecoveryManager {
+private:
+    std::mutex registry_lock_;
+    std::unordered_map<uint64_t, MemorySliceMetadata> active_transactions_;
+    std::unordered_map<uint64_t, TransactionState> transaction_states_;
+
+public:
+    /**
+     * Registers a tracking checkpoint before bytes hit the wire.
+     */
+    void RegisterTransaction(uint64_t transaction_id, uint64_t pool_offset, uint64_t length) {
+        std::lock_guard<std::mutex> lock(registry_lock_);
+        MemorySliceMetadata slice{};
+        slice.offset = pool_offset;
+        slice.length = length;
+        slice.backup_staging_ptr = nullptr; // Optional host snapshot for strict isolation
+
+        active_transactions_[transaction_id] = slice;
+        transaction_states_[transaction_id] = TransactionState::PENDING;
+        VVM_LOG_INFO("[Recovery] Registered Transaction ID: {} (offset={}, len={})",
+                     transaction_id, pool_offset, length);
+    }
+
+    /**
+     * Called when Orchestrator completes all socket barriers successfully.
+     */
+    void CommitTransaction(uint64_t transaction_id) {
+        std::lock_guard<std::mutex> lock(registry_lock_);
+        auto it_state = transaction_states_.find(transaction_id);
+        if (it_state != transaction_states_.end()) {
+            it_state->second = TransactionState::COMMITTED;
+            active_transactions_.erase(transaction_id);
+            transaction_states_.erase(it_state);
+            VVM_LOG_INFO("[Recovery] Transaction {} marked clean: COMMITTED", transaction_id);
+        }
+    }
+
+    /**
+     * Triggered if any thread catches socket crash, drop, or checksum mismatch.
+     * Instructs Vulkan Memory Allocator to clear/isollate the damaged block.
+     */
+    void ExecuteEmergencyRollback(uint64_t transaction_id, uint8_t* vulkan_pool_base_ptr) {
+        std::lock_guard<std::mutex> lock(registry_lock_);
+        auto it = active_transactions_.find(transaction_id);
+        if (it == active_transactions_.end()) return;
+
+        MemorySliceMetadata bad_slice = it->second;
+        transaction_states_[transaction_id] = TransactionState::CORRUPTED_ROLLBACK;
+
+        VVM_LOG_ERROR("[CRITICAL RECOVERY] Node dropped pipe on Tx: {}. Scrubbing pool offset {} ({} bytes)",
+                      transaction_id, bad_slice.offset, bad_slice.length);
+
+        // Prevent ghost weights from polluting inference: scrub memory to clean zeroes
+        uint8_t* contaminated_zone = vulkan_pool_base_ptr + bad_slice.offset;
+        std::memset(contaminated_zone, 0, bad_slice.length);
+
+        // Cleanup registration
+        active_transactions_.erase(it);
+        transaction_states_.erase(transaction_id);
+
+        VVM_LOG_INFO("[Recovery] Rollback complete for Tx={}. Memory scrubbed. Safe to retry.", transaction_id);
+    }
+};
+
+// Global singleton accessor
+inline ClusterRecoveryManager& GetRecoveryManager() {
+    static ClusterRecoveryManager instance;
+    return instance;
+}
+
+} // namespace recovery
 
 // 32-byte protocol header:
 //   [4 magic][1 version][3 reserved][4 type][4 flags][4 bodyLen][4 seq][8 streamLen]
@@ -650,7 +1088,7 @@ struct TcpTransport::Impl {
                 }
                 
                 // Set non-blocking for async operation
-                SetNonBlocking(sock);
+                stripe_scaler::SetNonBlocking(sock);
                 
                 PooledConnection pc;
                 pc.socket = sock;
