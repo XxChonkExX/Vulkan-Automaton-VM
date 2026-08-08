@@ -462,3 +462,132 @@ transport->allReduce({t0, t1, t2}, ReduceOp::Sum, {0, 1, 2});
 - **GitHub Issues** — Bug reports, feature requests
 
 *VulkanVM — Making GPUs play nice since 2026.*
+
+---
+
+## Android / Vulkan (AHardwareBuffer External Memory)
+
+On Android, VulkanVM supports **zero-copy external memory** via `VK_ANDROID_external_memory_android_hardware_buffer`. This enables zero-copy sharing between Vulkan and Android's graphics pipeline (Surface, MediaCodec, Camera, etc.).
+
+### Requirements
+
+- Android NDK r27+ (for `VK_ANDROID_external_memory_android_hardware_buffer`)
+- Android 10+ (API 29+) for `AHardwareBuffer` support
+- Vulkan 1.1+ with `VK_ANDROID_external_memory_android_hardware_buffer` extension
+
+### Building for Android
+
+```bash
+# Linux
+./scripts/build_android.sh arm64-v8a android-34 Release
+
+# Windows (PowerShell)
+.\scripts\build_android.bat arm64-v8a android-34 Release
+```
+
+### Using AHardwareBuffer External Memory
+
+```cpp
+#include <vulkan_vm/vulkan_vm.hpp>
+#include <android/hardware_buffer.h>
+
+// 1. Create AHardwareBuffer (e.g., from Surface, MediaCodec, Camera, or manually)
+AHardwareBuffer_Desc desc{};
+desc.width = 1920;
+desc.height = 1080;
+desc.layers = 1;
+desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+desc.usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | 
+             AHARDWAREBUFFER_USAGE_CPU_READ_NEVER |
+             AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT;
+desc.stride = 0;
+
+AHardwareBuffer* hardwareBuffer;
+AHardwareBuffer_allocate(&desc, &hardwareBuffer);
+
+// 2. Import into VulkanVM pool as external memory
+ExternalMemoryInfo extInfo;
+extInfo.type = ExternalHandleType::AndroidHardwareBuffer;
+extInfo.handle = ExternalHandle(hardwareBuffer);  // RAII wrapper
+extInfo.size = bufferSize;
+extInfo.dedicatedAllocation = true;
+
+auto allocation = pool.importMemory(std::move(extInfo), 
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+
+// 3. Use in shaders via device address
+auto deviceAddress = allocation->deviceAddress;
+
+// 4. Cleanup: AHardwareBuffer is reference-counted, released when ExternalHandle destructs
+```
+
+### Exporting Vulkan Memory as AHardwareBuffer
+
+```cpp
+// Allocate dedicated exportable memory
+auto alloc = pool->allocateDedicatedExportable(size, 
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+
+// Export as AHardwareBuffer
+ExternalMemoryInfo extInfo = pool->exportMemory(*alloc, 
+    ExternalHandleType::AndroidHardwareBuffer);
+
+// Pass to Android framework (Surface, MediaCodec, etc.)
+AHardwareBuffer* buffer = extInfo.handle.get();
+// Pass to ANativeWindow, MediaCodec, etc.
+```
+
+### ExternalHandleType::AndroidHardwareBuffer
+
+Added to `ExternalHandleType` enum:
+```cpp
+enum class ExternalHandleType {
+    OpaqueFd,
+    OpaqueWin32,
+    D3D12Heap,
+    DmaBuf,
+    AndroidHardwareBuffer  // VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID
+};
+```
+
+The `ExternalHandle` class now supports `AHardwareBuffer*` with automatic reference counting via `AHardwareBuffer_acquire`/`release`.
+
+### Build Configuration
+
+Add to `CMakeLists.txt`:
+```cmake
+# Android-specific options
+option(VVM_ANDROID_HARDWARE_BUFFER "Enable Android AHardwareBuffer support" ON)
+option(VVM_ANDROID_EXTERNAL_MEMORY "Enable Android external memory" ON)
+```
+
+Or via command line:
+```bash
+cmake -DCMAKE_TOOLCHAIN_FILE=cmake/android.toolchain.cmake \
+      -DANDROID_ABI=arm64-v8a \
+      -DANDROID_PLATFORM=android-34 \
+      -DVVM_ANDROID_HARDWARE_BUFFER=ON \
+      -DVVM_ANDROID_EXTERNAL_MEMORY=ON \
+      ..
+```
+
+### Cross-Vendor Compatibility
+
+| Source → Target | Android Handle Type |
+|-----------------|---------------------|
+| Android → Android | `AndroidHardwareBuffer` (direct) |
+| Android → Linux (DMA-BUF) | Export as `DmaBuf` (via `AHardwareBuffer_toGralloc`) |
+| Android → Windows | Not directly supported; use host-staged fallback |
+
+> **Note**: Direct Android ↔ Desktop GPU sharing requires vendor-specific extensions. For cross-platform sharing, use host-staged fallback or vendor-specific paths.
+
+---
+
+## Need Help?
+
+- **README.md** — Full API reference, cross-vendor matrix, build options
+- **examples/** — `network_test`, `model_registry_test`, `tensor_compute`, `offload_test`, `multi_gpu_test`, `tensor_network_test`
+- **tests/** — Unit tests for buddy allocator, external handles, sparse, placement
+- **GitHub Issues** — Bug reports, feature requests
+
+*VulkanVM — Making GPUs play nice since 2026.*

@@ -470,8 +470,9 @@ config.tlsCaPath = "ca.pem";
 |----------|------|-----------|----------|
 | 1 | **P2P** | `VK_EXTERNAL_MEMORY` + `vkCmdCopyBuffer` | ❌ No |
 | 2 | **RDMA** | GPU-Direct: `ibv_reg_dmabuf_mr` / NDKPI | ❌ No |
-| 3 | **Host-Staged** | 4 MiB chunks via host memory | ✅ Yes |
-| 4 | **Network** | TCP/RDMA multi-node | ✅ Yes |
+| 3 | **AHardwareBuffer** | Android: `VK_ANDROID_external_memory_android_hardware_buffer` | ❌ No |
+| 4 | **Host-Staged** | 4 MiB chunks via host memory | ✅ Yes |
+| 5 | **Network** | TCP/RDMA multi-node | ✅ Yes |
 
 ### Collective Operations
 
@@ -824,31 +825,129 @@ Without SoftRoCE or hardware RNIC, the network module falls back to **host-stage
 
 ### SoftRoCE Persistence (WSL2 / Linux)
 
-SoftRoCE links reset on every WSL2 boot. Use the provided script to auto-create them:
+---
+
+## Android / Vulkan (AHardwareBuffer External Memory)
+
+On Android, VulkanVM supports **zero-copy external memory** via `VK_ANDROID_external_memory_android_hardware_buffer`. This enables zero-copy sharing between Vulkan and Android's graphics pipeline (Surface, MediaCodec, Camera, etc.).
+
+### Requirements
+
+- Android NDK r27+ (for `VK_ANDROID_external_memory_android_hardware_buffer`)
+- Android 10+ (API 29+) for `AHardwareBuffer` support
+- Vulkan 1.1+ with `VK_ANDROID_external_memory_android_hardware_buffer` extension
+
+### Building for Android
 
 ```bash
-# One-time creation
-sudo ./scripts/softroce_persist.sh create
+# Linux
+./scripts/build_android.sh arm64-v8a android-34 Release
 
-# Install as systemd service (auto on boot)
-sudo ./scripts/softroce_persist.sh install
-
-# Check status
-./scripts/softroce_persist.sh status
+# Windows (PowerShell)
+.\scripts\build_android.bat arm64-v8a android-34 Release
 ```
 
-**Windows (PowerShell):**
-```powershell
-.\scripts\softroce_persist.ps1 -Create
-.\scripts\softroce_persist.ps1 -Install
-.\scripts\softroce_persist.ps1 -Status
+The build script uses the Android NDK toolchain (`cmake/android.toolchain.cmake`) and produces `libvulkan_vm.so`.
+
+### Using AHardwareBuffer External Memory
+
+```cpp
+#include <vulkan_vm/vulkan_vm.hpp>
+#include <android/hardware_buffer.h>
+
+// 1. Create AHardwareBuffer (e.g., from Surface, MediaCodec, Camera, or manually)
+AHardwareBuffer_Desc desc{};
+desc.width = 1920;
+desc.height = 1080;
+desc.layers = 1;
+desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+desc.usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | 
+             AHARDWAREBUFFER_USAGE_CPU_READ_NEVER |
+             AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT;
+desc.stride = 0;
+
+AHardwareBuffer* hardwareBuffer;
+AHardwareBuffer_allocate(&desc, &hardwareBuffer);
+
+// 2. Import into VulkanVM pool as external memory
+ExternalMemoryInfo extInfo;
+extInfo.type = ExternalHandleType::AndroidHardwareBuffer;
+extInfo.handle = ExternalHandle(hardwareBuffer);  // RAII wrapper
+extInfo.size = bufferSize;
+extInfo.dedicatedAllocation = true;
+
+auto allocation = pool.importMemory(std::move(extInfo), 
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+
+// 3. Use in shaders via device address
+auto deviceAddress = allocation->deviceAddress;
+
+// 4. Cleanup: AHardwareBuffer is reference-counted, released when ExternalHandle destructs
 ```
 
-The script creates `rxe0` on `eth0` and `rxe1` on `lo`, waits for `ACTIVE` state, and optionally installs a systemd service for persistence.
+### Exporting Vulkan Memory as AHardwareBuffer
+
+```cpp
+// Allocate dedicated exportable memory
+auto alloc = pool->allocateDedicatedExportable(size, 
+    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+
+// Export as AHardwareBuffer
+ExternalMemoryInfo extInfo = pool->exportMemory(*alloc, 
+    ExternalHandleType::AndroidHardwareBuffer);
+
+// Pass to Android framework (Surface, MediaCodec, etc.)
+AHardwareBuffer* buffer = extInfo.handle.get();
+// Pass to ANativeWindow, MediaCodec, etc.
+```
+
+### ExternalHandleType::AndroidHardwareBuffer
+
+Added to `ExternalHandleType` enum:
+```cpp
+enum class ExternalHandleType {
+    OpaqueFd,
+    OpaqueWin32,
+    D3D12Heap,
+    DmaBuf,
+    AndroidHardwareBuffer  // VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID
+};
+```
+
+The `ExternalHandle` class now supports `AHardwareBuffer*` with automatic reference counting via `AHardwareBuffer_acquire`/`release`.
+
+### Build Configuration
+
+Add to `CMakeLists.txt`:
+```cmake
+# Android-specific options
+option(VVM_ANDROID_HARDWARE_BUFFER "Enable Android AHardwareBuffer support" ON)
+option(VVM_ANDROID_EXTERNAL_MEMORY "Enable Android external memory" ON)
+```
+
+Or via command line:
+```bash
+cmake -DCMAKE_TOOLCHAIN_FILE=cmake/android.toolchain.cmake \
+      -DANDROID_ABI=arm64-v8a \
+      -DANDROID_PLATFORM=android-34 \
+      -DVVM_ANDROID_HARDWARE_BUFFER=ON \
+      -DVVM_ANDROID_EXTERNAL_MEMORY=ON \
+      ..
+```
+
+### Cross-Vendor Compatibility
+
+| Source → Target | Android Handle Type |
+|-----------------|---------------------|
+| Android → Android | `AndroidHardwareBuffer` (direct) |
+| Android → Linux (DMA-BUF) | Export as `DmaBuf` (via `AHardwareBuffer_toGralloc`) |
+| Android → Windows | Not directly supported; use host-staged fallback |
+
+> **Note**: Direct Android ↔ Desktop GPU sharing requires vendor-specific extensions. For cross-platform sharing, use host-staged fallback or vendor-specific paths.
 
 ---
 
-## Windows Network Direct (NDKPI) Transport
+## PyTorch C++ Extension
 
 On Windows, VulkanVM implements **GPU-Direct RDMA via the Network Direct Kernel Provider Interface (NDKPI)** using the user-mode Network Direct SPI (`IND2Provider`, `IND2Adapter`, `IND2CompletionQueue`, `IND2QueuePair`, `IND2Connector`, `IND2Listener`, `IND2MemoryRegion`).
 
@@ -1316,7 +1415,7 @@ MemoryTopology topo = detectMemoryTopology(physicalDevice);
 - [x] GPU-Direct RDMA wiring (`ibv_reg_dmabuf_mr` on Linux, NVIDIA peermem)
 - [x] **Windows Network Direct (NDKPI) transport** — `NdkRdmaTransport` with IND2 SPI, fake provider test harness
 - [x] **Tensor collectives** — Ring all-reduce, broadcast, all-gather, reduce-scatter with CPU fallback (FP32/FP16/BF16/FP8/INT4/INT8/INT32/BOOL)
+- [x] **Android/Vulkan support** — AHardwareBuffer external memory, NDK r27+ build scripts
 - [ ] Windows WDDM2.6+ hardware scheduling hints
-- [ ] Android/Vulkan support
 - [ ] Kernel NDKPI provider skeleton (Windows)
 - [ ] Tensor Transport: NCCL-style production collectives
