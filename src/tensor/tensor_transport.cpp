@@ -619,10 +619,11 @@ public:
     }
     
     bool copyTensorAsync(const TensorHandle& src, const TensorHandle& dst, CompletionCallback cb) override {
-        // For now, just do synchronous copy and invoke callback
-        bool ok = copyTensor(src, dst);
-        if (cb) cb(ok, ok ? "" : "Copy failed");
-        return ok;
+        enqueueAsync([this, src, dst, cb]() {
+            bool ok = copyTensor(src, dst);
+            if (cb) cb(ok, ok ? "" : "Copy failed");
+        });
+        return true;
     }
     
     // ========================================================================
@@ -649,6 +650,14 @@ public:
         return true;
     }
     
+    bool allReduceAsync(const std::vector<TensorHandle>& tensors, ReduceOp op, const std::vector<uint32_t>& deviceIndices, CompletionCallback cb) override {
+        enqueueAsync([this, tensors, op, deviceIndices, cb]() {
+            bool ok = allReduce(tensors, op, deviceIndices);
+            if (cb) cb(ok, ok ? "" : "allReduce failed");
+        });
+        return true;
+    }
+    
     bool broadcast(const TensorHandle& root, const std::vector<uint32_t>& deviceIndices, uint32_t rootIndex) override {
         if (!isReady() || deviceIndices.empty()) return false;
         
@@ -663,6 +672,14 @@ public:
         }
         
         // For now, just return success
+        return true;
+    }
+    
+    bool broadcastAsync(const TensorHandle& root, const std::vector<uint32_t>& deviceIndices, uint32_t rootIndex, CompletionCallback cb) override {
+        enqueueAsync([this, root, deviceIndices, rootIndex, cb]() {
+            bool ok = broadcast(root, deviceIndices, rootIndex);
+            if (cb) cb(ok, ok ? "" : "broadcast failed");
+        });
         return true;
     }
     
@@ -707,6 +724,14 @@ public:
             offset += inputs[i]->metadata.bytes();
         }
         
+        return true;
+    }
+    
+    bool allGatherAsync(const std::vector<TensorHandle>& inputs, TensorHandle output, const std::vector<uint32_t>& deviceIndices, CompletionCallback cb) override {
+        enqueueAsync([this, inputs, output, deviceIndices, cb]() {
+            bool ok = allGather(inputs, output, deviceIndices);
+            if (cb) cb(ok, ok ? "" : "allGather failed");
+        });
         return true;
     }
     
@@ -757,6 +782,14 @@ public:
             }
         }
         
+        return true;
+    }
+    
+    bool reduceScatterAsync(const std::vector<TensorHandle>& inputs, TensorHandle output, ReduceOp op, const std::vector<uint32_t>& deviceIndices, CompletionCallback cb) override {
+        enqueueAsync([this, inputs, output, op, deviceIndices, cb]() {
+            bool ok = reduceScatter(inputs, output, op, deviceIndices);
+            if (cb) cb(ok, ok ? "" : "reduceScatter failed");
+        });
         return true;
     }
     
@@ -912,11 +945,50 @@ private:
                     lock.unlock();
                     
                     // Process async operation
-                    // (Currently no async ops beyond the sync ones above)
+                    try {
+                        op();
+                    } catch (const std::exception& e) {
+                        VVM_LOG_ERROR("Async operation threw: {}", e.what());
+                    }
                     
                     lock.lock();
                 }
             }
+        }
+    }
+    
+    void flushAsync() override {
+        // If async thread is running, wait until queue is drained
+        if (asyncThread_.joinable()) {
+            std::unique_lock<std::mutex> lock(asyncMutex_);
+            asyncCV_.wait(lock, [this] { return asyncQueue_.empty(); });
+        }
+        // Without async thread, operations run inline so nothing to drain
+    }
+    
+    void enqueueAsync(AsyncOperation op) override {
+        {
+            std::lock_guard<std::mutex> lock(asyncMutex_);
+            asyncQueue_.push(std::move(op));
+        }
+        if (!asyncThread_.joinable()) {
+            // No async thread running, process inline
+            AsyncOperation next;
+            while (true) {
+                {
+                    std::lock_guard<std::mutex> lock(asyncMutex_);
+                    if (asyncQueue_.empty()) break;
+                    next = std::move(asyncQueue_.front());
+                    asyncQueue_.pop();
+                }
+                try {
+                    next();
+                } catch (const std::exception& e) {
+                    VVM_LOG_ERROR("Async operation failed: {}", e.what());
+                }
+            }
+        } else {
+            asyncCV_.notify_one();
         }
     }
     

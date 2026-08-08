@@ -143,6 +143,8 @@ enum class ReduceOp {
 
 using CompletionCallback = std::function<void(bool success, const std::string& error)>;
 
+using AsyncOperation = std::function<void()>;
+
 class Transport {
 public:
     virtual ~Transport() = default;
@@ -171,9 +173,13 @@ public:
     
     // Collective operations
     virtual bool allReduce(const std::vector<TensorHandle>& tensors, ReduceOp op, const std::vector<uint32_t>& deviceIndices) = 0;
+    virtual bool allReduceAsync(const std::vector<TensorHandle>& tensors, ReduceOp op, const std::vector<uint32_t>& deviceIndices, CompletionCallback cb) = 0;
     virtual bool broadcast(const TensorHandle& root, const std::vector<uint32_t>& deviceIndices, uint32_t rootIndex) = 0;
+    virtual bool broadcastAsync(const TensorHandle& root, const std::vector<uint32_t>& deviceIndices, uint32_t rootIndex, CompletionCallback cb) = 0;
     virtual bool allGather(const std::vector<TensorHandle>& inputs, TensorHandle output, const std::vector<uint32_t>& deviceIndices) = 0;
+    virtual bool allGatherAsync(const std::vector<TensorHandle>& inputs, TensorHandle output, const std::vector<uint32_t>& deviceIndices, CompletionCallback cb) = 0;
     virtual bool reduceScatter(const std::vector<TensorHandle>& inputs, TensorHandle output, ReduceOp op, const std::vector<uint32_t>& deviceIndices) = 0;
+    virtual bool reduceScatterAsync(const std::vector<TensorHandle>& inputs, TensorHandle output, ReduceOp op, const std::vector<uint32_t>& deviceIndices, CompletionCallback cb) = 0;
     
     // Multi-node network
     virtual bool joinCluster(const std::string& bootstrapAddress) = 0;
@@ -187,6 +193,10 @@ public:
     virtual bool supportsP2P() const = 0;
     virtual bool supportsRDMA() const = 0;
     virtual bool supportsNetwork() const = 0;
+    
+    // Async pipeline
+    virtual void enqueueAsync(AsyncOperation op) = 0;
+    virtual void flushAsync() = 0;
 };
 
 } // namespace tensor
