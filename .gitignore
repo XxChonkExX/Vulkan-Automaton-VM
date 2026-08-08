@@ -1,7 +1,10 @@
 # Build directories
 build/
+build_*/
 build-*/
+cmake-build-*/
 *.build/
+build_ninja/
 
 # CMake
 CMakeFiles/

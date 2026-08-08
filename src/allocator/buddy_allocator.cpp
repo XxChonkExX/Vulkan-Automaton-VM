@@ -1,285 +1,186 @@
 #include "vulkan_vm/buddy_allocator.hpp"
-#include "vulkan_vm/vulkan_vm.hpp"
 #include "vulkan_vm/utils.hpp"
 
 #include <algorithm>
-#include <cmath>
-#include <unordered_map>
-#include <memory>
-#include <cassert>
-#include <functional>
+#include <utility>
 
 namespace vvm {
 
-// ============================================================================
-// BuddyAllocator Implementation
-// ============================================================================
-
-// Helper: check if value is power of two
-static inline bool isPowerOfTwo(VkDeviceSize value) {
-    return value != 0 && (value & (value - 1)) == 0;
-}
-
-// Helper: round up to next power of two
-static inline VkDeviceSize nextPowerOfTwo(VkDeviceSize value) {
-    if (value == 0) return 1;
-    value--;
-    value |= value >> 1;
-    value |= value >> 2;
-    value |= value >> 4;
-    value |= value >> 8;
-    value |= value >> 16;
-    value |= value >> 32;
-    return value + 1;
-}
-
 BuddyAllocator::BuddyAllocator(VkDeviceSize blockSize, VkDeviceSize minSize)
-    : blockSize_(blockSize), minSize_(minSize) {
-    
-    // Enforce power-of-two sizes for buddy allocator correctness
-    assert(isPowerOfTwo(blockSize_) && "blockSize must be power of two");
-    assert(isPowerOfTwo(minSize_) && "minSize must be power of two");
-    assert(blockSize_ >= minSize_ && "blockSize must be >= minSize");
-    
-    maxLevel_ = 0;
-    VkDeviceSize temp = blockSize_;
-    while (temp > minSize_) {
-        temp >>= 1;
-        maxLevel_++;
+    : blockSize_(blockSize), minSize_(minSize)
+{
+    if (!isPowerOfTwo(blockSize_) || !isPowerOfTwo(minSize_) || blockSize_ < minSize_) {
+        VVM_LOG_ERROR("BuddyAllocator: blockSize and minSize must be powers of two "
+                      "and blockSize >= minSize (got block={}, min={})",
+                      blockSize_, minSize_);
+        maxOrder_ = -1;
+        return;
     }
-    
-    root_ = createNode(0, blockSize_, 0);
-    if (!root_) {
-        // Mark as invalid - allocate() will return nullopt
-        maxLevel_ = -1;
+
+    // Compute number of orders: minSize << maxOrder == blockSize
+    maxOrder_ = 0;
+    VkDeviceSize s = minSize_;
+    while (s < blockSize_) {
+        s <<= 1;
+        ++maxOrder_;
+        if (maxOrder_ > 63) {           // defensive
+            maxOrder_ = -1;
+            return;
+        }
     }
+
+    freeLists_.assign(static_cast<size_t>(maxOrder_) + 1, {});
+    // Initially the whole block is free at the highest order.
+    freeLists_[maxOrder_].push_back(0);
 }
 
-BuddyAllocator::~BuddyAllocator() {
-    destroyNode(root_);
-}
-
-BuddyNode* BuddyAllocator::createNode(VkDeviceSize offset, VkDeviceSize size, int level) {
-    // Use nothrow new to avoid exceptions, return nullptr on OOM
-    BuddyNode* node = new (std::nothrow) BuddyNode();
-    if (!node) {
-        VVM_LOG_ERROR("BuddyAllocator: failed to allocate BuddyNode (out of memory)");
-        return nullptr;
-    }
-    node->offset = offset;
-    node->size = size;
-    node->free = true;
-    node->level = level;
-    node->left = nullptr;
-    node->right = nullptr;
-    node->parent = nullptr;
-    return node;
-}
-
-void BuddyAllocator::destroyNode(BuddyNode* node) {
-    if (!node) return;
-    destroyNode(node->left);
-    destroyNode(node->right);
-    delete node;
-}
-
-int BuddyAllocator::getLevelForSize(VkDeviceSize size) const {
-    // Round up to power of two for buddy allocator
+int BuddyAllocator::sizeToOrder(VkDeviceSize size) const {
     size = nextPowerOfTwo(size);
-    
-    // Clamp to minSize
     if (size < minSize_) size = minSize_;
-    
-    int level = 0;
-    VkDeviceSize temp = blockSize_;
-    while (temp > size && level < maxLevel_) {
-        temp >>= 1;
-        level++;
+    if (size > blockSize_) return -1;
+
+    int order = 0;
+    VkDeviceSize s = minSize_;
+    while (s < size) {
+        s <<= 1;
+        ++order;
     }
-    return std::min(level, maxLevel_);
+    return order;
 }
 
-BuddyNode* BuddyAllocator::findFree(BuddyNode* node, VkDeviceSize size) {
-    if (!node || node->size < size) {
-        return nullptr;
-    }
-
-    // Already split -> search children only
-    if (node->left != nullptr) {
-        BuddyNode* result = findFree(node->left, size);
-        if (result) {
-            return result;
-        }
-        return findFree(node->right, size);
-    }
-
-    // Leaf
-    if (!node->free) {
-        return nullptr;
-    }
-
-    // Free leaf large enough. Split only if a half still fits the request
-    // and we have not hit maxLevel_.
-    if (node->level < maxLevel_ && (node->size / 2) >= size) {
-        split(node);
-        // If split failed (OOM), this node is still a leaf - use it if it fits
-        if (node->left == nullptr) {
-            return node;
-        }
-        // Prefer left child (deterministic, good locality)
-        BuddyNode* result = findFree(node->left, size);
-        if (result) {
-            return result;
-        }
-        return findFree(node->right, size);
-    }
-
-    // This leaf is the right size (or the smallest we can give)
-    return node;
+void BuddyAllocator::pushFree(int order, VkDeviceSize offset) {
+    assert(order >= 0 && order <= maxOrder_);
+    freeLists_[order].push_back(offset);
 }
 
-void BuddyAllocator::split(BuddyNode* node) {
-    if (!node || node->level >= maxLevel_ || node->left != nullptr) {
-        return;
-    }
-
-    const VkDeviceSize halfSize = node->size / 2;
-    node->left  = createNode(node->offset,            halfSize, node->level + 1);
-    node->right = createNode(node->offset + halfSize, halfSize, node->level + 1);
-    
-    // Check if node creation failed
-    if (!node->left || !node->right) {
-        // Clean up any partial allocation
-        if (node->left) {
-            delete node->left;
-            node->left = nullptr;
-        }
-        if (node->right) {
-            delete node->right;
-            node->right = nullptr;
-        }
-        VVM_LOG_ERROR("BuddyAllocator: failed to split node (out of memory)");
-        return;
-    }
-    
-    node->left->parent  = node;
-    node->right->parent = node;
-
-    // Parent is no longer a free leaf
-    node->free = false;
+std::optional<VkDeviceSize> BuddyAllocator::popFree(int order) {
+    if (order < 0 || order > maxOrder_) return std::nullopt;
+    auto& list = freeLists_[order];
+    if (list.empty()) return std::nullopt;
+    VkDeviceSize off = list.back();
+    list.pop_back();
+    return off;
 }
 
-BuddyNode* BuddyAllocator::getBuddy(BuddyNode* node) {
-    if (!node->parent) return nullptr;
-    if (node->parent->left == node) return node->parent->right;
-    return node->parent->left;
-}
-
-void BuddyAllocator::merge(BuddyNode* node) {
-    while (node && node->parent) {
-        BuddyNode* buddy = getBuddy(node);
-        // Buddy must exist, be free, and still be a leaf
-        if (!buddy || !buddy->free || buddy->left != nullptr) {
-            break;
-        }
-
-        BuddyNode* parent = node->parent;
-        destroyNode(parent->left);
-        destroyNode(parent->right);
-        parent->left  = nullptr;
-        parent->right = nullptr;
-        parent->free  = true;
-        node = parent;
+std::optional<VkDeviceSize> BuddyAllocator::splitTo(int order, int targetOrder) {
+    // We have a free block of `order`; we need one of `targetOrder` (<= order).
+    while (order > targetOrder) {
+        auto opt = popFree(order);
+        if (!opt) return std::nullopt;  // should not happen if called correctly
+        VkDeviceSize off = *opt;
+        --order;
+        VkDeviceSize half = orderToSize(order);
+        // Two buddies: [off, off+half)
+        pushFree(order, off + half);    // right buddy becomes free
+        pushFree(order, off);           // left will be taken / further split
     }
+    return popFree(targetOrder);
 }
 
 std::optional<VkDeviceSize> BuddyAllocator::allocate(VkDeviceSize size) {
-    // Check if allocator was initialized properly
-    if (maxLevel_ < 0 || !root_) {
-        VVM_LOG_ERROR("BuddyAllocator: allocator not properly initialized (OOM during construction)");
+    if (maxOrder_ < 0) {
+        VVM_LOG_ERROR("BuddyAllocator: not properly initialized");
         return std::nullopt;
     }
-    
-    if (size == 0) {
-        return std::nullopt;
+    if (size == 0) return std::nullopt;
+
+    int target = sizeToOrder(size);
+    if (target < 0) return std::nullopt;
+
+    // Find the smallest order >= target that has a free block.
+    int order = target;
+    while (order <= maxOrder_ && freeLists_[order].empty()) {
+        ++order;
     }
-    if (size < minSize_) {
-        size = minSize_;
+    if (order > maxOrder_) return std::nullopt;   // completely full
+
+    std::optional<VkDeviceSize> result;
+    if (order == target) {
+        result = popFree(order);
+    } else {
+        result = splitTo(order, target);
     }
 
-    size = nextPowerOfTwo(size);
-    if (size > blockSize_) {
-        return std::nullopt;
-    }
+    if (!result) return std::nullopt;
 
-    BuddyNode* node = findFree(root_, size);
-    if (!node) {
-        return std::nullopt;
-    }
-
-    // findFree already produced a leaf of appropriate size
-    node->free = false;
-    allocatedNodes_[node->offset] = {node, size};
-    return node->offset;
+    const VkDeviceSize granted = orderToSize(target);
+    allocated_[*result] = {target, granted};
+    return result;
 }
 
 void BuddyAllocator::deallocate(VkDeviceSize offset, VkDeviceSize size) {
-    if (maxLevel_ < 0 || !root_) {
-        VVM_LOG_ERROR("BuddyAllocator: cannot deallocate from uninitialized allocator");
+    if (maxOrder_ < 0) {
+        VVM_LOG_ERROR("BuddyAllocator: deallocate on uninitialized allocator");
         return;
     }
-    
-    auto it = allocatedNodes_.find(offset);
-    if (it == allocatedNodes_.end()) {
-        VVM_LOG_WARN("deallocate: offset %llu not found (double-free or invalid)", offset);
+
+    auto it = allocated_.find(offset);
+    if (it == allocated_.end()) {
+        VVM_LOG_WARN("BuddyAllocator: deallocate unknown offset {} (double-free or bad offset)",
+                     offset);
         return;
     }
-    
-    // Validate size matches (allow size==0 as "unknown" from caller)
-    if (size != 0 && it->second.size != size) {
-        VVM_LOG_WARN("deallocate: size mismatch for offset %llu - stored %llu vs passed %llu",
-                     offset, it->second.size, size);
+
+    const int order = it->second.order;
+    const VkDeviceSize recorded = it->second.size;
+
+    if (size != 0 && size != recorded) {
+        VVM_LOG_WARN("BuddyAllocator: size mismatch at offset {} (recorded {}, passed {})",
+                     offset, recorded, size);
+        // Still free using the recorded size – safer than trusting the caller.
     }
-    
-    BuddyNode* node = it->second.node;
-    
-    // Double-free validation: node must not be free already
-    if (!node->free) {
-        node->free = true;
-        merge(node);
-    } else {
-        VVM_LOG_WARN("deallocate: offset %llu already free (double-free)", offset);
+
+    allocated_.erase(it);
+    coalesce(order, offset);
+}
+
+void BuddyAllocator::coalesce(int order, VkDeviceSize offset) {
+    while (order < maxOrder_) {
+        const VkDeviceSize buddySize = orderToSize(order);
+        const VkDeviceSize buddy = offset ^ buddySize;   // classic buddy address
+
+        // Linear search is fine: free lists are short (orders are few).
+        // For extreme performance one can keep a set or sorted vector later.
+        auto& list = freeLists_[order];
+        auto pos = std::find(list.begin(), list.end(), buddy);
+        if (pos == list.end()) {
+            // Buddy is still allocated → just free this block.
+            pushFree(order, offset);
+            return;
+        }
+
+        // Buddy is free → remove it and merge upward.
+        list.erase(pos);
+        offset = std::min(offset, buddy);   // parent starts at the lower address
+        ++order;
     }
-    
-    allocatedNodes_.erase(it);
+    // Fully coalesced to the root.
+    pushFree(maxOrder_, 0);
 }
 
 VkDeviceSize BuddyAllocator::getLargestFree() const {
-    std::function<VkDeviceSize(BuddyNode*)> findLargest = [&](BuddyNode* node) -> VkDeviceSize {
-        if (!node) return 0;
-        if (node->free) return node->size;
-        return std::max(findLargest(node->left), findLargest(node->right));
-    };
-    return findLargest(root_);
+    if (maxOrder_ < 0) return 0;
+    for (int o = maxOrder_; o >= 0; --o) {
+        if (!freeLists_[o].empty()) {
+            return orderToSize(o);
+        }
+    }
+    return 0;
 }
 
 float BuddyAllocator::getFragmentation() const {
+    if (maxOrder_ < 0) return 0.f;
+
     VkDeviceSize totalFree = 0;
-    VkDeviceSize largestFree = 0;
-    
-    std::function<void(BuddyNode*)> traverse = [&](BuddyNode* node) {
-        if (!node) return;
-        if (node->free) {
-            totalFree += node->size;
-            largestFree = std::max(largestFree, node->size);
-        }
-        traverse(node->left);
-        traverse(node->right);
-    };
-traverse(root_);
-    
-    if (totalFree == 0) return 0.0f;
-    return 1.0f - static_cast<float>(largestFree) / static_cast<float>(totalFree);
+    VkDeviceSize largest   = 0;
+    for (int o = 0; o <= maxOrder_; ++o) {
+        const VkDeviceSize sz = orderToSize(o);
+        const size_t count = freeLists_[o].size();
+        totalFree += sz * count;
+        if (count > 0) largest = std::max(largest, sz);
+    }
+    if (totalFree == 0) return 0.f;
+    return 1.f - static_cast<float>(largest) / static_cast<float>(totalFree);
 }
 
 } // namespace vvm

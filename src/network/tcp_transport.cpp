@@ -75,6 +75,11 @@ constexpr uint8_t kProtocolVersion = 1;
 constexpr size_t kHeaderSize = 32;
 constexpr uint64_t kStreamSliceSize = 4ull * 1024 * 1024;  // 4MB slices (Spark-style)
 
+// Hard caps per message. These bound the wire protocol so a malformed or
+// hostile peer cannot cause unbounded allocations via header length fields.
+constexpr uint64_t kMaxBodySize  = 1ull * 1024 * 1024 * 1024;   // 1 GiB
+constexpr uint64_t kMaxStreamSize = 16ull * 1024 * 1024 * 1024;  // 16 GiB
+
 // 32-byte protocol header:
 //   [4 magic][1 version][3 reserved][4 type][4 flags][4 bodyLen][4 seq][8 streamLen]
 struct NetHeader {
@@ -87,6 +92,11 @@ struct NetHeader {
     uint32_t seq;
     uint64_t streamLen;
 };
+
+bool isValidHeaderLengths(const NetHeader& h) {
+    return static_cast<uint64_t>(h.bodyLen) <= kMaxBodySize &&
+           h.streamLen <= kMaxStreamSize;
+}
 
 std::vector<uint8_t> encodeHeader(const NetHeader& h) {
     std::vector<uint8_t> out;
@@ -828,6 +838,12 @@ void TcpTransport::serveConnection(uint64_t connId, uintptr_t sRaw) {
 
         NetHeader nh{};
         if (!decodeHeader(header.data(), header.size(), nh)) break;
+        if (!isValidHeaderLengths(nh)) {
+            VVM_LOG_ERROR("serveConnection: peer sent oversized message "
+                          "(bodyLen={}, streamLen={}); dropping connection",
+                          nh.bodyLen, nh.streamLen);
+            break;
+        }
 
         TcpMessage req;
         req.type = nh.type;
@@ -1049,6 +1065,13 @@ std::optional<TcpMessage> TcpTransport::request(ConnId id, const TcpMessage& req
 
     NetHeader nh{};
     if (!decodeHeader(header.data(), header.size(), nh)) return std::nullopt;
+    if (!isValidHeaderLengths(nh)) {
+        VVM_LOG_ERROR("TcpTransport::request: peer returned oversized message "
+                      "(bodyLen={}, streamLen={}); dropping connection",
+                      nh.bodyLen, nh.streamLen);
+        disconnect(id);
+        return std::nullopt;
+    }
 
     TcpMessage resp;
     resp.type = nh.type;
