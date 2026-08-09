@@ -1,4 +1,4 @@
-# VulkanVM — Unified Vulkan Memory Pool & Cross-GPU Model Distribution
+# VulkanVM — Unified Vulkan Memory Pool (Chonk Buffer) & Cross-GPU Model Distribution
 
 **VulkanVM** is a cross-vendor, high-performance Vulkan memory management library that solves GPU memory fragmentation, enables zero-copy memory sharing across AMD, NVIDIA, and Intel GPUs, and provides a Hugging Face–style model registry for distributing model weights over TCP. Download once, load into the pool, run local multi-GPU inference. This is intended to be a toolbox for the community. Please feel free to contribute, branch, borrow and bug report. Especially bug report!
 
@@ -51,7 +51,7 @@ DeviceConfig devConfig{
 PoolConfig poolConfig = PoolConfig::forDevice(physicalDevice);
 poolConfig.maxHeapFraction = 0.75f;  // never exceed 75% of device heap budget
 
-auto pool = UnifiedMemoryPool::create(devConfig, poolConfig);
+auto pool = UnifiedMemoryPool::create(devConfig, poolConfig);  // (Chonk Buffer)
 if (!pool) { /* handle error */ }
 
 // 4. Allocate a tensor buffer (bindless-ready, 64 MB)
@@ -65,7 +65,7 @@ pool->deallocate(std::move(*tensor));
 
 ---
 
-## Core Memory Pool
+## Core Memory Pool (Chonk Buffer)
 
 ### Key Properties
 
@@ -176,7 +176,7 @@ manager.waitAllIdle();
 
 ## Multi-GPU Pool Manager
 
-`MultiGPUPoolManager` wraps multiple `UnifiedMemoryPool`s and automates cross-GPU allocation + sync.
+`MultiGPUPoolManager` wraps multiple `UnifiedMemoryPool`s (Chonk Buffers) and automates cross-GPU allocation + sync.
 
 ```cpp
 std::vector<DeviceConfig> devices = { amdConfig, intelConfig, nvidiaConfig };
@@ -1085,7 +1085,7 @@ dev_config = vvm.DeviceConfig(
 # Create pool
 pool_config = vvm.PoolConfig.for_device(best.device)
 pool_config.maxHeapFraction = 0.75
-pool = vvm.UnifiedMemoryPool.create(dev_config, pool_config)
+pool = vvm.UnifiedMemoryPool.create(dev_config, pool_config)  # (Chonk Buffer)
 
 # Allocate tensor (returns object with device_address, buffer, host_ptr)
 alloc = pool.allocate_tensor(64 * 1024 * 1024, "weights")
@@ -1139,7 +1139,7 @@ plan = vvm.ShardPlacer.plan(model, cluster, policy)
 
 | Class | Description |
 |-------|-------------|
-| `UnifiedMemoryPool` | Main memory pool with allocate/deallocate/offload/export/import |
+| `UnifiedMemoryPool` (Chonk Buffer) | Main memory pool with allocate/deallocate/offload/export/import |
 | `Allocation` / `UniqueAllocation` | RAII allocation handle with device_address, buffer, host_ptr |
 | `PoolConfig` | Pool configuration (blockSize, maxHeapFraction, etc.) |
 | `DeviceConfig` | Vulkan device + queue configuration |

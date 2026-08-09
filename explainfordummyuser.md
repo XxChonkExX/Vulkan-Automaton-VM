@@ -314,7 +314,7 @@ pool.uncommit(reservation, 64_GiB, 64_GiB);              // Release when done
 
 ```python
 import vulkanvm_torch as vvm
-pool = vvm.UnifiedMemoryPool.create(dev_config, pool_config)
+pool = vvm.UnifiedMemoryPool.create(dev_config, pool_config)  # (Chonk Buffer)
 alloc = pool.allocate_tensor(64 * 1024 * 1024, "weights")
 
 # Offload/reload
@@ -451,6 +451,19 @@ pool->reloadToDevice(alloc);
 auto transport = vvm::tensor::createTensorTransport(cfg, devices, poolConfig);
 transport->allReduce({t0, t1, t2}, ReduceOp::Sum, {0, 1, 2});
 ```
+
+---
+
+## Why "Chonk Buffer"?
+
+The core memory pool is affectionately nicknamed the **Chonk Buffer** (as in "chunk" — a contiguous block of memory). 
+
+It's a tongue-in-cheek reference to:
+- **Chunk** = standard term for a contiguous memory block
+- **Chonk** = internet slang for "thicc" / hefty — because the pool reserves a massive chunk of VRAM upfront (e.g., 512 MB - 80 GB)
+- **Brand alignment** — GitHub org is `XxChonkExX`, repo is `Vulkan-Automaton-VM`
+
+Don't let the name fool you — under the hood it's a production-grade, hardened buddy allocator with zero fragmentation, budget awareness, and full thread safety.
 
 ---
 
