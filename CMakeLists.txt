@@ -157,9 +157,7 @@ if(VVM_BUILD_NETWORK)
     endif()
 endif()
 
-# Include directories
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
-
+# Include directories (target-based)
 # Library
 add_library(vulkan_vm
     src/core/unified_memory_pool.cpp
@@ -174,12 +172,16 @@ add_library(vulkan_vm
     src/placement/placement_executor.cpp
 )
 
-target_include_directories(vulkan_vm PRIVATE
-    ${Vulkan_INCLUDE_DIRS}
-    ${WINDOWS_SDK_UM}
-    ${WINDOWS_SDK_SHARED}
-    ${WINDOWS_SDK_UCRT}
-    ${MSVC_INCLUDE_PATH}
+target_include_directories(vulkan_vm
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+    PRIVATE
+        ${Vulkan_INCLUDE_DIRS}
+        ${WINDOWS_SDK_UM}
+        ${WINDOWS_SDK_SHARED}
+        ${WINDOWS_SDK_UCRT}
+        ${MSVC_INCLUDE_PATH}
 )
 target_link_libraries(vulkan_vm PRIVATE
     ${Vulkan_LIBRARIES}

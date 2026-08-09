@@ -4,8 +4,10 @@
 #include <vector>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <cstdint>
 #include <cassert>
+#include <mutex>
 
 namespace vvm {
 
@@ -13,7 +15,7 @@ class BuddyAllocator {
 public:
     // blockSize and minSize MUST be powers of two, blockSize >= minSize.
     // Recommended defaults for general use: minSize = 4 * 1024 (or 64 * 1024 for tensors).
-    BuddyAllocator(VkDeviceSize blockSize, VkDeviceSize minSize);
+    BuddyAllocator(VkDeviceSize blockSize, VkDeviceSize minSize, bool threadSafe = false);
     ~BuddyAllocator() = default;
 
     BuddyAllocator(const BuddyAllocator&) = delete;
@@ -27,8 +29,8 @@ public:
 
     VkDeviceSize getLargestFree() const;
     float getFragmentation() const;
-    size_t getAllocationCount() const { return allocated_.size(); }
-    bool isValid() const { return maxOrder_ >= 0; }
+    size_t getAllocationCount() const;
+    bool isValid() const;
 
     VkDeviceSize blockSize() const { return blockSize_; }
     VkDeviceSize minSize()  const { return minSize_; }
@@ -48,9 +50,7 @@ private:
 
     // Order 0 = minSize, order maxOrder_ = blockSize.
     int sizeToOrder(VkDeviceSize size) const;
-    VkDeviceSize orderToSize(int order) const {
-        return minSize_ << order;
-    }
+    VkDeviceSize orderToSize(int order) const;
 
     // Push a free block of the given order onto its free list.
     void pushFree(int order, VkDeviceSize offset);
@@ -69,7 +69,8 @@ private:
     int          maxOrder_  = -1;   // -1 = invalid
 
     // freeLists_[order] holds offsets of free blocks of size (minSize << order)
-    std::vector<std::vector<VkDeviceSize>> freeLists_;
+    // Using unordered_set for O(1) buddy lookup during coalesce.
+    std::vector<std::unordered_set<VkDeviceSize>> freeLists_;
 
     // Validation / size recovery only. Not on the hot path for performance-critical
     // code that already knows the size. Can be disabled with a compile flag later.
@@ -78,6 +79,20 @@ private:
         VkDeviceSize size;          // power-of-two size actually granted
     };
     std::unordered_map<VkDeviceSize, AllocInfo> allocated_;
+
+    // Optional thread-safety
+    mutable std::mutex mutex_;
+    bool threadSafe_ = false;
+
+    // Thread-safe wrapper helpers
+    template<typename Func>
+    auto withLock(Func&& f) const -> decltype(auto) {
+        if (threadSafe_) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return f();
+        }
+        return f();
+    }
 };
 
 } // namespace vvm

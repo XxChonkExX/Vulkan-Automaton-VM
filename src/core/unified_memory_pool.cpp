@@ -98,6 +98,9 @@ UnifiedMemoryPool::UnifiedMemoryPool(UnifiedMemoryPool&& other) noexcept
     , offloadManager_(std::move(other.offloadManager_))
     , mutex_() {
     
+    // Lock source mutex to ensure thread-safe move
+    std::lock_guard<std::mutex> lock(other.mutex_);
+    
     other.device_ = VK_NULL_HANDLE;
     other.transferCmdPool_ = VK_NULL_HANDLE;
     other.fnSetDebugName_ = nullptr;
