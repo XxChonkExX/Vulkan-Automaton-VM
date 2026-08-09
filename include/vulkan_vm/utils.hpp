@@ -426,7 +426,7 @@ struct ExternalMemoryInfo {
 // need N distinct handles. dup() on Linux, DuplicateHandle() on Windows.
 // The returned ExternalMemoryInfo independently owns its OWN handle; the
 // source stays untouched (its handle remains valid for the original exporter).
-inline ExternalMemoryInfo duplicateForImport(const ExternalMemoryInfo& src) {
+[[nodiscard]] inline ExternalMemoryInfo duplicateForImport(const ExternalMemoryInfo& src) {
     ExternalMemoryInfo copy;
     copy.type = src.type;
     copy.size = src.size;

@@ -7,8 +7,8 @@
 
 namespace vvm {
 
-BuddyAllocator::BuddyAllocator(VkDeviceSize blockSize, VkDeviceSize minSize)
-    : blockSize_(blockSize), minSize_(minSize)
+BuddyAllocator::BuddyAllocator(VkDeviceSize blockSize, VkDeviceSize minSize, bool threadSafe)
+    : blockSize_(blockSize), minSize_(minSize), threadSafe_(threadSafe)
 {
     if (!isPowerOfTwo(blockSize_) || !isPowerOfTwo(minSize_) || blockSize_ < minSize_) {
         VVM_LOG_ERROR("BuddyAllocator: blockSize and minSize must be powers of two "
@@ -32,7 +32,7 @@ BuddyAllocator::BuddyAllocator(VkDeviceSize blockSize, VkDeviceSize minSize)
 
     freeLists_.assign(static_cast<size_t>(maxOrder_) + 1, {});
     // Initially the whole block is free at the highest order.
-    freeLists_[maxOrder_].push_back(0);
+    freeLists_[maxOrder_].insert(0);
 }
 
 int BuddyAllocator::sizeToOrder(VkDeviceSize size) const {
@@ -51,15 +51,16 @@ int BuddyAllocator::sizeToOrder(VkDeviceSize size) const {
 
 void BuddyAllocator::pushFree(int order, VkDeviceSize offset) {
     assert(order >= 0 && order <= maxOrder_);
-    freeLists_[order].push_back(offset);
+    freeLists_[order].insert(offset);
 }
 
 std::optional<VkDeviceSize> BuddyAllocator::popFree(int order) {
     if (order < 0 || order > maxOrder_) return std::nullopt;
-    auto& list = freeLists_[order];
-    if (list.empty()) return std::nullopt;
-    VkDeviceSize off = list.back();
-    list.pop_back();
+    auto& set = freeLists_[order];
+    if (set.empty()) return std::nullopt;
+    auto it = set.begin();
+    VkDeviceSize off = *it;
+    set.erase(it);
     return off;
 }
 
@@ -79,60 +80,64 @@ std::optional<VkDeviceSize> BuddyAllocator::splitTo(int order, int targetOrder) 
 }
 
 std::optional<VkDeviceSize> BuddyAllocator::allocate(VkDeviceSize size) {
-    if (maxOrder_ < 0) {
-        VVM_LOG_ERROR("BuddyAllocator: not properly initialized");
-        return std::nullopt;
-    }
-    if (size == 0) return std::nullopt;
+    return withLock([this, size]() -> std::optional<VkDeviceSize> {
+        if (maxOrder_ < 0) {
+            VVM_LOG_ERROR("BuddyAllocator: not properly initialized");
+            return std::nullopt;
+        }
+        if (size == 0) return std::nullopt;
 
-    int target = sizeToOrder(size);
-    if (target < 0) return std::nullopt;
+        int target = sizeToOrder(size);
+        if (target < 0) return std::nullopt;
 
-    // Find the smallest order >= target that has a free block.
-    int order = target;
-    while (order <= maxOrder_ && freeLists_[order].empty()) {
-        ++order;
-    }
-    if (order > maxOrder_) return std::nullopt;   // completely full
+        // Find the smallest order >= target that has a free block.
+        int order = target;
+        while (order <= maxOrder_ && freeLists_[order].empty()) {
+            ++order;
+        }
+        if (order > maxOrder_) return std::nullopt;   // completely full
 
-    std::optional<VkDeviceSize> result;
-    if (order == target) {
-        result = popFree(order);
-    } else {
-        result = splitTo(order, target);
-    }
+        std::optional<VkDeviceSize> result;
+        if (order == target) {
+            result = popFree(order);
+        } else {
+            result = splitTo(order, target);
+        }
 
-    if (!result) return std::nullopt;
+        if (!result) return std::nullopt;
 
-    const VkDeviceSize granted = orderToSize(target);
-    allocated_[*result] = {target, granted};
-    return result;
+        const VkDeviceSize granted = orderToSize(target);
+        allocated_[*result] = {target, granted};
+        return result;
+    });
 }
 
 void BuddyAllocator::deallocate(VkDeviceSize offset, VkDeviceSize size) {
-    if (maxOrder_ < 0) {
-        VVM_LOG_ERROR("BuddyAllocator: deallocate on uninitialized allocator");
-        return;
-    }
+    withLock([this, offset, size]() {
+        if (maxOrder_ < 0) {
+            VVM_LOG_ERROR("BuddyAllocator: deallocate on uninitialized allocator");
+            return;
+        }
 
-    auto it = allocated_.find(offset);
-    if (it == allocated_.end()) {
-        VVM_LOG_WARN("BuddyAllocator: deallocate unknown offset {} (double-free or bad offset)",
-                     offset);
-        return;
-    }
+        auto it = allocated_.find(offset);
+        if (it == allocated_.end()) {
+            VVM_LOG_WARN("BuddyAllocator: deallocate unknown offset {} (double-free or bad offset)",
+                         offset);
+            return;
+        }
 
-    const int order = it->second.order;
-    const VkDeviceSize recorded = it->second.size;
+        const int order = it->second.order;
+        const VkDeviceSize recorded = it->second.size;
 
-    if (size != 0 && size != recorded) {
-        VVM_LOG_WARN("BuddyAllocator: size mismatch at offset {} (recorded {}, passed {})",
-                     offset, recorded, size);
-        // Still free using the recorded size – safer than trusting the caller.
-    }
+        if (size != 0 && size != recorded) {
+            VVM_LOG_WARN("BuddyAllocator: size mismatch at offset {} (recorded {}, passed {})",
+                         offset, recorded, size);
+            // Still free using the recorded size – safer than trusting the caller.
+        }
 
-    allocated_.erase(it);
-    coalesce(order, offset);
+        allocated_.erase(it);
+        coalesce(order, offset);
+    });
 }
 
 void BuddyAllocator::coalesce(int order, VkDeviceSize offset) {
@@ -140,18 +145,16 @@ void BuddyAllocator::coalesce(int order, VkDeviceSize offset) {
         const VkDeviceSize buddySize = orderToSize(order);
         const VkDeviceSize buddy = offset ^ buddySize;   // classic buddy address
 
-        // Linear search is fine: free lists are short (orders are few).
-        // For extreme performance one can keep a set or sorted vector later.
-        auto& list = freeLists_[order];
-        auto pos = std::find(list.begin(), list.end(), buddy);
-        if (pos == list.end()) {
+        auto& set = freeLists_[order];
+        auto pos = set.find(buddy);
+        if (pos == set.end()) {
             // Buddy is still allocated → just free this block.
             pushFree(order, offset);
             return;
         }
 
         // Buddy is free → remove it and merge upward.
-        list.erase(pos);
+        set.erase(pos);
         offset = std::min(offset, buddy);   // parent starts at the lower address
         ++order;
     }
@@ -160,28 +163,44 @@ void BuddyAllocator::coalesce(int order, VkDeviceSize offset) {
 }
 
 VkDeviceSize BuddyAllocator::getLargestFree() const {
-    if (maxOrder_ < 0) return 0;
-    for (int o = maxOrder_; o >= 0; --o) {
-        if (!freeLists_[o].empty()) {
-            return orderToSize(o);
+    return withLock([this]() -> VkDeviceSize {
+        if (maxOrder_ < 0) return 0;
+        for (int o = maxOrder_; o >= 0; --o) {
+            if (!freeLists_[o].empty()) {
+                return orderToSize(o);
+            }
         }
-    }
-    return 0;
+        return 0;
+    });
 }
 
 float BuddyAllocator::getFragmentation() const {
-    if (maxOrder_ < 0) return 0.f;
+    return withLock([this]() -> float {
+        if (maxOrder_ < 0) return 0.f;
 
-    VkDeviceSize totalFree = 0;
-    VkDeviceSize largest   = 0;
-    for (int o = 0; o <= maxOrder_; ++o) {
-        const VkDeviceSize sz = orderToSize(o);
-        const size_t count = freeLists_[o].size();
-        totalFree += sz * count;
-        if (count > 0) largest = std::max(largest, sz);
-    }
-    if (totalFree == 0) return 0.f;
-    return 1.f - static_cast<float>(largest) / static_cast<float>(totalFree);
+        VkDeviceSize totalFree = 0;
+        VkDeviceSize largest   = 0;
+        for (int o = 0; o <= maxOrder_; ++o) {
+            const VkDeviceSize sz = orderToSize(o);
+            const size_t count = freeLists_[o].size();
+            totalFree += sz * count;
+            if (count > 0) largest = std::max(largest, sz);
+        }
+        if (totalFree == 0) return 0.f;
+        return 1.f - static_cast<float>(largest) / static_cast<float>(totalFree);
+    });
+}
+
+size_t BuddyAllocator::getAllocationCount() const {
+    return withLock([this]() -> size_t {
+        return allocated_.size();
+    });
+}
+
+bool BuddyAllocator::isValid() const {
+    return withLock([this]() -> bool {
+        return maxOrder_ >= 0;
+    });
 }
 
 } // namespace vvm

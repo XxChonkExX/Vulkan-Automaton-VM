@@ -260,8 +260,8 @@ public:
     // allocateDedicatedExportable). Sub-allocated blocks are NOT supported
     // for cross-GPU export because Vulkan external memory import requires
     // dedicated allocations for reliable cross-device import.
-    std::optional<ExternalMemoryInfo> exportMemory(const Allocation& alloc,
-                                                   ExternalHandleType type);
+    [[nodiscard]] std::optional<ExternalMemoryInfo> exportMemory(const Allocation& alloc,
+                                                       ExternalHandleType type);
     
     // Ownership contract: on SUCCESS the OS handle (FD/HANDLE) is transferred
     // to the driver and info is emptied (importMemory consumes it). Pass an
@@ -269,8 +269,8 @@ public:
     // e.g. from exportMemory or duplicateForImport. Use duplicateForImport
     // when the same memory must be imported on multiple peers.
     // On FAILURE, info still owns the handle and its destructor closes it.
-    std::optional<Allocation> importMemory(ExternalMemoryInfo&& info,
-                                           VkBufferUsageFlags usage);
+    [[nodiscard]] std::optional<Allocation> importMemory(ExternalMemoryInfo&& info,
+                                               VkBufferUsageFlags usage);
 
     // Offload/Swap
     std::optional<MigrationOperation> offloadToHost(Allocation& alloc);
