@@ -738,7 +738,8 @@ struct WindowPipe {
         windowBytes = winBytes;
         depth = (std::clamp)(buffers, 2u, 4u);
         for (uint32_t i = 0; i < depth; ++i) {
-            stag[i] = m->createStaging(windowBytes);
+            uint64_t sz = (i == 0) ? total : windowBytes;
+            stag[i] = m->createStaging(sz);
             if (!stag[i]) {
                 drain();
                 return false;
@@ -1030,18 +1031,23 @@ std::optional<NetworkMigrationOperation> MultiNodePoolManager::migrateToRemote(
     std::optional<Allocation> staging;
     StreamIO streamIO;
     if (networkConfig_.enableAdaptiveWindow && pipe.init(this, source.size, adaptivePipelineDepth(), adaptiveWindowBytes(source.size))) {
+        bool fullCopyDone = false;
         streamIO.onWindowProvide = [&](uint64_t chunkIdx, const void** src, uint64_t want, uint64_t& got) -> bool {
             if (!pipe.waitReusable(chunkIdx)) return false;
             uint64_t off = chunkIdx * kTransferChunk;
             if (off >= source.size) return false;
             uint64_t n = (std::min)(want, source.size - off);
             if (n == 0) return false;
-            if (!pipe.submit(chunkIdx, source.buffer, pipe.stag[chunkIdx % pipe.depth]->buffer,
-                             off, 0, n)) {
-                return false;
+
+            if (!fullCopyDone) {
+                if (!pipe.submit(0, source.buffer, pipe.stag[0]->buffer, 0, 0, source.size)) {
+                    return false;
+                }
+                if (!pipe.waitReady(0)) return false;
+                fullCopyDone = true;
             }
-            if (!pipe.waitReady(chunkIdx)) return false;  // data must be resident before sending
-            *src = pipe.stag[chunkIdx % pipe.depth]->hostPtr;
+
+            *src = static_cast<const uint8_t*>(pipe.stag[0]->hostPtr) + off;
             got = n;
             return true;
         };
@@ -1366,7 +1372,7 @@ bool MultiNodePoolManager::initCopyEngine() {
 
     VkCommandPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    poolInfo.flags = 0;
     poolInfo.queueFamilyIndex = transferQueueFamily_;
 
     VkResult res = vkCreateCommandPool(localPools_[0].getDevice(), &poolInfo, nullptr, &copyCmdPool_);
@@ -1870,27 +1876,34 @@ void MultiNodePoolManager::onTcpRequest(TcpMessage& request, TcpMessage& respons
             auto serveAlloc = std::make_shared<Allocation>(*alloc);
             auto pipe = std::make_shared<WindowPipe>();
             if (networkConfig_.enableAdaptiveWindow && pipe->init(this, size, adaptivePipelineDepth(), adaptiveWindowBytes(size))) {
+                bool fullCopyDone = false;
                 response = makeResponse(request.type, TcpFlagsResponse);
                 response.streamLen = size;
-                response.streamWindowProvide = [pipe, serveAlloc, srcOffset, total = size](
+                response.streamWindowProvide = [pipe, serveAlloc, srcOffset, total = size, &fullCopyDone](
                     uint64_t chunkIdx, const void** src, uint64_t want, uint64_t& got) -> bool {
                     if (!pipe->waitReusable(chunkIdx)) return false;
                     uint64_t off = chunkIdx * kTransferChunk;
                     if (off >= total) return false;
                     uint64_t n = (std::min)(want, total - off);
                     if (n == 0) return false;
-                    if (!pipe->submit(chunkIdx, serveAlloc->buffer,
-                                      pipe->stag[chunkIdx % pipe->depth]->buffer,
-                                      srcOffset + off, 0, n)) {
-                        return false;
+
+if (!fullCopyDone) {
+                        VkDeviceSize fullSize = total;
+                        if (!pipe->submit(0, serveAlloc->buffer,
+                                          pipe->stag[0]->buffer,
+                                          srcOffset, 0, fullSize)) {
+                            return false;
+                        }
+                        if (!pipe->waitReady(0)) return false;
+                        fullCopyDone = true;
                     }
-                    if (!pipe->waitReady(chunkIdx)) return false;
-                    *src = pipe->stag[chunkIdx % pipe->depth]->hostPtr;
+
+                    *src = static_cast<const uint8_t*>(pipe->stag[0]->hostPtr) + off;
                     got = n;
                     return true;
                 };
                 response.streamCleanup = [pipe]() { pipe->drain(); };
-                VVM_LOG_INFO("MigratePull: serving {} bytes for allocation {} (windowed)",
+                VVM_LOG_INFO("MigratePull: serving {} bytes for allocation {} (windowed, full-copy)",
                              size, localAllocId);
                 break;
             }
@@ -1949,17 +1962,17 @@ void MultiNodePoolManager::onTcpRequest(TcpMessage& request, TcpMessage& respons
                         if (off >= p.totalBytes) return false;
                         uint64_t n = (std::min)(want, p.totalBytes - off);
                         if (n == 0) return false;
-                        *dst = p.stag[chunkIdx % p.depth]->hostPtr;
+                        // All chunks land in the single stag[0] at the correct offset
+                        *dst = static_cast<uint8_t*>(p.stag[0]->hostPtr) + off;
                         got = n;
                         return true;
                     };
                     response.streamWindowConsumed = [state](uint64_t chunkIdx, uint64_t len) -> bool {
-                        WindowPipe& p = *state->pipe;
-                        return p.submit(chunkIdx, p.stag[chunkIdx % p.depth]->buffer,
-                                        state->target->buffer, 0,
-                                        chunkIdx * kTransferChunk, len);
+                        // Windowed receive: just acknowledge the chunk; actual GPU copy
+                        // happens in bulk at finalize to avoid device loss on Arc.
+                        return true;
                     };
-                    VVM_LOG_INFO("MigratePush: receiving {} bytes for allocation {} (windowed)",
+                    VVM_LOG_INFO("MigratePush: receiving {} bytes for allocation {} (windowed, bulk-copy)",
                                  size, localAllocId);
                     return;
                 }
@@ -1988,10 +2001,15 @@ void MultiNodePoolManager::onTcpRequest(TcpMessage& request, TcpMessage& respons
             PushState& state = *statePtr;  // kept alive by the cleanup lambdas
 
             if (state.pipe) {
-                state.pipe->drain();  // waits all pipelined host -> device copies
+                if (!copyHostToDevice(*state.pipe->stag[0], *state.target, 0, size)) {
+                    VVM_LOG_ERROR("MigratePush: host -> device bulk copy failed");
+                    response = makeResponse(request.type, TcpFlagsError);
+                    return;
+                }
+                state.pipe->drain();
                 response = makeResponse(request.type, TcpFlagsResponse);
                 detail::putU8(response.body, 1);
-                VVM_LOG_INFO("MigratePush: received {} bytes for allocation {} (windowed)",
+                VVM_LOG_INFO("MigratePush: received {} bytes for allocation {} (windowed, bulk-copy)",
                              size, localAllocId);
                 break;
             }
