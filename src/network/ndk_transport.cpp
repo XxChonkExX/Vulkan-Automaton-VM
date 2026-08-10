@@ -310,6 +310,31 @@ public:
             return std::nullopt;
         }
 
+        // Check if we already have a persistent region for this address
+        {
+            std::lock_guard<std::mutex> lock(regionsMutex_);
+            auto it = regions_.find(reinterpret_cast<uintptr_t>(ptr));
+            if (it != regions_.end() && it->second.persistentlyPinned) {
+                // Reuse existing persistent registration
+                RegisteredRegion& reg = it->second;
+                reg.refCount++;
+                
+                RdmaMemoryRegion region;
+                region.addr = ptr;
+                region.length = size;
+                region.lkey = reg.mr->GetLocalToken();
+                region.rkey = reg.mr->GetRemoteToken();
+                region.rdmaAddr = reinterpret_cast<uint64_t>(ptr);
+                region.ownsMemory = false;
+                region.vkMemory = VK_NULL_HANDLE;
+                region.vkBuffer = VK_NULL_HANDLE;
+                VVM_LOG_DEBUG("ND: reused persistent host memory {} bytes (ref={})", 
+                              size, reg.refCount);
+                return region;
+            }
+        }
+
+        // Create new registration
         HANDLE hOvlFile = INVALID_HANDLE_VALUE;
         IND2MemoryRegion* mr = nullptr;
         if (FAILED(adapter_->CreateOverlappedFile(&hOvlFile))) return std::nullopt;
@@ -345,6 +370,8 @@ public:
         reg.hOvlFile = hOvlFile;
         reg.addr = ptr;
         reg.length = size;
+        reg.refCount = 1;
+        reg.persistentlyPinned = false;
         {
             std::lock_guard<std::mutex> lock(regionsMutex_);
             regions_[reinterpret_cast<uintptr_t>(ptr)] = reg;
@@ -364,27 +391,83 @@ public:
         return region;
     }
 
+    // Persistently pin host memory for reuse (GDRCopy-style)
+    // Returns true if successful; the memory will stay registered until
+    // releasePersistentHostMemory is called with the same address.
+    bool pinPersistentHostMemory(void* ptr, size_t size) {
+        auto regionOpt = registerHostMemory(ptr, size);
+        if (!regionOpt) return false;
+        
+        std::lock_guard<std::mutex> lock(regionsMutex_);
+        auto it = regions_.find(reinterpret_cast<uintptr_t>(ptr));
+        if (it != regions_.end()) {
+            it->second.persistentlyPinned = true;
+            VVM_LOG_INFO("ND: persistently pinned host memory {} bytes at {}", size, ptr);
+            return true;
+        }
+        return false;
+    }
+
+    // Release persistently pinned host memory
+    // Decrements ref count; only actually deregisters when ref count reaches 0
+    void releasePersistentHostMemory(void* ptr) {
+        std::lock_guard<std::mutex> lock(regionsMutex_);
+        auto it = regions_.find(reinterpret_cast<uintptr_t>(ptr));
+        if (it == regions_.end()) return;
+        
+        RegisteredRegion& reg = it->second;
+        if (!reg.persistentlyPinned) return;
+        
+        if (reg.refCount > 1) {
+            reg.refCount--;
+            VVM_LOG_DEBUG("ND: released persistent pin (ref={}) for {}", reg.refCount, ptr);
+            return;
+        }
+        
+        // Last reference - remove persistent flag but keep registered
+        reg.persistentlyPinned = false;
+        VVM_LOG_INFO("ND: removed persistent pin for {}", ptr);
+    }
+
     void unregisterMemory(const RdmaMemoryRegion& region) override {
         if (!region.addr) return;
-        RegisteredRegion reg;
-        {
-            std::lock_guard<std::mutex> lock(regionsMutex_);
-            auto it = regions_.find(reinterpret_cast<uintptr_t>(region.addr));
-            if (it == regions_.end()) return;
-            reg = it->second;
-            regions_.erase(it);
+        std::unique_lock<std::mutex> lock(regionsMutex_);
+        auto it = regions_.find(reinterpret_cast<uintptr_t>(region.addr));
+        if (it == regions_.end()) return;
+        
+        RegisteredRegion& reg = it->second;
+        
+        // Don't unregister if persistently pinned
+        if (reg.persistentlyPinned) {
+            VVM_LOG_DEBUG("ND: skipping unregister for persistently pinned memory at {}", region.addr);
+            return;
         }
-        if (reg.mr) {
+        
+        // Decrement ref count if > 0
+        if (reg.refCount > 0) {
+            reg.refCount--;
+            if (reg.refCount > 0) {
+                VVM_LOG_DEBUG("ND: deferred unregister (ref={}) for {}", reg.refCount, region.addr);
+                return;
+            }
+        }
+        
+        // Actually unregister
+        RegisteredRegion toUnreg = reg;
+        regions_.erase(it);
+        lock.unlock();
+        
+        if (toUnreg.mr) {
             OVERLAPPED ovl{};
             ovl.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
             if (ovl.hEvent) {
-                HRESULT hr = reg.mr->Deregister(&ovl);
-                if (hr == ND_PENDING) completeOverlapped(reg.mr, &ovl);
+                HRESULT hr = toUnreg.mr->Deregister(&ovl);
+                if (hr == ND_PENDING) completeOverlapped(toUnreg.mr, &ovl);
                 CloseHandle(ovl.hEvent);
             }
-            reg.mr->Release();
+            toUnreg.mr->Release();
         }
-        if (reg.hOvlFile != INVALID_HANDLE_VALUE) CloseHandle(reg.hOvlFile);
+        if (toUnreg.hOvlFile != INVALID_HANDLE_VALUE) CloseHandle(toUnreg.hOvlFile);
     }
 
     // ========================================================================
@@ -586,6 +669,10 @@ private:
         HANDLE hOvlFile = INVALID_HANDLE_VALUE;
         void* addr = nullptr;
         size_t length = 0;
+        
+        // Persistent pinning support (GDRCopy-style)
+        uint32_t refCount = 0;          // Reference count for persistent pinning
+        bool persistentlyPinned = false; // Whether this region is in the persistent pool
     };
 
     struct ConnectionInfo {

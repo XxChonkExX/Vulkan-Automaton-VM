@@ -84,6 +84,19 @@ else()
     message(STATUS "VulkanVM network: RDMA/verbs transport disabled (host-staged TCP only)")
 endif()
 
+# UCX transport (optional): Unified Communication X
+if(UCX_FOUND)
+    message(STATUS "VulkanVM network: UCX transport enabled")
+    list(APPEND NETWORK_CORE_SRCS
+        ucx_transport.cpp
+    )
+    list(APPEND NETWORK_ABI_DEFS VVM_HAS_UCX=1)
+    set(VVM_NETWORK_UCX_LIBS ${UCX_LIBRARIES})
+    set(VVM_NETWORK_UCX_INCS ${UCX_INCLUDE_DIRS})
+else()
+    message(STATUS "VulkanVM network: UCX transport disabled")
+endif()
+
 # Windows: Level Zero GPU-direct (Intel)
 if(WIN32 AND LevelZero_FOUND)
     message(STATUS "VulkanVM network: Level Zero GPU-direct enabled for Intel")
@@ -118,6 +131,7 @@ target_include_directories(vulkan_vm_network PRIVATE
     ${Vulkan_INCLUDE_DIRS}
     ${VVM_NETWORK_VERBS_INCS}
     ${VVM_NETWORK_L0_INCS}
+    ${VVM_NETWORK_UCX_INCS}
     ${VVM_NETWORK_NDK_INCS}
     ${WINDOWS_SDK_UM}
     ${WINDOWS_SDK_SHARED}
@@ -130,6 +144,7 @@ target_link_libraries(vulkan_vm_network PRIVATE
     Threads::Threads
     ${VVM_NETWORK_GRPC_LIBS}
     ${VVM_NETWORK_VERBS_LIBS}
+    ${VVM_NETWORK_UCX_LIBS}
     ${VVM_NETWORK_L0_LIBS}
     ${VVM_NETWORK_TLS_LIBS}
 )
@@ -174,6 +189,7 @@ install(FILES
     include/vulkan_vm/network/model_registry.hpp
     include/vulkan_vm/network/model_types.hpp
     include/vulkan_vm/network/sha256.hpp
+    include/vulkan_vm/ucx_transport.hpp
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/vulkan_vm/network
 )
 
