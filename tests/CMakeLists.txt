@@ -88,6 +88,15 @@ target_include_directories(multi_gpu_test PRIVATE
 # add_executable(stress_test stress_test.cpp)
 # target_link_libraries(stress_test PRIVATE vulkan_vm)
 
+# CPU-only wire-format regression tests (no Vulkan device required)
+add_executable(serialization_test serialization_test.cpp)
+target_link_libraries(serialization_test PRIVATE vulkan_vm_network)
+target_include_directories(serialization_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
+add_test(NAME serialization_test COMMAND serialization_test)
+
 # Placement API tests (pure logic, no Vulkan device required)
 add_executable(placement_test placement_test.cpp)
 target_link_libraries(placement_test PRIVATE vulkan_vm)
@@ -118,6 +127,11 @@ if(WIN32)
     )
     target_compile_definitions(ndfake_provider PRIVATE NDFAKE_BUILD)
     target_link_libraries(ndfake_provider PRIVATE ws2_32)
+    # DllGetClassObject is predeclared by combaseapi.h (via windows.h), so the
+    # definition cannot carry a second linkage spec; force the export instead.
+    if(MSVC)
+        target_link_options(ndfake_provider PRIVATE "/EXPORT:DllGetClassObject")
+    endif()
 
     # Loopback test: exercises NdkRdmaTransport via fake provider
     # Requires VVM_ND_PROVIDER_DLL env var pointing to ndfake_provider.dll at runtime

@@ -1,3 +1,14 @@
+#ifdef VVM_PLATFORM_WINDOWS
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
+
 #include "vulkan_vm/vulkan_vm.hpp"
 #include "vulkan_vm/utils.hpp"
 #include "vulkan_vm/network/multi_node_manager.hpp"
@@ -7,6 +18,8 @@
 #include <cassert>
 #include <thread>
 #include <chrono>
+#include <atomic>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Minimal device setup (single GPU, graphics + compute + transfer queues)
@@ -218,6 +231,94 @@ static void fillPattern(void* buf, size_t size, uint8_t val) {
     std::memset(buf, val, size);
 }
 
+// ---------------------------------------------------------------------------
+// Striped TCP sender regression: exercises the parallel stripe engine
+// (multi-socket pooling, TCP_NODELAY + buffered sockets, 1:1
+// socket-to-segment mapping). A raw loopback listener mirrors the receive
+// side contract: connection k carries segment k, of size base+(rem if last).
+// Mirrors the sender's stripe math exactly so a mapping mismatch fails.
+// ---------------------------------------------------------------------------
+#ifdef VVM_PLATFORM_WINDOWS
+static bool runStripedSenderTest() {
+    using vvm::network::TcpTransport;
+
+    constexpr uint64_t kSliceBytes = 4ull * 1024 * 1024;
+    const uint64_t kStripeTotal = (33ull * 1024 * 1024) + 12345; // remainder tail
+    const size_t poolSize = 4;
+
+    size_t hw = std::thread::hardware_concurrency();
+    uint64_t sliceCount = (kStripeTotal + kSliceBytes - 1) / kSliceBytes;
+    size_t stripes = poolSize;
+    if (hw > 0 && stripes > hw) stripes = hw;
+    if (stripes > sliceCount) stripes = static_cast<size_t>(sliceCount);
+    const uint64_t base = kStripeTotal / stripes;
+    const uint64_t rem = kStripeTotal % stripes;
+
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return false;
+
+    SOCKET listener = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener == INVALID_SOCKET) return false;
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0; // ephemeral port; resolved below
+    if (bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+        listen(listener, static_cast<int>(stripes)) != 0) {
+        closesocket(listener);
+        return false;
+    }
+    sockaddr_in bound{};
+    int blen = static_cast<int>(sizeof(bound));
+    if (getsockname(listener, reinterpret_cast<sockaddr*>(&bound), &blen) != 0) {
+        closesocket(listener);
+        return false;
+    }
+    const uint16_t port = ntohs(bound.sin_port);
+
+    std::vector<uint8_t> src(kStripeTotal);
+    fillPattern(src.data(), src.size(), 0x55);
+    std::vector<uint8_t> assembled(kStripeTotal);
+    std::atomic<bool> listenOk{true};
+
+    std::thread listenerThread([&]() {
+        std::vector<std::thread> readers;
+        readers.reserve(stripes);
+        for (size_t k = 0; k < stripes; ++k) {
+            SOCKET c = accept(listener, nullptr, nullptr);
+            if (c == INVALID_SOCKET) { listenOk = false; break; }
+            int rcvTimeout = 15000; // ms: fail instead of hanging on mapping bugs
+            setsockopt(c, SOL_SOCKET, SO_RCVTIMEO,
+                       reinterpret_cast<const char*>(&rcvTimeout), sizeof(rcvTimeout));
+            uint64_t segLen = base + (k == stripes - 1 ? rem : 0);
+            uint8_t* dst = assembled.data() + k * base;
+            readers.emplace_back([c, dst, segLen, &listenOk]() {
+                size_t got = 0;
+                while (got < segLen) {
+                    int chunk = static_cast<int>((std::min)(segLen - got, uint64_t{INT_MAX}));
+                    int n = recv(c, reinterpret_cast<char*>(dst + got), chunk, 0);
+                    if (n <= 0) { listenOk = false; break; }
+                    got += static_cast<size_t>(n);
+                }
+                closesocket(c);
+            });
+        }
+        for (auto& r : readers) r.join();
+        closesocket(listener);
+    });
+
+    TcpTransport t;
+    bool sent = t.writeStreamStriped("127.0.0.1", port, src.data(), kStripeTotal, poolSize);
+    t.shutdownConnectionPool("127.0.0.1", port);
+    listenerThread.join();
+
+    bool ok = sent && listenOk &&
+              std::memcmp(src.data(), assembled.data(), kStripeTotal) == 0;
+    WSACleanup();
+    return ok;
+}
+#endif
+
 // Device-side copy (src buffer -> dst buffer) using a transient command pool.
 static bool deviceCopy(VkDevice device, VkQueue queue, VkBuffer src, VkBuffer dst, VkDeviceSize size) {
     VkCommandPool pooled[1];
@@ -372,6 +473,16 @@ int main() {
                     ++failures;
                 } else {
                     bool ok = verifyPattern(regA->hostPtr, kTestSize, 0xAB);
+                    if (!ok) {
+                        const uint8_t* q = static_cast<const uint8_t*>(regA->hostPtr);
+                        for (size_t di = 0; di < kTestSize; ++di) {
+                            if (q[di] != 0xAB) {
+                                std::cout << "  Push first mismatch at byte " << di << " (chunk "
+                                          << (di / (4ull * 1024 * 1024)) << ")\n";
+                                break;
+                            }
+                        }
+                    }
                     std::cout << "  Push verify: " << (ok ? "PASS" : "FAIL") << "\n";
                     if (!ok) ++failures;
                 }
@@ -472,6 +583,17 @@ int main() {
             mgrB->deallocateRemote(*exportedB3);
         }
     }
+
+    // ---- Striped TCP sender (parallel stripe engine) ----
+    std::cout << "\n--- Striped TCP transfer (parallel sockets) ---\n";
+
+#ifdef VVM_PLATFORM_WINDOWS
+    bool striped = runStripedSenderTest();
+    std::cout << "  Striped verify: " << (striped ? "PASS" : "FAIL") << "\n";
+    if (!striped) ++failures;
+#else
+    std::cout << "  Striped verify: SKIPPED (Windows-only raw listener)\n";
+#endif
 
     // ---- Cleanup ----
     std::cout << "\n--- Cleanup ---\n";

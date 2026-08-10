@@ -88,7 +88,9 @@ void copyToRemote(uint32_t remoteToken, uint64_t remoteAddr, const void* src, si
     std::lock_guard<std::mutex> lock(g_mrMutex);
     auto it = g_memoryRegions.find(remoteToken);
     if (it == g_memoryRegions.end()) return;
-    void* dst = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(it->second.base) + remoteAddr);
+    // ND semantics: remoteAddress is the absolute virtual address of the
+    // destination inside the remote region (region base + offset).
+    void* dst = reinterpret_cast<void*>(remoteAddr);
     std::memcpy(dst, src, size);
 }
 
@@ -96,7 +98,7 @@ void copyFromRemote(uint32_t remoteToken, uint64_t remoteAddr, void* dst, size_t
     std::lock_guard<std::mutex> lock(g_mrMutex);
     auto it = g_memoryRegions.find(remoteToken);
     if (it == g_memoryRegions.end()) return;
-    const void* src = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(it->second.base) + remoteAddr);
+    const void* src = reinterpret_cast<void*>(remoteAddr);
     std::memcpy(dst, src, size);
 }
 
@@ -473,6 +475,10 @@ public:
     // IND2Overlapped
     STDMETHODIMP CancelOverlappedRequests() override {
         cancelled_ = true;
+        {
+            std::lock_guard<std::mutex> lock(g_pendingMutex);
+            g_pendingCancelled = true;
+        }
         g_pendingCv.notify_all();
         return S_OK;
     }

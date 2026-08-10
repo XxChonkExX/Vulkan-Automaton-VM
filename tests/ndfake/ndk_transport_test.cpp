@@ -44,16 +44,27 @@ static bool tryCreateVulkan(VkInstance* outInstance, VkPhysicalDevice* outPhysDe
     appInfo.pApplicationName = "ndk_transport_test";
     appInfo.apiVersion = VK_API_VERSION_1_3;
 
-    const char* exts[] = {
+    const char* wantExts[] = {
         VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME,
-        VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
-        VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
         VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
+        VK_EXT_DEBUG_UTILS_EXTENSION_NAME,
     };
+    uint32_t availCount = 0;
+    vkEnumerateInstanceExtensionProperties(nullptr, &availCount, nullptr);
+    std::vector<VkExtensionProperties> avail(availCount);
+    vkEnumerateInstanceExtensionProperties(nullptr, &availCount, avail.data());
+    std::vector<const char*> exts;
+    for (const char* e : wantExts) {
+        bool found = false;
+        for (auto& p : avail) {
+            if (std::strcmp(p.extensionName, e) == 0) { found = true; break; }
+        }
+        if (found) exts.push_back(e);
+    }
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &appInfo;
-    ici.enabledExtensionCount = sizeof(exts)/sizeof(exts[0]);
-    ici.ppEnabledExtensionNames = exts;
+    ici.enabledExtensionCount = static_cast<uint32_t>(exts.size());
+    ici.ppEnabledExtensionNames = exts.data();
 
     VkResult vr = vkCreateInstance(&ici, nullptr, outInstance);
     if (vr != VK_SUCCESS) {
@@ -78,20 +89,32 @@ static bool tryCreateVulkan(VkInstance* outInstance, VkPhysicalDevice* outPhysDe
     *outPhysDev = physDevs[0];
 
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-    const char* devExts[] = {
+    const char* wantDevExts[] = {
         VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
         VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
         VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
         VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
     };
+    uint32_t devAvailCount = 0;
+    vkEnumerateDeviceExtensionProperties(*outPhysDev, nullptr, &devAvailCount, nullptr);
+    std::vector<VkExtensionProperties> devAvail(devAvailCount);
+    vkEnumerateDeviceExtensionProperties(*outPhysDev, nullptr, &devAvailCount, devAvail.data());
+    std::vector<const char*> devExts;
+    for (const char* e : wantDevExts) {
+        bool found = false;
+        for (auto& p : devAvail) {
+            if (std::strcmp(p.extensionName, e) == 0) { found = true; break; }
+        }
+        if (found) devExts.push_back(e);
+    }
     VkPhysicalDeviceBufferDeviceAddressFeatures bufAddrFeat{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
     bufAddrFeat.bufferDeviceAddress = VK_TRUE;
     VkPhysicalDeviceTimelineSemaphoreFeatures tsFeat{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
     tsFeat.timelineSemaphore = VK_TRUE;
     bufAddrFeat.pNext = &tsFeat;
     dci.pEnabledFeatures = nullptr;
-    dci.enabledExtensionCount = sizeof(devExts)/sizeof(devExts[0]);
-    dci.ppEnabledExtensionNames = devExts;
+    dci.enabledExtensionCount = static_cast<uint32_t>(devExts.size());
+    dci.ppEnabledExtensionNames = devExts.data();
     dci.pNext = &bufAddrFeat;
 
     vr = vkCreateDevice(*outPhysDev, &dci, nullptr, outDevice);
@@ -172,12 +195,16 @@ static bool testLoopback(uint16_t portA, uint16_t portB, VkPhysicalDevice physDe
                 "Data mismatch after rdmaWrite (A's memory should equal B's sendBuf)");
     std::printf("A: memory verified after B's write\n");
 
-    // A does RDMA_READ from B's memory (reads back into A's buffer)
+    // A does RDMA_READ from B's memory (reads back into A's buffer).
+    // Each side owns its own connection handle: A's is the accepted one.
+    auto connsA = transportA->getConnections();
+    TEST_ASSERT(connsA.size() == 1, "A should see the accepted connection");
+    RdmaConnection connA = connsA.front();
     std::vector<uint8_t> readBackBuf(testSize);
     auto mrRead = transportA->registerHostMemory(readBackBuf.data(), testSize);
     TEST_ASSERT(mrRead.has_value(), "A register read buffer failed");
 
-    ok = transportA->rdmaRead(*conn, *mrRead, mrB->rdmaAddr, mrB->rkey, testSize, UINT64_MAX);
+    ok = transportA->rdmaRead(connA, *mrRead, mrB->rdmaAddr, mrB->rkey, testSize, UINT64_MAX);
     TEST_ASSERT(ok, "A rdmaRead from B failed");
     std::printf("A: rdmaRead from B completed\n");
 
@@ -189,8 +216,8 @@ static bool testLoopback(uint16_t portA, uint16_t portB, VkPhysicalDevice physDe
     transportA->unregisterMemory(*mrRead);
     transportA->unregisterMemory(*mrA);
     transportB->unregisterMemory(*mrB);
-    transportA->disconnect(*conn);
     transportB->disconnect(*conn);
+    transportA->disconnect(connA);
 
     std::printf("Loopback test PASSED\n");
     return true;
@@ -230,6 +257,8 @@ static bool testProviderLoad() {
 }
 
 int main(int argc, char* argv[]) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "-v") == 0 || std::strcmp(argv[i], "--verbose") == 0) {
             gVerbose = true;

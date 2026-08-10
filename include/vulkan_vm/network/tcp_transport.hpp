@@ -67,15 +67,39 @@ struct TcpMessage {
     void* streamSink = nullptr;
     std::function<void()> streamSinkCleanup;
     void* streamContext = nullptr;  // handler-private state between phases
+
+    // --- Optional windowed streaming (double-buffered pipeline) ---
+    // Same contract as StreamIO::onWindowAcquire/onWindowConsumed for
+    // inbound request streams, and onWindowProvide for outbound response
+    // streams.
+    std::function<bool(uint64_t idx, void** dst, uint64_t want, uint64_t& got)> streamWindowAcquire;
+    std::function<bool(uint64_t idx, uint64_t len)> streamWindowConsumed;
+    std::function<bool(uint64_t idx, const void** src, uint64_t want, uint64_t& got)> streamWindowProvide;
 };
 
 // Client-side stream I/O for request(): streams a request payload out of
 // writeBuffer and/or a response payload into readBuffer, slice by slice.
+// Optional windowed mode (double-buffered pipeline): when the window
+// callbacks are set, streaming runs through them instead so the caller can
+// overlap GPU copies with network I/O and ride out high-latency links with
+// more in-flight data.
 struct StreamIO {
     const void* writeBuffer = nullptr;  // bytes to send as the request stream
     uint64_t writeLen = 0;
     void* readBuffer = nullptr;         // where to receive the response stream
     uint64_t readLen = 0;
+
+    // Receive side: acquire() hands the transport a stable destination for
+    // the next slice (the caller may block on its own copy fences first so
+    // a buffer is only refilled after its previous contents were consumed).
+    // consumed() is called once the slice landed, so the caller can submit
+    // GPU work on it while later slices are still arriving.
+    std::function<bool(uint64_t idx, void** dst, uint64_t want, uint64_t& got)> onWindowAcquire;
+    std::function<bool(uint64_t idx, uint64_t len)> onWindowConsumed;
+
+    // Send side: provide() fills the next slice (blocking on GPU copies),
+    // so copies of later slices pipeline behind the wire.
+    std::function<bool(uint64_t idx, const void** src, uint64_t want, uint64_t& got)> onWindowProvide;
 };
 
 // TLS configuration
@@ -156,25 +180,7 @@ public:
     
     // Get the calculated optimal stripe count for a given payload size
     static size_t calculateOptimalStripes(uint64_t dataSize);
-    
-    // ========================================================================
-    // Control Plane & Cluster Orchestration
-    // ========================================================================
-    // Initiates master->worker handshake, then streams tensor data with
-    // dynamic stripe scaling and zero-copy Vulkan memory delivery.
-    // Returns true on successful transfer with commit, false on failure with rollback.
-    bool broadcastTensor(const std::string& host, uint16_t dataPort, uint16_t controlPort,
-                         const void* tensorData, uint64_t tensorSize,
-                         uint64_t targetOffset, uint64_t transactionId);
-    
-    // Worker-side: listens for master handshake, receives tensor directly into
-    // Vulkan pool memory. Blocks until transfer completes or fails.
-    bool ingestTensor(const std::string& host, uint16_t dataPort, uint16_t controlPort,
-                      void* vulkanPoolBase, uint64_t poolCapacity);
-    
-    // Transactional recovery: manually trigger rollback for a failed transaction
-    void triggerRollback(uint64_t transactionId, void* vulkanPoolBase);
-    
+
     // TLS support
     bool enableTls(const TlsConfig& tlsConfig);
     bool isTlsEnabled() const;

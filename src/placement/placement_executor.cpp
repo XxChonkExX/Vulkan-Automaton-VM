@@ -2,7 +2,9 @@
 #include "vulkan_vm/network/multi_node_manager.hpp"
 #include "vulkan_vm/network/model_registry.hpp"
 #include "vulkan_vm/offload.hpp"
+#include "vulkan_vm/utils.hpp"
 #include <algorithm>
+#include <memory>
 #include <mutex>
 #include <chrono>
 
@@ -23,28 +25,30 @@ struct ShardState {
 
 class ShardTable {
 public:
-    ShardState* get(const std::string& shardId) {
+    // Returns a reference-counted handle so concurrent erases cannot leave a
+    // caller with a dangling pointer (the map owns shared_ptr slots).
+    std::shared_ptr<ShardState> get(const std::string& shardId) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = table_.find(shardId);
-        return it != table_.end() ? it->second.get() : nullptr;
+        return it != table_.end() ? it->second : nullptr;
     }
 
-    ShardState& emplace(const std::string& shardId, const std::string& contentHash, MemTier tier, VkDeviceSize bytes) {
+    std::shared_ptr<ShardState> emplace(const std::string& shardId, const std::string& contentHash, MemTier tier, VkDeviceSize bytes) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = table_.find(shardId);
         if (it == table_.end()) {
-            auto ptr = std::make_unique<ShardState>();
+            auto ptr = std::make_shared<ShardState>();
             ptr->shardId = shardId;
             ptr->contentHash = contentHash;
             ptr->tier = tier;
-            ptr->bytes = 0;
-            auto [it2, inserted] = table_.emplace(shardId, std::move(ptr));
-            return *it2->second;
+            ptr->bytes = bytes;
+            auto [it2, inserted] = table_.emplace(shardId, ptr);
+            return it2->second;
         }
         // Already exists - update fields
-        ShardState& state = *it->second;
-        state.contentHash = contentHash;
-        state.tier = tier;
+        std::shared_ptr<ShardState> state = it->second;
+        state->contentHash = contentHash;
+        state->tier = tier;
         return state;
     }
 
@@ -62,7 +66,7 @@ public:
     }
 
 private:
-    std::unordered_map<std::string, std::unique_ptr<ShardState>> table_;
+    std::unordered_map<std::string, std::shared_ptr<ShardState>> table_;
     mutable std::mutex mutex_;
 };
 
@@ -149,9 +153,17 @@ private:
     PlacementPolicy policy_;
     ShardTable shardTable_;
 
+    // Buffer usage for resident shards: STORAGE + device address + transfer so
+    // model code can read weights and the hub can stage them in/out.
+    static constexpr VkBufferUsageFlags kShardUsage =
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
     Status executeShard(const ShardSpec& spec, const ShardPlacement& placement, const ExecuteOptions& opt) {
         // Idempotency: check if already ready with same hash
-        ShardState* existing = shardTable_.get(spec.shardId);
+        auto existing = shardTable_.get(spec.shardId);
         if (existing) {
             std::lock_guard<std::mutex> lock(existing->mutex);
             if (existing->state == ShardState::State::Ready && existing->contentHash == spec.contentHash) {
@@ -163,33 +175,40 @@ private:
         }
 
         // Ensure entry exists
-        ShardState& state = shardTable_.emplace(spec.shardId, spec.contentHash, placement.tier, spec.bytes);
-        state.bytes = spec.bytes;
+        auto state = shardTable_.emplace(spec.shardId, spec.contentHash, placement.tier, spec.bytes);
+        state->bytes = spec.bytes;
 
-        // Fetch if needed
-        if (opt.fetchIfMissing && hub_) {
-            // ModelHub::fetch(shard) -> local cache path
-            // For now, assume files are already in cache or fetch is handled by hub
+        // Fetch if needed (v0: assumes files pre-seeded under the hub cache;
+        // remote chunk fetch belongs to the coordinator RPC layer).
+        if (opt.fetchIfMissing && hub_ && placement.tier == MemTier::DiskCache) {
+            // Nothing to pull locally; hub ownership of the cache is sufficient.
         }
 
         // Allocate based on tier
         if (placement.tier == MemTier::DeviceLocal || placement.tier == MemTier::HostOffload) {
-            // Use UnifiedMemoryPool via MultiNodePoolManager
-            // This is a simplified version; actual implementation needs pool access
-            // For now, return success
-        } else if (placement.tier == MemTier::DiskCache) {
-            // Just verify cache file exists
+            auto alloc = node_.allocateLocal(spec.bytes, kShardUsage);
+            if (!alloc) {
+                VVM_LOG_ERROR("executeShard: allocation failed for {} ({} bytes)", spec.shardId, spec.bytes);
+                state->state = ShardState::State::Failed;
+                return Status::fail(ErrorCode::AllocationFailed,
+                                    "shard allocation failed: " + spec.shardId);
+            }
+            state->allocation = std::make_unique<Allocation>(std::move(*alloc));
+            state->state = ShardState::State::Ready;
+            return Status::ok();
         }
 
+        // DiskCache tier: nothing to allocate; the data is cold on disk by
+        // definition and is staged when demanded.
+        state->state = ShardState::State::Ready;
         return Status::ok();
     }
 
     void rollbackLocal(const std::vector<std::string>& shardIds) {
         for (const auto& id : shardIds) {
-            if (auto* state = shardTable_.get(id)) {
-                // Free allocation if any
+            if (auto state = shardTable_.get(id)) {
                 if (state->allocation) {
-                    // Would call pool_->deallocate(std::move(*state->allocation));
+                    node_.deallocateLocal(std::move(*state->allocation));
                 }
                 shardTable_.erase(id);
             }

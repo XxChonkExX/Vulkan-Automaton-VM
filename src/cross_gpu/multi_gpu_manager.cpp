@@ -400,10 +400,9 @@ bool MultiGPUPoolManager::copyDeviceToDevice(
         return false;
     }
 
-    bool waitInternal = (fence == VK_NULL_HANDLE);
     VkFence done = fence;
     VkFence internalFence = VK_NULL_HANDLE;
-    if (waitInternal) {
+    if (fence == VK_NULL_HANDLE) {
         VkFenceCreateInfo fInfo{};
         fInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         if (vkCreateFence(dev.device, &fInfo, nullptr, &internalFence) != VK_SUCCESS) {
@@ -420,8 +419,12 @@ bool MultiGPUPoolManager::copyDeviceToDevice(
     submitInfo.pCommandBuffers = &cmd;
     rc = vkQueueSubmit(queue, 1, &submitInfo, done);
 
-    if (waitInternal && rc == VK_SUCCESS) {
-        rc = vkWaitForFences(dev.device, 1, &internalFence, VK_TRUE, UINT64_MAX);
+    // Always wait before tearing down the command pool and the imported
+    // alias: with a caller-provided fence, skipping an internal wait would
+    // destroy the command buffer and the remote-alias memory while the GPU
+    // copy is still reading it.
+    if (rc == VK_SUCCESS) {
+        rc = vkWaitForFences(dev.device, 1, &done, VK_TRUE, UINT64_MAX);
     }
 
     if (rc != VK_SUCCESS) {
@@ -538,50 +541,25 @@ bool MultiGPUPoolManager::copyDeviceToDeviceHostStaged(
 void MultiGPUPoolManager::submitMigrationBarrier(
     const std::vector<MigrationOperation>& ops) {
     
-    if (ops.empty()) return;
+    if (instances_.empty()) return;
+    (void)ops;
     
     // Signal timeline semaphore on master
     timelineValue_++;
     
-    VkTimelineSemaphoreSubmitInfo timelineInfo{};
-    timelineInfo.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
-    timelineInfo.signalSemaphoreValueCount = 1;
-    timelineInfo.pSignalSemaphoreValues = &timelineValue_;
-    
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.pNext = &timelineInfo;
-    submitInfo.signalSemaphoreCount = 1;
-    submitInfo.pSignalSemaphores = &timelineSemaphore_;
-    submitInfo.commandBufferCount = 0;
-    
-    // Submit to master's transfer queue
-    auto& master = instances_[0];
-    VkQueue queue = master.config.transferQueue != VK_NULL_HANDLE 
-        ? master.config.transferQueue 
-        : master.config.graphicsQueue;
-    
-    vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
-    
-    // Wait on all peer devices
-    for (size_t i = 1; i < instances_.size(); ++i) {
-        VkTimelineSemaphoreSubmitInfo waitTimelineInfo{};
-        waitTimelineInfo.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
-        waitTimelineInfo.waitSemaphoreValueCount = 1;
-        waitTimelineInfo.pWaitSemaphoreValues = &timelineValue_;
-        
-        VkSubmitInfo waitSubmitInfo{};
-        waitSubmitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        waitSubmitInfo.pNext = &waitTimelineInfo;
-        waitSubmitInfo.waitSemaphoreCount = 1;
-        waitSubmitInfo.pWaitSemaphores = &timelineSemaphore_;
-        waitSubmitInfo.commandBufferCount = 0;
-        
-        VkQueue peerQueue = instances_[i].config.transferQueue != VK_NULL_HANDLE
-            ? instances_[i].config.transferQueue
-            : instances_[i].config.graphicsQueue;
-        
-        vkQueueSubmit(peerQueue, 1, &waitSubmitInfo, VK_NULL_HANDLE);
+    // A VkSemaphore is device-scoped: submitting waits for the master's
+    // semaphore on peer-device queues is invalid (VUID-VkSubmitInfo-
+    // waitSemaphore-00061). Sharing it across devices would require external
+    // semaphore import, which is not wired here. Implement the barrier
+    // host-side instead: every device must be idle before the barrier
+    // returns, which is a strict superset of the intended ordering.
+    for (auto& instance : instances_) {
+        VkQueue queue = instance.config.transferQueue != VK_NULL_HANDLE
+            ? instance.config.transferQueue
+            : instance.config.graphicsQueue;
+        if (queue != VK_NULL_HANDLE) {
+            vkQueueWaitIdle(queue);
+        }
     }
 }
 

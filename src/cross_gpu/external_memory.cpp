@@ -102,6 +102,7 @@ VendorPairCaps getCrossVendorCaps(VkPhysicalDevice src, VkPhysicalDevice dst) {
     bool dstNvidia = (dstVendor.vendorID == 0x10DE);
     bool dstAmd = (dstVendor.vendorID == 0x1002);
     bool dstIntel = (dstVendor.vendorID == 0x8086);
+    caps.sameVendor = (srcVendor.vendorID == dstVendor.vendorID);
     
     auto srcCaps = queryExternalMemoryCaps(src);
     auto dstCaps = queryExternalMemoryCaps(dst);

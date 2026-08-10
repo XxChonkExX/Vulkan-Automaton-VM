@@ -200,17 +200,38 @@ PlacementPlan ShardPlacer::plan(const ModelManifest& model,
                     continue;
                 }
 
-                // Check activation reservation
+                // Check activation reservation. Activations execute on the GPU
+                // regardless of the weight tier, so the reserve always comes
+                // out of vramFree before any shard is placed.
                 if (!node.activationReserved && node.reservedActivation > 0) {
-                    if (node.vramFree >= node.reservedActivation) {
-                        node.vramFree -= node.reservedActivation;
-                        node.activationReserved = true;
+                    if (node.vramFree < node.reservedActivation) {
+                        // This node cannot even hold its activation reserve.
+                        if (available > bestTry.bestFree) {
+                            bestTry.bestFree = available;
+                            bestTry.bestTier = tier;
+                            bestTry.nodeId = node.nodeId;
+                        }
+                        continue;
                     }
+                    node.vramFree -= node.reservedActivation;
+                    node.activationReserved = true;
                 }
 
-                // Allocate
+                // Allocate. Re-check DeviceLocal capacity now that the
+                // activation reserve is held, so vramFree can never wrap.
                 switch (tier) {
-                    case MemTier::DeviceLocal: node.vramFree -= need; break;
+                    case MemTier::DeviceLocal: {
+                        if (node.vramFree < need) {
+                            if (available > bestTry.bestFree) {
+                                bestTry.bestFree = available;
+                                bestTry.bestTier = tier;
+                                bestTry.nodeId = node.nodeId;
+                            }
+                            continue;
+                        }
+                        node.vramFree -= need;
+                        break;
+                    }
                     case MemTier::HostOffload: node.hostFree -= need; break;
                     case MemTier::DiskCache: node.diskFree -= need; break;
                 }

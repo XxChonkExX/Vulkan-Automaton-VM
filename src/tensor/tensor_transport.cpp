@@ -437,6 +437,7 @@ public:
         if (config_.enableAsyncPipeline) {
             stopAsyncThread_ = false;
             asyncThread_ = std::thread(&TensorTransportImpl::asyncProcessingLoop, this);
+            asyncThreadId_ = asyncThread_.get_id();
         }
         
         initialized_ = true;
@@ -629,10 +630,64 @@ public:
         
         // Need layout conversion - use compute shader
         if (!convertLayoutShader(src, dst, targetLayout)) {
-            VVM_LOG_WARN("Layout conversion failed, falling back to plain copy");
-            return copyTensor(src, dst);
+            VVM_LOG_WARN("Layout conversion shader failed for {}", static_cast<int>(targetLayout));
+            // Fall back to an honest CPU permute so the conversion is applied
+            // even when the SPIR-V shader is unavailable.
+            return convertLayoutCpuFallback(src, dst, targetLayout);
         }
         
+        return true;
+    }
+    
+    // Host-side NHWC <-> NCHW permute. Also covers non-4D tensors with a flat
+    // copy, where the layout flags have no byte-level meaning.
+    bool convertLayoutCpuFallback(const TensorHandle& src, const TensorHandle& dst, MemoryLayout targetLayout) {
+        const size_t bytes = src->metadata.bytes();
+        if (dst->metadata.bytes() != bytes) {
+            VVM_LOG_ERROR("convertLayoutCpuFallback: size mismatch (src={}, dst={})", bytes, dst->metadata.bytes());
+            return false;
+        }
+        if (bytes == 0) return true;
+        
+        std::vector<uint8_t> hostSrc(bytes);
+        std::vector<uint8_t> hostDst(bytes);
+        if (!gpuToHost(src, hostSrc.data(), 0, bytes)) {
+            VVM_LOG_ERROR("convertLayoutCpuFallback: gpuToHost failed");
+            return false;
+        }
+        
+        const TensorShape& shape = src->metadata.shape;
+        const size_t elemSize = packedElemSize(src->metadata.dtype);
+        if (shape.dims.size() < 4) {
+            std::memcpy(hostDst.data(), hostSrc.data(), bytes);
+        } else {
+            const uint32_t N = static_cast<uint32_t>(shape.dims[0]);
+            const uint32_t H = static_cast<uint32_t>(shape.dims[1]);
+            const uint32_t W = static_cast<uint32_t>(shape.dims[2]);
+            const uint32_t C = static_cast<uint32_t>(shape.dims[3]);
+            const bool toNchw = (src->metadata.layout == MemoryLayout::ChannelsLast &&
+                                 targetLayout == MemoryLayout::Contiguous);
+            
+            const uint64_t planes = static_cast<uint64_t>(N) * H * W;
+            const uint8_t* s = hostSrc.data();
+            uint8_t* d = hostDst.data();
+            for (uint64_t i = 0; i < planes; ++i) {
+                for (uint32_t c = 0; c < C; ++c) {
+                    const uint64_t srcOffset = toNchw
+                        ? (i * C + c) * elemSize
+                        : (c * planes + i) * elemSize;
+                    const uint64_t dstOffset = toNchw
+                        ? (c * planes + i) * elemSize
+                        : (i * C + c) * elemSize;
+                    std::memcpy(d + dstOffset, s + srcOffset, elemSize);
+                }
+            }
+        }
+        
+        if (!hostToGpu(dst, 0, hostDst.data(), bytes)) {
+            VVM_LOG_ERROR("convertLayoutCpuFallback: hostToGpu failed");
+            return false;
+        }
         return true;
     }
     
@@ -866,7 +921,8 @@ public:
             pushConstants[0] = 1;
             pushConstants[1] = 1;
             pushConstants[2] = 1;
-            pushConstants[3] = static_cast<uint32_t>(src->metadata.bytes() / 2); // Assuming FP16
+            pushConstants[3] = static_cast<uint32_t>(
+                src->metadata.bytes() / packedElemSize(src->metadata.dtype));
         }
         if (shaderName == "NHWC_to_NCHW") {
             pushConstants[4] = 0;
@@ -968,59 +1024,12 @@ public:
             }
         }
         
-        if (!loaded) {
-            VVM_LOG_WARN("Failed to load layout conversion shader from any path, using fallback");
-            // Fallback to minimal valid SPIR-V (no-op shader)
-            const uint32_t fallbackSpirv[] = {
-                0x07230203, 0x00010000, 0x00080001, 0x0000001e,  // SPIR-V header
-                0x00000000, 0x00000001, 0x00000000, 0x00000000,
-                0x0000000b, 0x00000001, 0x00000000, 0x00000000,
-                0x00000000, 0x00000001, 0x00000000, 0x00000000,
-                0x00000005, 0x00000004, 0x00000000, 0x00000000,
-                0x00000047, 0x00000004, 0x00000004, 0x6d61696e,
-                0x00000000, 0x00000000, 0x00000000, 0x00000000,
-                0x00000005, 0x00000004, 0x00000001, 0x6d61696e,
-                0x00000005, 0x00000009, 0x0000000d, 0x00000011,
-                0x00000005, 0x00000004, 0x00000002, 0x00000000,
-                0x00000003, 0x00000004, 0x00000003, 0x00000000,
-                0x00000002, 0x00000004, 0x00000000, 0x00000000,
-                0x00000002, 0x00000004, 0x00000001, 0x00000000,
-                0x00000005, 0x00000004, 0x00000004, 0x00000000,
-                0x00000003, 0x00000004, 0x00000005, 0x00000000,
-                0x00000004, 0x00000004, 0x00000006, 0x00000000,
-                0x00000005, 0x00000003, 0x00000004, 0x00000000,
-                0x00000002, 0x00000004, 0x00000007, 0x00000000,
-                0x00000004, 0x00000003, 0x00000007, 0x00000000,
-                0x00000001, 0x00000004, 0x00000008, 0x00000000,
-                0x00000004, 0x00000003, 0x00000008, 0x00000000,
-                0x00000005, 0x00000004, 0x00000009, 0x00000000,
-                0x00000004, 0x00000003, 0x00000009, 0x00000000,
-                0x00000005, 0x00000004, 0x0000000a, 0x00000000,
-                0x00000004, 0x00000003, 0x0000000a, 0x00000000,
-                0x00000005, 0x00000004, 0x0000000b, 0x00000000,
-                0x00000004, 0x00000003, 0x0000000b, 0x00000000,
-                0x00000005, 0x00000004, 0x0000000c, 0x00000000,
-                0x00000004, 0x00000003, 0x0000000c, 0x00000000,
-                0x00000005, 0x00000004, 0x0000000d, 0x00000000,
-                0x00000004, 0x00000003, 0x0000000d, 0x00000000,
-                0x00000005, 0x00000004, 0x0000000e, 0x00000000,
-                0x00000004, 0x00000003, 0x0000000e, 0x00000000,
-                0x00000005, 0x00000004, 0x0000000f, 0x00000000,
-                0x00000004, 0x00000003, 0x0000000f, 0x00000000,
-                0x00000005, 0x00000004, 0x00000010, 0x00000000,
-                0x00000004, 0x00000003, 0x00000010, 0x00000000,
-            };
-            
-            VkShaderModuleCreateInfo createInfo{};
-            createInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-            createInfo.codeSize = sizeof(fallbackSpirv);
-            createInfo.pCode = fallbackSpirv;
-            
-            VkShaderModule shaderModule;
-            if (vkCreateShaderModule(device, &createInfo, nullptr, &shaderModule) != VK_SUCCESS) {
-                return VK_NULL_HANDLE;
-            }
-            return shaderModule;
+if (!loaded) {
+            // No synthetic fallback: a no-op module would let the caller
+            // believe the layout was converted while the data stays in the
+            // source order. Fail loudly; callers switch to the CPU fallback.
+            VVM_LOG_ERROR("Failed to load layout conversion shader from any search path");
+            return VK_NULL_HANDLE;
         }
         
         VkShaderModuleCreateInfo createInfo{};
@@ -1382,6 +1391,8 @@ private:
                     
                     lock.lock();
                 }
+                // Queue drained: wake flushAsync() waiters.
+                asyncCV_.notify_all();
             }
         }
     }
@@ -1389,8 +1400,13 @@ private:
     void flushAsync() override {
         // If async thread is running, wait until queue is drained
         if (asyncThread_.joinable()) {
+            if (std::this_thread::get_id() == asyncThreadId_) {
+                // Called from the async worker itself; waiting here would
+                // self-deadlock, and pending ops run after we return.
+                return;
+            }
             std::unique_lock<std::mutex> lock(asyncMutex_);
-            asyncCV_.wait(lock, [this] { return asyncQueue_.empty(); });
+            asyncCV_.wait(lock, [this] { return asyncQueue_.empty() || stopAsyncThread_; });
         }
         // Without async thread, operations run inline so nothing to drain
     }
@@ -1521,6 +1537,7 @@ private:
     
     // Async processing
     std::thread asyncThread_;
+    std::thread::id asyncThreadId_{};
     std::atomic<bool> stopAsyncThread_{false};
     std::mutex asyncMutex_;
     std::condition_variable asyncCV_;

@@ -301,6 +301,12 @@ build_ninja\examples\model_registry_test.exe
 
 **Protocol hardening:** every inbound message is length-checked against hard caps (`kMaxBodySize` = 1 GiB, `kMaxStreamSize` = 16 GiB) on both the server and client receive paths. Headers that exceed a cap are rejected and the connection dropped, preventing malformed or hostile peers from triggering unbounded allocations. TLS 1.2+ (OpenSSL) is supported for non-localhost clusters, and `NetworkConfig::validate()` rejects invalid MTU/listen settings.
 
+**Transfer paths (push and pull migrations):**
+- **Default — single full-sized staging buffer (proven):** one host-visible staging allocation per transfer, one synchronous device copy, and the bulk stream moved directly between socket and staging in 4 MB slices. This is the default and only enabled path.
+- **Striped transfers (enabled by default):** transfers larger than 64 MB are sharded across multiple parallel pool sockets (`writeStreamStripedAuto` / `readStreamStripedAuto`), bounded by `poolSize × hwCores × sliceCount`; each socket owns a contiguous segment, so assembly uses no intermediate copy. Byte-exact verified on loopback.
+- **EXPERIMENTAL — windowed double-buffered pipeline (opt-in, off by default):** `NetworkConfig::enableAdaptiveWindow = true` switches migrations onto a two-to-four-window host-staging pipeline with per-window fences and adaptive window sizing (`streamWindowBytes`, `streamPipelineBuffers`). Designed to keep data in flight under high latency, but **not yet validated on real multi-IP fabrics or all drivers** — do not enable in production clusters until proven. Small transfers always fall back to the single-staging path.
+- **RDMA / GPU-direct:** `NdkRdmaTransport` (Windows, Network Direct) and `VerbsRdmaTransport` (Linux) implement the `RdmaTransport` contract; host-staged RDMA is the supported data route on Windows (`registerGpuMemory` reports GPU-direct unsupported there). RDMA is compiled out unless `VVM_NETWORK_HAS_VERBS` / `VVM_NETWORK_HAS_NDKPI` is defined and `enableRdma` is set.
+
 ### Control-Plane Messages
 
 `MsgRegisterNode`, `MsgGetClusterView`, `MsgAllocate`, `MsgExport`, `MsgImport`, `MsgMigratePull`, `MsgMigratePush`, `MsgHeartbeat`, `MsgLeaveCluster`, `MsgDeallocate`, `MsgModelList`, `MsgModelManifest`, `MsgModelChunk`.
