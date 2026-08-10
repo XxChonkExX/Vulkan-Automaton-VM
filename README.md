@@ -325,6 +325,64 @@ migrateFromRemote: pulled 16777216 bytes from 127.0.0.1:51012#0
 
 **Status:** ✅ End-to-end verified on WSL2 (custom kernel 6.18.40, `rxe0` + `rxe1`). On native Linux with physical RNIC, the same verbs path uses hardware RDMA. Without SoftRoCE or hardware RNIC, the network module falls back to **host-staged TCP** (always available).
 
+### UCX (Unified Communication X) Transport
+
+For production multi-transport clusters, VulkanVM integrates **UCX** (Unified Communication X) as a high-level transport backend. UCX automatically selects the best available transport at runtime: InfiniBand verbs, RoCE, TCP, shared memory, and GPU memory (CUDA/ROCm/Level Zero).
+
+**Key features:**
+- **Auto transport selection**: IB verbs → RoCE → TCP → shared memory → CUDA IPC
+- **GPU memory registration**: `ucp_mem_map` for zero-copy RDMA from GPU VRAM
+- **Tag matching + RMA**: `ucp_tag_send`/`recv` for control, `ucp_put`/`get` for RDMA
+- **Rendezvous protocol**: Automatic switch to RDMA for large messages
+- **CUDA/ROCm/Ze IPC**: Intra-node GPU copies without host staging
+
+**Enable UCX:**
+```cpp
+TransportConfig config;
+config.enableUCX = true;
+config.ucxTLS = "rc,ud,sm,tcp";      // transport layers
+config.ucxNetDevices = "mlx5_0:1";   // NIC selection
+config.ucxEnableGPUMem = true;       // GPU memory registration
+config.ucxEnableRndv = true;         // rendezvous for large msgs
+config.ucxRndvThreshold = 8192;      // bytes
+config.ucxEnableCudaIpc = true;      // intra-node GPU IPC
+```
+
+**UCX TLS (Transport Layer Selection):**
+| TLS | Description |
+|-----|-------------|
+| `rc` | Reliable Connected (InfiniBand/RoCE) |
+| `ud` | Unreliable Datagram |
+| `sm` | Shared Memory (intra-node) |
+| `tcp` | TCP/IP fallback |
+| `cuda_ipc` | CUDA IPC (intra-node GPU) |
+| `cuda_copy` | CUDA copy (staged) |
+
+**Attribution:** UCX (https://github.com/openucx/ucx) — BSD-3-Clause, Pavel Shamis et al.
+
+### GDRCopy-Style Persistent Host Pinning (NDKPI / Windows)
+
+For high-frequency RDMA on Windows NDKPI, VulkanVM implements **persistent host memory pinning** inspired by NVIDIA's GDRCopy (`gdr_pin_buffer`/`gdr_unpin_buffer`). This avoids repeated `IND2MemoryRegion::Register`/`Deregister` overhead on hot paths.
+
+**API:**
+```cpp
+// Pin host memory for repeated RDMA use (ref-counted)
+bool pinPersistentHostMemory(void* ptr, size_t size);
+
+// Release persistent pin (decrements ref count; actual deregister at 0)
+void releasePersistentHostMemory(void* ptr);
+```
+
+**How it works:**
+- First `pinPersistentHostMemory` → creates `IND2MemoryRegion` + `Register`
+- Subsequent pins → increments ref count, reuses existing registration
+- `releasePersistentHostMemory` → decrements ref count; actual `Deregister` only at 0
+- Thread-safe with `std::unique_lock`
+
+**Use case:** Pre-pin staging buffers during initialization, reuse for thousands of RDMA operations without registration overhead.
+
+**Attribution:** Pattern inspired by GDRCopy (https://github.com/NVIDIA/gdrcopy) — MIT, NVIDIA.
+
 ---
 
 ## ModelHub & Shard Placement
