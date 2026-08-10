@@ -139,24 +139,26 @@ std::optional<UnifiedMemoryPool> UnifiedMemoryPool::create(
 }
 
 UnifiedMemoryPool::UnifiedMemoryPool(UnifiedMemoryPool&& other) noexcept
-    : deviceConfig_(std::move(other.deviceConfig_))
-    , config_(std::move(other.config_))
-    , device_(other.device_)
-    , blocks_(std::move(other.blocks_))
-    , dedicatedAllocations_(std::move(other.dedicatedAllocations_))
-    , deviceLocalMemoryType_(other.deviceLocalMemoryType_)
-    , hostVisibleMemoryType_(other.hostVisibleMemoryType_)
-    , deviceLocalHeapIndex_(other.deviceLocalHeapIndex_)
-    , memoryBudgetAvailable_(other.memoryBudgetAvailable_)
-    , transferCmdPool_(other.transferCmdPool_)
-    , debugUtilsEnabled_(other.debugUtilsEnabled_)
-    , fnSetDebugName_(other.fnSetDebugName_)
-    , offloadManager_(std::move(other.offloadManager_))
-    , mutex_() {
+    : mutex_() {
     
-    // Lock source mutex to ensure thread-safe move
+    // Lock source mutex FIRST before any member access
     std::lock_guard<std::mutex> lock(other.mutex_);
     
+    deviceConfig_ = std::move(other.deviceConfig_);
+    config_ = std::move(other.config_);
+    device_ = other.device_;
+    blocks_ = std::move(other.blocks_);
+    dedicatedAllocations_ = std::move(other.dedicatedAllocations_);
+    deviceLocalMemoryType_ = other.deviceLocalMemoryType_;
+    hostVisibleMemoryType_ = other.hostVisibleMemoryType_;
+    deviceLocalHeapIndex_ = other.deviceLocalHeapIndex_;
+    memoryBudgetAvailable_ = other.memoryBudgetAvailable_;
+    transferCmdPool_ = other.transferCmdPool_;
+    debugUtilsEnabled_ = other.debugUtilsEnabled_;
+    fnSetDebugName_ = other.fnSetDebugName_;
+    offloadManager_ = std::move(other.offloadManager_);
+    
+    // Invalidate source
     other.device_ = VK_NULL_HANDLE;
     other.transferCmdPool_ = VK_NULL_HANDLE;
     other.fnSetDebugName_ = nullptr;
@@ -763,6 +765,8 @@ VVM_LOG_INFO("allocateDedicatedExportable: bind succeeded");
     alloc.memoryFlags = memFlags;
     alloc.hostPtr = hostPtr;
     alloc.deviceAddress = deviceAddress;
+    // Generation counter for handle validation
+    alloc.generation = nextGeneration();
     
     VVM_LOG_INFO("allocateDedicatedExportable: pushing to dedicatedAllocations_");
     // Track dedicated allocation for cleanup in destructor
@@ -839,12 +843,30 @@ std::optional<Allocation> UnifiedMemoryPool::allocateTensor(VkDeviceSize size,
 
 void UnifiedMemoryPool::deallocate(Allocation&& alloc) {
     std::lock_guard<std::mutex> lock(mutex_);
+    
+    // Validate generation counter to prevent stale handle use
+    if (!isValidGeneration(alloc.generation)) {
+        VVM_LOG_WARN("deallocate: stale allocation handle (generation {}) rejected", alloc.generation);
+        return;
+    }
+    
+    // Invalidate the generation to prevent double-free
+    alloc.generation = 0;
+    
     if (alloc.blockIndex == UINT32_MAX) {
         // Dedicated allocation - destroy directly
         subDeallocate(std::move(alloc));
     } else if (alloc.blockIndex < blocks_.size()) {
         subDeallocate(std::move(alloc));
     }
+}
+
+void UnifiedMemoryPool::deallocate(UniqueAllocation&& alloc) {
+    if (!alloc) return;
+    
+    // Extract the raw allocation and deallocate
+    Allocation rawAlloc = alloc.release();
+    deallocate(std::move(rawAlloc));
 }
 
 std::optional<ExternalMemoryInfo> UnifiedMemoryPool::exportMemory(
@@ -1400,6 +1422,9 @@ std::optional<Allocation> UnifiedMemoryPool::subAllocate(VkDeviceSize size,
         alloc.deviceAddress = vkGetBufferDeviceAddress(device_, &addrInfo);
     }
     
+    // Generation counter for handle validation
+    alloc.generation = nextGeneration();
+    
     return alloc;
 }
 
@@ -1407,6 +1432,14 @@ void UnifiedMemoryPool::subDeallocate(Allocation&& alloc) {
     // Dedicated allocations (blockIndex == UINT32_MAX) have their own VkDeviceMemory
     // and VkBuffer - destroy both directly and remove from tracking
     if (alloc.blockIndex == UINT32_MAX) {
+        // Validate generation counter
+        if (!isValidGeneration(alloc.generation)) {
+            VVM_LOG_WARN("subDeallocate: stale dedicated allocation handle (generation {}) rejected", alloc.generation);
+            return;
+        }
+        // Invalidate generation
+        alloc.generation = 0;
+        
         if (alloc.buffer) vkDestroyBuffer(device_, alloc.buffer, nullptr);
         if (alloc.memory) {
             if (alloc.hostPtr) vkUnmapMemory(device_, alloc.memory);
@@ -1423,6 +1456,14 @@ void UnifiedMemoryPool::subDeallocate(Allocation&& alloc) {
     }
 
     if (alloc.blockIndex >= blocks_.size()) return;
+
+    // Validate generation counter
+    if (!isValidGeneration(alloc.generation)) {
+        VVM_LOG_WARN("subDeallocate: stale block allocation handle (generation {}) rejected", alloc.generation);
+        return;
+    }
+    // Invalidate generation
+    alloc.generation = 0;
 
     vkDestroyBuffer(device_, alloc.buffer, nullptr);
 

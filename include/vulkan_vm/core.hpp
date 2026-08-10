@@ -144,6 +144,10 @@ struct Allocation {
 
     // Saved from the original pool mapping so reload can restore it.
     void* savedHostPtr = nullptr;
+
+    // Generation counter for handle validation (prevents stale handle use).
+    // Incremented on deallocate; allocation must match current generation to be valid.
+    uint64_t generation = 0;
 };
 
 // Block metadata (internal)
@@ -233,11 +237,30 @@ struct Result {
     }
 };
 
+// Templated Result for operations that return a value
+template<typename T>
+struct ResultT {
+    ErrorCode code = ErrorCode::Success;
+    VkResult vkResult = VK_SUCCESS;
+    std::string message;
+    T value;
+    
+    explicit operator bool() const { return code == ErrorCode::Success; }
+    static ResultT<T> success(T val) { return {ErrorCode::Success, VK_SUCCESS, "", std::move(val)}; }
+    static ResultT<T> error(ErrorCode c, const std::string& msg, VkResult vk = VK_SUCCESS) {
+        return {c, vk, msg, T{}};
+    }
+};
+
 class OffloadManager;  // forward declaration for UnifiedMemoryPool
 
 // ============================================================================
 // Unified Memory Pool (core definition)
 // ============================================================================
+//
+// Thread Safety: All public methods are thread-safe (guarded by internal mutex).
+//                Not thread-safe for concurrent move operations (move before use).
+//                Use UniqueAllocation for RAII ownership; avoid raw Allocation handles.
 
 class UnifiedMemoryPool {
 public:
@@ -272,6 +295,7 @@ public:
                                              VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     
     void deallocate(Allocation&& alloc);
+    void deallocate(UniqueAllocation&& alloc);
 
     // Cross-GPU: Export/Import
     // NOTE: exportMemory only supports dedicated allocations (created via
@@ -325,6 +349,14 @@ private:
     // Verify required Vulkan features/extensions were enabled at device creation.
     bool validateDeviceCapabilities() const;
     
+    // Generation tracking for handle validation
+    uint64_t nextGeneration() { return ++generationCounter_; }
+    uint64_t getCurrentGeneration() const { return generationCounter_; }
+    bool isValidGeneration(uint64_t generation) const { return generation == generationCounter_; }
+    
+    // Verify required Vulkan features/extensions were enabled at device creation.
+    bool validateDeviceCapabilities() const;
+    
     std::optional<uint32_t> findMemoryType(VkMemoryPropertyFlags required,
                                            VkMemoryPropertyFlags preferred);
     std::optional<VkDeviceMemory> allocateBlock(VkDeviceSize size,
@@ -363,6 +395,9 @@ private:
     
     // Offload manager for host swap
     std::unique_ptr<OffloadManager> offloadManager_;
+    
+    // Generation counter for handle validation (prevents stale handle use)
+    uint64_t generationCounter_ = 0;
 };
 
 // ============================================================================

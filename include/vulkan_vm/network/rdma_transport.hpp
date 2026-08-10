@@ -58,6 +58,10 @@ struct RdmaConnection {
     uint64_t lastActivityNs = 0;
 };
 
+// Thread Safety: All public methods are thread-safe.
+//                  initialize()/shutdown() must not be called concurrently with operations.
+//                  registerGpuMemory/unregisterMemory are thread-safe.
+//                  rdmaWrite/rdmaRead are thread-safe per connection.
 class RdmaTransport {
 public:
     // Factory

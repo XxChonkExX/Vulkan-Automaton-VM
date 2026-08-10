@@ -140,6 +140,7 @@ VkDeviceSize HostShadowManager::alignUp(VkDeviceSize value, VkDeviceSize alignme
 }
 
 std::optional<VkDeviceSize> HostShadowManager::allocateRegion(VkDeviceSize size) {
+    std::lock_guard<std::mutex> lock(mutex_);
     size = alignUp(size, 4096);  // Page align for madvise/mprotect
     
     for (auto it = shadowBuffer_.freeRanges.begin(); it != shadowBuffer_.freeRanges.end(); ++it) {
@@ -160,6 +161,7 @@ std::optional<VkDeviceSize> HostShadowManager::allocateRegion(VkDeviceSize size)
 }
 
 void HostShadowManager::freeRegion(VkDeviceSize offset, VkDeviceSize size) {
+    std::lock_guard<std::mutex> lock(mutex_);
     size = alignUp(size, 4096);
     shadowBuffer_.freeRanges.emplace_back(offset, size);
     shadowBuffer_.used -= size;
@@ -180,6 +182,7 @@ void HostShadowManager::freeRegion(VkDeviceSize offset, VkDeviceSize size) {
 }
 
 void* HostShadowManager::mapRegion(VkDeviceSize offset, VkDeviceSize size) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!shadowBuffer_.mappedPtr) return nullptr;
     return static_cast<char*>(shadowBuffer_.mappedPtr) + offset;
 }
@@ -192,26 +195,31 @@ void HostShadowManager::unmapRegion(VkDeviceSize offset, VkDeviceSize size) {
 
 #ifdef VVM_PLATFORM_LINUX
 void HostShadowManager::adviseDontNeed(VkDeviceSize offset, VkDeviceSize size) {
+    std::lock_guard<std::mutex> lock(mutex_);
     void* ptr = static_cast<char*>(shadowBuffer_.mappedPtr) + offset;
     madvise(ptr, size, MADV_DONTNEED);
 }
 
 void HostShadowManager::adviseWillNeed(VkDeviceSize offset, VkDeviceSize size) {
+    std::lock_guard<std::mutex> lock(mutex_);
     void* ptr = static_cast<char*>(shadowBuffer_.mappedPtr) + offset;
     madvise(ptr, size, MADV_WILLNEED);
 }
 
 void HostShadowManager::adviseFree(VkDeviceSize offset, VkDeviceSize size) {
+    std::lock_guard<std::mutex> lock(mutex_);
     void* ptr = static_cast<char*>(shadowBuffer_.mappedPtr) + offset;
     madvise(ptr, size, MADV_FREE);
 }
 
 void HostShadowManager::protectRegion(VkDeviceSize offset, VkDeviceSize size) {
+    std::lock_guard<std::mutex> lock(mutex_);
     void* ptr = static_cast<char*>(shadowBuffer_.mappedPtr) + offset;
     mprotect(ptr, size, PROT_NONE);
 }
 
 void HostShadowManager::unprotectRegion(VkDeviceSize offset, VkDeviceSize size) {
+    std::lock_guard<std::mutex> lock(mutex_);
     void* ptr = static_cast<char*>(shadowBuffer_.mappedPtr) + offset;
     mprotect(ptr, size, PROT_READ | PROT_WRITE);
 }

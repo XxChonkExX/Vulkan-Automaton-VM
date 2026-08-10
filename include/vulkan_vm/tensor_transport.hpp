@@ -159,6 +159,10 @@ using CompletionCallback = std::function<void(bool success, const std::string& e
 
 using AsyncOperation = std::function<void()>;
 
+// Thread Safety: All public methods are thread-safe.
+//                  initialize()/shutdown() must not be called concurrently with operations.
+//                  allocateTensor/collectives are thread-safe.
+//                  sendTensor/recvTensor must not be called concurrently for the same tensor.
 class Transport {
 public:
     virtual ~Transport() = default;

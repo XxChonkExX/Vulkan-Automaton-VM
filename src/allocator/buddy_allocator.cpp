@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <utility>
+#include <set>
 
 namespace vvm {
 
@@ -65,7 +66,8 @@ std::optional<VkDeviceSize> BuddyAllocator::popFree(int order) {
     if (set.empty()) return std::nullopt;
     // Deterministic placement: hand out the lowest free offset so that buddy
     // pairs stay adjacent and coalescing works as expected.
-    auto it = std::min_element(set.begin(), set.end());
+    // O(1) with std::set since begin() is the minimum.
+    auto it = set.begin();
     VkDeviceSize off = *it;
     set.erase(it);
     return off;
