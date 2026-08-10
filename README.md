@@ -20,14 +20,14 @@
    - [Buddy Allocator — Zero Fragmentation](#buddy-allocator--zero-fragmentation)
    - [Auto-Tuning (APU / Discrete / High-VRAM)](#auto-tuning-apu--discrete--high-vram)
    - [Memory Usage Intents](#memory-usage-intents-no-raw-flags)
-4. [Cross-GPU Memory Sharing](#cross-gpu-memory-sharing)
-5. [Host Offload / Demand Paging](#host-offload--demand-paging)
-6. [Sparse / Residency Virtual Memory](#sparse--residency-virtual-memory)
-7. [Android / Vulkan (AHardwareBuffer)](#android--vulkan-ahardwarebuffer-external-memory)
-8. [PyTorch & ONNX Integration](#pytorch--onnx-integration)
-9. [Building](#building)
-10. [Hardware Compatibility](#hardware-compatibility)
-11. [License & Credits](#license--credits)
+5. [Cross-GPU Memory Sharing](#cross-gpu-memory-sharing)
+6. [Host Offload / Demand Paging](#host-offload--demand-paging)
+7. [Sparse / Residency Virtual Memory](#sparse--residency-virtual-memory)
+8. [Android / Vulkan (AHardwareBuffer)](#android--vulkan-ahardwarebuffer-external-memory)
+9. [PyTorch & ONNX Integration](#pytorch--onnx-integration)
+10. [Building](#building)
+11. [Hardware Compatibility](#hardware-compatibility)
+12. [License & Credits](#license--credits)
 
 ---
 
@@ -219,9 +219,11 @@ For NIC-attached GPU memory DMA (bypassing host CPU entirely), VulkanVM provides
 
 | GPU Vendor | Linux Path | Windows Path |
 |------------|------------|--------------|
-| **NVIDIA (0x10DE)** | `VK_NV_external_memory_rdma` → `vkGetMemoryRemoteAddressNV` → `ibv_reg_mr` on PCI BAR (requires `nvidia-peermem`) | NDKPI (`IND2Provider`) + `CreateMemoryRegion` from `D3D12_HEAP`/`OPAQUE_WIN32` |
-| **AMD (0x1002)** | `DMA_BUF` → `ibv_reg_dmabuf_mr` (or mmap fallback) | `OPAQUE_WIN32` → `MapViewOfFile` → NDKPI `CreateMemoryRegion` |
-| **Intel (0x8086)** | `DMA_BUF` → `ibv_reg_dmabuf_mr` (Xe KMD) | **Level Zero** `zeMemGetAllocProperties` + `ze_external_memory_export_win32_handle_t` → NDKPI |
+| **NVIDIA (0x10DE)** | `VK_NV_external_memory_rdma` → `vkGetMemoryRemoteAddressNV` → `ibv_reg_mr` on PCI BAR (requires `nvidia-peermem`) — **true GPU-direct BAR peer-mem** | NDKPI (`IND2Provider`) + `CreateMemoryRegion` from `D3D12_HEAP`/`OPAQUE_WIN32` — **true GPU-direct when provider supports it** |
+| **AMD (0x1002)** | `DMA_BUF` → `ibv_reg_dmabuf_mr` (or mmap fallback) — **best-effort; not always BAR peer-mem class** | `OPAQUE_WIN32` → `MapViewOfFile` → NDKPI `CreateMemoryRegion` — **host/ND registration unless provider does GPU MR** |
+| **Intel (0x8086)** | `DMA_BUF` → `ibv_reg_dmabuf_mr` (Xe KMD) — **best-effort; not always BAR peer-mem class** | **Level Zero** `zeMemGetAllocProperties` + `ze_external_memory_export_win32_handle_t` → NDKPI — **host/ND registration unless provider does GPU MR** |
+
+**Note on "GPU-Direct" claims:** NVIDIA + `VK_NV_external_memory_rdma` with `nvidia-peermem` achieves true BAR peer-mem GPU↔NIC DMA. AMD and Intel paths use DMA-BUF / Level Zero export + NDKPI which are **practical host-staged or best-effort GPU registration** — they do not always achieve zero-copy NIC↔GPU BAR DMA. The transport logs which path engaged and whether zero-copy was achieved.
 
 ```cpp
 // In rdma_transport.cpp (VerbsRdmaTransport)
@@ -357,6 +359,31 @@ config.ucxEnableCudaIpc = true;      // intra-node GPU IPC
 | `tcp` | TCP/IP fallback |
 | `cuda_ipc` | CUDA IPC (intra-node GPU) |
 | `cuda_copy` | CUDA copy (staged) |
+
+**Important:** UCX "TLS" means *Transport Layer Selection* (which fabrics UCX may use: `rc`, `ud`, `sm`, `tcp`, `cuda_ipc`, etc.). It is **not** related to OpenSSL TLS (`TransportConfig::enableTLS`, `tlsCertPath`, etc.), which secures the TCP control plane. UCX TLS is configured via `config.ucxTLS` or `UCX_TLS` env; OpenSSL TLS is configured via `config.enableTLS`.
+
+### UCX Address Exchange
+
+UCX endpoints are created from **opaque worker addresses** (`ucp_worker_get_address`), not TCP `host:port` strings. VulkanVM exchanges these blobs over the existing TCP control plane (`CtrlMsg::UcxAddrExchange`, length-prefixed via `vvm::network::wire::putBytes` / `getBytes`), then calls `ucp_ep_create`. IB/RoCE/TCP selection is controlled by `TransportConfig::ucxTLS` (or `UCX_TLS` env) and happens **after** the endpoint is created.
+
+Bootstrap flow (handled by `UcxTransport::exchangeAndConnect`):
+
+```cpp
+// Active side (client that initiated TCP connect):
+auto ep = ucx.exchangeAndConnect(peerKey, nodeId, true,
+    // sendFn: send our UCX worker address over TCP control
+    [&](const std::vector<uint8_t>& addr) {
+        return session.sendControl(CtrlMsg::UcxAddrExchange, 
+                                   vvm::network::wire::putBytes(body, addr));
+    },
+    // recvFn: receive peer's UCX worker address
+    [&](std::vector<uint8_t>& outAddr) {
+        return session.recvControl(CtrlMsg::UcxAddrExchange, body) &&
+               vvm::network::wire::getBytes(body.data(), body.data() + body.size(), outAddr);
+    });
+```
+
+Both peers must use compatible TLS sets (shared intersection that can actually connect). If you set `UCX_TLS=rc` only and there is no usable RC device, EP creation or first send fails — always keep `tcp` or `sm` in dev presets.
 
 **Attribution:** UCX (https://github.com/openucx/ucx) — BSD-3-Clause, Pavel Shamis et al.
 
@@ -777,6 +804,55 @@ transport->recvTensor(receiver, "192.168.1.11:51002#0", callback);
 auto region = rdmaTransport->registerGpuMemory(memory, offset, size, buffer);
 // region.lkey, region.rkey, region.rdmaAddr for NIC DMA
 ```
+
+---
+
+## Third-Party Licenses & Credits
+
+### Open Source Libraries
+
+| Component | License | Use in VulkanVM |
+|-----------|---------|-----------------|
+| **UCX (Unified Communication X)** | BSD-3-Clause | High-performance transport backend (InfiniBand, RoCE, TCP, shared memory, GPU) |
+| **GDRCopy** | MIT | Persistent host pinning pattern for NDKPI (inspired by `gdr_pin_buffer`/`gdr_unpin_buffer`) |
+| **Volk** | MIT | Vulkan function pointer loading (optional) |
+| **glslang / SPIRV-Tools** | BSD-3-Clause | Shader compilation to SPIR-V |
+| **Vulkan Memory Allocator (VMA)** | MIT | Reference for allocation patterns (not directly used) |
+| **Vulkan-Hpp** | Apache-2.0 | C++ bindings for Vulkan API |
+| **Windows NDKPI Headers** | Microsoft EULA | Vendored ND SPI headers (`third_party/ndk/`) |
+| **SoftRoCE (rxe)** | GPL-2.0 | Linux software RDMA for CI/testing (system dependency) |
+
+### Hardware Vendors & SDKs
+
+| Company | Technology / SDK | Role in VulkanVM |
+|---------|------------------|------------------|
+| **NVIDIA** | CUDA, CUDA Driver, `VK_NV_external_memory_rdma`, `nvidia-peermem`, GPUDirect RDMA | GPU compute, GPU-direct RDMA registration, peer memory |
+| **AMD** | ROCm / HIP, `VK_EXT_external_memory_dma_buf`, Radeon Pro / Instinct GPUs | GPU compute, DMA-BUF export, GPU-direct via HIP |
+| **Intel** | Level Zero, Xe KMD, `VK_EXT_external_memory_dma_buf`, Arc / Data Center GPUs | GPU compute, DMA-BUF export, Windows GPU-direct via Level Zero |
+| **Mellanox / NVIDIA Networking** | ConnectX / BlueField NICs, MLNX_OFED, `ibverbs`, `rdma_cm`, UCX | High-performance RDMA/RoCE networking |
+| **Khronos Group** | Vulkan API, SPIR-V, extensions | Core graphics/compute API and specifications |
+| **Microsoft** | Windows SDK, NDKPI (Network Direct), WDDM | Windows networking, RDMA via NDKPI, display |
+| **Linux Kernel** | `ibverbs`, `rdma_cm`, `dma-buf`, `rxe` (SoftRoCE) | Linux RDMA stack, DMA-BUF, software RDMA |
+
+### Attribution & Thanks
+
+- **UCX team**: Pavel Shamis, Yossi Itigin, et al. — https://github.com/openucx/ucx
+- **NVIDIA GDRCopy**: NVIDIA Corporation — https://github.com/NVIDIA/gdrcopy
+- **Khronos Group**: Vulkan API specification and headers
+- **Intel Level Zero team**: https://github.com/oneapi-src/level-zero
+- **AMD ROCm team**: https://github.com/RadeonOpenCompute/ROCm
+- **Mellanox / NVIDIA Networking**: OFED, UCX integration, hardware enablement
+- **Vulkan-Hpp maintainers**: https://github.com/KhronosGroup/Vulkan-Hpp
+- **Volk maintainers**: https://github.com/zeux/volk
+- **glslang/SPIRV-Tools**: https://github.com/KhronosGroup/glslang
+
+### Development Infrastructure
+
+- **GitHub Actions**: CI/CD pipelines
+- **CMake / Ninja**: Build system
+- **MSVC / Clang / GCC**: Compilers
+- **Visual Studio / VS Code**: IDEs
+- **Vulkan SDK**: LunarG Vulkan SDK (validation layers, tools)
 
 ---
 

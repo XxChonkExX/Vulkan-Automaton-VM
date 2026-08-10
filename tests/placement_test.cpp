@@ -55,10 +55,11 @@ int main() {
         ModelManifest model;
         model.modelId = "test/constraint";
         model.version = "v1";
-        model.shards.emplace_back(ShardSpec{"must-be-gpu", "hash1", ShardKind::Weights, 4ull * 1024 * 1024 * 1024, -1, -1, false, false});
+        model.shards.emplace_back(ShardSpec{"must-be-gpu", "hash1", ShardKind::Weights, 4ull * 1024 * 1024 * 1024, -1, -1, true, false});
 
         ClusterCapacity cluster;
-        cluster.nodes.emplace_back(NodeCapacity{"node-a", 2ull * 1024 * 1024 * 1024, 8ull * 1024 * 1024 * 1024, 0, 0, 1, 1000, true});
+        // 0 vramFree, 8GB vramTotal, 8GB hostOffloadFree, 0 diskCacheFree, 1 GPU, 1000 MBps, trusted
+        cluster.nodes.emplace_back(NodeCapacity{"node-a", 0, 8ull * 1024 * 1024 * 1024, 8ull * 1024 * 1024 * 1024, 0, 1, 1000, true});
 
         PlacementPolicy policy;
         policy.allowHostOffload = true;
@@ -160,6 +161,7 @@ int main() {
         cluster.reservedActivationBytes = 1ull * 1024 * 1024 * 1024; // 1GB reserved
 
         PlacementPolicy policy;
+        policy.maxVramFill = 1.0f;  // Use 100% to make test math work
         PlacementPlan plan = ShardPlacer::plan(model, cluster, policy);
         // 3GB free, 2GB shard, 1GB reserved -> fits exactly after reserve
         assert(plan.status);
@@ -174,9 +176,11 @@ int main() {
 
         ClusterCapacity cluster;
         cluster.nodes.emplace_back(NodeCapacity{"node-a", 8ull * 1024 * 1024 * 1024, 0, 0, 0, 1, 1000, true});
+        cluster.reservedActivationBytes = 0;  // No activation reserve so 8GB fits exactly
 
         PlacementPolicy policy;
         policy.bestEffort = true;
+        policy.maxVramFill = 1.0f;  // Use 100% so 8GB shard fits in 8GB node
 
         PlacementPlan plan = ShardPlacer::plan(model, cluster, policy);
         assert(!plan.status);

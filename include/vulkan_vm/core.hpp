@@ -262,6 +262,8 @@ class OffloadManager;  // forward declaration for UnifiedMemoryPool
 //                Not thread-safe for concurrent move operations (move before use).
 //                Use UniqueAllocation for RAII ownership; avoid raw Allocation handles.
 
+class UniqueAllocation;  // forward declaration for deallocate(UniqueAllocation&&)
+
 class UnifiedMemoryPool {
 public:
     // Factory
@@ -353,9 +355,6 @@ private:
     uint64_t nextGeneration() { return ++generationCounter_; }
     uint64_t getCurrentGeneration() const { return generationCounter_; }
     bool isValidGeneration(uint64_t generation) const { return generation == generationCounter_; }
-    
-    // Verify required Vulkan features/extensions were enabled at device creation.
-    bool validateDeviceCapabilities() const;
     
     std::optional<uint32_t> findMemoryType(VkMemoryPropertyFlags required,
                                            VkMemoryPropertyFlags preferred);

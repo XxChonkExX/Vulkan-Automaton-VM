@@ -103,7 +103,10 @@ bool ModelHub::start(const std::string& listenAddr, uint16_t port) {
     if (running_) return false;
     transport_ = std::make_unique<TcpTransport>();
     auto handler = [this](TcpMessage& req, TcpMessage& resp) { onRequest(req, resp); };
-    if (!transport_->start(listenAddr, port, std::move(handler))) return false;
+    // NetworkConfig with defaults for ModelHub
+    NetworkConfig netConfig;
+    netConfig.listenAddress = listenAddr + ":" + std::to_string(port);
+    if (!transport_->start(listenAddr, port, std::move(handler), netConfig)) return false;
     boundPort_ = transport_->getBoundPort();
     running_ = true;
     VVM_LOG_INFO("ModelHub listening on {}:{} (cache: {})", listenAddr, boundPort_, cacheDir_);

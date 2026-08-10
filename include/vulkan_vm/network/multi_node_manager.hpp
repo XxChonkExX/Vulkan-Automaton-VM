@@ -321,6 +321,16 @@ private:
     VkQueue transferQueue_ = VK_NULL_HANDLE;
     uint32_t transferQueueFamily_ = UINT32_MAX;
 
+    // Windowed copy contexts for double-buffered migration pipeline
+    struct CopyContext {
+        VkCommandBuffer cmdBuffer = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        bool inUse = false;
+    };
+    std::vector<CopyContext> copyContexts_;
+    uint32_t maxCopyContexts_ = 0;
+    mutable std::mutex copyContextsMutex_;
+
     // Allocation registry: localAllocId -> Allocation (for remote access)
     std::unordered_map<uint64_t, Allocation> remoteAllocs_;
     mutable std::mutex allocsMutex_;

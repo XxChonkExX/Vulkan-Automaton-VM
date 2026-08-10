@@ -124,6 +124,7 @@ MultiNodePoolManager::MultiNodePoolManager(MultiNodePoolManager&& other) noexcep
     , localHost_(std::move(other.localHost_))
     , seedEndpoints_(std::move(other.seedEndpoints_))
     , copyCmdPool_(other.copyCmdPool_)
+    , copyContexts_(std::move(other.copyContexts_))
     , transferQueue_(other.transferQueue_)
     , transferQueueFamily_(other.transferQueueFamily_)
     , remoteAllocs_(std::move(other.remoteAllocs_))
@@ -158,6 +159,7 @@ MultiNodePoolManager& MultiNodePoolManager::operator=(MultiNodePoolManager&& oth
         localHost_ = std::move(other.localHost_);
         seedEndpoints_ = std::move(other.seedEndpoints_);
         copyCmdPool_ = other.copyCmdPool_;
+        copyContexts_ = std::move(other.copyContexts_);
         transferQueue_ = other.transferQueue_;
         transferQueueFamily_ = other.transferQueueFamily_;
         remoteAllocs_ = std::move(other.remoteAllocs_);
@@ -284,7 +286,7 @@ bool MultiNodePoolManager::start() {
         onTcpRequest(request, response);
     };
 
-    if (!tcpTransport_->start(listenHost, listenPort, std::move(handler))) {
+    if (!tcpTransport_->start(listenHost, listenPort, std::move(handler), networkConfig_)) {
         VVM_LOG_ERROR("Failed to start TCP server on {}:{}", listenHost, listenPort);
         tcpTransport_.reset();
         return false;

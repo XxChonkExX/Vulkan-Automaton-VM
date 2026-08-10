@@ -16,6 +16,8 @@ struct NodeBudget {
     VkDeviceSize hostFree = 0;
     VkDeviceSize diskFree = 0;
     VkDeviceSize originalVramFree = 0;
+    VkDeviceSize originalHostFree = 0;
+    VkDeviceSize originalDiskFree = 0;
     uint32_t gpuCount = 1;
     bool trusted = true;
     VkDeviceSize reservedActivation = 0;
@@ -103,7 +105,9 @@ PlacementPlan ShardPlacer::plan(const ModelManifest& model,
         nb.vramFree = static_cast<VkDeviceSize>(nc.vramFree * policy.maxVramFill);
         nb.hostFree = static_cast<VkDeviceSize>(nc.hostOffloadFree * policy.maxHostFill);
         nb.diskFree = nc.diskCacheFree;
-        nb.originalVramFree = nc.vramFree;
+        nb.originalVramFree = nb.vramFree;
+        nb.originalHostFree = nb.hostFree;
+        nb.originalDiskFree = nb.diskFree;
         nb.gpuCount = nc.gpuCount;
         nb.trusted = nc.trusted;
         nb.reservedActivation = cluster.reservedActivationBytes;
@@ -271,9 +275,9 @@ PlacementPlan ShardPlacer::plan(const ModelManifest& model,
             // Check if shard is larger than any possible node even with all tiers
             VkDeviceSize maxTotal = 0;
             for (const auto& n : nodes) {
-                VkDeviceSize total = n.vramFree;
-                if (policy.allowHostOffload) total += n.hostFree;
-                if (policy.allowDiskCache) total += n.diskFree;
+                VkDeviceSize total = n.originalVramFree;
+                if (policy.allowHostOffload) total += n.originalHostFree;
+                if (policy.allowDiskCache) total += n.originalDiskFree;
                 maxTotal = std::max(maxTotal, total);
             }
             if (need > maxTotal) {
