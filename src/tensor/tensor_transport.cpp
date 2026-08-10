@@ -521,6 +521,7 @@ public:
         auto handle = std::make_shared<TensorAllocation>();
         handle->allocation = std::move(*alloc);
         handle->metadata = meta;
+        handle->deviceIndex = deviceIndex;
         return handle;
     }
     
@@ -582,6 +583,7 @@ public:
             auto peerHandle = std::make_shared<TensorAllocation>();
             peerHandle->allocation = std::move(*peerAlloc);
             peerHandle->metadata = results[0]->metadata;
+            peerHandle->deviceIndex = peerIdx;
             results.push_back(peerHandle);
         }
 
@@ -605,17 +607,17 @@ public:
             return false;
         }
         
-        auto& srcPool = poolManager_->getPool(src->allocation.blockIndex);
-        auto& dstPool = poolManager_->getPool(dst->allocation.blockIndex);
+        auto& srcPool = poolManager_->getPool(src->deviceIndex);
+        auto& dstPool = poolManager_->getPool(dst->deviceIndex);
         
         // Same device - direct copy
-        if (src->allocation.blockIndex == dst->allocation.blockIndex) {
+        if (src->deviceIndex == dst->deviceIndex) {
             return srcPool.copyBuffer(src->allocation, dst->allocation, 0, 0, src->metadata.bytes());
         }
         
         // Cross-device copy via MultiGPUPoolManager
         return poolManager_->copyDeviceToDevice(
-            src->allocation.blockIndex, dst->allocation.blockIndex,
+            src->deviceIndex, dst->deviceIndex,
             src->allocation, dst->allocation, 0, 0, src->metadata.bytes());
     }
     
@@ -628,17 +630,17 @@ public:
             return false;
         }
         
-        auto& srcPool = poolManager_->getPool(src->allocation.blockIndex);
-        auto& dstPool = poolManager_->getPool(dst->allocation.blockIndex);
+        auto& srcPool = poolManager_->getPool(src->deviceIndex);
+        auto& dstPool = poolManager_->getPool(dst->deviceIndex);
         
         // Same device - direct copy
-        if (src->allocation.blockIndex == dst->allocation.blockIndex) {
+        if (src->deviceIndex == dst->deviceIndex) {
             return srcPool.copyBuffer(src->allocation, dst->allocation, srcOffset, dstOffset, size);
         }
         
         // Cross-device copy via MultiGPUPoolManager
         return poolManager_->copyDeviceToDevice(
-            src->allocation.blockIndex, dst->allocation.blockIndex,
+            src->deviceIndex, dst->deviceIndex,
             src->allocation, dst->allocation, srcOffset, dstOffset, size);
     }
     
@@ -1126,9 +1128,9 @@ if (!loaded) {
         }
 
         const uint32_t rootDevice = deviceIndices[rootIndex];
-        if (root->allocation.blockIndex != rootDevice) {
+        if (root->deviceIndex != rootDevice) {
             VVM_LOG_ERROR("broadcast: root tensor lives on device {} but rootIndex maps to device {}",
-                          root->allocation.blockIndex, rootDevice);
+                          root->deviceIndex, rootDevice);
             return false;
         }
 
@@ -1465,6 +1467,11 @@ private:
         // Without async thread, operations run inline so nothing to drain
     }
     
+    vvm::MultiGPUPoolManager* getPoolManager() override {
+        if (poolManager_) return &(*poolManager_);
+        return nullptr;
+    }
+    
     void enqueueAsync(AsyncOperation op) override {
         {
             std::lock_guard<std::mutex> lock(asyncMutex_);
@@ -1498,7 +1505,7 @@ private:
     // Copy `size` bytes at `offset` from a GPU tensor into `out` via a
     // host-visible staging allocation so CPU-side reduce kernels can see it.
     bool gpuToHost(const TensorHandle& t, uint8_t* out, VkDeviceSize offset, size_t size) {
-        auto& pool = poolManager_->getPool(t->allocation.blockIndex);
+        auto& pool = poolManager_->getPool(t->deviceIndex);
 
         vvm::AllocDesc desc;
         desc.size = size;
@@ -1523,7 +1530,7 @@ private:
 
     // Upload `size` bytes into a GPU tensor (offset-relative) through staging.
     bool hostToGpu(const TensorHandle& t, VkDeviceSize offset, const uint8_t* in, size_t size) {
-        auto& pool = poolManager_->getPool(t->allocation.blockIndex);
+        auto& pool = poolManager_->getPool(t->deviceIndex);
 
         vvm::AllocDesc stage;
         stage.size = size;

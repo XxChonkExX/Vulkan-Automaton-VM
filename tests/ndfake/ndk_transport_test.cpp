@@ -18,6 +18,8 @@
 #include <thread>
 #include <vector>
 
+#include <windows.h>
+
 using namespace vvm::network;
 
 static bool gVerbose = false;
@@ -259,6 +261,24 @@ static bool testProviderLoad() {
 int main(int argc, char* argv[]) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::setvbuf(stderr, nullptr, _IONBF, 0);
+
+    // Set VVM_ND_PROVIDER_DLL if not already set (for CI/local testing)
+    if (!std::getenv("VVM_ND_PROVIDER_DLL")) {
+        // Try to find ndfake_provider.dll next to the executable
+        char exePath[MAX_PATH];
+        if (GetModuleFileNameA(nullptr, exePath, MAX_PATH)) {
+            std::string exeDir = exePath;
+            size_t pos = exeDir.find_last_of("\\/");
+            if (pos != std::string::npos) {
+                exeDir = exeDir.substr(0, pos);
+                std::string fakeDll = exeDir + "\\ndfake_provider.dll";
+                if (GetFileAttributesA(fakeDll.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    _putenv_s("VVM_ND_PROVIDER_DLL", fakeDll.c_str());
+                }
+            }
+        }
+    }
+
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "-v") == 0 || std::strcmp(argv[i], "--verbose") == 0) {
             gVerbose = true;

@@ -115,6 +115,26 @@ target_include_directories(tensor_collective_test PRIVATE
 )
 add_test(NAME tensor_collective_test COMMAND tensor_collective_test)
 
+# Windows-only NDK persistent pin ref-count test
+if(WIN32)
+    add_executable(persistent_pin_test persistent_pin_test.cpp)
+    target_link_libraries(persistent_pin_test PRIVATE
+        vulkan_vm_network
+        ${CMAKE_DL_LIBS}
+    )
+    target_include_directories(persistent_pin_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${TEST_EXTRA_INCLUDES}
+    )
+    # Copy fake provider DLL next to test exe for runtime loading
+    add_custom_command(TARGET persistent_pin_test POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:ndfake_provider>
+            $<TARGET_FILE_DIR:persistent_pin_test>/
+    )
+    add_test(NAME persistent_pin_test COMMAND persistent_pin_test)
+endif()
+
 # Windows-only ND fake provider + loopback test
 if(WIN32)
     # Fake ND provider DLL (implements IND2 SPI on host RAM)

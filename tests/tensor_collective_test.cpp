@@ -35,13 +35,12 @@ struct TestEnv {
     VkDevice device = VK_NULL_HANDLE;
     std::vector<DeviceConfig> devices;
     PoolConfig poolConfig;
-    MultiGPUPoolManager poolManager;   // test-side buffers for seeding/verifying
 };
 
 // Read a GPU allocation back into host memory.
-bool readGpu(MultiGPUPoolManager& mgr, const Allocation& alloc,
+bool readGpu(MultiGPUPoolManager& mgr, uint32_t deviceIdx, const Allocation& alloc,
              std::vector<uint8_t>& out) {
-    auto& pool = mgr.getPool(alloc.blockIndex);
+    auto& pool = mgr.getPool(deviceIdx);
     AllocDesc desc;
     desc.size = alloc.size;
     desc.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -62,9 +61,9 @@ bool readGpu(MultiGPUPoolManager& mgr, const Allocation& alloc,
 }
 
 // Upload host bytes into an existing GPU allocation.
-bool writeGpu(MultiGPUPoolManager& mg, const Allocation& alloc,
+bool writeGpu(MultiGPUPoolManager& mg, uint32_t deviceIdx, const Allocation& alloc,
               const std::vector<uint8_t>& in) {
-    auto& pool = mg.getPool(alloc.blockIndex);
+    auto& pool = mg.getPool(deviceIdx);
     AllocDesc desc;
     desc.size = in.size();
     desc.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -103,6 +102,7 @@ TensorHandle makeHandle(const Allocation& alloc, DataType dt, size_t bytes,
     h->metadata.layout = MemoryLayout::Contiguous;
     h->metadata.shape = TensorShape::makeContiguous({static_cast<int64_t>(bytes / dataTypeSize(dt))});
     h->metadata.name = std::move(name);
+    h->deviceIndex = 0;
     return h;
 }
 
@@ -216,15 +216,12 @@ bool envInit(TestEnv& env) {
     env.devices.push_back(cfg);
 
     env.poolConfig.blockSize = 256 * 1024 * 1024;
-    env.poolConfig.minAlignment = 256 * 1024;
+    env.poolConfig.minAlignment = 4 * 1024;  // 4KB alignment for small test tensors
     env.poolConfig.enableHostVisible = true;
     env.poolConfig.enableExternal = true;
     env.poolConfig.enableDeviceAddress = true;
-    env.poolConfig.maxBlocks = 8;
+    env.poolConfig.maxBlocks = 32;  // Increased for test allocations + shadow buffers
 
-    auto mgr = MultiGPUPoolManager::create(env.devices, env.poolConfig, 0);
-    if (!mgr) return false;
-    env.poolManager = std::move(*mgr);
     return true;
 }
 
@@ -236,12 +233,6 @@ int main() {
         std::printf("SKIP: no Vulkan device available\n");
         return 0;
     }
-    if (env.devices.size() != env.poolManager.getInstances().size()) {
-        std::printf("SKIP: pool manager did not mirror device list\n");
-        vkDestroyDevice(env.device, nullptr);
-        vkDestroyInstance(env.instance, nullptr);
-        return 0;
-    }
 
     TransportConfig cfg;
     cfg.preference = TransportConfig::Preference::Auto;
@@ -251,26 +242,30 @@ int main() {
     auto transport = Transport::create(cfg, env.devices, env.poolConfig);
     CHECK(transport != nullptr);
     CHECK(transport->initialize());
+
+    // Use the transport's internal pool manager for all allocations and read/write
+    MultiGPUPoolManager* poolMgr = transport->getPoolManager();
+    CHECK(poolMgr != nullptr);
     if (failures) goto done;
 
     {
         // ---- allReduce Sum, three participants on device 0 ----
-        const size_t n = 16;
+        const size_t n = 1024;  // 1024 floats = 4KB
         const size_t bytes = n * sizeof(float);
         std::vector<TensorHandle> group;
         for (uint32_t r = 0; r < 3; ++r) {
-            group.push_back(makeHandle(allocGpu(env.poolManager, 0, bytes),
+            group.push_back(makeHandle(allocGpu(*poolMgr, 0, bytes),
                                        DataType::Float32, bytes, "ar" + std::to_string(r)));
             std::vector<float> seeds(n);
             for (size_t i = 0; i < n; ++i) seeds[i] = static_cast<float>(i + r);
-            CHECK(writeGpu(env.poolManager, group.back()->allocation, bytesOf(seeds)));
+            CHECK(writeGpu(*poolMgr, 0, group.back()->allocation, bytesOf(seeds)));
         }
         CHECK(transport->allReduce(group, ReduceOp::Sum, {0, 0, 0}));
         std::vector<float> ref(n);
         for (size_t i = 0; i < n; ++i) ref[i] = static_cast<float>(3 * i + 3);
         for (const auto& t : group) {
-std::vector<uint8_t> raw;
-            CHECK(readGpu(env.poolManager, t->allocation, raw));
+            std::vector<uint8_t> raw;
+            CHECK(readGpu(*poolMgr, 0, t->allocation, raw));
             auto got = floatsOf(raw);
             for (size_t i = 0; i < n; ++i) {
                 CHECK(std::fabs(got[i] - ref[i]) < 1e-4f);
@@ -280,38 +275,38 @@ std::vector<uint8_t> raw;
 
     {
         // allReduce with Mean
-        const size_t n = 8;
+        const size_t n = 1024;
         const size_t bytes = n * sizeof(float);
         std::vector<TensorHandle> group;
         for (uint32_t r = 0; r < 2; ++r) {
-            group.push_back(makeHandle(allocGpu(env.poolManager, 0, bytes),
+            group.push_back(makeHandle(allocGpu(*poolMgr, 0, bytes),
                                        DataType::Float32, bytes, "arm" + std::to_string(r)));
             std::vector<float> seeds(n, static_cast<float>(5.0 * (r + 1)));
-            CHECK(writeGpu(env.poolManager, group.back()->allocation, bytesOf(seeds)));
+            CHECK(writeGpu(*poolMgr, 0, group.back()->allocation, bytesOf(seeds)));
         }
         CHECK(transport->allReduce(group, ReduceOp::Mean, {0, 0}));
         std::vector<uint8_t> raw;
-        CHECK(readGpu(env.poolManager, group[0]->allocation, raw));
+        CHECK(readGpu(*poolMgr, 0, group[0]->allocation, raw));
         auto got = floatsOf(raw);
         for (size_t i = 0; i < n; ++i) CHECK(std::fabs(got[i] - 7.5f) < 1e-4f);
     }
 
     {
         // allReduce on integer data: sum of small ints must be exact.
-        const size_t n = 12;
+        const size_t n = 1024;
         const size_t bytes = n * sizeof(int32_t);
         std::vector<TensorHandle> group;
         for (uint32_t r = 1; r <= 3; ++r) {
-            group.push_back(makeHandle(allocGpu(env.poolManager, 0, bytes),
+            group.push_back(makeHandle(allocGpu(*poolMgr, 0, bytes),
                                         DataType::Int32, bytes, "ari" + std::to_string(r)));
             std::vector<int32_t> seeds(n, static_cast<int32_t>(r));
             std::vector<uint8_t> raw(seeds.size() * sizeof(int32_t));
             std::memcpy(raw.data(), seeds.data(), raw.size());
-            CHECK(writeGpu(env.poolManager, group.back()->allocation, raw));
+            CHECK(writeGpu(*poolMgr, 0, group.back()->allocation, raw));
         }
         CHECK(transport->allReduce(group, ReduceOp::Sum, {0, 0, 0}));
         std::vector<uint8_t> raw;
-        CHECK(readGpu(env.poolManager, group[0]->allocation, raw));
+        CHECK(readGpu(*poolMgr, 0, group[0]->allocation, raw));
         std::vector<int32_t> got(raw.size() / sizeof(int32_t));
         std::memcpy(got.data(), raw.data(), raw.size());
         for (size_t i = 0; i < n; ++i) CHECK(got[i] == 6);
@@ -319,39 +314,39 @@ std::vector<uint8_t> raw;
 
     {
         // allReduce Product: 1*2*3=6 per element.
-        const size_t n = 8;
+        const size_t n = 1024;
         const size_t bytes = n * sizeof(float);
         std::vector<TensorHandle> group;
         std::vector<float> ref(n, 6.0f);
         for (uint32_t r = 1; r <= 3; ++r) {
-            group.push_back(makeHandle(allocGpu(env.poolManager, 0, bytes),
+            group.push_back(makeHandle(allocGpu(*poolMgr, 0, bytes),
                                         DataType::Float32, bytes, "arp" + std::to_string(r)));
             std::vector<float> seeds(n, static_cast<float>(r));
-            CHECK(writeGpu(env.poolManager, group.back()->allocation, bytesOf(seeds)));
+            CHECK(writeGpu(*poolMgr, 0, group.back()->allocation, bytesOf(seeds)));
         }
         CHECK(transport->allReduce(group, ReduceOp::Product, {0, 0, 0}));
         std::vector<uint8_t> raw;
-        CHECK(readGpu(env.poolManager, group[0]->allocation, raw));
+        CHECK(readGpu(*poolMgr, 0, group[0]->allocation, raw));
         auto got = floatsOf(raw);
         for (size_t i = 0; i < n; ++i) CHECK(std::fabs(got[i] - ref[i]) < 1e-4f);
     }
 
     {
         // allGather: two contributors appended in order.
-        const size_t n = 8;
+        const size_t n = 1024;
         const size_t bytes = n * sizeof(float);
         std::vector<TensorHandle> inputs(2);
-        inputs[0] = makeHandle(allocGpu(env.poolManager, 0, bytes), DataType::Float32, bytes, "ag0");
-        inputs[1] = makeHandle(allocGpu(env.poolManager, 0, bytes), DataType::Float32, bytes, "ag1");
+        inputs[0] = makeHandle(allocGpu(*poolMgr, 0, bytes), DataType::Float32, bytes, "ag0");
+        inputs[1] = makeHandle(allocGpu(*poolMgr, 0, bytes), DataType::Float32, bytes, "ag1");
         std::vector<float> a(n, 1.0f), b(n, 2.0f);
-        CHECK(writeGpu(env.poolManager, inputs[0]->allocation, bytesOf(a)));
-        CHECK(writeGpu(env.poolManager, inputs[1]->allocation, bytesOf(b)));
+        CHECK(writeGpu(*poolMgr, 0, inputs[0]->allocation, bytesOf(a)));
+        CHECK(writeGpu(*poolMgr, 0, inputs[1]->allocation, bytesOf(b)));
 
-        auto output = makeHandle(allocGpu(env.poolManager, 0, 2 * bytes),
+        auto output = makeHandle(allocGpu(*poolMgr, 0, 2 * bytes),
                                   DataType::Float32, 2 * bytes, "agout");
         CHECK(transport->allGather(inputs, output, {0, 0}));
         std::vector<uint8_t> raw;
-        CHECK(readGpu(env.poolManager, output->allocation, raw));
+        CHECK(readGpu(*poolMgr, 0, output->allocation, raw));
         auto got = floatsOf(raw);
         for (size_t i = 0; i < n; ++i) {
             CHECK(std::fabs(got[i] - 1.0f) < 1e-6f);
@@ -361,24 +356,24 @@ std::vector<uint8_t> raw;
 
     {
         // reduceScatter: 2 participants -> output gets chunk 0 of the reduced.
-        const size_t n = 32;
+        const size_t n = 4096;
         const size_t bytes = n * sizeof(float);
         std::vector<TensorHandle> inputs(2);
-        inputs[0] = makeHandle(allocGpu(env.poolManager, 0, bytes), DataType::Float32, bytes, "rs0");
-        inputs[1] = makeHandle(allocGpu(env.poolManager, 0, bytes), DataType::Float32, bytes, "rs1");
+        inputs[0] = makeHandle(allocGpu(*poolMgr, 0, bytes), DataType::Float32, bytes, "rs0");
+        inputs[1] = makeHandle(allocGpu(*poolMgr, 0, bytes), DataType::Float32, bytes, "rs1");
         std::vector<float> a(n), b(n);
         for (size_t i = 0; i < n; ++i) {
             a[i] = static_cast<float>(i);
             b[i] = static_cast<float>(n - i);
         }
-        CHECK(writeGpu(env.poolManager, inputs[0]->allocation, bytesOf(a)));
-        CHECK(writeGpu(env.poolManager, inputs[1]->allocation, bytesOf(b)));
+        CHECK(writeGpu(*poolMgr, 0, inputs[0]->allocation, bytesOf(a)));
+        CHECK(writeGpu(*poolMgr, 0, inputs[1]->allocation, bytesOf(b)));
 
-        auto output = makeHandle(allocGpu(env.poolManager, 0, bytes / 2),
+        auto output = makeHandle(allocGpu(*poolMgr, 0, bytes / 2),
                                   DataType::Float32, bytes / 2, "rsout");
         CHECK(transport->reduceScatter(inputs, output, ReduceOp::Sum, {0, 0}));
         std::vector<uint8_t> raw;
-        CHECK(readGpu(env.poolManager, output->allocation, raw));
+        CHECK(readGpu(*poolMgr, 0, output->allocation, raw));
         auto got = floatsOf(raw);
         for (size_t i = 0; i < n / 2; ++i) {
             CHECK(std::fabs(got[i] - static_cast<float>(n)) < 1e-4f);
@@ -397,7 +392,7 @@ std::vector<uint8_t> raw;
         if (!dist.empty()) {
             std::vector<float> seeds(16);
             for (size_t i = 0; i < 16; ++i) seeds[i] = static_cast<float>(i * 3);
-            CHECK(writeGpu(env.poolManager, dist[0]->allocation, bytesOf(seeds)));
+            CHECK(writeGpu(*poolMgr, 0, dist[0]->allocation, bytesOf(seeds)));
         }
         if (dist.size() == 1) {
             CHECK(transport->broadcast(dist[0], {0}, 0));
@@ -406,7 +401,7 @@ std::vector<uint8_t> raw;
 
     {
         // Broadcast across 2 devices when hardware allows.
-        if (env.poolManager.getInstances().size() < 2) {
+        if (poolMgr->getInstances().size() < 2) {
             static constexpr char kMsg[] = "SKIP broadcast two-device: insufficient GPUs\n";
             std::fwrite(kMsg, 1, sizeof(kMsg) - 1, stdout);
         } else {
@@ -419,10 +414,10 @@ std::vector<uint8_t> raw;
             if (dist.size() == 2) {
                 std::vector<float> seeds(32);
                 for (size_t i = 0; i < 32; ++i) seeds[i] = static_cast<float>(i + 1);
-                CHECK(writeGpu(env.poolManager, dist[0]->allocation, bytesOf(seeds)));
+                CHECK(writeGpu(*poolMgr, 0, dist[0]->allocation, bytesOf(seeds)));
                 CHECK(transport->broadcast(dist[0], {0, 1}, 0));
                 std::vector<uint8_t> raw;
-                CHECK(readGpu(env.poolManager, dist[1]->allocation, raw));
+                CHECK(readGpu(*poolMgr, 1, dist[1]->allocation, raw));
                 auto got = floatsOf(raw);
                 for (size_t i = 0; i < 32; ++i) {
                     CHECK(std::fabs(got[i] - static_cast<float>(i + 1)) < 1e-6f);
@@ -433,7 +428,6 @@ std::vector<uint8_t> raw;
 
 done:
     transport->shutdown();
-    env.poolManager = {};
     if (env.device) vkDestroyDevice(env.device, nullptr);
     if (env.instance) vkDestroyInstance(env.instance, nullptr);
 
@@ -444,3 +438,4 @@ done:
     std::printf("PASS: tensor collective tests\n");
     return 0;
 }
+

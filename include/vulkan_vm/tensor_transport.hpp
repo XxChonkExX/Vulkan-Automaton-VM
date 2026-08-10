@@ -147,6 +147,7 @@ struct TransportConfig {
 struct TensorAllocation {
     Allocation allocation;
     TensorMetadata metadata;
+    uint32_t deviceIndex = 0;  // Which GPU device this tensor is on
 };
 
 using TensorHandle = std::shared_ptr<TensorAllocation>;
@@ -215,6 +216,9 @@ public:
     // Async pipeline
     virtual void enqueueAsync(AsyncOperation op) = 0;
     virtual void flushAsync() = 0;
+    
+    // Access internal pool manager for direct buffer operations (test/debug)
+    virtual vvm::MultiGPUPoolManager* getPoolManager() = 0;
 };
 
 } // namespace tensor

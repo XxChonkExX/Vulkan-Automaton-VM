@@ -132,6 +132,14 @@ public:
     bool initialize() override {
         if (shuttingDown_.load()) return false;
 
+        // Initialize Winsock for WSCEnumProtocols
+        WSADATA wsaData;
+        if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+            VVM_LOG_ERROR("ND: WSAStartup failed");
+            return false;
+        }
+        winsockInitialized_ = true;
+
         // Partially-built state released on any failure below (mirrors shutdown
         // ordering: CQ/listener/overlapped file before adapter/provider/lib).
         auto failCleanup = [&]() {
@@ -274,6 +282,10 @@ public:
             FreeLibrary(providerLib_);
             providerLib_ = nullptr;
         }
+        if (winsockInitialized_) {
+            WSACleanup();
+            winsockInitialized_ = false;
+        }
     }
 
     bool isReady() const override {
@@ -391,43 +403,88 @@ public:
         return region;
     }
 
-    // Persistently pin host memory for reuse (GDRCopy-style)
-    // Returns true if successful; the memory will stay registered until
-    // releasePersistentHostMemory is called with the same address.
-    bool pinPersistentHostMemory(void* ptr, size_t size) {
-        auto regionOpt = registerHostMemory(ptr, size);
-        if (!regionOpt) return false;
+// Persistently pin host memory for reuse (GDRCopy-style)
+// Returns true if successful; the memory will stay registered until
+// releasePersistentHostMemory is called with the same address.
+bool pinPersistentHostMemory(void* ptr, size_t size) override {
+    if (!isReady() || !ptr || size == 0) return false;
+    
+    std::unique_lock<std::mutex> lock(regionsMutex_);
+    auto it = regions_.find(reinterpret_cast<uintptr_t>(ptr));
+    
+    if (it != regions_.end()) {
+        RegisteredRegion& reg = it->second;
         
-        std::lock_guard<std::mutex> lock(regionsMutex_);
-        auto it = regions_.find(reinterpret_cast<uintptr_t>(ptr));
-        if (it != regions_.end()) {
-            it->second.persistentlyPinned = true;
-            VVM_LOG_INFO("ND: persistently pinned host memory {} bytes at {}", size, ptr);
+        // Size mismatch check
+        if (reg.length != size) {
+            VVM_LOG_ERROR("ND: pinPersistentHostMemory size mismatch for {} (existing={}, requested={})",
+                          ptr, reg.length, size);
+            return false;
+        }
+        
+        // Already persistently pinned - increment ref count
+        if (reg.persistentlyPinned) {
+            reg.refCount++;
+            VVM_LOG_DEBUG("ND: persistent pin ref++ (ref={}) for {}", reg.refCount, ptr);
             return true;
         }
-        return false;
+        
+        // Was registered but not persistently pinned - upgrade to persistent
+        reg.persistentlyPinned = true;
+        reg.refCount = std::max<uint32_t>(reg.refCount, 1);
+        VVM_LOG_INFO("ND: upgraded to persistent pin for {}", ptr);
+        return true;
     }
+    
+    // Not registered yet - register and mark as persistent
+    lock.unlock();
+    auto regionOpt = registerHostMemory(ptr, size);
+    if (!regionOpt) return false;
+    
+    lock.lock();
+    it = regions_.find(reinterpret_cast<uintptr_t>(ptr));
+    if (it != regions_.end()) {
+        it->second.persistentlyPinned = true;
+        it->second.refCount = std::max<uint32_t>(it->second.refCount, 1);
+        VVM_LOG_INFO("ND: registered and persistently pinned host memory {} bytes at {}", size, ptr);
+        return true;
+    }
+    return false;
+}
 
-    // Release persistently pinned host memory
-    // Decrements ref count; only actually deregisters when ref count reaches 0
-    void releasePersistentHostMemory(void* ptr) {
-        std::lock_guard<std::mutex> lock(regionsMutex_);
-        auto it = regions_.find(reinterpret_cast<uintptr_t>(ptr));
-        if (it == regions_.end()) return;
-        
-        RegisteredRegion& reg = it->second;
-        if (!reg.persistentlyPinned) return;
-        
-        if (reg.refCount > 1) {
-            reg.refCount--;
-            VVM_LOG_DEBUG("ND: released persistent pin (ref={}) for {}", reg.refCount, ptr);
-            return;
-        }
-        
+// Release persistently pinned host memory
+// Decrements ref count; only actually deregisters when ref count reaches 0
+void releasePersistentHostMemory(void* ptr) override {
+    if (!ptr) return;
+    
+    std::unique_lock<std::mutex> lock(regionsMutex_);
+    auto it = regions_.find(reinterpret_cast<uintptr_t>(ptr));
+    if (it == regions_.end()) {
+        VVM_LOG_WARN("ND: releasePersistentHostMemory called for unknown ptr {}", ptr);
+        return;
+    }
+    
+    RegisteredRegion& reg = it->second;
+    
+    if (!reg.persistentlyPinned) {
+        VVM_LOG_WARN("ND: releasePersistentHostMemory called for non-persistent ptr {}", ptr);
+        return;
+    }
+    
+    if (reg.refCount == 0) {
+        VVM_LOG_ERROR("ND: releasePersistentHostMemory refCount underflow for {}", ptr);
+        return;
+    }
+    
+    reg.refCount--;
+    VVM_LOG_DEBUG("ND: released persistent pin (ref={}) for {}", reg.refCount, ptr);
+    
+    if (reg.refCount == 0) {
         // Last reference - remove persistent flag but keep registered
         reg.persistentlyPinned = false;
-        VVM_LOG_INFO("ND: removed persistent pin for {}", ptr);
+        VVM_LOG_INFO("ND: removed persistent pin flag for {}", ptr);
     }
+}
 
     void unregisterMemory(const RdmaMemoryRegion& region) override {
         if (!region.addr) return;
@@ -1093,6 +1150,8 @@ private:
     std::atomic<uint64_t> nextContextCounter_{1};
     std::mutex connectMutex_;
     std::mutex transferMutex_;  // serializes post+wait on the shared CQ
+
+    bool winsockInitialized_ = false;
 };
 
 // ============================================================================
