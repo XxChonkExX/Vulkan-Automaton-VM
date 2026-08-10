@@ -163,6 +163,53 @@ ibv_devices     # lists rxe0, rxe1
 
 **Verified:** `tensor_network_test` passes on WSL2 (kernel 6.18.40) with `rxe0` + `rxe1`. On native Linux with physical RNIC, same code uses hardware RDMA. Without SoftRoCE/RNIC → falls back to host-staged TCP (always available).
 
+### UCX (Unified Communication X) Transport
+
+For production clusters, UCX provides a **unified transport layer** that auto-selects the best path: InfiniBand/RoCE verbs → TCP → shared memory → GPU memory (CUDA/ROCm/Level Zero).
+
+```cpp
+TransportConfig config;
+config.enableUCX = true;
+config.ucxTLS = "rc,ud,sm,tcp";      // IB verbs, datagram, shmem, TCP
+config.ucxNetDevices = "mlx5_0:1";   // NIC selection
+config.ucxEnableGPUMem = true;       // GPU memory registration
+config.ucxEnableRndv = true;         // Rendezvous for large msgs
+config.ucxRndvThreshold = 8192;      // bytes
+config.ucxEnableCudaIpc = true;      // Intra-node GPU IPC
+```
+
+**UCX TLS (Transport Layers):**
+| TLS | Description |
+|-----|-------------|
+| `rc` | Reliable Connected (InfiniBand/RoCE) |
+| `ud` | Unreliable Datagram |
+| `sm` | Shared Memory (intra-node) |
+| `tcp` | TCP/IP fallback |
+| `cuda_ipc` | CUDA IPC (intra-node GPU) |
+
+**Attribution:** UCX (https://github.com/openucx/ucx) — BSD-3-Clause.
+
+### GDRCopy-Style Persistent Host Pinning (NDKPI / Windows)
+
+For high-frequency RDMA on Windows NDKPI, VulkanVM implements **persistent host memory pinning** inspired by NVIDIA's GDRCopy. This avoids repeated registration overhead on hot paths.
+
+```cpp
+// Pin host memory for repeated RDMA use (ref-counted)
+rdmaTransport->pinPersistentHostMemory(ptr, size);
+
+// Release persistent pin (decrements ref count; actual deregister at 0)
+rdmaTransport->releasePersistentHostMemory(ptr);
+```
+
+**How it works:**
+- First pin → creates `IND2MemoryRegion` + `Register`
+- Subsequent pins → increments ref count, reuses registration
+- Release → decrements ref count; actual `Deregister` only at 0
+
+**Use case:** Pre-pin staging buffers during init, reuse for thousands of RDMA ops.
+
+**Attribution:** Pattern inspired by GDRCopy (https://github.com/NVIDIA/gdrcopy) — MIT, NVIDIA.
+
 ---
 
 ## Unified Tensor Transport
