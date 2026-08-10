@@ -103,6 +103,17 @@ public:
     // Unregister memory region
     virtual void unregisterMemory(const RdmaMemoryRegion& region) = 0;
     
+    // Persistent host memory pinning (GDRCopy-style)
+    // Pin memory for repeated RDMA use - avoids repeated registration overhead
+    virtual bool pinPersistentHostMemory(void* ptr, size_t size) {
+        (void)ptr; (void)size; return false; // Default: not supported
+    }
+    
+    // Release persistently pinned host memory
+    virtual void releasePersistentHostMemory(void* ptr) {
+        (void)ptr; // Default: not supported
+    }
+    
     // ========================================================================
     // Connection management
     // ========================================================================

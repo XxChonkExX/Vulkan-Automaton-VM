@@ -4,6 +4,10 @@
 #include "vulkan_vm/network/multi_node_manager.hpp"
 #include "vulkan_vm/utils.hpp"
 
+#if defined(VVM_HAS_UCX)
+#include "vulkan_vm/ucx_transport.hpp"
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -425,6 +429,17 @@ public:
         }
         poolManager_ = std::move(poolOpt);
         
+        // Initialize UCX transport (if enabled)
+#if defined(VVM_HAS_UCX)
+        if (config_.enableUCX || 
+            config_.preference == TransportConfig::Preference::UCXOnly ||
+            config_.preference == TransportConfig::Preference::Auto) {
+            if (!initUCXTransport()) {
+                VVM_LOG_WARN("UCX transport initialization failed");
+            }
+        }
+#endif
+        
         // Initialize network transport
         if (config_.preference == TransportConfig::Preference::NetworkOnly ||
             config_.preference == TransportConfig::Preference::Auto) {
@@ -453,6 +468,13 @@ public:
         if (asyncThread_.joinable()) {
             asyncThread_.join();
         }
+        
+#if defined(VVM_HAS_UCX)
+        if (ucxTransport_) {
+            ucxTransport_->shutdown();
+            ucxTransport_.reset();
+        }
+#endif
         
         if (networkManager_) {
             networkManager_->stop();
@@ -1232,6 +1254,38 @@ if (!loaded) {
     }
     
     // ========================================================================
+    // UCX Transport
+    // ========================================================================
+    
+#if defined(VVM_HAS_UCX)
+    bool initUCXTransport() {
+        if (!poolManager_) return false;
+        
+        ucxTransport_ = std::make_unique<vvm::tensor::UcxTransport>();
+        
+        vvm::tensor::UcxTransportConfig ucxConfig;
+        ucxConfig.workerThreadCount = 1;
+        ucxConfig.enableRndv = config_.ucxEnableRndv;
+        ucxConfig.rndvThreshold = config_.ucxRndvThreshold;
+        ucxConfig.enableGpuMemory = config_.ucxEnableGPUMem;
+        ucxConfig.tls = config_.ucxTLS;
+        ucxConfig.netDevices = config_.ucxNetDevices;
+        ucxConfig.enableCudaIpc = config_.ucxEnableCudaIpc;
+        
+        if (!ucxTransport_->initialize(ucxConfig)) {
+            VVM_LOG_ERROR("Failed to initialize UCX transport");
+            ucxTransport_.reset();
+            return false;
+        }
+        
+        VVM_LOG_INFO("UCX transport initialized (GPU mem: {}, RNDV: {})", 
+                     config_.ucxEnableGPUMem ? "on" : "off",
+                     config_.ucxEnableRndv ? "on" : "off");
+        return true;
+    }
+#endif
+    
+    // ========================================================================
     // Multi-Node Network
     // ========================================================================
     
@@ -1530,6 +1584,10 @@ private:
     
     std::optional<vvm::MultiGPUPoolManager> poolManager_;
     std::unique_ptr<vvm::network::MultiNodePoolManager> networkManager_;
+    
+#if defined(VVM_HAS_UCX)
+    std::unique_ptr<vvm::tensor::UcxTransport> ucxTransport_;
+#endif
 
     // Broadcast targets: device index -> nearest handle (populated by
     // allocateDistributed).

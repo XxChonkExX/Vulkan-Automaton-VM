@@ -8,6 +8,10 @@
 #include "vulkan_vm/cross_gpu.hpp"
 #include "vulkan_vm/network.hpp"
 
+#if defined(VVM_HAS_UCX)
+#include "vulkan_vm/ucx_transport.hpp"
+#endif
+
 namespace vvm {
 namespace tensor {
 
@@ -102,11 +106,12 @@ struct TensorMetadata {
 
 struct TransportConfig {
     enum class Preference {
-        Auto,           // P2P -> RDMA -> HostStaged -> Network
+        Auto,           // P2P -> RDMA -> HostStaged -> Network -> UCX
         P2POnly,        // Local multi-GPU only
         RDMAOnly,       // GPU-Direct RDMA
         HostStagedOnly, // CPU-staged copies
-        NetworkOnly     // Multi-node
+        NetworkOnly,    // Multi-node TCP/RDMA
+        UCXOnly         // UCX (InfiniBand/RoCE/TCP/GPU)
     };
     
     Preference preference = Preference::Auto;
@@ -124,6 +129,15 @@ struct TransportConfig {
     std::string tlsCertPath;
     std::string tlsKeyPath;
     std::string tlsCaPath;
+    
+    // UCX (Unified Communication X)
+    bool enableUCX = false;
+    std::string ucxTLS;           // e.g., "rc,ud,sm,tcp"
+    std::string ucxNetDevices;    // e.g., "mlx5_0:1"
+    bool ucxEnableGPUMem = true;  // GPU memory registration
+    bool ucxEnableRndv = true;    // Rendezvous protocol
+    size_t ucxRndvThreshold = 8192;
+    bool ucxEnableCudaIpc = true;
 };
 
 // ============================================================================
