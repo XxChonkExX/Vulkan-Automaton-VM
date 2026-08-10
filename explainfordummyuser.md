@@ -2,58 +2,268 @@
 
 ## What Is VulkanVM?
 
-**VulkanVM is a Vulkan memory management library that solves three hard problems:** eliminating GPU memory fragmentation on AMD APUs, enabling zero-copy memory sharing across NVIDIA/AMD/Intel GPUs, and providing demand-paged host offload when VRAM runs out. It also includes a Hugging Face–style model registry for distributing model weights over TCP and a capacity-first shard placer for multi-node model distribution.
+**VulkanVM is a cross-vendor GPU networking and RDMA library** that moves tensor VRAM across AMD, NVIDIA, and Intel GPUs — locally and across machines — with zero-copy where hardware allows, automatic fallback where it doesn't. It's built on a hardened, zero-fragmentation Vulkan memory pool (the "Chonk Buffer") and includes a Hugging Face–style model registry, capacity-first shard placement, and a unified tensor transport for AI inference clusters.
 
 **One header, one library, zero system changes.** It's a library you link into your application — not a driver, not a daemon, not a kernel module.
 
 ---
 
-## The Three Problems It Solves
+## The Primary Feature: GPU Networking & RDMA
 
-### Problem 1: Memory Fragmentation (The "Messy Heap" Problem)
+VulkanVM's networking stack is a **production-grade multi-node GPU fabric** that moves tensor VRAM across machines with zero-copy where hardware allows, automatic fallback where it doesn't.
 
-**What happens:** GPU memory allocators return blocks of varying sizes. Over time, free space becomes scattered — 100 MB free total, but no single contiguous 50 MB block. On AMD's unified-memory APUs (Strix Halo), this causes allocation failures even when plenty of VRAM appears free.
+### What It Solves
 
-**VulkanVM's fix:** At startup, VulkanVM reserves a large portion of VRAM (e.g., 80% of the heap budget) in a few large blocks. It then uses a **buddy allocator** — a power-of-two splitting/coalescing algorithm — to sub-allocate. Memory is **never returned to the OS**, so the heap never fragments. Large contiguous allocations always succeed.
+| Problem | Solution |
+|---------|----------|
+| **GPU↔GPU across machines** | TCP host-staged (always works), RDMA (Linux), GPU-Direct RDMA (bypass CPU) |
+| **Different GPU vendors** | Universal translator: NVIDIA DMA-BUF/D3D12, AMD/Intel OPAQUE_WIN32/DMA-BUF, Intel Level Zero |
+| **No RNIC hardware** | SoftRoCE (Linux `rxe` kernel module) — RDMA over standard Ethernet |
+| **Windows RDMA** | NDKPI (`IND2Provider`) — kernel-bypass Network Direct |
+| **Model distribution** | Hugging Face–style registry + capacity-first shard placement |
 
-### Problem 2: Cross-Vendor Memory Sharing (The "Different Protocols" Problem)
+### Transport Priority (Auto-Selected)
 
-**What happens:** NVIDIA, AMD, and Intel GPUs each use different external memory handle types. They can't directly share `VkDeviceMemory` — the handle from one vendor is opaque to another.
+```cpp
+TransportConfig config;
+config.preference = TransportConfig::Preference::Auto;  // P2P → RDMA → HostStaged → Network
+```
 
-**VulkanVM's fix:** VulkanVM acts as a universal translator. It knows the handle type for every vendor pair:
-
-| Source → Target | Linux Handle | Windows Handle |
-|-----------------|--------------|----------------|
-| NVIDIA → AMD    | DMA-BUF      | D3D12_HEAP → OPAQUE_WIN32 |
-| NVIDIA → Intel  | DMA-BUF      | D3D12_HEAP → OPAQUE_WIN32 |
-| AMD → NVIDIA    | DMA-BUF      | OPAQUE_WIN32 → D3D12_HEAP |
-| Intel → NVIDIA  | DMA-BUF      | OPAQUE_WIN32 → D3D12_HEAP |
-| AMD ↔ Intel     | DMA-BUF / OPAQUE_FD | OPAQUE_WIN32 |
-
-**The workflow:**
-1. Allocate a **dedicated exportable** buffer on the source GPU (one `VkDeviceMemory` per shareable buffer)
-2. Export the handle — VulkanVM translates to the target's handle type
-3. Import on the target GPU — VulkanVM handles cross-vendor memory type re-selection
-4. Both GPUs now reference the **same physical memory**
-
-### Problem 3: VRAM Overflow (The "Out of VRAM" Crash)
-
-**What happens:** Large models exceed GPU VRAM. Traditional allocators fail with `VK_ERROR_OUT_OF_DEVICE_MEMORY`.
-
-**VulkanVM's fix:** A **host-shadow buffer** (pinned host memory) acts as a spill warehouse. When VRAM fills:
-1. `offloadToHost()` — asynchronously copies allocation to host shadow via GPU copy engine
-2. Original VRAM freed; program continues
-3. `reloadToDevice()` — brings it back when needed
-
-The copy engine handles the transfer asynchronously; your compute keeps running.
+| Priority | Path | Mechanism | Staging? |
+|----------|------|-----------|----------|
+| 1 | **P2P** | `VK_EXTERNAL_MEMORY` + `vkCmdCopyBuffer` | ❌ |
+| 2 | **RDMA** | GPU-Direct: `ibv_reg_dmabuf_mr` / NDKPI | ❌ |
+| 3 | **AHardwareBuffer** | Android: `VK_ANDROID_external_memory_android_hardware_buffer` | ❌ |
+| 4 | **Host-Staged** | 4 MiB chunks via host memory | ✅ |
+| 5 | **Network** | TCP/RDMA multi-node | ✅ |
 
 ---
 
-## Core Architecture
+## Quick Start — GPU Networking
 
-### The Buddy Allocator (Zero Fragmentation)
+```cpp
+#include <vulkan_vm/vulkan_vm.hpp>
+#include <vulkan_vm/tensor_transport.hpp>
+using namespace vvm;
+using namespace vvm::tensor;
 
-A power-of-two allocator that splits and merges blocks with their "buddy":
+// 1. Select GPU
+VkInstance instance = createInstance();
+auto devices = enumerateDevices(instance);
+auto best = selectBestDevice(devices, true, 1024);
+VkPhysicalDevice physicalDevice = best->device;
+
+auto queues = findQueueFamilies(physicalDevice);
+DeviceConfig devConfig{
+    .physicalDevice = physicalDevice,
+    .device = createDevice(physicalDevice, queues),
+    .graphicsQueueFamily = queues.graphics.value_or(0),
+    .computeQueueFamily  = queues.compute.value_or(0),
+    .transferQueueFamily = queues.transfer.value_or(0),
+};
+
+// 2. Create pool (auto-tuned)
+PoolConfig poolConfig = PoolConfig::forDevice(physicalDevice);
+poolConfig.maxHeapFraction = 0.75f;
+
+// 3. Configure tensor transport with networking
+TransportConfig config;
+config.preference = TransportConfig::Preference::Auto;
+config.enableAsyncPipeline = true;
+config.maxInFlightTransfers = 4;
+config.networkPort = 51000;
+config.enableTLS = true;
+config.tlsCertPath = "cert.pem";
+config.tlsKeyPath = "key.pem";
+config.tlsCaPath = "ca.pem";
+
+// 4. Create transport
+auto transport = vvm::tensor::createTensorTransport(config, {devConfig}, poolConfig);
+if (!transport->initialize()) { /* handle error */ }
+
+// 5. Allocate a tensor
+TensorMetadata meta;
+meta.dtype = DataType::Float16;
+meta.layout = MemoryLayout::ChannelsLast;
+meta.shape = TensorShape::makeChannelsLast({1, 32, 32, 128});
+meta.name = "conv_weight";
+
+auto tensor = transport->allocateTensor(meta, 0);
+
+// 6. Multi-node send/recv (auto-picks best path)
+transport->sendTensor(tensor, "192.168.1.10:51001#0", 
+    [](bool ok, const std::string& err) { /* done */ });
+
+transport->recvTensor(receiver, "192.168.1.11:51002#0",
+    [](bool ok, const std::string& err) { /* done */ });
+
+// 7. Collectives (ring all-reduce across GPUs/nodes)
+transport->allReduce({t0, t1, t2}, ReduceOp::Sum, {0, 1, 2});
+```
+
+---
+
+## GPU-Direct RDMA Vendor Paths
+
+For NIC-attached GPU memory DMA (bypassing host CPU entirely):
+
+| GPU Vendor | Linux Path | Windows Path |
+|------------|------------|--------------|
+| **NVIDIA (0x10DE)** | `VK_NV_external_memory_rdma` → `vkGetMemoryRemoteAddressNV` → `ibv_reg_mr` on PCI BAR (needs `nvidia-peermem`) | NDKPI + `CreateMemoryRegion` from `D3D12_HEAP`/`OPAQUE_WIN32` |
+| **AMD (0x1002)** | `DMA_BUF` → `ibv_reg_dmabuf_mr` (or mmap fallback) | `OPAQUE_WIN32` → `MapViewOfFile` → NDKPI |
+| **Intel (0x8086)** | `DMA_BUF` → `ibv_reg_dmabuf_mr` (Xe KMD) | **Level Zero** `zeMemGetAllocProperties` + `ze_external_memory_export_win32_handle_t` → NDKPI |
+
+```cpp
+// In VerbsRdmaTransport:
+auto region = rdmaTransport->registerGpuMemory(memory, offset, size, buffer);
+// Returns RdmaMemoryRegion with lkey/rkey/rdmaAddr for direct NIC DMA
+```
+
+**Intel Level Zero (Windows) — New:**
+```cpp
+// Export GPU memory as Win32 handle via Level Zero
+ze_external_memory_export_win32_handle_t exportDesc{};
+exportDesc.stype = ZE_STRUCTURE_TYPE_EXTERNAL_MEMORY_EXPORT_WIN32;
+exportDesc.flags = ZE_EXTERNAL_MEMORY_TYPE_FLAG_OPAQUE_WIN32;
+zeMemGetAllocProperties(context, allocation, &props, &exportDesc);
+// exportDesc.handle → NDKPI CreateMemoryRegion / user-mode RDMA
+```
+
+**AMD ROCm (Linux) — New:**
+```cpp
+// Import DMA-BUF into HIP external memory
+hipExternalMemoryHandleDesc desc{};
+desc.type = HIP_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF;
+desc.handle.fd = dmaBufFd;
+desc.size = size;
+hipExternalMemory_t extMem;
+hipImportExternalMemory(&extMem, &desc);
+
+hipExternalMemoryBufferDesc bufDesc{};
+bufDesc.offset = offset;
+bufDesc.size = size;
+void* mappedPtr;
+hipExternalMemoryGetMappedBuffer(&mappedPtr, extMem, &bufDesc);
+// mappedPtr → ibv_reg_mr for RDMA
+```
+
+---
+
+## SoftRoCE (Linux Software RDMA)
+
+No RNIC? No problem. Kernel `rxe` module enables verbs/RDMA over standard Ethernet.
+
+```bash
+# WSL2 / Ubuntu 24.04
+sudo rdma link add rxe0 type rxe netdev eth0
+sudo rdma link add rxe1 type rxe netdev lo
+rdma link show  # verify ACTIVE
+ibv_devices     # lists rxe0, rxe1
+```
+
+**Verified:** `tensor_network_test` passes on WSL2 (kernel 6.18.40) with `rxe0` + `rxe1`. On native Linux with physical RNIC, same code uses hardware RDMA. Without SoftRoCE/RNIC → falls back to host-staged TCP (always available).
+
+---
+
+## Unified Tensor Transport
+
+Moves **tensors** — not raw bytes — with shape, dtype, and layout awareness.
+
+```cpp
+#include <vulkan_vm/tensor_transport.hpp>
+using namespace vvm::tensor;
+
+TransportConfig config;
+config.preference = TransportConfig::Preference::Auto;
+config.enableAsyncPipeline = true;
+config.maxInFlightTransfers = 4;
+config.networkPort = 51000;
+config.enableTLS = true;
+
+auto transport = vvm::tensor::createTensorTransport(config, devices, poolConfig);
+transport->initialize();
+
+// Allocate + distribute
+auto tensor = transport->allocateTensor(meta, 0);
+auto tensors = transport->allocateDistributed(meta, {0, 1, 2});
+
+// Collectives
+transport->allReduce({t0, t1, t2}, ReduceOp::Sum, {0, 1, 2});
+transport->broadcast(rootTensor, {0, 1, 2}, 0);
+transport->allGather({t0, t1, t2}, output, {0, 1, 2});
+transport->reduceScatter({t0, t1, t2}, output, ReduceOp::Sum, {0, 1, 2});
+
+// Async
+transport->allReduceAsync({t0, t1, t2}, ReduceOp::Sum, {0, 1, 2},
+    [](bool ok, const std::string& err) { /* done */ });
+transport->flushAsync();
+
+// Multi-node
+transport->sendTensor(tensor, "192.168.1.10:51001#0", callback);
+transport->recvTensor(receiver, "192.168.1.11:51002#0", callback);
+```
+
+**Collective dtypes:** FP32, FP16, BF16, FP8_E4M3, FP8_E5M2, Int4 (packed), Int8, UInt8, Int32, Int64, Bool  
+**Collective ops:** Sum, Mean, Min, Max, Product, Band, Bor, Bxor
+
+---
+
+## ModelHub & Shard Placement
+
+### ModelHub — Model Weight Distribution
+
+Content-addressed, Hugging Face–style model registry with TCP distribution.
+
+```cpp
+// Server
+ModelHub hub("/data/model-store");
+hub.start("0.0.0.0", 51010);
+hub.publish("my-org/llama-3b-q4", "./local-model-files", "v1");
+
+// Client
+ModelHub::fetch("192.168.1.50:51010", "my-org/llama-3b-q4", "./my-models", "v1");
+```
+
+### Shard Placement (Capacity-First Bin Packing)
+
+```cpp
+#include <vulkan_vm/placement.hpp>
+using namespace vvm::placement;
+
+// Model manifest
+ModelManifest model;
+model.shards = {
+    ShardSpec{"blk.0-3", "hash1", ShardKind::Weights, 2_GiB, 0, 3},
+    ShardSpec{"blk.4-7", "hash2", ShardKind::Weights, 2_GiB, 4, 7},
+    ShardSpec{"blk.8-11", "hash3", ShardKind::Weights, 2_GiB, 8, 11},
+};
+
+// Cluster topology
+ClusterCapacity cluster;
+cluster.nodes = {
+    NodeCapacity{"node-a", 8_GiB, 8_GiB, 4_GiB, 1, 1, 1000, true},
+    NodeCapacity{"node-b", 8_GiB, 8_GiB, 4_GiB, 1, 1, 1000, true},
+};
+cluster.reservedActivationBytes = 512_MiB;
+
+// Policy
+PlacementPolicy policy;
+policy.allowHostOffload = true;
+policy.preferContiguousLayers = true;
+policy.packMode = PackMode::PackDense;
+
+// Plan + Execute
+PlacementPlan plan = ShardPlacer::plan(model, cluster, policy);
+PlacementExecutor executor(nodeManager, modelHub);
+ExecuteOptions opt{ .fetchIfMissing=true, .verifyChecksum=true };
+ExecuteResult result = executor.executeLocal(model, plan, opt);
+```
+
+---
+
+## Core Memory Pool (Chonk Buffer)
+
+### Buddy Allocator — Zero Fragmentation
 
 ```
 512 MB block
@@ -65,72 +275,66 @@ A power-of-two allocator that splits and merges blocks with their "buddy":
         └── 64 MB (free)  ← merges back with buddy when freed
 ```
 
-**Key properties:**
-- Blocks always merge with their "buddy" (adjacent block from same parent split)
-- No external fragmentation — free blocks always coalesce
-- O(1) allocation/deallocation
-- Deterministic placement — lowest free offset handed out first, so buddy pairs stay adjacent and coalescing always works
-- Power-of-two alignment guaranteed
+- Power-of-two splitting/coalescing — no external fragmentation
+- O(1) via `unordered_set` free lists per order
+- Optional internal mutex (`threadSafe_`)
+- Deterministic lowest-offset placement
 
-### Auto-Tuning (APU vs Discrete vs High-VRAM)
+### Auto-Tuning
 
-`PoolConfig::forDevice()` reads the device memory at runtime and picks the block profile:
+| Hardware | Blocks | Heap Fraction |
+|----------|--------|---------------|
+| APU / Strix Halo | 1-2 GB | Capped |
+| Discrete <24 GB | 512 MB | 0.75 |
+| High-VRAM ≥24 GB | 2 GB | 0.8-0.85 |
 
-- **APUs / unified memory (Strix Halo)** → 1-2 GB blocks, host-visible, capped heap fraction
-- **Discrete cards under 24 GB** → 512 MB blocks (16 blocks, 0.75 heap fraction) so mid-range cards stay conservative
-- **High-VRAM cards ≥24 GB (RTX 4090, RTX 6000 Ada)** → auto-scales to 2 GB blocks, 64 blocks, 0.8-0.85 heap fraction so big pools can actually be saturated
+```cpp
+PoolConfig poolConfig = PoolConfig::forDevice(physicalDevice);
+poolConfig.maxHeapFraction = 0.75f;
+```
 
-Explicit overrides are available: `PoolConfig::forHighVRAM(physicalDevice)` (2 GB blocks, up to 0.85 of the heap) and `PoolConfig::forAPU(totalSystemRAM)` (RAM-budget-aware). Default to `forDevice()` and let detection do the work.
-
-### Memory Usage Intents (No Raw Flags)
-
-Instead of raw `VkMemoryPropertyFlags`, you declare intent:
+### Memory Usage Intents
 
 ```cpp
 enum class MemoryUsage {
-    GpuOnly,        // DEVICE_LOCAL — fastest GPU access
-    CpuToGpu,       // HOST_VISIBLE | HOST_COHERENT — upload staging
+    GpuOnly,        // DEVICE_LOCAL
+    CpuToGpu,       // HOST_VISIBLE | HOST_COHERENT — upload
     GpuToCpu,       // HOST_VISIBLE | HOST_COHERENT — readback
-    CpuCopy,        // HOST_VISIBLE — CPU-only copies
+    CpuCopy,        // HOST_VISIBLE — CPU-only
     Auto            // Let VulkanVM decide
 };
 ```
 
-### External Handle Ownership (No Leaks)
-
-```cpp
-// Export: returns RAII handle — closes on scope exit
-auto handle = pool.exportMemory(allocation, ExternalHandleType::OpaqueWin32);
-
-// Import: CONSUMES the handle (driver takes ownership). On failure, handle still closes.
-auto imported = peerPool.importMemory(std::move(handle), usage);
-
-// Multiple peers? Duplicate first:
-for (auto& peer : peers) {
-    auto perPeer = duplicateForImport(handle);  // dup() / DuplicateHandle()
-    peer.importMemory(std::move(perPeer), usage);
-}
-```
-
 ---
 
-## Cross-GPU Sharing (Multi-GPU Pool Manager)
+## Cross-GPU Memory Sharing
+
+Universal translator for GPU memory handles:
+
+| Source → Target | Linux | Windows |
+|-----------------|-------|---------|
+| NVIDIA → AMD | DMA-BUF | D3D12_HEAP → OPAQUE_WIN32 |
+| AMD → NVIDIA | DMA-BUF | OPAQUE_WIN32 → D3D12_HEAP |
+| AMD ↔ Intel | DMA-BUF / OPAQUE_FD | OPAQUE_WIN32 |
 
 ```cpp
-// Configure devices
-std::vector<DeviceConfig> devices = { amdConfig, intelConfig, nvidiaConfig };
-PoolConfig config = PoolConfig::forDevice(devices[0].physicalDevice);
+// Master allocates dedicated exportable
+auto masterAlloc = masterPool.allocateDedicatedExportable(256_MiB, usage);
+auto exportInfo = masterPool.exportMemory(*masterAlloc,
+    #ifdef VVM_PLATFORM_LINUX
+        ExternalHandleType::DmaBuf
+    #else
+        ExternalHandleType::OpaqueWin32
+    #endif
+);
 
-// GPU 0 = master (allocates + exports)
-auto manager = MultiGPUPoolManager::create(devices, config, 0);
+// Peer imports (per-peer duplicate)
+auto peerHandle = duplicateForImport(exportInfo.handle);
+auto peerAlloc = peerPool.importMemory(std::move(peerHandle), usage);
+// Same physical memory on both GPUs
 
-// One call: allocates on master, imports on all peers
-auto allocs = manager.allocateDistributed(512_MiB, usage);
-// allocs[i] is valid on devices[i], all aliasing the same memory
-
-// Direct GPU→GPU copy (no host staging) when driver supports it
+// Direct GPU→GPU copy (no host staging)
 manager->copyDeviceToDevice(0, 1, *srcAlloc, *dstAlloc, 0, 0, size);
-// Falls back to 4 MB chunked host-staged copy if driver refuses cross-import
 ```
 
 ---
@@ -145,190 +349,71 @@ cfg.transferQueueFamily = transferQueueFamily;
 
 pool->initializeOffload(cfg);
 
-// Async offload (device → host)
+// Async offload
 auto op = pool->offloadToHost(allocation);
-// ... do other work while DMA runs ...
 pool->waitMigration(op);
 
-// Sync reload (host → device)
+// Reload
 pool->reloadToDevice(allocation);
 ```
 
-Uses GPU copy engine (DMA engines), not `madvise`/`mprotect` (unsafe on driver mappings).
-
----
-
-## ModelHub — Model Weight Distribution
-
-**Server (Hub):**
-```cpp
-ModelHub hub("/data/model-store");
-hub.start("0.0.0.0", 51010);
-hub.publish("my-org/llama-3b-q4", "./local-model-files", "v1");
-```
-
-**Client:**
-```cpp
-ModelHub::fetch("192.168.1.50:51010", "my-org/llama-3b-q4", "./my-models", "v1");
-```
-
-**Cache layout (HF-style):**
-```
-~/.cache/vvm/models/my-org/llama-3b-q4/v1/
-  config.json
-  weights.safetensors
-  tokenizer/tokenizer.json
-  .vvm_complete          # marker = cache entry valid
-```
-
-Content-addressed chunks (SHA-256, 4 MiB slices), resume support, TLS optional.
-
----
-
-## Unified Tensor Transport (`vvm::tensor::Transport`)
-
-Moves tensors — not raw bytes — with shape, dtype, and layout awareness.
-
-### Tensor Metadata
-
-```cpp
-struct TensorMetadata {
-    DataType dtype = DataType::Float32;      // FP32, FP16, BF16, INT8, INT4, FP8_E4M3, FP8_E5M2
-    MemoryLayout layout = MemoryLayout::Contiguous;  // Contiguous, ChannelsLast, Blocked, Strided
-    TensorShape shape;                        // dims + optional strides
-    std::string name;
-};
-```
-
-### Operations
-
-```cpp
-auto transport = vvm::tensor::createTensorTransport(config, devices, poolConfig);
-transport->initialize();
-
-// Allocate + distribute
-auto tensor = transport->allocateTensor(meta, 0);           // on GPU 0
-auto tensors = transport->allocateDistributed(meta, {0, 1, 2});  // across GPUs
-
-// Copy with layout conversion (compute shaders, no host round-trip)
-transport->copyWithLayoutConversion(src, dst, MemoryLayout::Blocked);
-
-// Collectives (ring all-reduce, broadcast, all-gather, reduce-scatter)
-transport->allReduce({t0, t1, t2}, ReduceOp::Sum, {0, 1, 2});
-transport->broadcast(rootTensor, {0, 1, 2}, 0);
-transport->allGather({t0, t1, t2}, output, {0, 1, 2});
-transport->reduceScatter({t0, t1, t2}, output, ReduceOp::Sum, {0, 1, 2});
-
-// Async variants (worker thread + callbacks)
-transport->allReduceAsync({t0, t1, t2}, ReduceOp::Sum, {0, 1, 2}, 
-    [](bool ok, const std::string& err) { /* done */ });
-transport->flushAsync();  // wait for all queued ops
-```
-
-### Multi-Node Network
-
-```cpp
-// Node A (bootstrap)
-TransportConfig cfgA; cfgA.listenAddress = "0.0.0.0:51001";
-auto nodeA = createTensorTransport(cfgA, devices, poolConfig);
-nodeA->joinCluster("0.0.0.0:51001");
-
-// Node B (joins)
-TransportConfig cfgB; cfgB.listenAddress = "0.0.0.0:51002";
-cfgB.seedNodes = {"127.0.0.1:51001"};
-auto nodeB = createTensorTransport(cfgB, devices, poolConfig);
-nodeB->joinCluster("127.0.0.1:51001");
-
-// Send/recv (auto-picks P2P → RDMA → Host-Staged → Network)
-nodeB->sendTensor(tensor, "192.168.1.10:51001#0", callback);
-nodeA->recvTensor(receiver, "192.168.1.11:51002#0", callback);
-```
-
----
-
-## GPU-Direct RDMA (Zero-Copy NIC DMA)
-
-For NIC-attached GPU memory DMA (bypassing host CPU):
-
-| GPU Vendor | Path |
-|------------|------|
-| **NVIDIA** | `VK_NV_external_memory_rdma` → `vkGetMemoryRemoteAddressNV` → `ibv_reg_mr` on PCI BAR (Linux, needs nvidia-peermem) or NDKPI (Windows) |
-| **AMD/Intel** | Export `OPAQUE_WIN32`/`DMA_BUF` → `MapViewOfFile`/`mmap` → `ibv_reg_mr` on mapped VA |
-
-```cpp
-auto region = rdmaTransport->registerGpuMemory(memory, offset, size, buffer);
-// Returns RdmaMemoryRegion with lkey/rkey/rdmaAddr for direct NIC DMA
-```
-
-**Linux SoftRoCE (no RNIC needed):** Kernel `rxe` module enables verbs/RDMA over standard Ethernet. Verified on WSL2.
-
----
-
-## Shard Placement API (Capacity-First Bin Packing)
-
-For distributing model shards across a GPU cluster:
-
-```cpp
-// 1. Model manifest (from ModelHub)
-ModelManifest model;
-model.shards = {
-    ShardSpec{"blk.0-3", "hash1", ShardKind::Weights, 2_GiB, 0, 3},
-    ShardSpec{"blk.4-7", "hash2", ShardKind::Weights, 2_GiB, 4, 7},
-    ShardSpec{"blk.8-11", "hash3", ShardKind::Weights, 2_GiB, 8, 11},
-};
-
-// 2. Cluster topology
-ClusterCapacity cluster;
-cluster.nodes = {
-    NodeCapacity{"node-a", 8_GiB, 8_GiB, 4_GiB, 1, 1, 1000, true},
-    NodeCapacity{"node-b", 8_GiB, 8_GiB, 4_GiB, 1, 1, 1000, true},
-};
-cluster.reservedActivationBytes = 512_MiB;  // KV cache slack
-
-// 3. Policy
-PlacementPolicy policy;
-policy.allowHostOffload = true;
-policy.preferContiguousLayers = true;
-policy.packMode = PackMode::PackDense;
-
-// 4. Plan
-PlacementPlan plan = ShardPlacer::plan(model, cluster, policy);
-// plan.assignments = [ {blk.0-3 → node-a, DeviceLocal}, ... ]
-
-// Execute (per-node)
-PlacementExecutor executor(nodeManager, modelHub);
-ExecuteOptions opt{ .fetchIfMissing=true, .verifyChecksum=true };
-ExecuteResult result = executor.executeLocal(model, plan, opt);
-// Idempotent, transactional rollback on failure
-```
+Uses GPU copy engine (DMA), not `madvise`/`mprotect`.
 
 ---
 
 ## Sparse / Residency Virtual Memory
 
-Reserve huge virtual address space, commit physical pages on demand:
-
 ```cpp
 SparseVirtualMemoryPool pool(device, physicalDevice);
-pool.initialize(1_TiB, 32_MiB);  // 1 TB virtual, 32 MB pages
+pool.initialize(1_TiB, 32_MiB);
 
-auto reservation = pool.reserveVirtual(256_GiB, usage);  // No physical memory yet
-pool.commit(reservation, 64_GiB, 64_GiB, memoryFlags);   // Commit 64 GB at offset 64 GB
-pool.uncommit(reservation, 64_GiB, 64_GiB);              // Release when done
+auto reservation = pool.reserveVirtual(256_GiB, usage);  // No physical yet
+pool.commit(reservation, 64_GiB, 64_GiB, memoryFlags);   // Commit on demand
+pool.uncommit(reservation, 64_GiB, 64_GiB);              // Release
+```
+
+---
+
+## Android / Vulkan (AHardwareBuffer)
+
+Zero-copy sharing with Android graphics pipeline (Surface, MediaCodec, Camera).
+
+```bash
+./scripts/build_android.sh arm64-v8a android-34 Release
+```
+
+```cpp
+#include <vulkan_vm/vulkan_vm.hpp>
+#include <android/hardware_buffer.h>
+
+AHardwareBuffer_Desc desc{};
+desc.width = 1920; desc.height = 1080;
+desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+desc.usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | 
+             AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT;
+
+AHardwareBuffer* hardwareBuffer;
+AHardwareBuffer_allocate(&desc, &hardwareBuffer);
+
+ExternalMemoryInfo extInfo;
+extInfo.type = ExternalHandleType::AndroidHardwareBuffer;
+extInfo.handle = ExternalHandle(hardwareBuffer);
+extInfo.size = bufferSize;
+extInfo.dedicatedAllocation = true;
+
+auto allocation = pool.importMemory(std::move(extInfo), usage);
+auto deviceAddress = allocation->deviceAddress;  // Use in shaders
 ```
 
 ---
 
 ## PyTorch & ONNX Integration
 
-### PyTorch (`vulkanvm_torch`)
-
 ```python
 import vulkanvm_torch as vvm
-pool = vvm.UnifiedMemoryPool.create(dev_config, pool_config)  # (Chonk Buffer)
+pool = vvm.UnifiedMemoryPool.create(dev_config, pool_config)
 alloc = pool.allocate_tensor(64 * 1024 * 1024, "weights")
 
-# Offload/reload
 pool.initialize_offload(4_GB, transfer_queue, transfer_queue_family)
 op = pool.offload_to_host(alloc)
 pool.wait_migration(op)
@@ -338,8 +423,6 @@ pool.reload_to_device(alloc)
 exported = pool.export_memory(alloc, vvm.ExternalHandleType.OpaqueWin32)
 peer_alloc = peer_pool.import_memory(exported, usage)
 ```
-
-### ONNX Runtime (`vulkanvm_onnx`)
 
 ```python
 import vulkanvm_onnx as vvm
@@ -355,27 +438,22 @@ output_np = provider.download_tensor(alloc, output_np, output_np.nbytes)
 
 ## Building
 
-### Windows (PowerShell)
+### Windows
 ```powershell
 .\scripts\build.ps1 -Tests -BuildType Release
-# Or manually:
-cmd /c "call 'VC\Auxiliary\Build\vcvars64.bat' && cmake -G Ninja -B build_ninja -DCMAKE_BUILD_TYPE=Release -DVVM_BUILD_TESTS=ON && cmake --build build_ninja --config Release"
 ```
 
 ### Linux
 ```bash
 ./scripts/build.sh --tests
-# Or manually:
-cmake -B build -DCMAKE_BUILD_TESTS=ON
-cmake --build build --config Release
-ctest --test-dir build --output-on-failure
 ```
 
 ### Requirements
-- CMake 3.20+, C++20 compiler (GCC 10+, Clang 12+, MSVC 19.30+)
+- CMake 3.20+, C++20 (GCC 10+, Clang 12+, MSVC 19.30+)
 - Vulkan SDK 1.3+
 - Optional: Volk, OpenSSL, gRPC/Protobuf, ibverbs/rdma_cm
-- **Windows SDK 10.0.26100+** for NDKPI headers
+- **Windows SDK 10.0.26100+** for NDKPI
+- **Level Zero SDK** for Intel GPU-direct on Windows
 
 ---
 
@@ -383,11 +461,11 @@ ctest --test-dir build --output-on-failure
 
 | GPU | Works? | Notes |
 |-----|--------|-------|
-| RTX 4090 / 7900 XTX (24 GB) | ✅ Excellent | 2 GB blocks (auto-detected ≥24 GB VRAM) |
+| RTX 4090 / 7900 XTX (24 GB) | ✅ Excellent | 2 GB blocks (auto-detected) |
 | RTX 4070 / 7800 XT (12-16 GB) | ✅ Excellent | 256 MB blocks |
-| Arc A770 / A750 (16/8 GB) | ✅ Good | 256 MB blocks |
+| Arc A770 / A750 / B70 (16/8 GB) | ✅ Good | 256 MB blocks, Level Zero GPU-direct |
 | Laptop dGPU (8 GB) | ✅ Good | 128 MB blocks |
-| **Strix Halo APU (96-128 GB unified)** | ✅ **BEST** | 2 GB blocks (auto-detected), this is the sweet spot |
+| **Strix Halo APU (96-128 GB)** | ✅ **BEST** | 2 GB blocks, sweet spot |
 | Integrated (2-8 GB shared) | ⚠️ Works but tight | 64 MB blocks |
 | Ancient GPU (Vulkan 1.0) | ❌ | Needs Vulkan 1.3+ |
 
@@ -432,39 +510,6 @@ ctest --test-dir build --output-on-failure
 
 ---
 
-## Quick Reference: Common Patterns
-
-```cpp
-// 1. Basic allocation
-auto alloc = pool->allocateTensor(64_MiB);
-
-// 2. Staging (upload)
-auto staging = pool->allocate({ .size=128_MiB, .usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                                .memoryUsage=MemoryUsage::CpuToGpu, .mapped=true });
-
-// 3. Readback
-auto readback = pool->allocate({ .size=16_MiB, .memoryUsage=MemoryUsage::GpuToCpu, .mapped=true });
-
-// 4. Exportable (for cross-GPU)
-auto exportable = pool->allocateDedicatedExportable(256_MiB, usage);
-
-// 5. Cross-GPU share
-auto handle = pool->exportMemory(*exportable, ExternalHandleType::OpaqueWin32);
-auto peerHandle = duplicateForImport(handle);  // per peer
-auto peerAlloc = peerPool->importMemory(std::move(peerHandle), usage);
-
-// 6. Offload/reload
-auto op = pool->offloadToHost(alloc);
-pool->waitMigration(op);
-pool->reloadToDevice(alloc);
-
-// 7. Tensor transport
-auto transport = vvm::tensor::createTensorTransport(cfg, devices, poolConfig);
-transport->allReduce({t0, t1, t2}, ReduceOp::Sum, {0, 1, 2});
-```
-
----
-
 ## Why "Chonk Buffer"?
 
 The core memory pool is affectionately nicknamed the **Chonk Buffer** (as in "chunk" — a contiguous block of memory). 
@@ -475,135 +520,6 @@ It's a tongue-in-cheek reference to:
 - **Brand alignment** — GitHub org is `XxChonkExX`, repo is `Vulkan-Automaton-VM`
 
 Don't let the name fool you — under the hood it's a production-grade, hardened buddy allocator with zero fragmentation, budget awareness, and full thread safety.
-
----
-
-## Need Help?
-
-- **README.md** — Full API reference, cross-vendor matrix, build options
-- **examples/** — `network_test`, `model_registry_test`, `tensor_compute`, `offload_test`, `multi_gpu_test`, `tensor_network_test`
-- **tests/** — Unit tests for buddy allocator, external handles, sparse, placement
-- **GitHub Issues** — Bug reports, feature requests
-
-*VulkanVM — Making GPUs play nice since 2026.*
-
----
-
-## Android / Vulkan (AHardwareBuffer External Memory)
-
-On Android, VulkanVM supports **zero-copy external memory** via `VK_ANDROID_external_memory_android_hardware_buffer`. This enables zero-copy sharing between Vulkan and Android's graphics pipeline (Surface, MediaCodec, Camera, etc.).
-
-### Requirements
-
-- Android NDK r27+ (for `VK_ANDROID_external_memory_android_hardware_buffer`)
-- Android 10+ (API 29+) for `AHardwareBuffer` support
-- Vulkan 1.1+ with `VK_ANDROID_external_memory_android_hardware_buffer` extension
-
-### Building for Android
-
-```bash
-# Linux
-./scripts/build_android.sh arm64-v8a android-34 Release
-
-# Windows (PowerShell)
-.\scripts\build_android.bat arm64-v8a android-34 Release
-```
-
-### Using AHardwareBuffer External Memory
-
-```cpp
-#include <vulkan_vm/vulkan_vm.hpp>
-#include <android/hardware_buffer.h>
-
-// 1. Create AHardwareBuffer (e.g., from Surface, MediaCodec, Camera, or manually)
-AHardwareBuffer_Desc desc{};
-desc.width = 1920;
-desc.height = 1080;
-desc.layers = 1;
-desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
-desc.usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | 
-             AHARDWAREBUFFER_USAGE_CPU_READ_NEVER |
-             AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT;
-desc.stride = 0;
-
-AHardwareBuffer* hardwareBuffer;
-AHardwareBuffer_allocate(&desc, &hardwareBuffer);
-
-// 2. Import into VulkanVM pool as external memory
-ExternalMemoryInfo extInfo;
-extInfo.type = ExternalHandleType::AndroidHardwareBuffer;
-extInfo.handle = ExternalHandle(hardwareBuffer);  // RAII wrapper
-extInfo.size = bufferSize;
-extInfo.dedicatedAllocation = true;
-
-auto allocation = pool.importMemory(std::move(extInfo), 
-    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-
-// 3. Use in shaders via device address
-auto deviceAddress = allocation->deviceAddress;
-
-// 4. Cleanup: AHardwareBuffer is reference-counted, released when ExternalHandle destructs
-```
-
-### Exporting Vulkan Memory as AHardwareBuffer
-
-```cpp
-// Allocate dedicated exportable memory
-auto alloc = pool->allocateDedicatedExportable(size, 
-    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-
-// Export as AHardwareBuffer
-ExternalMemoryInfo extInfo = pool->exportMemory(*alloc, 
-    ExternalHandleType::AndroidHardwareBuffer);
-
-// Pass to Android framework (Surface, MediaCodec, etc.)
-AHardwareBuffer* buffer = extInfo.handle.get();
-// Pass to ANativeWindow, MediaCodec, etc.
-```
-
-### ExternalHandleType::AndroidHardwareBuffer
-
-Added to `ExternalHandleType` enum:
-```cpp
-enum class ExternalHandleType {
-    OpaqueFd,
-    OpaqueWin32,
-    D3D12Heap,
-    DmaBuf,
-    AndroidHardwareBuffer  // VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID
-};
-```
-
-The `ExternalHandle` class now supports `AHardwareBuffer*` with automatic reference counting via `AHardwareBuffer_acquire`/`release`.
-
-### Build Configuration
-
-Add to `CMakeLists.txt`:
-```cmake
-# Android-specific options
-option(VVM_ANDROID_HARDWARE_BUFFER "Enable Android AHardwareBuffer support" ON)
-option(VVM_ANDROID_EXTERNAL_MEMORY "Enable Android external memory" ON)
-```
-
-Or via command line:
-```bash
-cmake -DCMAKE_TOOLCHAIN_FILE=cmake/android.toolchain.cmake \
-      -DANDROID_ABI=arm64-v8a \
-      -DANDROID_PLATFORM=android-34 \
-      -DVVM_ANDROID_HARDWARE_BUFFER=ON \
-      -DVVM_ANDROID_EXTERNAL_MEMORY=ON \
-      ..
-```
-
-### Cross-Vendor Compatibility
-
-| Source → Target | Android Handle Type |
-|-----------------|---------------------|
-| Android → Android | `AndroidHardwareBuffer` (direct) |
-| Android → Linux (DMA-BUF) | Export as `DmaBuf` (via `AHardwareBuffer_toGralloc`) |
-| Android → Windows | Not directly supported; use host-staged fallback |
-
-> **Note**: Direct Android ↔ Desktop GPU sharing requires vendor-specific extensions. For cross-platform sharing, use host-staged fallback or vendor-specific paths.
 
 ---
 
