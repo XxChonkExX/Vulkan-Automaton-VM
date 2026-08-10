@@ -37,6 +37,8 @@ config.preference = TransportConfig::Preference::Auto;  // P2P → RDMA → Host
 | 4 | **Host-Staged** | 4 MiB chunks via host memory | ✅ |
 | 5 | **Network** | TCP/RDMA multi-node | ✅ |
 
+**Protocol hardening**: 1 GiB body / 16 GiB stream caps (configurable per-connection), **absolute unconditional hard caps** enforced on every receive path, connection drop on violation.
+
 ---
 
 ## Quick Start — GPU Networking
@@ -326,18 +328,21 @@ ExecuteResult result = executor.executeLocal(model, plan, opt);
 - O(1) via `unordered_set` free lists per order
 - Optional internal mutex (`threadSafe_`)
 - Deterministic lowest-offset placement
+- **Debug invariant checker** (`checkInvariants()`) — validates free/allocated consistency
 
 ### Auto-Tuning
 
-| Hardware | Blocks | Heap Fraction |
-|----------|--------|---------------|
-| APU / Strix Halo | 1-2 GB | Capped |
-| Discrete <24 GB | 512 MB | 0.75 |
-| High-VRAM ≥24 GB | 2 GB | 0.8-0.85 |
+| Hardware | Blocks | Heap Fraction | Host Shadow |
+|----------|--------|---------------|-------------|
+| APU / Strix Halo | 1-2 GB | Capped | Disabled (VRAM host-visible) |
+| Discrete <24 GB | 512 MB | 0.75 | 4× multiplier |
+| High-VRAM ≥24 GB | 2 GB | 0.8-0.85 | 2× multiplier, capped at 4 GB |
 
 ```cpp
 PoolConfig poolConfig = PoolConfig::forDevice(physicalDevice);
 poolConfig.maxHeapFraction = 0.75f;
+poolConfig.hostShadowMultiplier = 2.0f;  // custom multiplier
+poolConfig.maxHostShadowBytes = 4_GiB;   // hard cap
 ```
 
 ### Memory Usage Intents
@@ -543,6 +548,9 @@ output_np = provider.download_tensor(alloc, output_np, output_np.nbytes)
 
 # Multi-GPU (requires 2+ GPUs)
 ./build/tests/multi_gpu_test
+
+# Multi-vendor RDMA (requires 2+ GPUs from different vendors, RDMA transport)
+./build/tests/multi_vendor_rdma_test
 
 # Network (2-node loopback)
 ./build/tests/network_test
