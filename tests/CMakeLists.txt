@@ -174,3 +174,34 @@ if(WIN32)
     )
     add_test(NAME ndk_transport_test COMMAND ndk_transport_test)
 endif()
+
+# Multi-vendor RDMA test (cross-vendor external memory round-trip)
+# Requires >= 2 GPUs from different vendors with compatible external memory handle types.
+# On Linux: uses Verbs transport (IBVERBS + RDMA_CM)
+# On Windows: uses ND transport (WIN32)
+# Skips gracefully if hardware/transport not available.
+if(IBVERBS_FOUND AND RDMA_CM_FOUND)
+    message(STATUS "Adding multi-vendor RDMA test (Linux/Verbs)")
+    add_executable(multi_vendor_rdma_test multi_vendor_rdma_test.cpp)
+    target_link_libraries(multi_vendor_rdma_test PRIVATE
+        vulkan_vm_network
+        ${CMAKE_DL_LIBS}
+    )
+    target_include_directories(multi_vendor_rdma_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${TEST_EXTRA_INCLUDES}
+    )
+    add_test(NAME multi_vendor_rdma_test COMMAND multi_vendor_rdma_test)
+elseif(WIN32)
+    message(STATUS "Adding multi-vendor RDMA test (Windows/ND)")
+    add_executable(multi_vendor_rdma_test multi_vendor_rdma_test.cpp)
+    target_link_libraries(multi_vendor_rdma_test PRIVATE
+        vulkan_vm_network
+        ${CMAKE_DL_LIBS}
+    )
+    target_include_directories(multi_vendor_rdma_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${TEST_EXTRA_INCLUDES}
+    )
+    add_test(NAME multi_vendor_rdma_test COMMAND multi_vendor_rdma_test)
+endif()
