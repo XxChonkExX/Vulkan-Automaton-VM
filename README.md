@@ -113,7 +113,7 @@ VulkanVM's networking stack is a **production-grade multi-node GPU fabric** that
 
 **Key features:**
 - **Spark-inspired wire protocol**: 32-byte versioned header + bulk stream in 4 MB slices
-- **Protocol hardening**: 1 GiB body / 16 GiB stream caps, connection drop on violation
+- **Protocol hardening**: 1 GiB body / 16 GiB stream caps (configurable per-connection), **absolute unconditional hard caps** enforced on every receive path, connection drop on violation
 - **TLS 1.2+**: OpenSSL-backed, SNI + ALPN (`vvm/1.0`), gated by `VVM_NETWORK_HAS_TLS`
 - **Automatic path selection**: `TransportConfig::Preference::Auto` → P2P → RDMA → HostStaged → Network
 - **Byte-exact verified**: All paths verified on loopback with checksums
@@ -509,16 +509,24 @@ A power-of-two allocator that splits and merges blocks with their "buddy":
 - Optional internal mutex (`threadSafe_` + `withLock()`)
 - Deterministic placement — lowest free offset handed out first
 - Power-of-two alignment guaranteed
+- **Debug invariant checker** (`checkInvariants()`) — validates free/allocated consistency, no overlaps, size sums
 
 ### Auto-Tuning (APU / Discrete / High-VRAM)
 
 `PoolConfig::forDevice()` reads the device memory at runtime and picks the block profile:
 
-- **APUs / unified memory (Strix Halo)** → 1-2 GB blocks, host-visible, capped heap fraction
+- **APUs / unified memory (Strix Halo)** → 1-2 GB blocks, host-visible, capped heap fraction, **host-shadow disabled** (VRAM is already host-visible)
 - **Discrete cards under 24 GB** → 512 MB blocks (16 blocks, 0.75 heap fraction)
-- **High-VRAM cards ≥24 GB (RTX 4090, RTX 6000 Ada)** → auto-scales to 2 GB blocks, 64 blocks, 0.8-0.85 heap fraction
+- **High-VRAM cards ≥24 GB (RTX 4090, RTX 6000 Ada)** → auto-scales to 2 GB blocks, 64 blocks, 0.8-0.85 heap fraction, **host-shadow capped at 4 GB**
 
-Explicit overrides: `PoolConfig::forHighVRAM(physicalDevice)` (2 GB blocks, up to 0.85 heap) and `PoolConfig::forAPU(totalSystemRAM)` (RAM-budget-aware).
+Explicit overrides: `PoolConfig::forHighVRAM(physicalDevice)` (2 GB blocks, up to 0.85 heap, 2× shadow multiplier, 4 GB shadow cap) and `PoolConfig::forAPU(totalSystemRAM)` (RAM-budget-aware, host-shadow disabled).
+
+**Host shadow tuning (new):**
+```cpp
+PoolConfig cfg = PoolConfig::forDevice(pd);
+cfg.hostShadowMultiplier = 2.0f;      // shadow = blockSize * multiplier
+cfg.maxHostShadowBytes = 4_GiB;       // hard cap (0 = no cap)
+```
 
 ### Memory Usage Intents (No Raw Flags)
 
@@ -752,6 +760,9 @@ ctest --test-dir build --output-on-failure
 
 # Multi-GPU (requires 2+ GPUs)
 ./build/tests/multi_gpu_test
+
+# Multi-vendor RDMA (requires 2+ GPUs from different vendors, RDMA transport)
+./build/tests/multi_vendor_rdma_test
 
 # Network (2-node loopback)
 ./build/tests/network_test
