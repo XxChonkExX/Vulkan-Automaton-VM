@@ -132,6 +132,17 @@ public:
     bool initialize() override {
         if (shuttingDown_.load()) return false;
 
+        // Partially-built state released on any failure below (mirrors shutdown
+        // ordering: CQ/listener/overlapped file before adapter/provider/lib).
+        auto failCleanup = [&]() {
+            if (pCq_) { pCq_->Release(); pCq_ = nullptr; }
+            if (pListener_) { pListener_->Release(); pListener_ = nullptr; }
+            if (hOvlFile_ != INVALID_HANDLE_VALUE) { CloseHandle(hOvlFile_); hOvlFile_ = INVALID_HANDLE_VALUE; }
+            if (adapter_) { adapter_->Release(); adapter_ = nullptr; }
+            if (provider_) { provider_->Release(); provider_ = nullptr; }
+            if (providerLib_) { FreeLibrary(providerLib_); providerLib_ = nullptr; }
+        };
+
         HRESULT hr = openNdkAdapter(preferredLocalIp(), &provider_, &adapter_, &providerLib_);
         if (FAILED(hr)) {
             VVM_LOG_ERROR("ND: no usable Network Direct adapter (hr {})", hrToString(hr));
@@ -143,11 +154,13 @@ public:
         hr = adapter_->Query(&adapterInfo_, &infoSize);
         if (FAILED(hr)) {
             VVM_LOG_ERROR("ND: adapter query failed: {}", hrToString(hr));
+            failCleanup();
             return false;
         }
 
         if (FAILED(adapter_->CreateOverlappedFile(&hOvlFile_))) {
             VVM_LOG_ERROR("ND: CreateOverlappedFile failed");
+            failCleanup();
             return false;
         }
 
@@ -158,33 +171,40 @@ public:
             reinterpret_cast<void**>(&pCq_));
         if (FAILED(hr) || !pCq_) {
             VVM_LOG_ERROR("ND: CreateCompletionQueue failed: {}", hrToString(hr));
+            failCleanup();
             return false;
         }
 
         sockaddr_in listenerAddr{};
         if (!toSockAddr("0.0.0.0", static_cast<uint16_t>(rdmaPort_), listenerAddr)) {
             VVM_LOG_ERROR("ND: invalid listener address");
+            failCleanup();
             return false;
         }
         if (FAILED(adapter_->CreateListener(IID_IND2Listener, hOvlFile_,
                                             reinterpret_cast<void**>(&pListener_)))) {
             VVM_LOG_ERROR("ND: CreateListener failed");
+            failCleanup();
             return false;
         }
         hr = pListener_->Bind(reinterpret_cast<const sockaddr*>(&listenerAddr),
                               static_cast<ULONG>(sizeof(listenerAddr)));
         if (FAILED(hr)) {
             VVM_LOG_ERROR("ND: failed to bind listener on port {}: {}", rdmaPort_, hrToString(hr));
+            failCleanup();
             return false;
         }
         if (FAILED(pListener_->Listen(16))) {
             VVM_LOG_ERROR("ND: failed to listen on port {}", rdmaPort_);
+            failCleanup();
             return false;
         }
 
         acceptThread_ = std::thread(&NdkRdmaTransport::acceptLoop, this);
-        VVM_LOG_INFO("NdkRdmaTransport initialized on ND adapter {:04X}:{:04X}, RDMA listener port {}",
-                     adapterInfo_.VendorId, adapterInfo_.DeviceId, rdmaPort_);
+        char devId[32];
+        std::snprintf(devId, sizeof(devId), "%04X:%04X", adapterInfo_.VendorId, adapterInfo_.DeviceId);
+        VVM_LOG_INFO("NdkRdmaTransport initialized on ND adapter {}, RDMA listener port {}",
+                     devId, rdmaPort_);
         return true;
     }
 
@@ -434,7 +454,7 @@ public:
         conn.qpNum = 0;  // NDQPs are opaque; no exposed QP number.
         conn.connected = true;
         conn.gpuDirect = false;
-        conn.internalId_ = ci.get();
+        conn.internalId_ = ci->connector;  // connections_ is keyed by connector pointer
         return conn;
     }
 
@@ -469,7 +489,7 @@ public:
             conn.remoteNodeIndex = ci->nodeIndex;
             conn.connected = true;
             conn.gpuDirect = false;
-            conn.internalId_ = ci.get();
+            conn.internalId_ = ci->connector;
             result.push_back(conn);
         }
         return result;

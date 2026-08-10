@@ -3,7 +3,9 @@
 #include "vulkan_vm/utils.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <thread>
 
 #ifdef VVM_PLATFORM_LINUX
 #include <sys/mman.h>
@@ -551,6 +553,10 @@ OffloadManager::~OffloadManager() {
 
 std::optional<MigrationOperation> OffloadManager::offload(Allocation& alloc) {
     std::lock_guard<std::mutex> lock(mutex_);
+    return offloadLocked(alloc);
+}
+
+std::optional<MigrationOperation> OffloadManager::offloadLocked(Allocation& alloc) {
     VVM_LOG_INFO("offload: alloc={}, size={}, offset={}", 
                   &alloc, alloc.size, alloc.offset);
     
@@ -605,6 +611,10 @@ std::optional<MigrationOperation> OffloadManager::offload(Allocation& alloc) {
 
 std::optional<MigrationOperation> OffloadManager::reload(Allocation& alloc) {
     std::lock_guard<std::mutex> lock(mutex_);
+    return reloadLocked(alloc);
+}
+
+std::optional<MigrationOperation> OffloadManager::reloadLocked(Allocation& alloc) {
     // Use the tracked shadow offset from the matching offload.
     if (alloc.shadowOffset == static_cast<VkDeviceSize>(-1)) {
         VVM_LOG_ERROR("reload: allocation is not currently offloaded (no shadow offset)");
@@ -652,44 +662,53 @@ bool OffloadManager::offloadSync(Allocation& alloc, uint64_t timeoutNs) {
     VVM_LOG_DEBUG("offloadSync called: alloc={}, size={}, timeout={}", 
                   &alloc, alloc.size, timeoutNs);
     
-    auto op = offload(alloc);
+    auto op = offloadLocked(alloc);
     if (!op) {
         VVM_LOG_ERROR("offload returned nullopt");
         return false;
     }
     
-    // Use the engine's waitMigration so the owning context is released back
-    // to the free pool. We can't honor arbitrary timeouts via waitMigration
-    // (which blocks forever), so approximate "bail" semantics with a poll.
-    if (timeoutNs == UINT64_MAX) {
-        migrationEngine_->waitMigration(*op);
-    } else {
-        uint64_t deadline = timeoutNs;  // simplistic; engine impl is infinite-wait
-        (void)deadline;
-        migrationEngine_->waitMigration(*op);
-    }
-    
-    std::lock_guard<std::mutex> statsLock(statsMutex_);
-    stats_.activeMigrations--;
-    stats_.completedMigrations++;
-    return true;
+    return waitSync(*op, timeoutNs);
 }
 
 bool OffloadManager::reloadSync(Allocation& alloc, uint64_t timeoutNs) {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto op = reload(alloc);
+    auto op = reloadLocked(alloc);
     if (!op) return false;
     
+    return waitSync(*op, timeoutNs);
+}
+
+bool OffloadManager::waitSync(MigrationOperation& op, uint64_t timeoutNs) {
     if (timeoutNs == UINT64_MAX) {
-        migrationEngine_->waitMigration(*op);
-    } else {
-        migrationEngine_->waitMigration(*op);
+        migrationEngine_->waitMigration(op);
+        finishSync();
+        return true;
     }
-    
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::nanoseconds(timeoutNs);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (migrationEngine_->pollMigration(op)) {
+            finishSync();
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    // Timed out while the GPU copy is still in flight. Hand the fence wait,
+    // completion callback (shadow region release) and context cleanup to a
+    // detached worker so nothing leaks, but report the timeout to the caller.
+    VVM_LOG_WARN("sync migration did not complete within timeout; finishing in background");
+    std::thread([this, op]() mutable {
+        migrationEngine_->waitMigration(op);
+        finishSync();
+    }).detach();
+    return false;
+}
+
+void OffloadManager::finishSync() {
     std::lock_guard<std::mutex> statsLock(statsMutex_);
     stats_.activeMigrations--;
     stats_.completedMigrations++;
-    return true;
 }
 
 void OffloadManager::waitAll() {

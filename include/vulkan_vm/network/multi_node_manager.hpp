@@ -367,6 +367,9 @@ private:
     // Stats
     mutable std::mutex statsMutex_;
     NetworkStats networkStats_;
+    // Adaptive pipeline state (guarded by statsMutex_): measured transfer
+    // throughput used to size staging windows on the next migration.
+    uint64_t lastThroughputBytesPerSec_ = 0;
     
     // Internal helpers
     std::optional<Allocation> createLocalAllocationForImport(
@@ -402,6 +405,18 @@ private:
                           VkDeviceSize dstOffset, VkDeviceSize size);
     bool runCopy(VkBuffer srcBuffer, VkBuffer dstBuffer,
                  VkDeviceSize srcOffset, VkDeviceSize dstOffset, VkDeviceSize size);
+
+    // Windowed-copy primitives for the double-buffered migration pipeline.
+    VkFence submitCopyAsync(VkBuffer srcBuffer, VkBuffer dstBuffer,
+                            VkDeviceSize srcOffset, VkDeviceSize dstOffset,
+                            VkDeviceSize size, VkCommandBuffer& outCmd);
+    void releaseAsyncCopy(VkCommandBuffer cmd, VkFence fence);
+    bool waitFence(VkFence fence);
+    uint32_t adaptiveWindowBytes(uint64_t totalBytes) const;
+    uint32_t adaptivePipelineDepth() const;
+    void recordTransferRate(uint64_t bytes, std::chrono::steady_clock::duration elapsed);
+
+    friend struct WindowPipe;
 
     uint64_t registerAllocation(Allocation&& alloc);
     std::optional<Allocation> findAllocation(uint64_t localAllocId);

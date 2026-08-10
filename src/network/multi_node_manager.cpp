@@ -14,6 +14,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstring>
 #include <random>
@@ -610,8 +611,11 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
             VVM_LOG_ERROR("exportForRemote: failed to export handle for allocation");
             return std::nullopt;
         }
-        netDesc.handleType = exportInfo ? vvm::ExternalHandleType::OpaqueWin32
-                                        : netDesc.handleType;
+        #ifdef VVM_PLATFORM_LINUX
+        netDesc.handleType = vvm::ExternalHandleType::OpaqueFd;
+#else
+        netDesc.handleType = vvm::ExternalHandleType::OpaqueWin32;
+#endif
         if (!exportInfo) {
             VVM_LOG_ERROR("exportForRemote: failed to export handle for allocation");
             return std::nullopt;
@@ -664,8 +668,10 @@ std::optional<Allocation> MultiNodePoolManager::importRemote(
 #if defined(VVM_NETWORK_HAS_VERBS)
     if (desc.canUseRdma() && rdmaTransport_) {
         // GPU-direct import: register local GPU memory and RDMA read from remote
-        auto localAlloc = pool_.allocate(desc.size, usage, 
-                                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        auto localAlloc = localPools_.empty()
+            ? std::nullopt
+            : localPools_.front().allocate(desc.size, usage, 
+                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (!localAlloc) {
             VVM_LOG_WARN("importRemote: failed to allocate local GPU memory, falling back to host-staged");
         } else {
@@ -707,6 +713,86 @@ std::future<std::optional<Allocation>> MultiNodePoolManager::importRemoteAsync(
         return importRemote(desc, usage);
     });
 }
+
+// ============================================================================
+// Double-buffered migration pipeline
+// ============================================================================
+
+// Two-to-four-window host staging pipeline: chunk i lands in hostPtr[i % d],
+// one fence per window guards reuse, and per-chunk GPU copies run while
+// later chunks are still on the wire. Only used when a transfer is large
+// enough to warrant it; small transfers keep the single-buffer legacy path.
+struct WindowPipe {
+    MultiNodePoolManager* mgr = nullptr;
+    uint32_t depth = 0;                 // 0 = not initialized (use legacy path)
+    uint64_t windowBytes = 0;
+    uint64_t totalBytes = 0;
+    std::array<std::optional<Allocation>, 4> stag;
+    std::array<VkFence, 4> fence{};
+    std::vector<std::pair<VkCommandBuffer, VkFence>> pending;
+
+    bool init(MultiNodePoolManager* m, uint64_t total, uint32_t buffers, uint64_t winBytes) {
+        if (total < winBytes || winBytes == 0) return false;
+        mgr = m;
+        totalBytes = total;
+        windowBytes = winBytes;
+        depth = (std::clamp)(buffers, 2u, 4u);
+        for (uint32_t i = 0; i < depth; ++i) {
+            stag[i] = m->createStaging(windowBytes);
+            if (!stag[i]) {
+                drain();
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Wait until the window that receives chunk idx is safe to refill, i.e.
+    // the GPU copy that last consumed it has finished. Near-instant when the
+    // GPU kept up with the wire.
+    bool waitReusable(uint64_t chunkIdx) {
+        if (chunkIdx < depth) return true;
+        VkFence f = fence[chunkIdx % depth];
+        return f == VK_NULL_HANDLE || mgr->waitFence(f);
+    }
+
+    // Submit an async copy consuming chunk idx's staging window.
+    bool submit(uint64_t chunkIdx, VkBuffer src, VkBuffer dst,
+                VkDeviceSize srcOff, VkDeviceSize dstOff, VkDeviceSize len) {
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VkFence f = mgr->submitCopyAsync(src, dst, srcOff, dstOff, len, cmd);
+        if (f == VK_NULL_HANDLE) return false;
+        fence[chunkIdx % depth] = f;
+        pending.emplace_back(cmd, f);
+        return true;
+    }
+
+    // Block until the copy for chunk idx is resident (send paths).
+    bool waitReady(uint64_t chunkIdx) {
+        VkFence f = fence[chunkIdx % depth];
+        return f != VK_NULL_HANDLE && mgr->waitFence(f);
+    }
+
+    void drain() {
+        for (auto& [cmd, f] : pending) mgr->releaseAsyncCopy(cmd, f);
+        pending.clear();
+        fence.fill(VK_NULL_HANDLE);
+        for (auto& s : stag) {
+            if (s) mgr->getLocalPool().deallocate(std::move(*s));
+            s.reset();
+        }
+    }
+
+    ~WindowPipe() { drain(); }
+};
+
+// Shared state for streamed MsgMigratePush requests, carried across the
+// prepare/finalize handler phases via TcpMessage::streamContext.
+struct PushState {
+    std::shared_ptr<WindowPipe> pipe;      // windowed mode
+    std::shared_ptr<Allocation> staging;   // legacy mode
+    std::shared_ptr<Allocation> target;    // destination allocation
+};
 
 // ============================================================================
 // Migration
@@ -783,11 +869,37 @@ std::optional<NetworkMigrationOperation> MultiNodePoolManager::migrateFromRemote
         return std::nullopt;
     }
 
-    // Stage received bytes into a host-visible buffer, then copy to device
-    auto staging = createStaging(source.size);
-    if (!staging) {
-        VVM_LOG_ERROR("migrateFromRemote: failed to allocate staging buffer");
-        return std::nullopt;
+    auto tStart = std::chrono::steady_clock::now();
+
+    // Windowed double-buffered pull: chunk i is copied into the destination
+    // GPU allocation while chunk i+1 is still on the wire. Small transfers
+    // fall back to a single full-sized staging buffer.
+    WindowPipe pipe;
+    std::optional<Allocation> staging;
+    StreamIO streamIO;
+    if (networkConfig_.enableAdaptiveWindow && pipe.init(this, source.size, adaptivePipelineDepth(), adaptiveWindowBytes(source.size))) {
+        streamIO.onWindowAcquire = [&](uint64_t chunkIdx, void** dst, uint64_t want, uint64_t& got) -> bool {
+            if (!pipe.waitReusable(chunkIdx)) return false;
+            uint64_t off = chunkIdx * kTransferChunk;
+            if (off >= source.size) return false;
+            uint64_t n = (std::min)(want, source.size - off);
+            if (n == 0) return false;
+            *dst = pipe.stag[chunkIdx % pipe.depth]->hostPtr;
+            got = n;
+            return true;
+        };
+        streamIO.onWindowConsumed = [&](uint64_t chunkIdx, uint64_t len) -> bool {
+            return pipe.submit(chunkIdx, pipe.stag[chunkIdx % pipe.depth]->buffer,
+                               destination.buffer, 0, chunkIdx * kTransferChunk, len);
+        };
+    } else {
+        staging = createStaging(source.size);
+        if (!staging) {
+            VVM_LOG_ERROR("migrateFromRemote: failed to allocate staging buffer");
+            return std::nullopt;
+        }
+        streamIO.readBuffer = staging->hostPtr;
+        streamIO.readLen = source.size;
     }
 
     std::vector<uint8_t> body;
@@ -799,11 +911,6 @@ std::optional<NetworkMigrationOperation> MultiNodePoolManager::migrateFromRemote
     req.type = MsgMigratePull;
     req.flags = TcpFlagsRequest;
     req.body = std::move(body);
-
-    // Slice mode: stream the pulled data straight into the staging buffer.
-    StreamIO streamIO;
-    streamIO.readBuffer = staging->hostPtr;
-    streamIO.readLen = source.size;
 
     auto resp = tcpTransport_->request(conn, req, &streamIO);
     if (!resp || resp->flags == TcpFlagsError) {
@@ -817,10 +924,16 @@ std::optional<NetworkMigrationOperation> MultiNodePoolManager::migrateFromRemote
         return std::nullopt;
     }
 
-    if (!copyHostToDevice(*staging, destination, 0, source.size)) {
-        VVM_LOG_ERROR("migrateFromRemote: staging -> device copy failed");
-        return std::nullopt;
+    bool copied = true;
+    if (pipe.depth > 0) {
+        pipe.drain();  // waits all pipelined copies (copies ran while receiving)
+    } else {
+        copied = copyHostToDevice(*staging, destination, 0, source.size);
+        if (!copied) VVM_LOG_ERROR("migrateFromRemote: staging -> device copy failed");
     }
+    if (!copied) return std::nullopt;
+
+    recordTransferRate(source.size, std::chrono::steady_clock::now() - tStart);
 
     NetworkMigrationOperation op;
     op.operationId = nextMigrationId_++;
@@ -908,16 +1021,43 @@ std::optional<NetworkMigrationOperation> MultiNodePoolManager::migrateToRemote(
         return std::nullopt;
     }
 
-    // Stage device memory into a host-visible buffer
-    auto staging = createStaging(source.size);
-    if (!staging) {
-        VVM_LOG_ERROR("migrateToRemote: failed to allocate staging buffer");
-        return std::nullopt;
-    }
+    auto tStart = std::chrono::steady_clock::now();
 
-    if (!copyDeviceToHost(source, 0, *staging, source.size)) {
-        VVM_LOG_ERROR("migrateToRemote: device -> staging copy failed");
-        return std::nullopt;
+    // Windowed double-buffered push: chunks are copied out of the source GPU
+    // allocation in windows while the wire drains previous windows. Small
+    // transfers fall back to a single full-sized staging buffer.
+    WindowPipe pipe;
+    std::optional<Allocation> staging;
+    StreamIO streamIO;
+    if (networkConfig_.enableAdaptiveWindow && pipe.init(this, source.size, adaptivePipelineDepth(), adaptiveWindowBytes(source.size))) {
+        streamIO.onWindowProvide = [&](uint64_t chunkIdx, const void** src, uint64_t want, uint64_t& got) -> bool {
+            if (!pipe.waitReusable(chunkIdx)) return false;
+            uint64_t off = chunkIdx * kTransferChunk;
+            if (off >= source.size) return false;
+            uint64_t n = (std::min)(want, source.size - off);
+            if (n == 0) return false;
+            if (!pipe.submit(chunkIdx, source.buffer, pipe.stag[chunkIdx % pipe.depth]->buffer,
+                             off, 0, n)) {
+                return false;
+            }
+            if (!pipe.waitReady(chunkIdx)) return false;  // data must be resident before sending
+            *src = pipe.stag[chunkIdx % pipe.depth]->hostPtr;
+            got = n;
+            return true;
+        };
+        streamIO.writeLen = source.size;  // advertises the stream length to the wire
+    } else {
+        staging = createStaging(source.size);
+        if (!staging) {
+            VVM_LOG_ERROR("migrateToRemote: failed to allocate staging buffer");
+            return std::nullopt;
+        }
+        if (!copyDeviceToHost(source, 0, *staging, source.size)) {
+            VVM_LOG_ERROR("migrateToRemote: device -> staging copy failed");
+            return std::nullopt;
+        }
+        streamIO.writeBuffer = staging->hostPtr;
+        streamIO.writeLen = source.size;
     }
 
     std::vector<uint8_t> body;
@@ -928,11 +1068,6 @@ std::optional<NetworkMigrationOperation> MultiNodePoolManager::migrateToRemote(
     req.type = MsgMigratePush;
     req.flags = TcpFlagsRequest;
     req.body = std::move(body);
-
-    // Slice mode: stream the staged data out of the staging buffer directly.
-    StreamIO streamIO;
-    streamIO.writeBuffer = staging->hostPtr;
-    streamIO.writeLen = source.size;
 
     auto conn = getPeerConnection(destination.owner.host, destination.owner.port);
     if (conn == 0) {
@@ -945,6 +1080,10 @@ std::optional<NetworkMigrationOperation> MultiNodePoolManager::migrateToRemote(
         VVM_LOG_ERROR("migrateToRemote: push request failed for {} bytes", source.size);
         return std::nullopt;
     }
+
+    if (pipe.depth > 0) pipe.drain();
+
+    recordTransferRate(source.size, std::chrono::steady_clock::now() - tStart);
 
     NetworkMigrationOperation op;
     op.operationId = nextMigrationId_++;
@@ -1342,6 +1481,146 @@ bool MultiNodePoolManager::runCopy(VkBuffer srcBuffer, VkBuffer dstBuffer,
     return res == VK_SUCCESS;
 }
 
+VkFence MultiNodePoolManager::submitCopyAsync(VkBuffer srcBuffer, VkBuffer dstBuffer,
+                                              VkDeviceSize srcOffset, VkDeviceSize dstOffset,
+                                              VkDeviceSize size, VkCommandBuffer& outCmd) {
+    outCmd = VK_NULL_HANDLE;
+    if (copyCmdPool_ == VK_NULL_HANDLE || srcBuffer == VK_NULL_HANDLE || dstBuffer == VK_NULL_HANDLE) {
+        VVM_LOG_ERROR("submitCopyAsync: invalid copy context (pool={} src={} dst={})",
+                      copyCmdPool_, srcBuffer, dstBuffer);
+        return VK_NULL_HANDLE;
+    }
+    VkDevice device = localPools_[0].getDevice();
+
+    VkCommandBufferAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.commandPool = copyCmdPool_;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+    if (vkAllocateCommandBuffers(device, &allocInfo, &outCmd) != VK_SUCCESS) return VK_NULL_HANDLE;
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VkBufferCopy region{};
+    region.srcOffset = srcOffset;
+    region.dstOffset = dstOffset;
+    region.size = size;
+    if (vkBeginCommandBuffer(outCmd, &beginInfo) != VK_SUCCESS) {
+        vkFreeCommandBuffers(device, copyCmdPool_, 1, &outCmd);
+        outCmd = VK_NULL_HANDLE;
+        return VK_NULL_HANDLE;
+    }
+    vkCmdCopyBuffer(outCmd, srcBuffer, dstBuffer, 1, &region);
+    if (vkEndCommandBuffer(outCmd) != VK_SUCCESS) {
+        vkFreeCommandBuffers(device, copyCmdPool_, 1, &outCmd);
+        outCmd = VK_NULL_HANDLE;
+        return VK_NULL_HANDLE;
+    }
+
+    VkFence fence = VK_NULL_HANDLE;
+    VkFenceCreateInfo fenceInfo{};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    if (vkCreateFence(device, &fenceInfo, nullptr, &fence) != VK_SUCCESS) {
+        vkFreeCommandBuffers(device, copyCmdPool_, 1, &outCmd);
+        outCmd = VK_NULL_HANDLE;
+        return VK_NULL_HANDLE;
+    }
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &outCmd;
+    VkResult res = vkQueueSubmit(transferQueue_, 1, &submitInfo, fence);
+    if (res != VK_SUCCESS) {
+        VVM_LOG_ERROR("submitCopyAsync: vkQueueSubmit failed: {}", vkResultToString(res));
+        vkDestroyFence(device, fence, nullptr);
+        vkFreeCommandBuffers(device, copyCmdPool_, 1, &outCmd);
+        outCmd = VK_NULL_HANDLE;
+        return VK_NULL_HANDLE;
+    }
+    return fence;
+}
+
+void MultiNodePoolManager::releaseAsyncCopy(VkCommandBuffer cmd, VkFence fence) {
+    if (fence == VK_NULL_HANDLE) return;
+    VkDevice device = localPools_[0].getDevice();
+    constexpr uint64_t kCopyTimeoutNs = 10ull * 1000 * 1000 * 1000;  // 10 seconds
+    VkResult waitRes = vkWaitForFences(device, 1, &fence, VK_TRUE, kCopyTimeoutNs);
+    if (waitRes == VK_TIMEOUT) {
+        VVM_LOG_ERROR("releaseAsyncCopy: fence wait timed out (GPU copy may be stuck)");
+    } else if (waitRes != VK_SUCCESS) {
+        VVM_LOG_ERROR("releaseAsyncCopy: vkWaitForFences failed: {}", vkResultToString(waitRes));
+    }
+    vkDestroyFence(device, fence, nullptr);
+    if (cmd != VK_NULL_HANDLE) vkFreeCommandBuffers(device, copyCmdPool_, 1, &cmd);
+}
+
+bool MultiNodePoolManager::waitFence(VkFence fence) {
+    if (fence == VK_NULL_HANDLE) return true;
+    // The transfer queue is shared with the other direction's pipeline, so a
+    // naive fixed-timeout wait can spuriously fail mid-stream and poison the
+    // connection. Poll generously instead.
+    constexpr uint64_t kCopyBudgetNs = 60ull * 1000 * 1000 * 1000;  // 60 seconds
+    auto t0 = std::chrono::steady_clock::now();
+    while (true) {
+        VkResult res = vkWaitForFences(localPools_[0].getDevice(), 1, &fence, VK_TRUE, 100ull * 1000 * 1000);
+        if (res == VK_SUCCESS) return true;
+        if (res != VK_TIMEOUT) {
+            VVM_LOG_ERROR("waitFence: vkWaitForFences failed: {}", vkResultToString(res));
+            return false;
+        }
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::nanoseconds(kCopyBudgetNs)) {
+            VVM_LOG_ERROR("waitFence: fence wait timed out after 60 seconds (GPU copy may be stuck)");
+            return false;
+        }
+    }
+}
+
+uint32_t MultiNodePoolManager::adaptiveWindowBytes(uint64_t totalBytes) const {
+    constexpr uint64_t kMinWin = 4ull * 1024 * 1024;
+    constexpr uint64_t kMaxWin = 16ull * 1024 * 1024;
+    uint64_t win = networkConfig_.streamWindowBytes != 0
+                       ? networkConfig_.streamWindowBytes
+                       : 8ull * 1024 * 1024;
+    if (networkConfig_.enableAdaptiveWindow) {
+        uint64_t rate = 0;
+        {
+            std::lock_guard<std::mutex> lock(statsMutex_);
+            rate = lastThroughputBytesPerSec_;
+        }
+        if (rate > 0) {
+            // Hold roughly 250us of line time per window (a LAN round-trip).
+            // Fast links grow toward the 16MB ceiling; slow/high-latency
+            // links shrink back to the 4MB floor so GPU-poor peers still
+            // make forward progress.
+            uint64_t sized = rate / 4000u;  // bytes per 250us
+            win = (std::clamp)(sized, kMinWin, kMaxWin);
+        }
+    }
+    return static_cast<uint32_t>((std::min)(win, (std::max)(totalBytes, uint64_t{1})));
+}
+
+uint32_t MultiNodePoolManager::adaptivePipelineDepth() const {
+    uint32_t d = (std::clamp)(networkConfig_.streamPipelineBuffers, 2u, 4u);
+    uint64_t rate = 0;
+    {
+        std::lock_guard<std::mutex> lock(statsMutex_);
+        rate = lastThroughputBytesPerSec_;
+    }
+    // Low-bandwidth links get the deepest pipeline so more data stays in
+    // flight under latency.
+    if (rate > 0 && rate < 50ull * 1024 * 1024) d = (std::max)(d, 3u);
+    return d;
+}
+
+void MultiNodePoolManager::recordTransferRate(uint64_t bytes, std::chrono::steady_clock::duration elapsed) {
+    double secs = std::chrono::duration<double>(elapsed).count();
+    if (secs <= 0.0 || bytes == 0) return;
+    std::lock_guard<std::mutex> lock(statsMutex_);
+    lastThroughputBytesPerSec_ = static_cast<uint64_t>(static_cast<double>(bytes) / secs);
+}
+
 uint64_t MultiNodePoolManager::registerAllocation(Allocation&& alloc) {
     std::lock_guard<std::mutex> lock(allocsMutex_);
     uint64_t id = nextAllocId_++;
@@ -1585,6 +1864,37 @@ void MultiNodePoolManager::onTcpRequest(TcpMessage& request, TcpMessage& respons
                 return;
             }
 
+            // Windowed serve: chunk i+1 is copied out of the device while
+            // chunk i streams over the wire. Falls back to a full staging
+            // buffer for small transfers.
+            auto serveAlloc = std::make_shared<Allocation>(*alloc);
+            auto pipe = std::make_shared<WindowPipe>();
+            if (networkConfig_.enableAdaptiveWindow && pipe->init(this, size, adaptivePipelineDepth(), adaptiveWindowBytes(size))) {
+                response = makeResponse(request.type, TcpFlagsResponse);
+                response.streamLen = size;
+                response.streamWindowProvide = [pipe, serveAlloc, srcOffset, total = size](
+                    uint64_t chunkIdx, const void** src, uint64_t want, uint64_t& got) -> bool {
+                    if (!pipe->waitReusable(chunkIdx)) return false;
+                    uint64_t off = chunkIdx * kTransferChunk;
+                    if (off >= total) return false;
+                    uint64_t n = (std::min)(want, total - off);
+                    if (n == 0) return false;
+                    if (!pipe->submit(chunkIdx, serveAlloc->buffer,
+                                      pipe->stag[chunkIdx % pipe->depth]->buffer,
+                                      srcOffset + off, 0, n)) {
+                        return false;
+                    }
+                    if (!pipe->waitReady(chunkIdx)) return false;
+                    *src = pipe->stag[chunkIdx % pipe->depth]->hostPtr;
+                    got = n;
+                    return true;
+                };
+                response.streamCleanup = [pipe]() { pipe->drain(); };
+                VVM_LOG_INFO("MigratePull: serving {} bytes for allocation {} (windowed)",
+                             size, localAllocId);
+                break;
+            }
+
             auto staging = createStaging(size);
             if (!staging) {
                 response = makeResponse(request.type, TcpFlagsError);
@@ -1619,33 +1929,80 @@ void MultiNodePoolManager::onTcpRequest(TcpMessage& request, TcpMessage& respons
             }
 
             if (!request.streamReceived) {
-                // Prepare phase: allocate the sink the incoming stream is staged into.
+                // Prepare phase: set up the receive pipeline (windowed) or a
+                // single full-sized sink (legacy), shared across both phases.
+                auto state = std::make_shared<PushState>();
+                state->target = std::make_shared<Allocation>(*alloc);
+                request.streamContext = state.get();
+                request.streamSinkCleanup = [state]() mutable { (void)state; };
+                response.streamSinkCleanup = [state]() mutable { (void)state; };
+
+                auto pipe = std::make_shared<WindowPipe>();
+                if (networkConfig_.enableAdaptiveWindow && pipe->init(this, size, adaptivePipelineDepth(), adaptiveWindowBytes(size))) {
+                    state->pipe = pipe;
+                    response = makeResponse(request.type, TcpFlagsResponse);
+                    response.streamWindowAcquire = [state](uint64_t chunkIdx, void** dst,
+                                                           uint64_t want, uint64_t& got) -> bool {
+                        WindowPipe& p = *state->pipe;
+                        if (!p.waitReusable(chunkIdx)) return false;
+                        uint64_t off = chunkIdx * kTransferChunk;
+                        if (off >= p.totalBytes) return false;
+                        uint64_t n = (std::min)(want, p.totalBytes - off);
+                        if (n == 0) return false;
+                        *dst = p.stag[chunkIdx % p.depth]->hostPtr;
+                        got = n;
+                        return true;
+                    };
+                    response.streamWindowConsumed = [state](uint64_t chunkIdx, uint64_t len) -> bool {
+                        WindowPipe& p = *state->pipe;
+                        return p.submit(chunkIdx, p.stag[chunkIdx % p.depth]->buffer,
+                                        state->target->buffer, 0,
+                                        chunkIdx * kTransferChunk, len);
+                    };
+                    VVM_LOG_INFO("MigratePush: receiving {} bytes for allocation {} (windowed)",
+                                 size, localAllocId);
+                    return;
+                }
+
+                // Legacy sink mode: single full-sized staging buffer that the
+                // transport streams into directly.
                 auto rawStaging = createStaging(size);
                 if (!rawStaging) {
                     response = makeResponse(request.type, TcpFlagsError);
                     return;
                 }
-                // Shared ownership keeps the staging alive across both handler
-                // phases; the raw Allocation* is stable because shared_ptr
-                // never moves the pointee.
                 auto staging = std::make_shared<Allocation>(std::move(*rawStaging));
-                request.streamContext = staging.get();
+                state->staging = staging;
                 request.streamSink = staging->hostPtr;
-                request.streamSinkCleanup = [staging]() mutable { (void)staging; };
-                response = makeResponse(request.type, TcpFlagsResponse);
                 response.streamSink = staging->hostPtr;
-                response.streamSinkCleanup = [staging]() mutable { (void)staging; };
                 return;
             }
 
-            auto* staging = static_cast<Allocation*>(request.streamContext);
-            if (staging == nullptr || staging->hostPtr == nullptr) {
+            // Finalize phase: the full stream has arrived.
+            auto* statePtr = static_cast<PushState*>(request.streamContext);
+            if (statePtr == nullptr) {
+                VVM_LOG_ERROR("MigratePush: missing push state on finalize");
+                response = makeResponse(request.type, TcpFlagsError);
+                return;
+            }
+            PushState& state = *statePtr;  // kept alive by the cleanup lambdas
+
+            if (state.pipe) {
+                state.pipe->drain();  // waits all pipelined host -> device copies
+                response = makeResponse(request.type, TcpFlagsResponse);
+                detail::putU8(response.body, 1);
+                VVM_LOG_INFO("MigratePush: received {} bytes for allocation {} (windowed)",
+                             size, localAllocId);
+                break;
+            }
+
+            if (state.staging == nullptr || state.staging->hostPtr == nullptr) {
                 VVM_LOG_ERROR("MigratePush: missing staging buffer on finalize");
                 response = makeResponse(request.type, TcpFlagsError);
                 return;
             }
 
-            if (!copyHostToDevice(*staging, *alloc, 0, size)) {
+            if (!copyHostToDevice(*state.staging, *state.target, 0, size)) {
                 VVM_LOG_ERROR("MigratePush: host -> device copy failed");
                 response = makeResponse(request.type, TcpFlagsError);
                 return;

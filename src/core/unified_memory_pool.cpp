@@ -780,9 +780,16 @@ std::optional<Allocation> UnifiedMemoryPool::allocate(VkDeviceSize size,
     // Align size
     size = alignUp(size, config_.minAlignment);
     
-    // Try existing blocks first - check buddy allocator
+    // Try existing blocks first - check buddy allocator. Only consider blocks
+    // of the requested memory class: handing out host-visible memory when the
+    // caller asked for device-local (or vice versa) breaks the mapping
+    // contract silently.
+    const bool wantHostVisible = (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
     for (uint32_t i = 0; i < blocks_.size(); ++i) {
-        if (blocks_[i].buddy && blocks_[i].buddy->getLargestFree() >= size) {
+        const auto& block = blocks_[i];
+        if (!block.buddy) continue;
+        if (block.isHostVisible != wantHostVisible) continue;
+        if (block.buddy->getLargestFree() >= size) {
             return subAllocate(size, config_.minAlignment, i, usage);
         }
     }
@@ -995,7 +1002,13 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
     
     VkMemoryAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.allocationSize = info.size;
+    // The exporter reports the logical size (info.size), but a dedicated
+    // import must satisfy THIS device's memory requirements for the buffer
+    // we just created. Alignment requirements differ between devices, so
+    // allocate max(exported size, local requirement).
+    VkMemoryRequirements importMemReq;
+    vkGetBufferMemoryRequirements(device_, buffer, &importMemReq);
+    allocInfo.allocationSize = std::max<VkDeviceSize>(info.size, importMemReq.size);
     allocInfo.memoryTypeIndex = memoryTypeIndex;
     
     void* pNext = nullptr;

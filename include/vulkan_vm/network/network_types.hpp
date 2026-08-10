@@ -31,6 +31,18 @@ struct NetworkConfig {
     // Fallback
     bool enableHostStagedFallback = true;
     uint32_t hostStagedThreads = 4;     // threads for host-staged copies
+
+    // Streaming pipeline (double-buffered TCP migrations). Larger windows
+    // and deeper pipelines push the upper end on fast links; the transport
+    // shrinks the window from measured throughput on slow/high-latency
+    // links so GPU-poor peers still make forward progress.
+    uint32_t streamWindowBytes = 8 * 1024 * 1024;   // staging buffer size per window (0 = 8MB default)
+    uint32_t streamPipelineBuffers = 3;             // windows in flight (clamped to 2..4)
+    // EXPERIMENTAL (opt-in): the windowed double-buffered push/pull pipeline.
+    // Default OFF - migrations use the proven single full-sized staging path.
+    // Enable only for staging/fabric experiments; not yet validated on real
+    // multi-IP fabrics or all drivers.
+    bool enableAdaptiveWindow = false;
     
     // Timeouts
     std::chrono::milliseconds connectTimeout{5000};

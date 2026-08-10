@@ -213,6 +213,15 @@ private:
     
     Stats stats_;
     mutable std::mutex statsMutex_;
+
+    // Caller must hold mutex_.
+    std::optional<MigrationOperation> offloadLocked(Allocation& alloc);
+    std::optional<MigrationOperation> reloadLocked(Allocation& alloc);
+
+    // Bounded wait for a migration. Returns false if the timeout expired
+    // (completion is finished by a detached worker so cleanup still runs).
+    bool waitSync(MigrationOperation& op, uint64_t timeoutNs);
+    void finishSync();
 };
 
 } // namespace vvm

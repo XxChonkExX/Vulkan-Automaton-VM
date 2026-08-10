@@ -448,9 +448,11 @@ struct ExternalMemoryInfo {
     }
 #elif defined(VVM_PLATFORM_ANDROID)
     if (src.handle) {
-        // AHardwareBuffer doesn't need explicit duplication - it's reference counted
-        // Just retain a new reference
-        copy.handle = src.handle;
+        // AHardwareBuffer is reference counted: bump the refcount so the
+        // source and the duplicate each own one release.
+        AHardwareBuffer* buf = src.handle.get();
+        AHardwareBuffer_acquire(buf);
+        copy.handle = ExternalHandle(buf);
     }
 #endif
     return copy;

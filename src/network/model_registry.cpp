@@ -1,6 +1,7 @@
 #include "vulkan_vm/network/model_registry.hpp"
 #include "vulkan_vm/network/sha256.hpp"
 #include "vulkan_vm/network/network_types.hpp"
+#include "vulkan_vm/network/wire_format.hpp"
 #include "vulkan_vm/utils.hpp"
 
 #include <algorithm>
@@ -18,53 +19,10 @@ namespace fs = std::filesystem;
 using namespace std::chrono_literals;
 
 // ============================================================================
-// Helpers: binary put/get
+// Helpers: binary put/get (canonical implementation in wire_format.hpp)
 // ============================================================================
 
-namespace detail {
-
-static inline void putU32(std::vector<uint8_t>& v, uint32_t x) {
-    v.push_back((x >> 24) & 0xff);
-    v.push_back((x >> 16) & 0xff);
-    v.push_back((x >> 8) & 0xff);
-    v.push_back(x & 0xff);
-}
-
-static inline void putU64(std::vector<uint8_t>& v, uint64_t x) {
-    for (int i = 7; i >= 0; --i) v.push_back((x >> (8 * i)) & 0xff);
-}
-
-static inline void putStr(std::vector<uint8_t>& v, const std::string& s) {
-    detail::putU32(v, static_cast<uint32_t>(s.size()));
-    v.insert(v.end(), s.begin(), s.end());
-}
-
-static inline bool getU32(const uint8_t*& p, const uint8_t* end, uint32_t& out) {
-    if (p + 4 > end) return false;
-    out = (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
-          (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
-    p += 4;
-    return true;
-}
-
-static inline bool getU64(const uint8_t*& p, const uint8_t* end, uint64_t& out) {
-    if (p + 8 > end) return false;
-    out = 0;
-    for (int i = 0; i < 8; ++i) out = (out << 8) | p[i];
-    p += 8;
-    return true;
-}
-
-static inline bool getStr(const uint8_t*& p, const uint8_t* end, std::string& out) {
-    uint32_t len = 0;
-    if (!getU32(p, end, len)) return false;
-    if (p + len > end) return false;
-    out.assign(reinterpret_cast<const char*>(p), len);
-    p += len;
-    return true;
-}
-
-} // namespace detail
+namespace detail = ::vvm::network::wire;
 
 // ============================================================================
 // ModelManifest serialization
@@ -294,10 +252,15 @@ void ModelHub::onRequest(TcpMessage& req, TcpMessage& resp) {
         const uint8_t* p = req.body.data();
         const uint8_t* end = p + req.body.size();
         std::string modelId, version = "1";
-        const char* cp = reinterpret_cast<const char*>(p);
-        modelId = cp;
-        cp += modelId.size() + 1;
-        if (cp < reinterpret_cast<const char*>(end)) version = cp;
+        if (p == end) { resp.flags = TcpFlagsError; return; }
+        const uint8_t* term = std::find(p, end, 0);
+        if (term == end) { resp.flags = TcpFlagsError; return; }  // unterminated
+        modelId.assign(reinterpret_cast<const char*>(p), static_cast<size_t>(term - p));
+        p = term + 1;
+        if (p < end) {
+            term = std::find(p, end, 0);
+            version.assign(reinterpret_cast<const char*>(p), static_cast<size_t>(term - p));
+        }
         auto man = getManifest(modelId, version);
         if (!man) {
             resp.flags = TcpFlagsError;
@@ -312,10 +275,12 @@ void ModelHub::onRequest(TcpMessage& req, TcpMessage& resp) {
         const uint8_t* p = req.body.data();
         const uint8_t* end = p + req.body.size();
         auto readCStr = [&](std::string& s) -> bool {
-            const char* cp = reinterpret_cast<const char*>(p);
-            s = cp;
-            p += s.size() + 1;
-            return p <= end;
+            if (p >= end) return false;
+            const uint8_t* term = std::find(p, end, 0);
+            if (term == end) return false;  // unterminated: refuse (no overread)
+            s.assign(reinterpret_cast<const char*>(p), static_cast<size_t>(term - p));
+            p = term + 1;
+            return true;
         };
         std::string modelId, version, filePath;
         if (!readCStr(modelId) || !readCStr(version) || !readCStr(filePath)) {
@@ -338,6 +303,23 @@ void ModelHub::onRequest(TcpMessage& req, TcpMessage& resp) {
             resp.flags = TcpFlagsError;
             return;
         }
+        if (man.chunkSize == 0) {
+            resp.flags = TcpFlagsError;
+            return;
+        }
+
+        // Defense in depth: even though filePath must match a published
+        // manifest entry, refuse anything that would escape the model root.
+        fs::path fileRel = fs::path(filePath).lexically_normal();
+        const std::string fileRelStr = fileRel.string();
+        const bool escapes = fileRel.is_absolute() ||
+                             fileRelStr == ".." ||
+                             fileRelStr.rfind("..\\", 0) == 0 ||
+                             fileRelStr.rfind("../", 0) == 0;
+        if (escapes) {
+            resp.flags = TcpFlagsError;
+            return;
+        }
 
         uint64_t fileSize = fIt->size;
         uint32_t chunkSize = man.chunkSize;
@@ -348,7 +330,7 @@ void ModelHub::onRequest(TcpMessage& req, TcpMessage& resp) {
         }
         uint64_t toRead = std::min<uint64_t>(chunkSize, fileSize - offset);
 
-        std::string fullPath = (fs::path(modelPath(modelId, version)) / filePath).string();
+        std::string fullPath = (fs::path(modelPath(modelId, version)) / fileRel).string();
         std::vector<uint8_t> chunk;
         chunk.resize(static_cast<size_t>(toRead));
         if (!readChunkFromDisk(fullPath, chunkIdx, chunkSize, chunk)) {
@@ -399,7 +381,12 @@ std::optional<ModelManifest> ModelHub::fetchManifest(
     size_t colon = connection.rfind(':');
     if (colon == std::string::npos) return std::nullopt;
     std::string host = connection.substr(0, colon);
-    uint16_t port = static_cast<uint16_t>(std::stoi(connection.substr(colon + 1)));
+    uint16_t port = 0;
+    try {
+        port = static_cast<uint16_t>(std::stoi(connection.substr(colon + 1)));
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
 
     TcpTransport transport;
     auto conn = transport.connect(host, port, timeoutMs);
@@ -432,10 +419,19 @@ uint64_t ModelHub::fetchModel(
     const std::string& destDir,
     ProgressFn progress,
     int32_t timeoutMs) {
+    if (manifest.chunkSize == 0) {
+        VVM_LOG_ERROR("fetchModel: manifest has chunkSize 0");
+        return 0;
+    }
     size_t colon = connection.rfind(':');
     if (colon == std::string::npos) return 0;
+    uint16_t port = 0;
+    try {
+        port = static_cast<uint16_t>(std::stoi(connection.substr(colon + 1)));
+    } catch (const std::exception&) {
+        return 0;
+    }
     std::string host = connection.substr(0, colon);
-    uint16_t port = static_cast<uint16_t>(std::stoi(connection.substr(colon + 1)));
 
     fs::create_directories(destDir);
 
@@ -456,10 +452,42 @@ uint64_t ModelHub::fetchModel(
         fs::path outPath = fs::path(destDir) / file.path;
         fs::create_directories(outPath.parent_path());
 
-        // Open/create output file
+        const uint64_t fileChunks = countFileChunks(file.size, manifest.chunkSize);
+
+        // Resume granularity is the whole file: a partial file cannot be
+        // validated chunk-by-chunk against the manifest (which only carries
+        // the whole-file sha256), so only an exact whole-file hash match lets
+        // us skip re-downloading.
+        bool fileComplete = false;
+        if (fs::exists(outPath)) {
+            std::ifstream check(outPath, std::ios::binary);
+            if (check) {
+                std::vector<uint8_t> whole(file.size > 0
+                    ? static_cast<size_t>(file.size) : 1);
+                check.read(reinterpret_cast<char*>(whole.data()),
+                           static_cast<std::streamsize>(whole.size()));
+                if (check.gcount() == static_cast<std::streamsize>(whole.size())) {
+                    Sha256 h;
+                    h.update(whole.data(), whole.size());
+                    uint8_t digest[32];
+                    h.finalize(digest);
+                    if (std::equal(digest, digest + 32, file.sha256)) {
+                        fileComplete = true;
+                        chunksDone += static_cast<uint32_t>(fileChunks);
+                        totalDownloaded += file.size;
+                        if (progress) {
+                            dl.bytesDone = totalDownloaded;
+                            dl.chunksDone = chunksDone;
+                            progress(dl);
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
+
         std::fstream out(outPath, std::ios::binary | std::ios::in | std::ios::out);
-        bool fileExisted = out.is_open();
-        if (!fileExisted) {
+        if (!out.is_open()) {
             out.open(outPath, std::ios::binary | std::ios::out);
             if (!out) {
                 VVM_LOG_ERROR("fetchModel: cannot create {}", outPath.string());
@@ -467,36 +495,8 @@ uint64_t ModelHub::fetchModel(
             }
         }
 
-        uint64_t fileChunks = countFileChunks(file.size, manifest.chunkSize);
         for (uint32_t ci = 0; ci < fileChunks; ++ci) {
-            uint64_t offset = static_cast<uint64_t>(ci) * manifest.chunkSize;
-            uint64_t toRead = std::min<uint64_t>(manifest.chunkSize, file.size - offset);
-
-            // Check if this chunk already matches
-            if (fileExisted) {
-                out.seekg(static_cast<std::streamoff>(offset));
-                if (out) {
-                    std::vector<uint8_t> existing(toRead);
-                    out.read(reinterpret_cast<char*>(existing.data()), toRead);
-                    if (out.gcount() == static_cast<std::streamsize>(toRead)) {
-                        Sha256 h;
-                        h.update(existing.data(), existing.size());
-                        uint8_t digest[32];
-                        h.finalize(digest);
-                        if (std::equal(digest, digest + 32, file.sha256)) {
-                            chunksDone++;
-                            if (progress) {
-                                dl.bytesDone += toRead;
-                                dl.chunksDone = chunksDone;
-                                progress(dl);
-                            }
-                            continue;
-                        }
-                    }
-                }
-            }
-
-            // Build chunk request
+            const uint64_t offset = static_cast<uint64_t>(ci) * manifest.chunkSize;
             TcpMessage req;
             req.type = MsgModelChunk;
             req.flags = TcpFlagsRequest;
