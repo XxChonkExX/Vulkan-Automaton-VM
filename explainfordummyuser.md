@@ -69,7 +69,18 @@ A power-of-two allocator that splits and merges blocks with their "buddy":
 - Blocks always merge with their "buddy" (adjacent block from same parent split)
 - No external fragmentation — free blocks always coalesce
 - O(1) allocation/deallocation
+- Deterministic placement — lowest free offset handed out first, so buddy pairs stay adjacent and coalescing always works
 - Power-of-two alignment guaranteed
+
+### Auto-Tuning (APU vs Discrete vs High-VRAM)
+
+`PoolConfig::forDevice()` reads the device memory at runtime and picks the block profile:
+
+- **APUs / unified memory (Strix Halo)** → 1-2 GB blocks, host-visible, capped heap fraction
+- **Discrete cards under 24 GB** → 512 MB blocks (16 blocks, 0.75 heap fraction) so mid-range cards stay conservative
+- **High-VRAM cards ≥24 GB (RTX 4090, RTX 6000 Ada)** → auto-scales to 2 GB blocks, 64 blocks, 0.8-0.85 heap fraction so big pools can actually be saturated
+
+Explicit overrides are available: `PoolConfig::forHighVRAM(physicalDevice)` (2 GB blocks, up to 0.85 of the heap) and `PoolConfig::forAPU(totalSystemRAM)` (RAM-budget-aware). Default to `forDevice()` and let detection do the work.
 
 ### Memory Usage Intents (No Raw Flags)
 
@@ -372,11 +383,11 @@ ctest --test-dir build --output-on-failure
 
 | GPU | Works? | Notes |
 |-----|--------|-------|
-| RTX 4090 / 7900 XTX (24 GB) | ✅ Excellent | 512 MB blocks |
+| RTX 4090 / 7900 XTX (24 GB) | ✅ Excellent | 2 GB blocks (auto-detected ≥24 GB VRAM) |
 | RTX 4070 / 7800 XT (12-16 GB) | ✅ Excellent | 256 MB blocks |
 | Arc A770 / A750 (16/8 GB) | ✅ Good | 256 MB blocks |
 | Laptop dGPU (8 GB) | ✅ Good | 128 MB blocks |
-| **Strix Halo APU (96-128 GB unified)** | ✅ **BEST** | 1-2 GB blocks, this is the sweet spot |
+| **Strix Halo APU (96-128 GB unified)** | ✅ **BEST** | 2 GB blocks (auto-detected), this is the sweet spot |
 | Integrated (2-8 GB shared) | ⚠️ Works but tight | 64 MB blocks |
 | Ancient GPU (Vulkan 1.0) | ❌ | Needs Vulkan 1.3+ |
 
