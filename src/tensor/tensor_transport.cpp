@@ -696,7 +696,7 @@ public:
         VkPushConstantRange pushConstant{};
         pushConstant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         pushConstant.offset = 0;
-        pushConstant.size = 4 * sizeof(uint32_t); // N, H, W, C
+        pushConstant.size = 10 * sizeof(uint32_t); // N, H, W, C, layoutMode, blockSize, strides (x4)
         layoutInfo.pPushConstantRanges = &pushConstant;
         
         if (vkCreatePipelineLayout(device, &layoutInfo, nullptr, &pipelineLayout) != VK_SUCCESS) {
@@ -853,9 +853,9 @@ public:
         
         vkCmdBindDescriptorSets(cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descSet, 0, nullptr);
         
-        // Push constants: N, H, W, C
+        // Push constants: N, H, W, C, layoutMode, blockSize, strides (x4)
         TensorShape shape = src->metadata.shape;
-        uint32_t pushConstants[4];
+        uint32_t pushConstants[10] = {};
         if (shape.dims.size() >= 4) {
             pushConstants[0] = static_cast<uint32_t>(shape.dims[0]); // N
             pushConstants[1] = static_cast<uint32_t>(shape.dims[1]); // H
@@ -868,6 +868,15 @@ public:
             pushConstants[2] = 1;
             pushConstants[3] = static_cast<uint32_t>(src->metadata.bytes() / 2); // Assuming FP16
         }
+        if (shaderName == "NHWC_to_NCHW") {
+            pushConstants[4] = 0;
+        } else if (shaderName == "NCHW_to_NHWC") {
+            pushConstants[4] = 1;
+        } else {
+            pushConstants[4] = UINT32_MAX; // unsupported mode; shader writes nothing
+        }
+        pushConstants[5] = 1; // blockSize (unused for modes 0/1)
+        // Strides (modes 0/1 are linear-to-linear; N strides only meaningful in mode 3)
         
         vkCmdPushConstants(cmdBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), pushConstants);
         
