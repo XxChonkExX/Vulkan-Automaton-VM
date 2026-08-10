@@ -164,9 +164,9 @@ struct NetHeader {
     uint64_t streamLen;
 };
 
-bool isValidHeaderLengths(const NetHeader& h) {
-    return static_cast<uint64_t>(h.bodyLen) <= kMaxBodySize &&
-           h.streamLen <= kMaxStreamSize;
+bool isValidHeaderLengths(const NetHeader& h, const NetworkConfig& netConfig) {
+    return static_cast<uint64_t>(h.bodyLen) <= netConfig.maxBodySize &&
+           h.streamLen <= netConfig.maxStreamSize;
 }
 
 std::vector<uint8_t> encodeHeader(const NetHeader& h) {
@@ -694,6 +694,9 @@ struct TcpTransport::Impl {
     std::mutex cleanupMutex;
     std::condition_variable cleanupCV;
 
+    // Network config (for caps, rate limits, etc.)
+    NetworkConfig netConfig;
+
     // ============================================================================
     // Connection Pool for Parallel Stream Transfers (TCP Stream Striping)
     // ============================================================================
@@ -1011,10 +1014,12 @@ TcpTransport::~TcpTransport() {
 }
 
 bool TcpTransport::start(const std::string& listenHost, uint16_t port, RequestHandler handler,
+                           const NetworkConfig& netConfig,
                            std::chrono::milliseconds idleTimeout) {
     ensureSocketsInit();
     if (impl_->running) return false;
     
+    impl_->netConfig = netConfig;
     impl_->connectionIdleTimeout = idleTimeout;
 
     SocketType sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -1228,7 +1233,7 @@ void TcpTransport::serveConnection(uint64_t connId, uintptr_t sRaw) {
 
         NetHeader nh{};
         if (!decodeHeader(header.data(), header.size(), nh)) break;
-        if (!isValidHeaderLengths(nh)) {
+        if (!isValidHeaderLengths(nh, impl_->netConfig)) {
             VVM_LOG_ERROR("serveConnection: peer sent oversized message "
                           "(bodyLen={}, streamLen={}); dropping connection",
                           nh.bodyLen, nh.streamLen);
@@ -1488,7 +1493,7 @@ std::optional<TcpMessage> TcpTransport::request(ConnId id, const TcpMessage& req
 
     NetHeader nh{};
     if (!decodeHeader(header.data(), header.size(), nh)) return std::nullopt;
-    if (!isValidHeaderLengths(nh)) {
+    if (!isValidHeaderLengths(nh, impl_->netConfig)) {
         VVM_LOG_ERROR("TcpTransport::request: peer returned oversized message "
                       "(bodyLen={}, streamLen={}); dropping connection",
                       nh.bodyLen, nh.streamLen);

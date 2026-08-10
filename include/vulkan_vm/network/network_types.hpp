@@ -3,6 +3,7 @@
 #include <vulkan/vulkan.h>
 
 #include "vulkan_vm/utils.hpp"
+#include "vulkan_vm/constants.hpp"
 
 #include <string>
 #include <vector>
@@ -26,7 +27,7 @@ struct NetworkConfig {
     bool enableRdma = true;
     bool enableGpuDirect = true;        // NVIDIA GPUDirect / AMD ROCm RDMA
     bool enableRdmaWrite = true;        // use RDMA_WRITE (vs RDMA_READ)
-    uint32_t rdmaMtu = 4096;            // MTU for RDMA (1024/2048/4096)
+    uint32_t rdmaMtu = constants::kDefaultRdmaMtu;            // MTU for RDMA (1024/2048/4096)
     
     // Fallback
     bool enableHostStagedFallback = true;
@@ -36,23 +37,37 @@ struct NetworkConfig {
     // and deeper pipelines push the upper end on fast links; the transport
     // shrinks the window from measured throughput on slow/high-latency
     // links so GPU-poor peers still make forward progress.
-    uint32_t streamWindowBytes = 8 * 1024 * 1024;   // staging buffer size per window (0 = 8MB default)
-    uint32_t streamPipelineBuffers = 3;             // windows in flight (clamped to 2..4)
+    uint32_t streamWindowBytes = constants::kDefaultStreamWindowBytes;   // staging buffer size per window (0 = 8MB default)
+    uint32_t streamPipelineBuffers = constants::kDefaultPipelineBuffers;             // windows in flight (clamped to 2..4)
     // EXPERIMENTAL (opt-in): the windowed double-buffered push/pull pipeline.
     // Default OFF - migrations use the proven single full-sized staging path.
     // Enable only for staging/fabric experiments; not yet validated on real
     // multi-IP fabrics or all drivers.
     bool enableAdaptiveWindow = false;
     
+    // Message size limits (hard caps for untrusted peers)
+    uint64_t maxBodySize = constants::kDefaultMaxBodySize;    // 1 GiB max message body
+    uint64_t maxStreamSize = constants::kDefaultMaxStreamSize; // 16 GiB max stream
+    
+    // Connection-level limits for untrusted peers
+    uint32_t maxConcurrentStreams = constants::kDefaultMaxConcurrentStreams;               // max concurrent streams per connection
+    uint64_t maxBytesPerSecond = constants::kDefaultMaxBytesPerSecond;                  // 0 = unlimited (bytes/sec rate limit)
+    uint32_t maxMessageRate = constants::kDefaultMaxMessageRate;                  // max messages per second
+    
+    // Authentication (for untrusted peers)
+    bool requireAuthentication = false;              // require mTLS or token auth
+    std::string authToken = "";                      // shared secret for token auth
+    
     // Timeouts
-    std::chrono::milliseconds connectTimeout{5000};
-    std::chrono::milliseconds rpcTimeout{30000};
-    std::chrono::milliseconds migrationTimeout{60000};
-    std::chrono::milliseconds heartbeatInterval{5000};
-    std::chrono::milliseconds connectionIdleTimeout{300000};  // 5 min default idle timeout
+    std::chrono::milliseconds connectTimeout{constants::kDefaultConnectTimeoutMs};
+    std::chrono::milliseconds rpcTimeout{constants::kDefaultRpcTimeoutMs};
+    std::chrono::milliseconds migrationTimeout{constants::kDefaultMigrationTimeoutMs};
+    std::chrono::milliseconds heartbeatInterval{constants::kDefaultHeartbeatIntervalMs};
+    std::chrono::milliseconds connectionIdleTimeout{constants::kDefaultConnectionIdleTimeoutMs};  // 5 min default idle timeout
     
     // Security (optional)
     bool useTls = false;
+    bool requireTlsForRemote = true;      // require TLS for non-localhost peers (opt-out for dev)
     std::string tlsCertPath = "";
     std::string tlsKeyPath = "";
     std::string tlsCaPath = "";
@@ -68,6 +83,24 @@ struct NetworkConfig {
         return true;
     }
 };
+
+// Returns true if the given host is a localhost/loopback address (127.0.0.1,
+// "localhost", "::1", etc.). Used to auto-decide whether TLS is required.
+inline bool isLocalhostAddress(const std::string& host) {
+    if (host.empty() || host == "localhost" || host == "127.0.0.1" ||
+        host == "::1" || host == "[::1]") {
+        return true;
+    }
+    return false;
+}
+
+// Returns true if TLS is required for the given peer host. When
+// requireTlsForRemote is set, TLS is required for any non-localhost host.
+inline bool isTlsRequiredForPeer(const NetworkConfig& cfg, const std::string& peerHost) {
+    if (!cfg.useTls) return false;
+    if (cfg.requireTlsForRemote && !isLocalhostAddress(peerHost)) return true;
+    return false;
+}
 
 // ============================================================================
 // Node identification

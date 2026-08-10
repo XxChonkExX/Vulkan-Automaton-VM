@@ -43,8 +43,9 @@ struct HostShadowBuffer {
     #endif
 };
 
-// Thread Safety: HostShadowManager is NOT thread-safe. All methods must be
-// externally synchronized.
+// Thread Safety: HostShadowManager IS thread-safe. All public methods are
+//                internally synchronized. Not thread-safe for concurrent move
+//                operations (move before use).
 
 class HostShadowManager {
 public:
@@ -81,9 +82,18 @@ public:
     void unprotectRegion(VkDeviceSize offset, VkDeviceSize size); // PROT_READ|WRITE
     
     // Get buffer for copy operations
-    VkBuffer getBuffer() const { return shadowBuffer_.buffer; }
-    VkDeviceSize getSize() const { return shadowBuffer_.size; }
-    VkDeviceSize getUsed() const { return shadowBuffer_.used; }
+    VkBuffer getBuffer() const { 
+        std::lock_guard<std::mutex> lock(mutex_); 
+        return shadowBuffer_.buffer; 
+    }
+    VkDeviceSize getSize() const { 
+        std::lock_guard<std::mutex> lock(mutex_); 
+        return shadowBuffer_.size; 
+    }
+    VkDeviceSize getUsed() const { 
+        std::lock_guard<std::mutex> lock(mutex_); 
+        return shadowBuffer_.used; 
+    }
 
 private:
     VkPhysicalDevice physicalDevice_;
@@ -91,6 +101,7 @@ private:
     OffloadConfig config_;
     HostShadowBuffer shadowBuffer_;
     VkCommandPool cmdPool_ = VK_NULL_HANDLE;
+    mutable std::mutex mutex_;  // protects shadowBuffer_ and freeRanges
     
     bool createShadowBuffer();
     void destroyShadowBuffer();

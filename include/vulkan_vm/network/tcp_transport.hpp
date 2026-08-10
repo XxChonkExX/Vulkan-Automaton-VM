@@ -112,6 +112,9 @@ struct TlsConfig {
     std::string alpnProtocols = "vvm/1.0";
 };
 
+// Thread Safety: All public methods are thread-safe.
+//                  start()/stop() must not be called concurrently with request().
+//                  Request handler must be thread-safe if called concurrently.
 class TcpTransport {
 public:
     using ConnId = uint64_t;
@@ -129,6 +132,7 @@ public:
     // Server
     // ========================================================================
     bool start(const std::string& listenHost, uint16_t port, RequestHandler handler,
+               const NetworkConfig& netConfig,
                std::chrono::milliseconds idleTimeout = std::chrono::milliseconds(300000));
     void stop();
     bool isRunning() const;

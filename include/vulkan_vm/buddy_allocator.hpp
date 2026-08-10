@@ -4,7 +4,7 @@
 #include <vector>
 #include <optional>
 #include <unordered_map>
-#include <unordered_set>
+#include <set>
 #include <cstdint>
 #include <cassert>
 #include <mutex>
@@ -54,7 +54,8 @@ private:
 
     // Push a free block of the given order onto its free list.
     void pushFree(int order, VkDeviceSize offset);
-    // Pop any free block of exactly this order (or nullopt).
+    // Pop the LOWEST free block of exactly this order (or nullopt).
+    // O(log n) using std::set ordered by offset.
     std::optional<VkDeviceSize> popFree(int order);
 
     // Split a block of `order` down until we obtain a block of `targetOrder`.
@@ -69,8 +70,8 @@ private:
     int          maxOrder_  = -1;   // -1 = invalid
 
     // freeLists_[order] holds offsets of free blocks of size (minSize << order)
-    // Using unordered_set for O(1) buddy lookup during coalesce.
-    std::vector<std::unordered_set<VkDeviceSize>> freeLists_;
+    // Using std::set for O(log n) min-offset retrieval + O(log n) buddy lookup during coalesce.
+    std::vector<std::set<VkDeviceSize>> freeLists_;
 
     // Validation / size recovery only. Not on the hot path for performance-critical
     // code that already knows the size. Can be disabled with a compile flag later.

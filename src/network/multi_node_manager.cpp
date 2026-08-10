@@ -3,6 +3,7 @@
 #include "vulkan_vm/network/network_types.hpp"
 #include "vulkan_vm/core.hpp"
 #include "vulkan_vm/utils.hpp"
+#include "vulkan_vm/constants.hpp"
 
 #if defined(VVM_NETWORK_HAS_GRPC)
 #include "vulkan_vm/network/cluster_client.hpp"
@@ -243,7 +244,13 @@ void MultiNodePoolManager::cleanup() {
 
     // Destroy copy engine
     if (copyCmdPool_ != VK_NULL_HANDLE && !localPools_.empty()) {
-        vkDestroyCommandPool(localPools_[0].getDevice(), copyCmdPool_, nullptr);
+        VkDevice device = localPools_[0].getDevice();
+        for (auto& ctx : copyContexts_) {
+            if (ctx.cmdBuffer) vkFreeCommandBuffers(device, copyCmdPool_, 1, &ctx.cmdBuffer);
+            if (ctx.fence) vkDestroyFence(device, ctx.fence, nullptr);
+        }
+        copyContexts_.clear();
+        vkDestroyCommandPool(device, copyCmdPool_, nullptr);
         copyCmdPool_ = VK_NULL_HANDLE;
     }
 
@@ -1380,6 +1387,37 @@ bool MultiNodePoolManager::initCopyEngine() {
         VVM_LOG_ERROR("initCopyEngine: failed to create command pool: {}", vkResultToString(res));
         return false;
     }
+
+    // Pre-allocate command buffers and fences for async copy operations
+    VkDevice device = localPools_[0].getDevice();
+    maxCopyContexts_ = std::clamp(networkConfig_.streamPipelineBuffers * 2,
+                                   constants::kMinCopyContexts,
+                                   constants::kMaxCopyContexts);
+    copyContexts_.resize(maxCopyContexts_);
+    
+    VkCommandBufferAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.commandPool = copyCmdPool_;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+
+    VkFenceCreateInfo fenceInfo{};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+
+    for (auto& ctx : copyContexts_) {
+        VkResult r = vkAllocateCommandBuffers(device, &allocInfo, &ctx.cmdBuffer);
+        if (r != VK_SUCCESS) {
+            VVM_LOG_ERROR("initCopyEngine: failed to allocate command buffer: {}", vkResultToString(r));
+            return false;
+        }
+        r = vkCreateFence(device, &fenceInfo, nullptr, &ctx.fence);
+        if (r != VK_SUCCESS) {
+            VVM_LOG_ERROR("initCopyEngine: failed to create fence: {}", vkResultToString(r));
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -1465,7 +1503,7 @@ bool MultiNodePoolManager::runCopy(VkBuffer srcBuffer, VkBuffer dstBuffer,
     if (res == VK_SUCCESS) {
         // Use a 10-second timeout instead of infinite wait to prevent hangs
         // if the GPU fails to signal the fence (driver issue, queue starvation, etc.)
-        constexpr uint64_t kCopyTimeoutNs = 10ull * 1000 * 1000 * 1000;  // 10 seconds
+        constexpr uint64_t kCopyTimeoutNs = constants::kCopyTimeoutNs;  // 10 seconds
         VkResult waitRes = vkWaitForFences(device, 1, &fence, VK_TRUE, kCopyTimeoutNs);
         if (waitRes == VK_TIMEOUT) {
             VVM_LOG_ERROR("runCopy: fence wait timed out after 10 seconds (GPU copy may be stuck)");
@@ -1498,12 +1536,27 @@ VkFence MultiNodePoolManager::submitCopyAsync(VkBuffer srcBuffer, VkBuffer dstBu
     }
     VkDevice device = localPools_[0].getDevice();
 
-    VkCommandBufferAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocInfo.commandPool = copyCmdPool_;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
-    if (vkAllocateCommandBuffers(device, &allocInfo, &outCmd) != VK_SUCCESS) return VK_NULL_HANDLE;
+    // Acquire a pre-allocated context
+    CopyContext* ctx = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(copyContextsMutex_);
+        for (auto& c : copyContexts_) {
+            VkResult res = vkGetFenceStatus(device, c.fence);
+            if (res == VK_SUCCESS) {
+                vkResetFences(device, 1, &c.fence);
+                vkResetCommandBuffer(c.cmdBuffer, 0);
+                c.inUse = true;
+                ctx = &c;
+                break;
+            }
+        }
+    }
+    if (!ctx) {
+        VVM_LOG_WARN("submitCopyAsync: no available copy context, waiting...");
+        return VK_NULL_HANDLE;
+    }
+
+    outCmd = ctx->cmdBuffer;
 
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -1513,22 +1566,13 @@ VkFence MultiNodePoolManager::submitCopyAsync(VkBuffer srcBuffer, VkBuffer dstBu
     region.dstOffset = dstOffset;
     region.size = size;
     if (vkBeginCommandBuffer(outCmd, &beginInfo) != VK_SUCCESS) {
-        vkFreeCommandBuffers(device, copyCmdPool_, 1, &outCmd);
+        ctx->inUse = false;
         outCmd = VK_NULL_HANDLE;
         return VK_NULL_HANDLE;
     }
     vkCmdCopyBuffer(outCmd, srcBuffer, dstBuffer, 1, &region);
     if (vkEndCommandBuffer(outCmd) != VK_SUCCESS) {
-        vkFreeCommandBuffers(device, copyCmdPool_, 1, &outCmd);
-        outCmd = VK_NULL_HANDLE;
-        return VK_NULL_HANDLE;
-    }
-
-    VkFence fence = VK_NULL_HANDLE;
-    VkFenceCreateInfo fenceInfo{};
-    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    if (vkCreateFence(device, &fenceInfo, nullptr, &fence) != VK_SUCCESS) {
-        vkFreeCommandBuffers(device, copyCmdPool_, 1, &outCmd);
+        ctx->inUse = false;
         outCmd = VK_NULL_HANDLE;
         return VK_NULL_HANDLE;
     }
@@ -1537,29 +1581,37 @@ VkFence MultiNodePoolManager::submitCopyAsync(VkBuffer srcBuffer, VkBuffer dstBu
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &outCmd;
-    VkResult res = vkQueueSubmit(transferQueue_, 1, &submitInfo, fence);
+    VkResult res = vkQueueSubmit(transferQueue_, 1, &submitInfo, ctx->fence);
     if (res != VK_SUCCESS) {
         VVM_LOG_ERROR("submitCopyAsync: vkQueueSubmit failed: {}", vkResultToString(res));
-        vkDestroyFence(device, fence, nullptr);
-        vkFreeCommandBuffers(device, copyCmdPool_, 1, &outCmd);
+        ctx->inUse = false;
         outCmd = VK_NULL_HANDLE;
         return VK_NULL_HANDLE;
     }
-    return fence;
+    return ctx->fence;
 }
 
 void MultiNodePoolManager::releaseAsyncCopy(VkCommandBuffer cmd, VkFence fence) {
     if (fence == VK_NULL_HANDLE) return;
     VkDevice device = localPools_[0].getDevice();
-    constexpr uint64_t kCopyTimeoutNs = 10ull * 1000 * 1000 * 1000;  // 10 seconds
+    constexpr uint64_t kCopyTimeoutNs = constants::kCopyTimeoutNs;  // 10 seconds
     VkResult waitRes = vkWaitForFences(device, 1, &fence, VK_TRUE, kCopyTimeoutNs);
     if (waitRes == VK_TIMEOUT) {
         VVM_LOG_ERROR("releaseAsyncCopy: fence wait timed out (GPU copy may be stuck)");
     } else if (waitRes != VK_SUCCESS) {
         VVM_LOG_ERROR("releaseAsyncCopy: vkWaitForFences failed: {}", vkResultToString(waitRes));
     }
-    vkDestroyFence(device, fence, nullptr);
-    if (cmd != VK_NULL_HANDLE) vkFreeCommandBuffers(device, copyCmdPool_, 1, &cmd);
+    
+    // Return the context to the pool
+    {
+        std::lock_guard<std::mutex> lock(copyContextsMutex_);
+        for (auto& c : copyContexts_) {
+            if (c.fence == fence && c.cmdBuffer == cmd) {
+                c.inUse = false;
+                break;
+            }
+        }
+    }
 }
 
 bool MultiNodePoolManager::waitFence(VkFence fence) {
@@ -1567,7 +1619,7 @@ bool MultiNodePoolManager::waitFence(VkFence fence) {
     // The transfer queue is shared with the other direction's pipeline, so a
     // naive fixed-timeout wait can spuriously fail mid-stream and poison the
     // connection. Poll generously instead.
-    constexpr uint64_t kCopyBudgetNs = 60ull * 1000 * 1000 * 1000;  // 60 seconds
+    constexpr uint64_t kCopyBudgetNs = constants::kCopyBudgetNs;  // 60 seconds
     auto t0 = std::chrono::steady_clock::now();
     while (true) {
         VkResult res = vkWaitForFences(localPools_[0].getDevice(), 1, &fence, VK_TRUE, 100ull * 1000 * 1000);
