@@ -67,6 +67,8 @@ PoolConfig PoolConfig::forDevice(VkPhysicalDevice physicalDevice) {
             cfg.maxBlocks = isHighVRAM ? 16 : 8;
             cfg.enableHostVisible = true;
             cfg.maxHeapFraction = isHighVRAM ? 0.8f : 0.7f;
+            cfg.hostShadowMultiplier = 0.0f;  // VRAM is already host-visible
+            cfg.maxHostShadowBytes = 0;
             cfg.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -75,6 +77,7 @@ PoolConfig PoolConfig::forDevice(VkPhysicalDevice physicalDevice) {
             cfg.blockSize = isHighVRAM ? 2048ull * 1024 * 1024 : 512ull * 1024 * 1024;
             cfg.maxBlocks = isHighVRAM ? 24 : 12;
             cfg.maxHeapFraction = 0.75f;
+            cfg.hostShadowMultiplier = 2.0f;  // Smaller shadow for hybrid
             break;
         case MemoryTopologyType::Discrete:
         default:
@@ -84,6 +87,7 @@ PoolConfig PoolConfig::forDevice(VkPhysicalDevice physicalDevice) {
             cfg.blockSize = isHighVRAM ? 2048ull * 1024 * 1024 : 512ull * 1024 * 1024;
             cfg.maxBlocks = isHighVRAM ? 64 : 16;
             cfg.maxHeapFraction = isHighVRAM ? 0.8f : 0.75f;
+            cfg.hostShadowMultiplier = isHighVRAM ? 2.0f : 4.0f;
             break;
     }
     return cfg;
@@ -106,6 +110,9 @@ PoolConfig PoolConfig::forAPU(VkDeviceSize totalSystemRAM) {
         cfg.maxBlocks = 8;
         cfg.maxHeapFraction = 0.5f;
     }
+    // APU VRAM is host-visible; shadow buffer is redundant
+    cfg.hostShadowMultiplier = 0.0f;
+    cfg.maxHostShadowBytes = 0;
     return cfg;
 }
 
@@ -124,6 +131,8 @@ PoolConfig PoolConfig::forHighVRAM(VkPhysicalDevice physicalDevice) {
                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     }
+    cfg.hostShadowMultiplier = 2.0f;
+    cfg.maxHostShadowBytes = 4ull * 1024 * 1024 * 1024;  // Cap at 4GB
     (void)vram;  // kept for future heuristics (e.g. block count scaling)
     return cfg;
 }
@@ -349,7 +358,11 @@ VVM_LOG_INFO("Selected HOST_VISIBLE memory type {} (heap budget: {} MB)",
     // Create OffloadManager if offload is enabled
     if (config_.enableHostVisible) {
         OffloadConfig offloadConfig;
-        offloadConfig.hostShadowSize = config_.blockSize * 4;  // Default to 4x block size
+        VkDeviceSize shadow = static_cast<VkDeviceSize>(config_.blockSize * config_.hostShadowMultiplier);
+        if (config_.maxHostShadowBytes > 0) {
+            shadow = std::min(shadow, config_.maxHostShadowBytes);
+        }
+        offloadConfig.hostShadowSize = shadow;
         // madvise/mprotect on vkMapMemory regions is unsafe (see OffloadConfig
         // docs); these MUST stay disabled by default.
         offloadConfig.useMadvise = false;

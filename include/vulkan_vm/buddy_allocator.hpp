@@ -32,6 +32,11 @@ public:
     size_t getAllocationCount() const;
     bool isValid() const;
 
+    // Debug-only invariant checker. Returns true if all internal state is consistent.
+    // Checks: free blocks don't overlap, free + allocated = blockSize, no duplicate
+    // entries in free lists, all free blocks are properly aligned to their order.
+    bool checkInvariants() const;
+
     VkDeviceSize blockSize() const { return blockSize_; }
     VkDeviceSize minSize()  const { return minSize_; }
     int maxOrder()          const { return maxOrder_; }
