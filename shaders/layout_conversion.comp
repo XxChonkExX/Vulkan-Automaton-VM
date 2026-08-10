@@ -12,15 +12,15 @@ layout(push_constant) uniform PushConstants {
     uint C;
     uint layoutMode;  // 0=NHWC_to_NCHW, 1=NCHW_to_NHWC, 2=Blocked_to_Contiguous, 3=Strided_to_Contiguous
     uint blockSize;   // for blocked layout
-    uint4 strides;    // for strided layout (N_stride, H_stride, W_stride, C_stride)
+    uvec4 strides;    // for strided layout (N_stride, H_stride, W_stride, C_stride)
 } pc;
 
 layout(set = 0, binding = 0) buffer SrcBuffer {
-    half src[];
+    float src[];
 };
 
 layout(set = 0, binding = 1) buffer DstBuffer {
-    half dst[];
+    float dst[];
 };
 
 uint linearIndexToNHWC(uint idx, out uint n, out uint h, out uint w, out uint c) {
@@ -29,6 +29,7 @@ uint linearIndexToNHWC(uint idx, out uint n, out uint h, out uint w, out uint c)
     w = hw % pc.W;
     h = (hw / pc.W) % pc.H;
     n = hw / (pc.W * pc.H);
+    return idx;
 }
 
 uint linearIndexToNCHW(uint idx, out uint n, out uint c, out uint h, out uint w) {
@@ -37,6 +38,7 @@ uint linearIndexToNCHW(uint idx, out uint n, out uint c, out uint h, out uint w)
     h = cw % pc.H;
     c = (cw / pc.H) % pc.C;
     n = cw / (pc.H * pc.C);
+    return idx;
 }
 
 uint nhwcIndex(uint n, uint h, uint w, uint c) {

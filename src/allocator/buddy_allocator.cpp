@@ -49,6 +49,11 @@ int BuddyAllocator::sizeToOrder(VkDeviceSize size) const {
     return order;
 }
 
+VkDeviceSize BuddyAllocator::orderToSize(int order) const {
+    assert(order >= 0 && order <= maxOrder_);
+    return minSize_ << order;
+}
+
 void BuddyAllocator::pushFree(int order, VkDeviceSize offset) {
     assert(order >= 0 && order <= maxOrder_);
     freeLists_[order].insert(offset);
@@ -58,7 +63,9 @@ std::optional<VkDeviceSize> BuddyAllocator::popFree(int order) {
     if (order < 0 || order > maxOrder_) return std::nullopt;
     auto& set = freeLists_[order];
     if (set.empty()) return std::nullopt;
-    auto it = set.begin();
+    // Deterministic placement: hand out the lowest free offset so that buddy
+    // pairs stay adjacent and coalescing works as expected.
+    auto it = std::min_element(set.begin(), set.end());
     VkDeviceSize off = *it;
     set.erase(it);
     return off;

@@ -38,28 +38,46 @@ namespace vvm {
 // ============================================================================
 
 struct PoolConfig {
-    VkDeviceSize blockSize = 512 * 1024 * 1024;           // 512MB per block
-    VkDeviceSize minAlignment = 256 * 1024;                // 256KB for tensor cores
+    // Block size for the buddy allocator (power of two). Default 512MB.
+    // For high-VRAM cards (RTX 4090 24GB, RTX 6000 48GB), consider 1GB or 2GB.
+    VkDeviceSize blockSize = 512ull * 1024 * 1024;  // 512MB per block
+    
+    // Minimum allocation alignment (power of two). 256KB for tensor cores.
+    VkDeviceSize minAlignment = 256 * 1024;
+    
+    // Enable host-visible memory for staging/offload
     bool enableHostVisible = true;                         // shadow buffer for swap
+    
+    // Enable external memory handle types for cross-GPU sharing
     bool enableExternal = true;                            // cross-GPU sharing
+    
+    // Enable VK_BUFFER_DEVICE_ADDRESS for bindless access
     bool enableDeviceAddress = true;                       // bindless access
+    
+    // Max number of blocks to allocate (0 = unlimited, limited by maxPoolBytes/heapFraction)
     uint32_t maxBlocks = 16;                               // max blocks per pool
+    
+    // Preferred memory flags for allocations
     VkMemoryPropertyFlags preferredFlags = 
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-
+    
     // Budget: never pre-allocate past this fraction of the heap (0 = disabled).
     // Checked against VK_EXT_memory_budget when available, otherwise the
     // static heap size. When the budget would be exceeded, allocate() fails
     // soft (falls back to offload/host memory) instead of stealing VRAM.
     float maxHeapFraction = 0.0f;
+    
     // Hard cap on total pool memory in bytes (0 = no explicit cap).
     VkDeviceSize maxPoolBytes = 0;
-
-    // Build a config tuned for a physical device (unified/APU vs discrete).
+    
+    // Build a config tuned for a physical device (Discrete/Hybrid/Unified)
     static PoolConfig forDevice(VkPhysicalDevice physicalDevice);
-
+    
     // APU-specific tuned config
     static PoolConfig forAPU(VkDeviceSize totalSystemRAM);
+    
+    // High-VRAM tuned config (for 24GB+ cards like RTX 4090, RTX 6000 Ada)
+    static PoolConfig forHighVRAM(VkPhysicalDevice physicalDevice);
 };
 
 struct DeviceConfig {

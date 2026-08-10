@@ -42,33 +42,89 @@ MemoryTopologyType detectMemoryTopology(VkPhysicalDevice physicalDevice) {
     return MemoryTopologyType::Discrete;
 }
 
+VkDeviceSize totalDeviceVRAM(VkPhysicalDevice physicalDevice) {
+    VkPhysicalDeviceMemoryProperties props;
+    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &props);
+    VkDeviceSize total = 0;
+    for (uint32_t h = 0; h < props.memoryHeapCount; ++h) {
+        if (props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            total += props.memoryHeaps[h].size;
+        }
+    }
+    return total;
+}
+
 PoolConfig PoolConfig::forDevice(VkPhysicalDevice physicalDevice) {
     PoolConfig cfg;
+    const VkDeviceSize vram = totalDeviceVRAM(physicalDevice);
+    const bool isHighVRAM = vram >= 24ull * 1024 * 1024 * 1024;
     switch (detectMemoryTopology(physicalDevice)) {
         case MemoryTopologyType::Unified:
             // APU / Strix Halo style: one shared heap. Bigger blocks, fewer of
             // them; host shadow is largely unnecessary since VRAM is
             // host-visible. Still cap the fraction so we don't starve the OS.
-            cfg.blockSize = 1024ull * 1024 * 1024;  // 1 GB
-            cfg.maxBlocks = 8;
+            cfg.blockSize = isHighVRAM ? 2048ull * 1024 * 1024 : 1024ull * 1024 * 1024;
+            cfg.maxBlocks = isHighVRAM ? 16 : 8;
             cfg.enableHostVisible = true;
-            cfg.maxHeapFraction = 0.7f;
+            cfg.maxHeapFraction = isHighVRAM ? 0.8f : 0.7f;
             cfg.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
             break;
         case MemoryTopologyType::Hybrid:
-            cfg.blockSize = 512ull * 1024 * 1024;
-            cfg.maxBlocks = 12;
+            cfg.blockSize = isHighVRAM ? 2048ull * 1024 * 1024 : 512ull * 1024 * 1024;
+            cfg.maxBlocks = isHighVRAM ? 24 : 12;
             cfg.maxHeapFraction = 0.75f;
             break;
         case MemoryTopologyType::Discrete:
         default:
-            cfg.blockSize = 512ull * 1024 * 1024;
-            cfg.maxBlocks = 16;
-            cfg.maxHeapFraction = 0.75f;
+            // High-VRAM discrete cards (RTX 4090 24GB, RTX 6000 Ada 48GB):
+            // 2GB blocks up to 64 blocks covers 128GB; heap fraction 0.8 leaves
+            // headroom for the driver/other consumers.
+            cfg.blockSize = isHighVRAM ? 2048ull * 1024 * 1024 : 512ull * 1024 * 1024;
+            cfg.maxBlocks = isHighVRAM ? 64 : 16;
+            cfg.maxHeapFraction = isHighVRAM ? 0.8f : 0.75f;
             break;
     }
+    return cfg;
+}
+
+PoolConfig PoolConfig::forAPU(VkDeviceSize totalSystemRAM) {
+    PoolConfig cfg;
+    cfg.enableHostVisible = true;
+    cfg.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    // APUs share system RAM with the GPU. Bigger blocks, modest count, and a
+    // conservative heap fraction so we never starve the OS.
+    if (totalSystemRAM >= 64ull * 1024 * 1024 * 1024) {
+        cfg.blockSize = 1024ull * 1024 * 1024;  // 1 GB
+        cfg.maxBlocks = 16;
+        cfg.maxHeapFraction = 0.6f;
+    } else {
+        cfg.blockSize = 512ull * 1024 * 1024;
+        cfg.maxBlocks = 8;
+        cfg.maxHeapFraction = 0.5f;
+    }
+    return cfg;
+}
+
+PoolConfig PoolConfig::forHighVRAM(VkPhysicalDevice physicalDevice) {
+    PoolConfig cfg;
+    const VkDeviceSize vram = totalDeviceVRAM(physicalDevice);
+    cfg.blockSize = 2048ull * 1024 * 1024;  // 2 GB
+    cfg.maxBlocks = 64;
+    // Cap at 85% so we never commit the whole heap; heap sizes are often the
+    // full VRAM minus a small reserved carve-out.
+    cfg.maxHeapFraction = 0.85f;
+    cfg.enableHostVisible = false;
+    if (detectMemoryTopology(physicalDevice) == MemoryTopologyType::Unified) {
+        cfg.enableHostVisible = true;
+        cfg.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    }
+    (void)vram;  // kept for future heuristics (e.g. block count scaling)
     return cfg;
 }
 
