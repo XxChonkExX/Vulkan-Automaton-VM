@@ -19,7 +19,7 @@
 11. [Sparse / Residency Virtual Memory](#sparse--residency-virtual-memory)
 12. [Building](#building)
 13. [Cross-Vendor Compatibility](#cross-vendor-compatibility)
-14. [APU-Specific Tuning](#apu-specific-tuning)
+14. [Pool Tuning — APU & High-VRAM](#apu--high-vram-pool-tuning)
 15. [License & Credits](#license--credits)
 
 ---
@@ -71,11 +71,11 @@ pool->deallocate(std::move(*tensor));
 
 | Property | Description |
 |----------|-------------|
-| **Persistent blocks** | Pre-allocates large blocks (default 512 MB) at startup; sub-allocates with a buddy allocator |
+| **Persistent blocks** | Pre-allocates large blocks (512 MB default; 2 GB auto-selected on ≥24 GB VRAM cards) at startup; sub-allocates with a buddy allocator |
 | **Zero fragmentation** | Memory is **never returned to the OS** — blocks stay resident; buddy allocator guarantees power-of-2 alignment and coalescing on free |
 | **Hardened buddy** | Free-list-per-order classic buddy (iterative split/coalesce, no per-node heap churn); configurable `minSize` (default `PoolConfig::minAlignment`), power-of-2 `blockSize`/`minSize` enforced |
 | **Budget-aware** | `maxHeapFraction` (e.g., 0.75) + `VK_EXT_memory_budget` prevent starving the system |
-| **Topology-aware** | `detectMemoryTopology()` classifies Discrete / Unified / Hybrid; `PoolConfig::forDevice()` picks tuned defaults |
+| **Topology-aware** | `detectMemoryTopology()` classifies Discrete / Unified / Hybrid; `PoolConfig::forDevice()` picks tuned defaults and auto-scales to 2 GB blocks / 64 blocks / 0.8 heap fraction for ≥24 GB VRAM cards |
 | **Intent API** | `MemoryUsage { GpuOnly, CpuToGpu, GpuToCpu, CpuCopy, Auto }` hides raw `VkMemoryPropertyFlags` |
 | **Rich descriptors** | `AllocDesc { size, usage, memoryUsage, exportable, mapped, name }` |
 | **Bindless ready** | Every allocation returns `VkDeviceAddress` for descriptor-free shader access |
@@ -124,6 +124,8 @@ PoolStats stats = pool->getStats();
 | **UniqueAllocation RAII leak** | Raw ctor now private; force `UniqueAllocation::make()` factory; deleter always set |
 | **OffloadManager thread-safety** | Added `mutex_` + `statsMutex_`; all public methods mutex-guarded; unique lock names for nesting |
 | **Logging format** | All `printf` converted to `fmt`-style `{}` across `unified_memory_pool.cpp`, `host_shadow.cpp`, `rdma_transport.cpp`, `tcp_transport.cpp`, `vulkan_utils.cpp`, `network/multi_node_manager.cpp` |
+| **Buddy allocator (Grok audit)** | O(1) free-list lookup via `unordered_set`, optional internal mutex (`threadSafe_` + `withLock()`), missing `orderToSize()` defined, deterministic lowest-offset `popFree()` |
+| **Shader build step** | `layout_conversion.comp` compiled to SPIR-V by `glslangValidator` at build time; push-constant layout aligned with the dispatcher (N, H, W, C, layoutMode, blockSize, strides) |
 
 ---
 
@@ -1263,7 +1265,7 @@ ctest --test-dir build --output-on-failure
 
 - CMake 3.20+
 - C++20 compiler (GCC 10+, Clang 12+, MSVC 19.30+)
-- Vulkan SDK 1.3+
+- Vulkan SDK 1.3+ (includes `glslangValidator`, used to pre-compile `shaders/layout_conversion.comp` at build time)
 - **Windows SDK 10.0.26100+** (for NDKPI headers: `ws2spi.h`, `ndspi.h`)
 - Optional: Volk (dynamic Vulkan loading), OpenSSL (TLS), gRPC/Protobuf (control plane), ibverbs/rdma_cm (RDMA)
 - **Linux RDMA:** Kernel with `CONFIG_RDMA_RXE=y` (built-in) + `rdma-core` userspace for SoftRoCE fallback. Without it, network module uses host-staged TCP.
@@ -1336,7 +1338,7 @@ All three support sparse binding + residency.
 
 ---
 
-## APU-Specific Tuning (Strix Halo 395 / Unified Memory)
+## Pool Tuning — APU & High-VRAM (Strix Halo 395 / Unified Memory)
 
 ```cpp
 // Auto-tuned:
@@ -1359,6 +1361,23 @@ MemoryTopology topo = detectMemoryTopology(physicalDevice);
 ```
 
 **Result:** Single massive block at boot. ROCm can't fragment what VulkanVM already owns.
+
+### High-VRAM Cards (RTX 4090 24 GB, RTX 6000 Ada 48 GB)
+
+`forDevice()` also handles **high-VRAM discrete cards**: when the device reports ≥24 GB of device-local VRAM it auto-scales to 2 GB blocks, 64 blocks and a 0.8 heap fraction, so a 48-64 GB card can actually be saturated without overflow. Explicit overrides:
+
+```cpp
+// Auto-detected (≥24 GB VRAM → 2 GB blocks, 64 blocks, 0.8 heap fraction)
+PoolConfig cfg = PoolConfig::forDevice(physicalDevice);
+
+// Explicit high-VRAM tuning (2 GB blocks, 64 blocks, up to 0.85 of the heap)
+PoolConfig cfg = PoolConfig::forHighVRAM(physicalDevice);
+
+// APUs with a known system-RAM budget (512 MB-1 GB blocks, capped fraction)
+PoolConfig cfg = PoolConfig::forAPU(totalSystemRAM);
+```
+
+For comparison, below 24 GB `forDevice()` keeps a smaller footprint (512 MB blocks, 16 blocks, 0.75 fraction), so mid-range cards stay conservative.
 
 ---
 
@@ -1416,6 +1435,9 @@ MemoryTopology topo = detectMemoryTopology(physicalDevice);
 - [x] **Windows Network Direct (NDKPI) transport** — `NdkRdmaTransport` with IND2 SPI, fake provider test harness
 - [x] **Tensor collectives** — Ring all-reduce, broadcast, all-gather, reduce-scatter with CPU fallback (FP32/FP16/BF16/FP8/INT4/INT8/INT32/BOOL)
 - [x] **Android/Vulkan support** — AHardwareBuffer external memory, NDK r27+ build scripts
+- [x] **High-VRAM pool configs** — `forDevice()` auto-detects ≥24 GB VRAM (2 GB blocks / 64 blocks / 0.8 fraction); `forHighVRAM()` / `forAPU()` helpers
+- [x] **Buddy allocator hardening** — O(1) free-list lookup (`unordered_set`), deterministic lowest-offset placement, optional internal mutex
+- [x] **Shader build step** — `layout_conversion.spv` compiled by `glslangValidator` during the CMake build
 - [ ] Windows WDDM2.6+ hardware scheduling hints
 - [ ] Kernel NDKPI provider skeleton (Windows)
 - [ ] Tensor Transport: NCCL-style production collectives
