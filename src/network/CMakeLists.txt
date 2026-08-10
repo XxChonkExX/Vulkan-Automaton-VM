@@ -7,6 +7,40 @@ find_package(gRPC QUIET)
 find_package(ibverbs QUIET)
 find_package(rdma_cm QUIET)
 
+# Level Zero (Intel GPU-direct on Windows)
+if(WIN32)
+    # Try to find Level Zero SDK
+    set(LEVEL_ZERO_ROOT_PATHS
+        "C:/Program Files/LevelZeroSDK"
+        "C:/Program Files (x86)/LevelZeroSDK"
+        "$ENV{LEVEL_ZERO_SDK_PATH}"
+    )
+    foreach(path ${LEVEL_ZERO_ROOT_PATHS})
+        if(EXISTS "${path}/include/level_zero/ze_api.h")
+            set(LEVEL_ZERO_INCLUDE_DIR "${path}/include")
+            set(LEVEL_ZERO_LIB_DIR "${path}/lib")
+            message(STATUS "Found Level Zero SDK at ${path}")
+            break()
+        endif()
+    endforeach()
+
+    if(LEVEL_ZERO_INCLUDE_DIR)
+        find_library(LEVEL_ZERO_LIB loader
+            PATHS "${LEVEL_ZERO_LIB_DIR}"
+            NO_DEFAULT_PATH)
+        if(LEVEL_ZERO_LIB)
+            message(STATUS "VulkanVM network: Level Zero (Intel GPU-direct) enabled")
+            list(APPEND NETWORK_ABI_DEFS VVM_HAS_LEVEL_ZERO=1)
+            set(VVM_NETWORK_L0_LIBS ${LEVEL_ZERO_LIB})
+            set(VVM_NETWORK_L0_INCS ${LEVEL_ZERO_INCLUDE_DIR})
+        else()
+            message(WARNING "Level Zero headers found but loader.lib not found in ${LEVEL_ZERO_LIB_DIR}")
+        endif()
+    else()
+        message(STATUS "VulkanVM network: Level Zero SDK not found (Intel GPU-direct disabled)")
+    endif()
+endif()
+
 set(NETWORK_CORE_SRCS
     tcp_transport.cpp
     multi_node_manager.cpp
@@ -50,6 +84,14 @@ else()
     message(STATUS "VulkanVM network: RDMA/verbs transport disabled (host-staged TCP only)")
 endif()
 
+# Windows: Level Zero GPU-direct (Intel)
+if(WIN32 AND LevelZero_FOUND)
+    message(STATUS "VulkanVM network: Level Zero GPU-direct enabled for Intel")
+    list(APPEND NETWORK_CORE_SRCS gpu_direct_registration.cpp)
+    set(VVM_NETWORK_L0_LIBS ${LevelZero_LIBRARIES})
+    set(VVM_NETWORK_L0_INCS ${LevelZero_INCLUDE_DIRS})
+endif()
+
 # Windows: Network Direct (ND) transport. NDKPI is the kernel-mode contract
 # RNIC miniports implement; the user-mode consumer this library talks to is the
 # ND SPI (IND2*, headers vendored under third_party/ndk).
@@ -75,6 +117,7 @@ target_include_directories(vulkan_vm_network PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     ${Vulkan_INCLUDE_DIRS}
     ${VVM_NETWORK_VERBS_INCS}
+    ${VVM_NETWORK_L0_INCS}
     ${VVM_NETWORK_NDK_INCS}
     ${WINDOWS_SDK_UM}
     ${WINDOWS_SDK_SHARED}
@@ -87,6 +130,7 @@ target_link_libraries(vulkan_vm_network PRIVATE
     Threads::Threads
     ${VVM_NETWORK_GRPC_LIBS}
     ${VVM_NETWORK_VERBS_LIBS}
+    ${VVM_NETWORK_L0_LIBS}
     ${VVM_NETWORK_TLS_LIBS}
 )
 

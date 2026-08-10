@@ -216,73 +216,58 @@ public:
 
         if (!pd_ || !memory || size == 0) return std::nullopt;
 
-        if (vendorId_ == 0x10DE) {
-            // NVIDIA: VK_NV_external_memory_rdma gives the remote address.
-            // Try to register with nvidia-peermem for a functional local MR.
-            VkQueue transferQueue = VK_NULL_HANDLE;
-            uint32_t transferQueueFamily = UINT32_MAX;
-            auto reg = registerGpuMemoryForRdmaVendor(
-                device_, physicalDevice_, memory, offset, size,
-                transferQueue, transferQueueFamily, config_.nicName, vendorId_);
-            if (!reg || !reg->valid) {
-                VVM_LOG_WARN("NVIDIA GPUDirect registration failed");
-                return std::nullopt;
-            }
+        GpuDirectConfig gpuConfig;
+        gpuConfig.vkDevice = device_;
+        gpuConfig.vkPhysicalDevice = physicalDevice_;
+        gpuConfig.vkMemory = memory;
+        gpuConfig.offset = offset;
+        gpuConfig.size = size;
+        gpuConfig.nicName = config_.nicName;
+        gpuConfig.vendorId = vendorId_;
 
-            // Try to register the GPU memory with peermem for a local MR
-            // This requires nvidia-peermem kernel module
+        auto reg = registerGpuMemoryForRdmaVendor(gpuConfig);
+        if (!reg || !reg->valid) {
+            VVM_LOG_WARN("GPU-direct registration failed for vendor {:#x}", vendorId_);
+            return std::nullopt;
+        }
+
+        RdmaMemoryRegion region;
+        region.length = size;
+        region.rdmaAddr = reinterpret_cast<uint64_t>(reg->remoteAddress);
+        region.ownsMemory = false;
+        region.vkMemory = memory;
+        region.vkBuffer = buffer;
+
+        if (vendorId_ == 0x10DE) {
+            // NVIDIA: try to register with peermem for local MR
             struct ibv_mr* mr = nullptr;
-            if (isPeermemLoaded()) {
-                // The remote address from VK_NV_external_memory_rdma IS the PCI BAR address
-                // We can try to register it with ibv_reg_mr
-                VkMemoryGetRemoteAddressInfoNV info{};
-                info.sType = VK_STRUCTURE_TYPE_MEMORY_GET_REMOTE_ADDRESS_INFO_NV;
-                info.memory = memory;
-                info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_RDMA_ADDRESS_BIT_NV;
-                
-                PFN_vkGetMemoryRemoteAddressNV vkGetMemoryRemoteAddressNV =
-                    (PFN_vkGetMemoryRemoteAddressNV)vkGetDeviceProcAddr(device_, "vkGetMemoryRemoteAddressNV");
-                
-                VkRemoteAddressNV remoteAddr;
-                VkResult result = vkGetMemoryRemoteAddressNV(device_, &info, &remoteAddr);
-                if (result == VK_SUCCESS) {
-                    // The remote address IS the PCI BAR address
-                    // Try to register it with ibv_reg_mr
-                    const int accessFlags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
-                                            IBV_ACCESS_REMOTE_READ;
-                    
-                    // The remote address IS the PCI BAR virtual address
-                    void* barAddr = remoteAddr;
-                    mr = ibv_reg_mr(pd_, barAddr, size, accessFlags);
-                    if (mr) {
-                        VVM_LOG_INFO("NVIDIA GPUDirect registered with peermem: lkey={}, rkey={}",
-                                     mr->lkey, mr->rkey);
-                    } else {
-                        VVM_LOG_WARN("ibv_reg_mr on peermem BAR failed: {}", strerror(errno));
-                    }
+            if (isPeermemLoaded() && reg->rkey != 0) {
+                mr = reg->mr;
+            }
+            if (!mr && isPeermemLoaded()) {
+                const int accessFlags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                                        IBV_ACCESS_REMOTE_READ;
+                void* barAddr = reg->remoteAddress;
+                mr = ibv_reg_mr(pd_, barAddr, size, accessFlags);
+                if (mr) {
+                    VVM_LOG_INFO("NVIDIA GPUDirect registered with peermem: lkey={}, rkey={}",
+                                 mr->lkey, mr->rkey);
                 }
             }
-
-            RdmaMemoryRegion region;
-            region.addr = nullptr;  // No local CPU mapping for GPU-direct
-            region.length = size;
             region.lkey = mr ? mr->lkey : 0;
             region.rkey = mr ? mr->rkey : 0;
-            region.rdmaAddr = reinterpret_cast<uint64_t>(reg->remoteAddress);
-            region.ownsMemory = false;
-            region.vkMemory = memory;
-            region.vkBuffer = buffer;
-            
             if (mr) {
                 std::lock_guard<std::mutex> lock(regionsMutex_);
                 registeredRegions_[mr] = region;
             }
-            
             VVM_LOG_INFO("NVIDIA GPUDirect registered: rdmaAddr={:#x}, lkey={}, rkey={}",
                          region.rdmaAddr, region.lkey, region.rkey);
             return region;
-        } else if (vendorId_ == 0x1002 || vendorId_ == 0x8086) {
-            // AMD/Intel: export a DMA-BUF then register it with ibv_reg_dmabuf_mr.
+        } else if (vendorId_ == 0x8086) {
+            // Intel: Level Zero path - register Win32 handle with verbs
+            // The remote address is the PCI BAR from Vulkan
+            // For verbs, we need to register the DMA-BUF or use the Win32 handle
+            // On Linux with Intel Xe, DMA-BUF is the path
             VkMemoryGetFdInfoKHR getFdInfo{};
             getFdInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
             getFdInfo.memory = memory;
@@ -291,23 +276,22 @@ public:
             PFN_vkGetMemoryFdKHR vkGetMemoryFdKHR =
                 (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(device_, "vkGetMemoryFdKHR");
             if (!vkGetMemoryFdKHR) {
-                VVM_LOG_ERROR("vkGetMemoryFdKHR not available");
+                VVM_LOG_ERROR("vkGetMemoryFdKHR not available for Intel DMA-BUF");
                 return std::nullopt;
             }
 
             int dmaBufFd = -1;
             VkResult result = vkGetMemoryFdKHR(device_, &getFdInfo, &dmaBufFd);
             if (result != VK_SUCCESS || dmaBufFd < 0) {
-                VVM_LOG_ERROR("vkGetMemoryFdKHR failed: {}", vkResultToString(result));
+                VVM_LOG_ERROR("vkGetMemoryFdKHR failed for Intel: {}", vkResultToString(result));
                 return std::nullopt;
             }
 
             const int accessFlags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                                     IBV_ACCESS_REMOTE_READ;
-
-            struct ibv_mr* mr = ibv_reg_dmabuf_mr(pd_, offset, size, 0 /* iova */, dmaBufFd, accessFlags);
+            struct ibv_mr* mr = ibv_reg_dmabuf_mr(pd_, offset, size, 0, dmaBufFd, accessFlags);
             if (!mr) {
-                VVM_LOG_WARN("ibv_reg_dmabuf_mr failed ({}), falling back to mmap+ibv_reg_mr",
+                VVM_LOG_WARN("ibv_reg_dmabuf_mr failed for Intel ({}), falling back to mmap",
                              strerror(errno));
                 void* mappedVa = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, dmaBufFd, 0);
                 if (mappedVa == MAP_FAILED) {
@@ -322,38 +306,95 @@ public:
                     close(dmaBufFd);
                     return std::nullopt;
                 }
-                RdmaMemoryRegion region;
                 region.addr = mappedVa;
-                region.length = size;
                 region.lkey = mr->lkey;
                 region.rkey = mr->rkey;
                 region.rdmaAddr = 0;
-                region.ownsMemory = false;
-                region.vkMemory = memory;
-                region.vkBuffer = buffer;
                 {
                     std::lock_guard<std::mutex> lock(regionsMutex_);
                     registeredRegions_[mr] = region;
                 }
-                VVM_LOG_INFO("AMD/Intel GPUDirect via DMA-BUF mmap fallback: lkey={}, rkey={}",
+                close(dmaBufFd);
+                VVM_LOG_INFO("Intel GPUDirect via DMA-BUF mmap fallback: lkey={}, rkey={}",
                              mr->lkey, mr->rkey);
                 return region;
             }
 
-            RdmaMemoryRegion region;
-            region.addr = nullptr;
-            region.length = size;
             region.lkey = mr->lkey;
             region.rkey = mr->rkey;
-            region.rdmaAddr = 0;  // remote DMA address needs a vendor query
-            region.ownsMemory = false;
-            region.vkMemory = memory;
-            region.vkBuffer = buffer;
+            region.rdmaAddr = 0;
             {
                 std::lock_guard<std::mutex> lock(regionsMutex_);
                 registeredRegions_[mr] = region;
             }
-            VVM_LOG_INFO("AMD/Intel GPUDirect via ibv_reg_dmabuf_mr: lkey={}, rkey={}",
+            close(dmaBufFd);
+            VVM_LOG_INFO("Intel GPUDirect via ibv_reg_dmabuf_mr: lkey={}, rkey={}",
+                         mr->lkey, mr->rkey);
+            return region;
+        } else if (vendorId_ == 0x1002) {
+            // AMD: DMA-BUF path
+            VkMemoryGetFdInfoKHR getFdInfo{};
+            getFdInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
+            getFdInfo.memory = memory;
+            getFdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+
+            PFN_vkGetMemoryFdKHR vkGetMemoryFdKHR =
+                (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(device_, "vkGetMemoryFdKHR");
+            if (!vkGetMemoryFdKHR) {
+                VVM_LOG_ERROR("vkGetMemoryFdKHR not available for AMD");
+                return std::nullopt;
+            }
+
+            int dmaBufFd = -1;
+            VkResult result = vkGetMemoryFdKHR(device_, &getFdInfo, &dmaBufFd);
+            if (result != VK_SUCCESS || dmaBufFd < 0) {
+                VVM_LOG_ERROR("vkGetMemoryFdKHR failed for AMD: {}", vkResultToString(result));
+                return std::nullopt;
+            }
+
+            const int accessFlags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                                    IBV_ACCESS_REMOTE_READ;
+
+            struct ibv_mr* mr = ibv_reg_dmabuf_mr(pd_, offset, size, 0, dmaBufFd, accessFlags);
+            if (!mr) {
+                VVM_LOG_WARN("ibv_reg_dmabuf_mr failed for AMD ({}), falling back to mmap",
+                             strerror(errno));
+                void* mappedVa = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, dmaBufFd, 0);
+                if (mappedVa == MAP_FAILED) {
+                    VVM_LOG_ERROR("mmap on DMA-BUF fd failed: {}", strerror(errno));
+                    close(dmaBufFd);
+                    return std::nullopt;
+                }
+                mr = ibv_reg_mr(pd_, mappedVa, size, accessFlags);
+                if (!mr) {
+                    VVM_LOG_ERROR("ibv_reg_mr on mapped DMA-BUF failed: {}", strerror(errno));
+                    munmap(mappedVa, size);
+                    close(dmaBufFd);
+                    return std::nullopt;
+                }
+                region.addr = mappedVa;
+                region.lkey = mr->lkey;
+                region.rkey = mr->rkey;
+                region.rdmaAddr = 0;
+                {
+                    std::lock_guard<std::mutex> lock(regionsMutex_);
+                    registeredRegions_[mr] = region;
+                }
+                close(dmaBufFd);
+                VVM_LOG_INFO("AMD GPUDirect via DMA-BUF mmap fallback: lkey={}, rkey={}",
+                             mr->lkey, mr->rkey);
+                return region;
+            }
+
+            region.lkey = mr->lkey;
+            region.rkey = mr->rkey;
+            region.rdmaAddr = 0;
+            {
+                std::lock_guard<std::mutex> lock(regionsMutex_);
+                registeredRegions_[mr] = region;
+            }
+            close(dmaBufFd);
+            VVM_LOG_INFO("AMD GPUDirect via ibv_reg_dmabuf_mr: lkey={}, rkey={}",
                          mr->lkey, mr->rkey);
             return region;
         }
