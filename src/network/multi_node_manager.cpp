@@ -404,7 +404,7 @@ bool MultiNodePoolManager::deallocateRemote(const RemoteAllocationDesc& desc) {
         req.type = MsgDeallocate;
         req.flags = TcpFlagsRequest;
         std::vector<uint8_t> body;
-        detail::putU64(body, desc.localAllocId);
+        vvm::detail::putU64(body, desc.localAllocId);
         req.body = std::move(body);
         auto resp = tcpTransport_->request(conn, req);
         return resp.has_value() && resp->flags != TcpFlagsError;
@@ -452,10 +452,10 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::allocateRemote(
     }
 
     std::vector<uint8_t> body;
-    detail::putU64(body, size);
-    detail::putU32(body, usage);
-    detail::putU32(body, flags);
-    detail::putU8(body, enableRdma ? 1 : 0);
+    vvm::detail::putU64(body, size);
+    vvm::detail::putU32(body, usage);
+    vvm::detail::putU32(body, flags);
+    vvm::detail::putU8(body, enableRdma ? 1 : 0);
 
     TcpMessage req;
     req.type = MsgAllocate;
@@ -471,7 +471,7 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::allocateRemote(
     const uint8_t* p = resp->body.data();
     const uint8_t* end = p + resp->body.size();
     uint8_t success = 0;
-    if (!detail::getU8(p, end, success) || success == 0) {
+    if (!vvm::detail::getU8(p, end, success) || success == 0) {
         VVM_LOG_ERROR("allocateRemote: remote node refused allocation");
         return std::nullopt;
     }
@@ -904,9 +904,9 @@ std::optional<NetworkMigrationOperation> MultiNodePoolManager::migrateFromRemote
     }
 
     std::vector<uint8_t> body;
-    detail::putU64(body, source.localAllocId);
-    detail::putU64(body, 0);  // srcOffset within allocation
-    detail::putU64(body, source.size);
+    vvm::detail::putU64(body, source.localAllocId);
+    vvm::detail::putU64(body, 0);  // srcOffset within allocation
+    vvm::detail::putU64(body, source.size);
 
     TcpMessage req;
     req.type = MsgMigratePull;
@@ -1067,8 +1067,8 @@ std::optional<NetworkMigrationOperation> MultiNodePoolManager::migrateToRemote(
     }
 
     std::vector<uint8_t> body;
-    detail::putU64(body, destination.localAllocId);
-    detail::putU64(body, destination.size);
+    vvm::detail::putU64(body, destination.localAllocId);
+    vvm::detail::putU64(body, destination.size);
 
     TcpMessage req;
     req.type = MsgMigratePush;
@@ -1170,7 +1170,7 @@ bool MultiNodePoolManager::announceRemoteTensor(
     const RemoteAllocationDesc& desc) {
 
     std::vector<uint8_t> body;
-    detail::putStr(body, name);
+    vvm::detail::putStr(body, name);
     auto bytes = serializeAllocationDesc(desc);
     body.insert(body.end(), bytes.begin(), bytes.end());
 
@@ -1798,10 +1798,10 @@ void MultiNodePoolManager::onTcpRequest(TcpMessage& request, TcpMessage& respons
             uint64_t size = 0;
             uint32_t usage = 0, flags = 0;
             uint8_t enableRdma = 0;
-            if (!detail::getU64(p, end, size) ||
-                !detail::getU32(p, end, usage) ||
-                !detail::getU32(p, end, flags) ||
-                !detail::getU8(p, end, enableRdma)) {
+            if (!vvm::detail::getU64(p, end, size) ||
+                !vvm::detail::getU32(p, end, usage) ||
+                !vvm::detail::getU32(p, end, flags) ||
+                !vvm::detail::getU8(p, end, enableRdma)) {
                 response = makeResponse(request.type, TcpFlagsError);
                 return;
             }
@@ -1809,56 +1809,56 @@ void MultiNodePoolManager::onTcpRequest(TcpMessage& request, TcpMessage& respons
             auto desc = handleAllocateRequest(requester, size, usage, flags, enableRdma != 0);
             response = makeResponse(request.type, TcpFlagsResponse);
             if (desc) {
-                detail::putU8(response.body, 1);
+                vvm::detail::putU8(response.body, 1);
                 auto bytes = serializeAllocationDesc(*desc);
                 response.body.insert(response.body.end(), bytes.begin(), bytes.end());
             } else {
-                detail::putU8(response.body, 0);
+                vvm::detail::putU8(response.body, 0);
             }
             break;
         }
         case MsgExport: {
             uint64_t localAllocId = 0;
             uint8_t enableRdma = 0, forceHostShadow = 0;
-            if (!detail::getU64(p, end, localAllocId) ||
-                !detail::getU8(p, end, enableRdma) ||
-                !detail::getU8(p, end, forceHostShadow)) {
+            if (!vvm::detail::getU64(p, end, localAllocId) ||
+                !vvm::detail::getU8(p, end, enableRdma) ||
+                !vvm::detail::getU8(p, end, forceHostShadow)) {
                 response = makeResponse(request.type, TcpFlagsError);
                 return;
             }
             auto desc = handleExportRequest(localNodeId_, localAllocId, enableRdma != 0, forceHostShadow != 0);
             response = makeResponse(request.type, TcpFlagsResponse);
             if (desc) {
-                detail::putU8(response.body, 1);
+                vvm::detail::putU8(response.body, 1);
                 auto bytes = serializeAllocationDesc(*desc);
                 response.body.insert(response.body.end(), bytes.begin(), bytes.end());
             } else {
-                detail::putU8(response.body, 0);
+                vvm::detail::putU8(response.body, 0);
             }
             break;
         }
         case MsgImport: {
             RemoteAllocationDesc desc;
             uint32_t usage = 0;
-            if (!deserializeAllocationDesc(p, end, desc) || !detail::getU32(p, end, usage)) {
+            if (!deserializeAllocationDesc(p, end, desc) || !vvm::detail::getU32(p, end, usage)) {
                 response = makeResponse(request.type, TcpFlagsError);
                 return;
             }
             auto alloc = handleImportRequest(localNodeId_, desc, usage);
             response = makeResponse(request.type, TcpFlagsResponse);
             if (alloc) {
-                detail::putU8(response.body, 1);
-                detail::putU64(response.body, registerAllocation(std::move(*alloc)));
+                vvm::detail::putU8(response.body, 1);
+                vvm::detail::putU64(response.body, registerAllocation(std::move(*alloc)));
             } else {
-                detail::putU8(response.body, 0);
+                vvm::detail::putU8(response.body, 0);
             }
             break;
         }
         case MsgMigratePull: {
             uint64_t localAllocId = 0, srcOffset = 0, size = 0;
-            if (!detail::getU64(p, end, localAllocId) ||
-                !detail::getU64(p, end, srcOffset) ||
-                !detail::getU64(p, end, size)) {
+            if (!vvm::detail::getU64(p, end, localAllocId) ||
+                !vvm::detail::getU64(p, end, srcOffset) ||
+                !vvm::detail::getU64(p, end, size)) {
                 response = makeResponse(request.type, TcpFlagsError);
                 return;
             }
@@ -1929,7 +1929,7 @@ if (!fullCopyDone) {
         }
         case MsgMigratePush: {
             uint64_t localAllocId = 0, size = 0;
-            if (!detail::getU64(p, end, localAllocId) || !detail::getU64(p, end, size)) {
+            if (!vvm::detail::getU64(p, end, localAllocId) || !vvm::detail::getU64(p, end, size)) {
                 response = makeResponse(request.type, TcpFlagsError);
                 return;
             }
@@ -2008,7 +2008,7 @@ if (!fullCopyDone) {
                 }
                 state.pipe->drain();
                 response = makeResponse(request.type, TcpFlagsResponse);
-                detail::putU8(response.body, 1);
+                vvm::detail::putU8(response.body, 1);
                 VVM_LOG_INFO("MigratePush: received {} bytes for allocation {} (windowed, bulk-copy)",
                              size, localAllocId);
                 break;
@@ -2027,7 +2027,7 @@ if (!fullCopyDone) {
             }
 
             response = makeResponse(request.type, TcpFlagsResponse);
-            detail::putU8(response.body, 1);
+            vvm::detail::putU8(response.body, 1);
             VVM_LOG_INFO("MigratePush: received {} bytes for allocation {}", size, localAllocId);
             break;
         }
@@ -2060,7 +2060,7 @@ if (!fullCopyDone) {
         }
         case MsgDeallocate: {
             uint64_t localAllocId = 0;
-            if (!detail::getU64(p, end, localAllocId)) {
+            if (!vvm::detail::getU64(p, end, localAllocId)) {
                 response = makeResponse(request.type, TcpFlagsError);
                 return;
             }
@@ -2072,13 +2072,13 @@ if (!fullCopyDone) {
                 VVM_LOG_WARN("Deallocate: unknown allocation {}", localAllocId);
             }
             response = makeResponse(request.type, TcpFlagsResponse);
-            detail::putU8(response.body, 1);
+            vvm::detail::putU8(response.body, 1);
             break;
         }
         case MsgTensorAnnounce: {
             std::string name;
             RemoteAllocationDesc desc;
-            if (!detail::getStr(p, end, name) ||
+            if (!vvm::detail::getStr(p, end, name) ||
                 !deserializeAllocationDesc(p, end, desc)) {
                 response = makeResponse(request.type, TcpFlagsError);
                 return;
@@ -2090,7 +2090,7 @@ if (!fullCopyDone) {
             remoteTensorsCV_.notify_all();
             VVM_LOG_INFO("TensorAnnounce: stored '{}' ({} bytes) from {}", name, desc.size, desc.owner.toString());
             response = makeResponse(request.type, TcpFlagsResponse);
-            detail::putU8(response.body, 1);
+            vvm::detail::putU8(response.body, 1);
             break;
         }
         default:
