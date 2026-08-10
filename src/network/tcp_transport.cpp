@@ -165,8 +165,16 @@ struct NetHeader {
 };
 
 bool isValidHeaderLengths(const NetHeader& h, const NetworkConfig& netConfig) {
-    return static_cast<uint64_t>(h.bodyLen) <= netConfig.maxBodySize &&
-           h.streamLen <= netConfig.maxStreamSize;
+    // First check config limits (settable per-connection)
+    if (static_cast<uint64_t>(h.bodyLen) > netConfig.maxBodySize) return false;
+    if (h.streamLen > netConfig.maxStreamSize) return false;
+
+    // Then enforce absolute hard caps that CANNOT be bypassed by config
+    // These prevent any single message from allocating unbounded memory
+    if (static_cast<uint64_t>(h.bodyLen) > kMaxBodySize) return false;
+    if (h.streamLen > kMaxStreamSize) return false;
+
+    return true;
 }
 
 std::vector<uint8_t> encodeHeader(const NetHeader& h) {

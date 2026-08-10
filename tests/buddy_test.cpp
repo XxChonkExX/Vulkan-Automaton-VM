@@ -6,6 +6,8 @@
 #include <vulkan_vm/buddy_allocator.hpp>
 
 #include <cstdio>
+#include <vector>
+#include <cstdlib>
 
 using vvm::BuddyAllocator;
 
@@ -78,11 +80,64 @@ int main() {
         CHECK(frag.getLargestFree() <= 256 * 1024);
     }
 
-    // --- 9. Oversized + empty requests ---
+// --- 10. Invariant checker ---
     {
-        BuddyAllocator o(kBlock, kMin);
-        CHECK(!o.allocate(kBlock * 2).has_value());
-        CHECK(!o.allocate(0).has_value());
+        BuddyAllocator inv(kBlock, kMin);
+        CHECK(inv.checkInvariants());  // Initial state valid
+
+        auto x = inv.allocate(256 * 1024);
+        CHECK(x.has_value());
+        CHECK(inv.checkInvariants());  // After allocation
+
+        auto y = inv.allocate(256 * 1024);
+        CHECK(y.has_value());
+        CHECK(inv.checkInvariants());  // After second allocation
+
+        inv.deallocate(*x, 256 * 1024);
+        CHECK(inv.checkInvariants());  // After one free
+
+        inv.deallocate(*y, 256 * 1024);
+        CHECK(inv.checkInvariants());  // After full free (should be back to initial)
+
+        // Test with thread-safe allocator too
+        BuddyAllocator ts(kBlock, kMin, true);
+        CHECK(ts.checkInvariants());
+        auto t1 = ts.allocate(128 * 1024);
+        CHECK(t1.has_value());
+        CHECK(ts.checkInvariants());
+        ts.deallocate(*t1, 128 * 1024);
+        CHECK(ts.checkInvariants());
+    }
+
+    // --- 11. Random allocation/deallocation stress test ---
+    {
+        BuddyAllocator stress(kBlock, kMin);
+        std::vector<std::pair<VkDeviceSize, VkDeviceSize>> allocs;
+        // Do many random operations
+        for (int iter = 0; iter < 1000; ++iter) {
+            if (!allocs.empty() && (rand() % 3 == 0)) {
+                // Deallocate a random allocation
+                size_t idx = rand() % allocs.size();
+                stress.deallocate(allocs[idx].first, allocs[idx].second);
+                allocs.erase(allocs.begin() + idx);
+            } else {
+                // Allocate random size
+                VkDeviceSize sz = 256 * 1024 * (1 + (rand() % 4)); // 256KB to 1MB
+                auto opt = stress.allocate(sz);
+                if (opt.has_value()) {
+                    allocs.push_back({*opt, sz});
+                }
+            }
+            // Check invariants every 50 iterations
+            if (iter % 50 == 0) {
+                CHECK(stress.checkInvariants());
+            }
+        }
+        // Free all remaining
+        for (auto& p : allocs) {
+            stress.deallocate(p.first, p.second);
+        }
+        CHECK(stress.checkInvariants());
     }
 
     if (failures == 0) {

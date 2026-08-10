@@ -69,6 +69,13 @@ struct PoolConfig {
     
     // Hard cap on total pool memory in bytes (0 = no explicit cap).
     VkDeviceSize maxPoolBytes = 0;
+
+    // Host shadow buffer configuration (for offload/staging).
+    // Shadow size = blockSize * hostShadowMultiplier, clamped to maxHostShadowBytes.
+    // Default multiplier is 4.0 (shadow is 4x block size).
+    float hostShadowMultiplier = 4.0f;
+    // Hard cap on host shadow size in bytes (0 = no explicit cap, only multiplier applies).
+    VkDeviceSize maxHostShadowBytes = 0;
     
     // Build a config tuned for a physical device (Discrete/Hybrid/Unified)
     static PoolConfig forDevice(VkPhysicalDevice physicalDevice);

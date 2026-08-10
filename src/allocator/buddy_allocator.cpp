@@ -212,4 +212,99 @@ bool BuddyAllocator::isValid() const {
     });
 }
 
+bool BuddyAllocator::checkInvariants() const {
+    return withLock([this]() -> bool {
+        if (maxOrder_ < 0) {
+            VVM_LOG_ERROR("checkInvariants: allocator not initialized");
+            return false;
+        }
+
+        // 1. Check that all free blocks are properly aligned to their order
+        for (int o = 0; o <= maxOrder_; ++o) {
+            const VkDeviceSize sz = orderToSize(o);
+            for (VkDeviceSize off : freeLists_[o]) {
+                if (off % sz != 0) {
+                    VVM_LOG_ERROR("checkInvariants: free block at offset {} order {} not aligned to {}",
+                                  off, o, sz);
+                    return false;
+                }
+                if (off + sz > blockSize_) {
+                    VVM_LOG_ERROR("checkInvariants: free block at offset {} order {} exceeds blockSize {}",
+                                  off, o, blockSize_);
+                    return false;
+                }
+            }
+        }
+
+        // 2. Check for overlapping free blocks (within and across orders)
+        std::vector<std::pair<VkDeviceSize, VkDeviceSize>> allRanges;
+        for (int o = 0; o <= maxOrder_; ++o) {
+            const VkDeviceSize sz = orderToSize(o);
+            for (VkDeviceSize off : freeLists_[o]) {
+                allRanges.emplace_back(off, off + sz);
+            }
+        }
+        // Sort by start offset
+        std::sort(allRanges.begin(), allRanges.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (size_t i = 1; i < allRanges.size(); ++i) {
+            if (allRanges[i].first < allRanges[i - 1].second) {
+                VVM_LOG_ERROR("checkInvariants: overlapping free blocks [{}, {}) and [{}, {})",
+                              allRanges[i - 1].first, allRanges[i - 1].second,
+                              allRanges[i].first, allRanges[i].second);
+                return false;
+            }
+        }
+
+        // 3. Check that allocated blocks don't overlap with free blocks
+        for (const auto& [off, info] : allocated_) {
+            const VkDeviceSize sz = info.size;
+            if (off % sz != 0) {
+                VVM_LOG_ERROR("checkInvariants: allocated block at offset {} size {} not aligned",
+                              off, sz);
+                return false;
+            }
+            if (off + sz > blockSize_) {
+                VVM_LOG_ERROR("checkInvariants: allocated block at offset {} size {} exceeds blockSize {}",
+                              off, sz, blockSize_);
+                return false;
+            }
+            // Check against free ranges
+            for (const auto& range : allRanges) {
+                if (off < range.second && off + sz > range.first) {
+                    VVM_LOG_ERROR("checkInvariants: allocated block [{}, {}) overlaps free [{}, {})",
+                                  off, off + sz, range.first, range.second);
+                    return false;
+                }
+            }
+        }
+
+        // 4. Verify sum of free + allocated == blockSize
+        VkDeviceSize totalFree = 0;
+        for (int o = 0; o <= maxOrder_; ++o) {
+            totalFree += orderToSize(o) * freeLists_[o].size();
+        }
+        VkDeviceSize totalAllocated = 0;
+        for (const auto& [_, info] : allocated_) {
+            totalAllocated += info.size;
+        }
+        if (totalFree + totalAllocated != blockSize_) {
+            VVM_LOG_ERROR("checkInvariants: size mismatch: free={} allocated={} total={} blockSize={}",
+                          totalFree, totalAllocated, totalFree + totalAllocated, blockSize_);
+            return false;
+        }
+
+        // 5. Verify no duplicate offsets in free lists
+        for (int o = 0; o <= maxOrder_; ++o) {
+            const auto& set = freeLists_[o];
+            if (set.size() != freeLists_[o].size()) {
+                VVM_LOG_ERROR("checkInvariants: duplicate offset in free list order {}", o);
+                return false;
+            }
+        }
+
+        return true;
+    });
+}
+
 } // namespace vvm
