@@ -796,23 +796,15 @@ public:
     }
     
     bool runLayoutConversion(const TensorHandle& src, const TensorHandle& dst, const std::string& shaderName) {
-        // Get source and destination device pools
-        auto& srcPool = poolManager_->getPool(src->allocation.blockIndex);
-        auto& dstPool = poolManager_->getPool(dst->allocation.blockIndex);
-        
-        // Get device and queue for the source device
-        uint32_t srcDeviceIdx = src->allocation.blockIndex;
-        uint32_t dstDeviceIdx = dst->allocation.blockIndex;
-        
+        uint32_t srcDeviceIdx = src->deviceIndex;
+        uint32_t dstDeviceIdx = dst->deviceIndex;
+
         if (srcDeviceIdx >= devices_.size() || dstDeviceIdx >= devices_.size()) {
             return false;
         }
-        
-        // For cross-device conversion, we need to use the appropriate device's compute queue
-        // For now, implement same-device conversion
+
         if (srcDeviceIdx != dstDeviceIdx) {
-            VVM_LOG_WARN("Cross-device layout conversion not yet implemented");
-            return false;
+            return runLayoutConversionCrossDevice(src, dst, shaderName, srcDeviceIdx, dstDeviceIdx);
         }
         
         auto& pool = poolManager_->getPool(srcDeviceIdx);
@@ -1067,7 +1059,206 @@ public:
         
         return true;
     }
-    
+
+    bool runLayoutConversionCrossDevice(const TensorHandle& src, const TensorHandle& dst,
+                                         const std::string& shaderName,
+                                         uint32_t srcDeviceIdx, uint32_t dstDeviceIdx) {
+        const size_t bytes = src->metadata.bytes();
+        if (dst->metadata.bytes() != bytes || bytes == 0) return false;
+
+        auto& srcPool = poolManager_->getPool(srcDeviceIdx);
+        auto& dstPool = poolManager_->getPool(dstDeviceIdx);
+        VkDevice srcDevice = srcPool.getDevice();
+        VkDevice dstDevice = dstPool.getDevice();
+
+        VkPhysicalDeviceMemoryProperties memProps{};
+        vkGetPhysicalDeviceMemoryProperties(devices_[srcDeviceIdx].physicalDevice, &memProps);
+        uint32_t hostVisibleType = UINT32_MAX;
+        for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+            VkMemoryPropertyFlags f = memProps.memoryTypes[i].propertyFlags;
+            if ((f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+                hostVisibleType = i;
+                break;
+            }
+        }
+        if (hostVisibleType == UINT32_MAX) return false;
+
+        VkCommandPoolCreateInfo poolInfo{};
+        poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+
+        poolInfo.queueFamilyIndex = devices_[srcDeviceIdx].transferQueueFamily;
+        VkCommandPool srcCmdPool = VK_NULL_HANDLE;
+        if (vkCreateCommandPool(srcDevice, &poolInfo, nullptr, &srcCmdPool) != VK_SUCCESS) return false;
+
+        poolInfo.queueFamilyIndex = devices_[dstDeviceIdx].transferQueueFamily;
+        VkCommandPool dstCmdPool = VK_NULL_HANDLE;
+        if (vkCreateCommandPool(dstDevice, &poolInfo, nullptr, &dstCmdPool) != VK_SUCCESS) {
+            vkDestroyCommandPool(srcDevice, srcCmdPool, nullptr);
+            return false;
+        }
+
+        VkCommandBufferAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocInfo.commandBufferCount = 1;
+
+        allocInfo.commandPool = srcCmdPool;
+        VkCommandBuffer srcCmd = VK_NULL_HANDLE;
+        if (vkAllocateCommandBuffers(srcDevice, &allocInfo, &srcCmd) != VK_SUCCESS) {
+            vkDestroyCommandPool(srcDevice, srcCmdPool, nullptr);
+            vkDestroyCommandPool(dstDevice, dstCmdPool, nullptr);
+            return false;
+        }
+
+        allocInfo.commandPool = dstCmdPool;
+        VkCommandBuffer dstCmd = VK_NULL_HANDLE;
+        if (vkAllocateCommandBuffers(dstDevice, &allocInfo, &dstCmd) != VK_SUCCESS) {
+            vkFreeCommandBuffers(srcDevice, srcCmdPool, 1, &srcCmd);
+            vkDestroyCommandPool(srcDevice, srcCmdPool, nullptr);
+            vkDestroyCommandPool(dstDevice, dstCmdPool, nullptr);
+            return false;
+        }
+
+        VkBufferCreateInfo bufInfo{};
+        bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufInfo.size = bytes;
+        bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        VkBuffer stagingBuf = VK_NULL_HANDLE;
+        if (vkCreateBuffer(srcDevice, &bufInfo, nullptr, &stagingBuf) != VK_SUCCESS) {
+            vkFreeCommandBuffers(srcDevice, srcCmdPool, 1, &srcCmd);
+            vkFreeCommandBuffers(dstDevice, dstCmdPool, 1, &dstCmd);
+            vkDestroyCommandPool(srcDevice, srcCmdPool, nullptr);
+            vkDestroyCommandPool(dstDevice, dstCmdPool, nullptr);
+            return false;
+        }
+
+        VkMemoryRequirements memReq{};
+        vkGetBufferMemoryRequirements(srcDevice, stagingBuf, &memReq);
+        VkMemoryAllocateInfo memAllocInfo{};
+        memAllocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        memAllocInfo.allocationSize = memReq.size;
+        memAllocInfo.memoryTypeIndex = hostVisibleType;
+        VkDeviceMemory stagingMem = VK_NULL_HANDLE;
+        if (vkAllocateMemory(srcDevice, &memAllocInfo, nullptr, &stagingMem) != VK_SUCCESS) {
+            vkDestroyBuffer(srcDevice, stagingBuf, nullptr);
+            vkFreeCommandBuffers(srcDevice, srcCmdPool, 1, &srcCmd);
+            vkFreeCommandBuffers(dstDevice, dstCmdPool, 1, &dstCmd);
+            vkDestroyCommandPool(srcDevice, srcCmdPool, nullptr);
+            vkDestroyCommandPool(dstDevice, dstCmdPool, nullptr);
+            return false;
+        }
+        if (vkBindBufferMemory(srcDevice, stagingBuf, stagingMem, 0) != VK_SUCCESS) {
+            vkFreeMemory(srcDevice, stagingMem, nullptr);
+            vkDestroyBuffer(srcDevice, stagingBuf, nullptr);
+            vkFreeCommandBuffers(srcDevice, srcCmdPool, 1, &srcCmd);
+            vkFreeCommandBuffers(dstDevice, dstCmdPool, 1, &dstCmd);
+            vkDestroyCommandPool(srcDevice, srcCmdPool, nullptr);
+            vkDestroyCommandPool(dstDevice, dstCmdPool, nullptr);
+            return false;
+        }
+
+        VkCommandBufferBeginInfo beginInfo{};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(srcCmd, &beginInfo);
+        VkBufferCopy copyRegion{};
+        copyRegion.size = bytes;
+        vkCmdCopyBuffer(srcCmd, src->allocation.buffer, stagingBuf, 1, &copyRegion);
+        vkEndCommandBuffer(srcCmd);
+
+        VkFenceCreateInfo fenceInfo{};
+        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        VkFence srcFence = VK_NULL_HANDLE;
+        vkCreateFence(srcDevice, &fenceInfo, nullptr, &srcFence);
+
+        VkSubmitInfo submitInfo{};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &srcCmd;
+        if (vkQueueSubmit(devices_[srcDeviceIdx].transferQueue, 1, &submitInfo, srcFence) != VK_SUCCESS) {
+            vkDestroyFence(srcDevice, srcFence, nullptr);
+            vkFreeMemory(srcDevice, stagingMem, nullptr);
+            vkDestroyBuffer(srcDevice, stagingBuf, nullptr);
+            vkFreeCommandBuffers(srcDevice, srcCmdPool, 1, &srcCmd);
+            vkFreeCommandBuffers(dstDevice, dstCmdPool, 1, &dstCmd);
+            vkDestroyCommandPool(srcDevice, srcCmdPool, nullptr);
+            vkDestroyCommandPool(dstDevice, dstCmdPool, nullptr);
+            return false;
+        }
+        vkWaitForFences(srcDevice, 1, &srcFence, VK_TRUE, UINT64_MAX);
+
+        void* mapped = nullptr;
+        if (vkMapMemory(srcDevice, stagingMem, 0, bytes, 0, &mapped) != VK_SUCCESS) {
+            vkDestroyFence(srcDevice, srcFence, nullptr);
+            vkFreeMemory(srcDevice, stagingMem, nullptr);
+            vkDestroyBuffer(srcDevice, stagingBuf, nullptr);
+            vkFreeCommandBuffers(srcDevice, srcCmdPool, 1, &srcCmd);
+            vkFreeCommandBuffers(dstDevice, dstCmdPool, 1, &dstCmd);
+            vkDestroyCommandPool(srcDevice, srcCmdPool, nullptr);
+            vkDestroyCommandPool(dstDevice, dstCmdPool, nullptr);
+            return false;
+        }
+
+        const TensorShape& shape = src->metadata.shape;
+        const size_t elemSize = packedElemSize(src->metadata.dtype);
+        std::vector<uint8_t> tempHost(bytes);
+        std::memcpy(tempHost.data(), mapped, bytes);
+        vkUnmapMemory(srcDevice, stagingMem);
+
+        if (shape.dims.size() >= 4) {
+            const uint32_t N = static_cast<uint32_t>(shape.dims[0]);
+            const uint32_t H = static_cast<uint32_t>(shape.dims[1]);
+            const uint32_t W = static_cast<uint32_t>(shape.dims[2]);
+            const uint32_t C = static_cast<uint32_t>(shape.dims[3]);
+            const uint64_t planes = static_cast<uint64_t>(N) * H * W;
+            const bool toNchw = (shaderName == "NHWC_to_NCHW");
+            const uint8_t* s = tempHost.data();
+            std::vector<uint8_t> out(bytes);
+            for (uint64_t i = 0; i < planes; ++i) {
+                for (uint32_t c = 0; c < C; ++c) {
+                    const uint64_t srcOff = toNchw ? (i * C + c) * elemSize : (c * planes + i) * elemSize;
+                    const uint64_t dstOff = toNchw ? (c * planes + i) * elemSize : (i * C + c) * elemSize;
+                    std::memcpy(out.data() + dstOff, s + srcOff, elemSize);
+                }
+            }
+            std::memcpy(mapped, out.data(), bytes);
+        }
+
+        vkBeginCommandBuffer(dstCmd, &beginInfo);
+        VkBufferCopy copyDst{};
+        copyDst.size = bytes;
+        vkCmdCopyBuffer(dstCmd, stagingBuf, dst->allocation.buffer, 1, &copyDst);
+        vkEndCommandBuffer(dstCmd);
+
+        VkFence dstFence = VK_NULL_HANDLE;
+        vkCreateFence(dstDevice, &fenceInfo, nullptr, &dstFence);
+        submitInfo.pCommandBuffers = &dstCmd;
+        if (vkQueueSubmit(devices_[dstDeviceIdx].transferQueue, 1, &submitInfo, dstFence) != VK_SUCCESS) {
+            vkDestroyFence(dstDevice, dstFence, nullptr);
+            vkDestroyFence(srcDevice, srcFence, nullptr);
+            vkFreeMemory(srcDevice, stagingMem, nullptr);
+            vkDestroyBuffer(srcDevice, stagingBuf, nullptr);
+            vkFreeCommandBuffers(srcDevice, srcCmdPool, 1, &srcCmd);
+            vkFreeCommandBuffers(dstDevice, dstCmdPool, 1, &dstCmd);
+            vkDestroyCommandPool(srcDevice, srcCmdPool, nullptr);
+            vkDestroyCommandPool(dstDevice, dstCmdPool, nullptr);
+            return false;
+        }
+        vkWaitForFences(dstDevice, 1, &dstFence, VK_TRUE, UINT64_MAX);
+
+        vkDestroyFence(dstDevice, dstFence, nullptr);
+        vkDestroyFence(srcDevice, srcFence, nullptr);
+        vkFreeMemory(srcDevice, stagingMem, nullptr);
+        vkDestroyBuffer(srcDevice, stagingBuf, nullptr);
+        vkFreeCommandBuffers(srcDevice, srcCmdPool, 1, &srcCmd);
+        vkFreeCommandBuffers(dstDevice, dstCmdPool, 1, &dstCmd);
+        vkDestroyCommandPool(srcDevice, srcCmdPool, nullptr);
+        vkDestroyCommandPool(dstDevice, dstCmdPool, nullptr);
+        return true;
+    }
+
     VkShaderModule createLayoutConversionShader(VkDevice device, const std::string& shaderName) {
         // Load compiled SPIR-V shader from file
         // The shader is compiled at build time by glslangValidator

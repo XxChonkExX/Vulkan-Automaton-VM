@@ -153,37 +153,12 @@ torch::Tensor allocate_tensor(
 
     Allocation alloc = std::move(*allocOpt);
 
-    // Create PyTorch tensor from the allocation
-    // We create a storage backed by the Vulkan memory
-    auto storage = c10::Storage(
-        c10::Storage::use_byte_size_t(),
-        size,
-        alloc.hostPtr ? std::make_unique<c10::Allocator>(/* custom */) : nullptr,
-        c10::Device(c10::DeviceType::CUDA, 0)  // placeholder; we use device addresses
-    );
-
-    // Better approach: create a tensor with a custom allocator
-    // For now, return a tensor that holds the allocation info
-    // The actual data lives in Vulkan memory, accessible via device address
-
-    // Store the allocation so it doesn't get destroyed
     void* key = reinterpret_cast<void*>(alloc.buffer);
     {
         std::lock_guard<std::mutex> alloc_lock(g_alloc_mutex);
         g_alloc_map.emplace(key, TorchAllocation{std::move(alloc), g_pool ? std::shared_ptr<UnifiedMemoryPool>(g_pool.get(), [](auto*){}) : nullptr});
     }
 
-    // Return a tensor with metadata (we'll use device address for actual compute)
-    auto options = torch::TensorOptions()
-        .dtype(torch::kUInt8)
-        .device(torch::kCUDA, 0);  // CUDA device for compatibility
-
-    // Create an empty tensor that we'll use as a handle
-    // The real data is in Vulkan memory
-    torch::Tensor handle = torch::empty({1}, options);
-    
-    // Store the Allocation info in the tensor's metadata via a custom class
-    // For now, return allocation info as a tensor
     return torch::tensor({
         static_cast<int64_t>(reinterpret_cast<uintptr_t>(alloc.buffer)),
         static_cast<int64_t>(reinterpret_cast<uintptr_t>(alloc.memory)),

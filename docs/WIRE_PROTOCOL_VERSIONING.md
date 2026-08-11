@@ -63,6 +63,18 @@ Version constants defined in `include/vulkan_vm/constants.hpp`:
 - `VVM_PROTOCOL_VERSION_PATCH`
 - `VVM_PROTOCOL_VERSION` (packed)
 
+## Cluster RPC Serialization (v0.2.0)
+
+All cluster control-plane RPCs now use the canonical wire format defined in `include/vulkan_vm/network/wire_format.hpp`:
+- **Serialization functions**: `putU8`, `putU32`, `putU64`, `putBytes`, `putStr`
+- **Deserialization functions**: `getU8`, `getU32`, `getU64`, `getBytes`, `getStr` (all bounds-checked)
+- **Endianness**: Big-endian (network order) for all multi-byte integers
+- **Length prefixes**: All variable-length fields use u32 length prefix
+
+Implemented in:
+- `src/network/cluster_client.cpp` — client-side serialization of allocate, export, import, migrate, registerNode, heartbeat RPCs
+- `src/network/cluster_server.cpp` — server-side deserialization and handler invocation
+
 ## Testing
 
 - CI runs protocol compatibility tests between adjacent versions

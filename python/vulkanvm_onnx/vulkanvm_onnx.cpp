@@ -103,8 +103,9 @@ public:
 
     onnxruntime::common::Status Compile(const std::vector<onnxruntime::GraphViewer*>& graph_viewers,
                                          const std::string& model_path) override {
-        // For now, delegate to default CPU EP
-        // TODO: Implement Vulkan-backed kernels
+        // Vulkan-backed kernels not yet implemented; fall back to CPU execution.
+        // This allows the provider to load and allocate tensors on Vulkan memory
+        // while ONNX Runtime handles kernel execution on the CPU provider.
         return onnxruntime::common::Status::OK();
     }
 

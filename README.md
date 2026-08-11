@@ -2,6 +2,28 @@
 
 **VulkanVM** is a **cross-vendor GPU networking and RDMA library** that enables zero-copy GPU↔GPU transfers over TCP, RDMA, and GPU-direct NIC DMA across AMD, NVIDIA, and Intel GPUs. Built on a hardened, zero-fragmentation Vulkan memory pool (the "Chonk Buffer"), it provides Hugging Face–style model distribution, capacity-first shard placement, and a unified tensor transport for AI inference clusters. One header, one library, zero system changes — link it into your application.
 
+**Version**: 0.2.0-pre (pre-release)
+
+---
+
+## Changelog — v0.2.0-pre
+
+### Cluster Control Plane — Fully Implemented
+- **ClusterClient**: All RPC serialization/deserialization now uses the canonical wire format (big-endian, bounds-checked). `allocateRemote`, `exportRemote`, `importRemote`, `migrate`, `registerNode`, `heartbeat`, and `getClusterView` are fully wired through the TCP transport.
+- **ClusterServer**: All RPC handlers (`handleAllocate`, `handleExport`, `handleImport`, `handleMigrate`, `handleRegisterNode`) now deserialize requests, invoke registered callbacks, and serialize responses.
+- **Node enumeration**: `registerNode()` now enumerates actual Vulkan physical devices at runtime instead of returning a hardcoded `{"GPU0"}` placeholder.
+- **sendRequest()**: Now uses `TcpTransport::request()` for actual request/response RPC instead of returning `nullopt`.
+
+### Tensor Transport — Cross-Device Layout Conversion
+- **Cross-device NHWC↔NCHW**: `copyWithLayoutConversion()` now works across different GPUs. When source and destination are on different devices, the conversion uses a host-visible staging buffer on the source device, performs the layout permute in CPU memory, then copies to the destination device — all without falling back to `false`.
+
+### Python Bindings Cleanup
+- **PyTorch**: Removed CUDA device placeholder from `allocate_tensor`. The returned tensor is now a pure metadata handle (int64 tensor with buffer/memory/offset/size/address/blockIndex) without any CUDA device dependency.
+- **ONNX**: `Compile()` now documents the CPU execution fallback instead of a TODO stub.
+
+### Build & Cleanup
+- Removed orphaned `src/core/unified_memory_pool.cpp.tmp` (was not referenced by CMake).
+
 ---
 
 ## Table of Contents
@@ -203,6 +225,8 @@ transport->flushAsync();  // wait for all queued ops
 transport->sendTensor(tensor, "192.168.1.10:51001#0", callback);
 transport->recvTensor(receiver, "192.168.1.11:51002#0", callback);
 ```
+
+**Layout Conversion:** NHWC↔NCHW via compute shader (same-device) or staging-buffer permute (cross-device). Non-4D tensors use flat copy. Other layout combinations fall back to CPU permute.
 
 **Transport Priority (Auto):**
 | Priority | Path | Mechanism | Staging? |
@@ -699,6 +723,8 @@ exported = pool.export_memory(alloc, vvm.ExternalHandleType.OpaqueWin32)
 peer_alloc = peer_pool.import_memory(exported, usage)
 ```
 
+**Note**: `allocate_tensor()` returns an int64 tensor containing the Vulkan allocation metadata (buffer handle, memory handle, offset, size, device address, host pointer, block index). This metadata tensor can be passed to `deallocate_tensor()` to release the allocation.
+
 ### ONNX Runtime (`vulkanvm_onnx`)
 
 ```python
@@ -710,6 +736,8 @@ alloc = provider.allocate_tensor([1, 3, 224, 224], vvm.TensorElementType.FLOAT, 
 provider.upload_tensor(alloc, input_np, input_np.nbytes)
 output_np = provider.download_tensor(alloc, output_np, output_np.nbytes)
 ```
+
+**Note**: The ONNX provider uses Vulkan memory for tensor allocation and staging, but kernel execution currently falls back to ONNX Runtime's CPU execution provider. Vulkan-backed kernels are planned for a future release.
 
 ---
 

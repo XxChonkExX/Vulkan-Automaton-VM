@@ -1,6 +1,7 @@
 #include "vulkan_vm/network/cluster_server.hpp"
 #include "vulkan_vm/network/tcp_transport.hpp"
 #include "vulkan_vm/network/network_types.hpp"
+#include "vulkan_vm/network/wire_format.hpp"
 #include "vulkan_vm/utils.hpp"
 
 #include <memory>
@@ -178,15 +179,39 @@ private:
     void handleAllocate(const TcpMessage& req, TcpMessage& resp) {
         if (!allocateHandler_) {
             resp.type = MsgError;
-            resp.body = {static_cast<uint8_t>(3)}; // handler not set
+            resp.body = {static_cast<uint8_t>(3)};
             return;
         }
 
-        // Deserialize request
-        // For now, placeholder
-        VVM_LOG_DEBUG("Allocate request received");
+        const uint8_t* p = req.body.data();
+        const uint8_t* end = p + req.body.size();
+        std::string host;
+        uint32_t port = 0, nodeIndex = 0;
+        std::string uuid;
+        uint64_t size = 0, usageVal = 0, flagsVal = 0;
+        uint8_t enableRdma = 0;
+        if (!wire::getStr(p, end, host) || !wire::getU32(p, end, port) ||
+            !wire::getU32(p, end, nodeIndex) || !wire::getStr(p, end, uuid) ||
+            !wire::getU64(p, end, size) || !wire::getU64(p, end, usageVal) ||
+            !wire::getU64(p, end, flagsVal) || !wire::getU8(p, end, enableRdma)) {
+            resp.type = MsgError;
+            resp.body = {static_cast<uint8_t>(4)}; // malformed request
+            return;
+        }
+
+        NodeId requester{host, port, nodeIndex, uuid};
+        auto result = allocateHandler_(requester, static_cast<VkDeviceSize>(size),
+                                       static_cast<VkBufferUsageFlags>(usageVal),
+                                       static_cast<VkMemoryPropertyFlags>(flagsVal),
+                                       enableRdma != 0);
+        if (!result) {
+            resp.type = MsgError;
+            resp.body = {static_cast<uint8_t>(5)}; // allocation failed
+            return;
+        }
+
         resp.type = MsgAllocate;
-        resp.body = {};
+        resp.body = serializeAllocationDesc(*result);
     }
 
     void handleExport(const TcpMessage& req, TcpMessage& resp) {
@@ -195,9 +220,33 @@ private:
             resp.body = {static_cast<uint8_t>(3)};
             return;
         }
-        VVM_LOG_DEBUG("Export request received");
+
+        const uint8_t* p = req.body.data();
+        const uint8_t* end = p + req.body.size();
+        std::string host;
+        uint32_t port = 0, nodeIndex = 0;
+        std::string uuid;
+        uint64_t localAllocId = 0;
+        uint8_t enableRdma = 0, forceHostShadow = 0;
+        if (!wire::getStr(p, end, host) || !wire::getU32(p, end, port) ||
+            !wire::getU32(p, end, nodeIndex) || !wire::getStr(p, end, uuid) ||
+            !wire::getU64(p, end, localAllocId) ||
+            !wire::getU8(p, end, enableRdma) || !wire::getU8(p, end, forceHostShadow)) {
+            resp.type = MsgError;
+            resp.body = {static_cast<uint8_t>(4)};
+            return;
+        }
+
+        NodeId requester{host, port, nodeIndex, uuid};
+        auto result = exportHandler_(requester, localAllocId, enableRdma != 0, forceHostShadow != 0);
+        if (!result) {
+            resp.type = MsgError;
+            resp.body = {static_cast<uint8_t>(5)};
+            return;
+        }
+
         resp.type = MsgExport;
-        resp.body = {};
+        resp.body = serializeAllocationDesc(*result);
     }
 
     void handleImport(const TcpMessage& req, TcpMessage& resp) {
@@ -206,9 +255,74 @@ private:
             resp.body = {static_cast<uint8_t>(3)};
             return;
         }
-        VVM_LOG_DEBUG("Import request received");
+
+        const uint8_t* p = req.body.data();
+        const uint8_t* end = p + req.body.size();
+        std::string host;
+        uint32_t port = 0, nodeIndex = 0;
+        std::string uuid;
+        uint64_t size = 0, usageVal = 0, descUsageVal = 0;
+        uint8_t hasRdma = 0, hasUcx = 0, hasHostShadow = 0;
+        if (!wire::getStr(p, end, host) || !wire::getU32(p, end, port) ||
+            !wire::getU32(p, end, nodeIndex) || !wire::getStr(p, end, uuid) ||
+            !wire::getU64(p, end, size) || !wire::getU64(p, end, usageVal) ||
+            !wire::getU64(p, end, descUsageVal) || !wire::getU8(p, end, hasRdma)) {
+            resp.type = MsgError;
+            resp.body = {static_cast<uint8_t>(4)};
+            return;
+        }
+
+        RemoteAllocationDesc desc;
+        desc.owner = NodeId{host, port, nodeIndex, uuid};
+        desc.size = size;
+        desc.usageFlags = static_cast<VkBufferUsageFlags>(descUsageVal);
+        desc.hasRdmaAddr = (hasRdma != 0);
+        if (desc.hasRdmaAddr) {
+            if (!wire::getU64(p, end, desc.rdmaAddr) || !wire::getU32(p, end, desc.rkey)) {
+                resp.type = MsgError;
+                resp.body = {static_cast<uint8_t>(4)};
+                return;
+            }
+        }
+        if (!wire::getU8(p, end, hasUcx)) {
+            resp.type = MsgError;
+            resp.body = {static_cast<uint8_t>(4)};
+            return;
+        }
+        desc.hasUcxAddr = (hasUcx != 0);
+        if (desc.hasUcxAddr) {
+            if (!wire::getBytes(p, end, desc.ucxWorkerAddr) ||
+                !wire::getBytes(p, end, desc.ucxPackedRkey) ||
+                !wire::getU64(p, end, desc.ucxRemoteAddr) ||
+                !wire::getU32(p, end, desc.ucxDeviceIndex)) {
+                resp.type = MsgError;
+                resp.body = {static_cast<uint8_t>(4)};
+                return;
+            }
+        }
+        uint8_t hostShadow = 0;
+        if (!wire::getU8(p, end, hostShadow)) {
+            resp.type = MsgError;
+            resp.body = {static_cast<uint8_t>(4)};
+            return;
+        }
+        desc.hasHostShadow = (hostShadow != 0);
+        if (!wire::getBytes(p, end, desc.externalHandle) || !wire::getStr(p, end, desc.allocationName)) {
+            resp.type = MsgError;
+            resp.body = {static_cast<uint8_t>(4)};
+            return;
+        }
+
+        NodeId requester{host, port, nodeIndex, uuid};
+        auto result = importHandler_(requester, desc, static_cast<VkBufferUsageFlags>(usageVal));
+        if (!result) {
+            resp.type = MsgError;
+            resp.body = {static_cast<uint8_t>(5)};
+            return;
+        }
+
         resp.type = MsgImport;
-        resp.body = {};
+        resp.body = serializeAllocation(*result);
     }
 
     void handleMigrate(const TcpMessage& req, TcpMessage& resp) {
@@ -217,9 +331,47 @@ private:
             resp.body = {static_cast<uint8_t>(3)};
             return;
         }
-        VVM_LOG_DEBUG("Migrate request received");
+
+        const uint8_t* p = req.body.data();
+        const uint8_t* end = p + req.body.size();
+        std::string host;
+        uint32_t port = 0, nodeIndex = 0;
+        std::string uuid;
+        uint64_t size = 0, localAllocId = 0, dstAllocId = 0;
+        uint8_t hasRdma = 0, useRdma = 0;
+        if (!wire::getStr(p, end, host) || !wire::getU32(p, end, port) ||
+            !wire::getU32(p, end, nodeIndex) || !wire::getStr(p, end, uuid) ||
+            !wire::getU64(p, end, size) || !wire::getU64(p, end, localAllocId) ||
+            !wire::getU8(p, end, hasRdma) || !wire::getU64(p, end, dstAllocId) ||
+            !wire::getU8(p, end, useRdma)) {
+            resp.type = MsgError;
+            resp.body = {static_cast<uint8_t>(4)};
+            return;
+        }
+
+        RemoteAllocationDesc source;
+        source.owner = NodeId{host, port, nodeIndex, uuid};
+        source.size = size;
+        source.localAllocId = localAllocId;
+        source.hasRdmaAddr = (hasRdma != 0);
+        if (source.hasRdmaAddr) {
+            if (!wire::getU64(p, end, source.rdmaAddr) || !wire::getU32(p, end, source.rkey)) {
+                resp.type = MsgError;
+                resp.body = {static_cast<uint8_t>(4)};
+                return;
+            }
+        }
+
+        NodeId requester{host, port, nodeIndex, uuid};
+        auto result = migrateHandler_(requester, source, dstAllocId, useRdma != 0);
+        if (!result) {
+            resp.type = MsgError;
+            resp.body = {static_cast<uint8_t>(5)};
+            return;
+        }
+
         resp.type = MsgMigrate;
-        resp.body = {};
+        resp.body = serializeMigrationOp(*result);
     }
 
     void handleRegisterNode(const TcpMessage& req, TcpMessage& resp) {
@@ -228,9 +380,73 @@ private:
             resp.body = {static_cast<uint8_t>(3)};
             return;
         }
-        VVM_LOG_DEBUG("RegisterNode request received");
+
+        const uint8_t* p = req.body.data();
+        const uint8_t* end = p + req.body.size();
+        NodeInfo info;
+        if (!wire::getStr(p, end, info.id.host) || !wire::getU32(p, end, info.id.port) ||
+            !wire::getU32(p, end, info.id.nodeIndex) || !wire::getStr(p, end, info.id.uuid)) {
+            resp.type = MsgError;
+            resp.body = {static_cast<uint8_t>(4)};
+            return;
+        }
+        uint32_t devCount = 0;
+        if (!wire::getU32(p, end, devCount)) {
+            resp.type = MsgError;
+            resp.body = {static_cast<uint8_t>(4)};
+            return;
+        }
+        info.gpuDevices.resize(devCount);
+        for (uint32_t d = 0; d < devCount; ++d) {
+            if (!wire::getStr(p, end, info.gpuDevices[d])) {
+                resp.type = MsgError;
+                resp.body = {static_cast<uint8_t>(4)};
+                return;
+            }
+        }
+        uint8_t v = 0;
+        if (!wire::getStr(p, end, info.nicName) || !wire::getU8(p, end, v)) {
+            resp.type = MsgError;
+            resp.body = {static_cast<uint8_t>(4)};
+            return;
+        }
+        info.rdmaCapable = (v != 0);
+        if (!wire::getU8(p, end, v)) {
+            resp.type = MsgError;
+            resp.body = {static_cast<uint8_t>(4)};
+            return;
+        }
+        info.gpuDirectCapable = (v != 0);
+        if (!wire::getU64(p, end, info.timestamp) || !wire::getU64(p, end, info.caps.totalVram) ||
+            !wire::getU64(p, end, info.caps.availableVram)) {
+            resp.type = MsgError;
+            resp.body = {static_cast<uint8_t>(4)};
+            return;
+        }
+        if (!wire::getU8(p, end, v)) {
+            resp.type = MsgError;
+            resp.body = {static_cast<uint8_t>(4)};
+            return;
+        }
+        info.caps.supportsRdmaAddr = (v != 0);
+        if (!wire::getU8(p, end, v)) { resp.type = MsgError; resp.body = {4}; return; }
+        info.caps.supportsDmaBuf = (v != 0);
+        if (!wire::getU8(p, end, v)) { resp.type = MsgError; resp.body = {4}; return; }
+        info.caps.supportsOpaqueFd = (v != 0);
+        if (!wire::getU8(p, end, v)) { resp.type = MsgError; resp.body = {4}; return; }
+        info.caps.supportsOpaqueWin32 = (v != 0);
+        if (!wire::getU8(p, end, v)) { resp.type = MsgError; resp.body = {4}; return; }
+        info.caps.supportsD3D12Heap = (v != 0);
+
+        auto result = registerHandler_(info);
+        if (!result) {
+            resp.type = MsgError;
+            resp.body = {static_cast<uint8_t>(5)};
+            return;
+        }
+
         resp.type = MsgRegisterNode;
-        resp.body = {};
+        resp.body = serializeNodeList(*result);
     }
 
     void handleHeartbeat(const TcpMessage& req, TcpMessage& resp) {
@@ -255,7 +471,70 @@ private:
 
     std::vector<uint8_t> serializeNodeList(const std::vector<NodeInfo>& nodes) {
         std::vector<uint8_t> data;
-        // Simplified serialization
+        wire::putU32(data, static_cast<uint32_t>(nodes.size()));
+        for (const auto& info : nodes) {
+            wire::putStr(data, info.id.host);
+            wire::putU32(data, info.id.port);
+            wire::putU32(data, info.id.nodeIndex);
+            wire::putStr(data, info.id.uuid);
+            wire::putU32(data, static_cast<uint32_t>(info.gpuDevices.size()));
+            for (const auto& dev : info.gpuDevices) {
+                wire::putStr(data, dev);
+            }
+            wire::putStr(data, info.nicName);
+            wire::putU8(data, info.rdmaCapable ? 1 : 0);
+            wire::putU8(data, info.gpuDirectCapable ? 1 : 0);
+            wire::putU64(data, info.timestamp);
+            wire::putU64(data, info.caps.totalVram);
+            wire::putU64(data, info.caps.availableVram);
+            wire::putU8(data, info.caps.supportsRdmaAddr ? 1 : 0);
+            wire::putU8(data, info.caps.supportsDmaBuf ? 1 : 0);
+            wire::putU8(data, info.caps.supportsOpaqueFd ? 1 : 0);
+            wire::putU8(data, info.caps.supportsOpaqueWin32 ? 1 : 0);
+            wire::putU8(data, info.caps.supportsD3D12Heap ? 1 : 0);
+        }
+        return data;
+    }
+
+    static std::vector<uint8_t> serializeAllocationDesc(const RemoteAllocationDesc& desc) {
+        std::vector<uint8_t> data;
+        wire::putStr(data, desc.owner.host);
+        wire::putU32(data, desc.owner.port);
+        wire::putU32(data, desc.owner.nodeIndex);
+        wire::putStr(data, desc.owner.uuid);
+        wire::putU64(data, desc.size);
+        wire::putU64(data, static_cast<uint64_t>(desc.usageFlags));
+        wire::putU8(data, desc.hasRdmaAddr ? 1 : 0);
+        if (desc.hasRdmaAddr) {
+            wire::putU64(data, desc.rdmaAddr);
+            wire::putU32(data, desc.rkey);
+        }
+        return data;
+    }
+
+    static std::vector<uint8_t> serializeAllocation(const Allocation& alloc) {
+        std::vector<uint8_t> data;
+        wire::putU8(data, 1); // success
+        wire::putU64(data, alloc.size);
+        wire::putU64(data, reinterpret_cast<uintptr_t>(alloc.buffer));
+        wire::putU64(data, reinterpret_cast<uintptr_t>(alloc.memory));
+        wire::putU64(data, reinterpret_cast<uintptr_t>(alloc.hostPtr));
+        wire::putU64(data, alloc.deviceAddress);
+        wire::putU64(data, alloc.offset);
+        wire::putU64(data, alloc.blockIndex);
+        wire::putU64(data, static_cast<uint64_t>(alloc.usage));
+        wire::putU8(data, alloc.mapped ? 1 : 0);
+        wire::putStr(data, alloc.name);
+        return data;
+    }
+
+    static std::vector<uint8_t> serializeMigrationOp(const NetworkMigrationOperation& op) {
+        std::vector<uint8_t> data;
+        wire::putU64(data, op.operationId);
+        wire::putU8(data, op.useRdma ? 1 : 0);
+        wire::putU64(data, op.destinationAllocId);
+        wire::putU8(data, op.completed ? 1 : 0);
+        wire::putStr(data, op.errorMessage);
         return data;
     }
 
