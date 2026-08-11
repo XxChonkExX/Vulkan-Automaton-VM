@@ -115,6 +115,15 @@ target_include_directories(tensor_collective_test PRIVATE
 )
 add_test(NAME tensor_collective_test COMMAND tensor_collective_test)
 
+# Dtype conversion tests (CPU-only, no Vulkan device required)
+add_executable(dtype_conversion_test dtype_conversion_test.cpp)
+target_link_libraries(dtype_conversion_test PRIVATE vulkan_vm)
+target_include_directories(dtype_conversion_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
+add_test(NAME dtype_conversion_test COMMAND dtype_conversion_test)
+
 # Windows-only NDK persistent pin ref-count test
 if(WIN32)
     add_executable(persistent_pin_test persistent_pin_test.cpp)
