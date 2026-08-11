@@ -193,11 +193,14 @@ struct DeviceMemoryInfo {
     std::vector<VkDeviceSize> heapUsed;
 };
 
+using MigrationId = uint64_t;
+
 // ============================================================================
 // Migration Operation
 // ============================================================================
 
 struct MigrationOperation {
+    MigrationId id = 0;
     Allocation* allocation = nullptr;
     bool toHost = true;          // true = device->host, false = host->device
     VkFence completionFence = VK_NULL_HANDLE;

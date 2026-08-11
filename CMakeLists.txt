@@ -54,90 +54,11 @@ if(VVM_BUILD_PYTORCH OR VVM_BUILD_ONNX)
     find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
 endif()
 
-# Windows SDK and MSVC include paths
+# Windows SDK and MSVC include paths - let CMake/MSVC handle this via toolchain
 if(WIN32)
-    # Find Windows SDK paths
-    set(WIN10_SDK_VERSIONS "10.0.26100.0" "10.0.22621.0" "10.0.19041.0" "10.0.18362.0" "10.0.17763.0")
-    foreach(ver ${WIN10_SDK_VERSIONS})
-        if(EXISTS "C:/Program Files (x86)/Windows Kits/10/Include/${ver}/um/windows.h")
-            set(WINDOWS_SDK_UM     "C:/Program Files (x86)/Windows Kits/10/Include/${ver}/um")
-            set(WINDOWS_SDK_SHARED "C:/Program Files (x86)/Windows Kits/10/Include/${ver}/shared")
-            set(WINDOWS_SDK_UCRT   "C:/Program Files (x86)/Windows Kits/10/Include/${ver}/ucrt")
-            message(STATUS "Found Windows SDK ${ver}")
-            break()
-        endif()
-    endforeach()
-    if(NOT WINDOWS_SDK_UM)
-        if(DEFINED ENV{WindowsSdkDir})
-            set(WINDOWS_SDK_UM     "$ENV{WindowsSdkDir}um")
-            set(WINDOWS_SDK_SHARED "$ENV{WindowsSdkDir}shared")
-            set(WINDOWS_SDK_UCRT   "$ENV{WindowsSdkDir}ucrt")
-            message(STATUS "Using Windows SDK from WindowsSdkDir environment variable")
-        else()
-            message(WARNING "Windows SDK not found - build may fail without proper include paths")
-        endif()
-    endif()
-
-    # Explicitly set Windows SDK version for MSBuild to avoid defaulting to unavailable 10.0.28000.0
-    if(WINDOWS_SDK_UM)
-        string(REGEX MATCH "10\\.0\\.[0-9]+" WINDOWS_SDK_VERSION "${WINDOWS_SDK_UM}")
-        set(CMAKE_SYSTEM_VERSION "${WINDOWS_SDK_VERSION}" CACHE STRING "Windows SDK version" FORCE)
-        set(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION "${WINDOWS_SDK_VERSION}" CACHE STRING "Windows SDK version" FORCE)
-        message(STATUS "Setting CMAKE_SYSTEM_VERSION=${CMAKE_SYSTEM_VERSION} and CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION=${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}")
-    endif()
-
-    # Find Windows SDK library path (for ws2_32.lib, kernel32.lib, etc.)
-    foreach(ver ${WIN10_SDK_VERSIONS})
-        if(EXISTS "C:/Program Files (x86)/Windows Kits/10/Lib/${ver}/um/x64/ws2_32.lib")
-            set(WINDOWS_SDK_LIB_PATH "C:/Program Files (x86)/Windows Kits/10/Lib/${ver}/um/x64")
-            set(WINDOWS_SDK_UCRT_LIB_PATH "C:/Program Files (x86)/Windows Kits/10/Lib/${ver}/ucrt/x64")
-            message(STATUS "Found Windows SDK libraries: ${WINDOWS_SDK_LIB_PATH}")
-            break()
-        elseif(EXISTS "C:/Program Files (x86)/Windows Kits/10/Lib/${ver}/um/x86/ws2_32.lib")
-            set(WINDOWS_SDK_LIB_PATH "C:/Program Files (x86)/Windows Kits/10/Lib/${ver}/um/x86")
-            set(WINDOWS_SDK_UCRT_LIB_PATH "C:/Program Files (x86)/Windows Kits/10/Lib/${ver}/ucrt/x86")
-            message(STATUS "Found Windows SDK libraries: ${WINDOWS_SDK_LIB_PATH}")
-            break()
-        endif()
-    endforeach()
-
-    # Find MSVC library path (needed for vcruntime.lib, msvcprt.lib, etc.)
-    # Try to auto-detect from the compiler path
-    if(CMAKE_CXX_COMPILER)
-        get_filename_component(MSVC_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
-        get_filename_component(MSVC_TOOLSET_DIR "${MSVC_BIN_DIR}/../../.." ABSOLUTE)
-        if(EXISTS "${MSVC_TOOLSET_DIR}/include/vcruntime.h")
-            set(MSVC_INCLUDE_PATH "${MSVC_TOOLSET_DIR}/include")
-            # Determine architecture subdirectory
-            if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-                set(MSVC_LIB_ARCH "x64")
-            else()
-                set(MSVC_LIB_ARCH "x86")
-            endif()
-            if(EXISTS "${MSVC_TOOLSET_DIR}/lib/${MSVC_LIB_ARCH}")
-                set(MSVC_LIBRARY_PATH "${MSVC_TOOLSET_DIR}/lib/${MSVC_LIB_ARCH}")
-                message(STATUS "Found MSVC: ${MSVC_TOOLSET_DIR}")
-            endif()
-        endif()
-    endif()
-    if(NOT MSVC_INCLUDE_PATH)
-        # Search common MSVC install locations
-        file(GLOB MSVC_VERSIONS
-            "C:/Program Files/Microsoft Visual Studio/2022/*/VC/Tools/MSVC/*"
-            "C:/Program Files (x86)/Microsoft Visual Studio/2022/*/VC/Tools/MSVC/*"
-            "C:/Program Files/Microsoft Visual Studio/2019/*/VC/Tools/MSVC/*"
-            "C:/Program Files (x86)/Microsoft Visual Studio/2019/*/VC/Tools/MSVC/*"
-        )
-        foreach(dir ${MSVC_VERSIONS})
-            if(EXISTS "${dir}/include/vcruntime.h")
-                set(MSVC_INCLUDE_PATH "${dir}/include")
-                message(STATUS "Found MSVC includes: ${dir}/include")
-                break()
-            endif()
-        endforeach()
-    endif()
-    if(NOT MSVC_INCLUDE_PATH)
-        message(WARNING "MSVC include path not found - build may fail without vcruntime.h")
+    # Require Windows SDK 10.0.22621 or newer for NDKPI headers
+    if(CMAKE_SYSTEM_VERSION VERSION_LESS "10.0.22621")
+        message(WARNING "Windows SDK 10.0.22621 or newer recommended for NDKPI headers")
     endif()
 endif()
 
@@ -195,28 +116,11 @@ target_include_directories(vulkan_vm
         $<INSTALL_INTERFACE:include>
     PRIVATE
         ${Vulkan_INCLUDE_DIRS}
-        ${WINDOWS_SDK_UM}
-        ${WINDOWS_SDK_SHARED}
-        ${WINDOWS_SDK_UCRT}
-        ${MSVC_INCLUDE_PATH}
 )
 target_link_libraries(vulkan_vm PRIVATE
     ${Vulkan_LIBRARIES}
     Threads::Threads
 )
-
-# Add Windows SDK + MSVC library paths to linker search
-if(WIN32)
-    if(WINDOWS_SDK_LIB_PATH)
-        target_link_directories(vulkan_vm PUBLIC ${WINDOWS_SDK_LIB_PATH})
-    endif()
-    if(WINDOWS_SDK_UCRT_LIB_PATH)
-        target_link_directories(vulkan_vm PUBLIC ${WINDOWS_SDK_UCRT_LIB_PATH})
-    endif()
-    if(MSVC_LIBRARY_PATH)
-        target_link_directories(vulkan_vm PUBLIC ${MSVC_LIBRARY_PATH})
-    endif()
-endif()
 
 if(VVM_USE_VOLK)
     target_link_libraries(vulkan_vm PRIVATE Volk::Volk)
@@ -247,7 +151,8 @@ target_include_directories(vulkan_vm PUBLIC
 # Network module
 if(VVM_BUILD_NETWORK)
     add_subdirectory(src/network)
-    target_link_libraries(vulkan_vm PUBLIC vulkan_vm_network)
+    # Note: vulkan_vm_network depends on vulkan_vm. Consumers that need
+    # networking should link both: target_link_libraries(app PRIVATE vulkan_vm vulkan_vm_network)
 endif()
 
 # Tensor Transport module

@@ -45,12 +45,14 @@ private:
     static bool isPowerOfTwo(VkDeviceSize v) {
         return v != 0 && (v & (v - 1)) == 0;
     }
-    static VkDeviceSize nextPowerOfTwo(VkDeviceSize v) {
-        if (v == 0) return 1;
+    static std::optional<VkDeviceSize> ceilPowerOfTwo(VkDeviceSize v) {
+        if (v == 0) return std::nullopt;
+        if (v > (VkDeviceSize{1} << 63)) return std::nullopt;
         --v;
         v |= v >> 1;  v |= v >> 2;  v |= v >> 4;
         v |= v >> 8;  v |= v >> 16; v |= v >> 32;
-        return v + 1;
+        ++v;
+        return v;
     }
 
     // Order 0 = minSize, order maxOrder_ = blockSize.

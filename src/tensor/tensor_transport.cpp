@@ -468,6 +468,20 @@ public:
     bool initialize() override {
         if (initialized_) return true;
         
+        // Validate device-address feature is supported
+        for (size_t i = 0; i < devices_.size(); ++i) {
+            VkPhysicalDeviceBufferDeviceAddressFeatures addrFeatures{};
+            addrFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+            VkPhysicalDeviceFeatures2 features2{};
+            features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            features2.pNext = &addrFeatures;
+            vkGetPhysicalDeviceFeatures2(devices_[i].physicalDevice, &features2);
+            if (!addrFeatures.bufferDeviceAddress) {
+                VVM_LOG_ERROR("Device {} does not support VK_KHR_buffer_device_address (bufferDeviceAddress)", i);
+                return false;
+            }
+        }
+        
         // Create MultiGPUPoolManager
         auto poolOpt = vvm::MultiGPUPoolManager::create(devices_, poolConfig_, 0);
         if (!poolOpt) {
@@ -1014,10 +1028,35 @@ public:
         vkCmdPushConstants(cmdBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), pushConstants);
         
         // Dispatch
-        uint32_t totalElements = pushConstants[0] * pushConstants[1] * pushConstants[2] * pushConstants[3];
-        uint32_t groupSize = 256;
-        uint32_t numGroups = (totalElements + groupSize - 1) / groupSize;
-        vkCmdDispatch(cmdBuffer, numGroups, 1, 1);
+        uint64_t totalElements = uint64_t(pushConstants[0]) *
+                                 uint64_t(pushConstants[1]) *
+                                 uint64_t(pushConstants[2]) *
+                                 uint64_t(pushConstants[3]);
+        const uint64_t kMaxSupportedElements = UINT64_C(1) << 40;  // ~1 trillion elements
+        if (totalElements == 0 || totalElements > kMaxSupportedElements) {
+            vkDestroyDescriptorPool(device, descPool, nullptr);
+            vkDestroyDescriptorSetLayout(device, setLayout, nullptr);
+            vkFreeCommandBuffers(device, cmdPool, 1, &cmdBuffer);
+            vkDestroyCommandPool(device, cmdPool, nullptr);
+            vkDestroyPipeline(device, pipeline, nullptr);
+            vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+            vkDestroyShaderModule(device, shaderModule, nullptr);
+            return false;
+        }
+        const uint32_t kMaxComputeWorkGroupCountX = 65535;
+        const uint32_t groupSize = 256;
+        uint64_t numGroups = (totalElements + groupSize - 1) / groupSize;
+        if (numGroups > kMaxComputeWorkGroupCountX) {
+            vkDestroyDescriptorPool(device, descPool, nullptr);
+            vkDestroyDescriptorSetLayout(device, setLayout, nullptr);
+            vkFreeCommandBuffers(device, cmdPool, 1, &cmdBuffer);
+            vkDestroyCommandPool(device, cmdPool, nullptr);
+            vkDestroyPipeline(device, pipeline, nullptr);
+            vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+            vkDestroyShaderModule(device, shaderModule, nullptr);
+            return false;
+        }
+        vkCmdDispatch(cmdBuffer, static_cast<uint32_t>(numGroups), 1, 1);
         
         vkEndCommandBuffer(cmdBuffer);
         

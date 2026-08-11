@@ -88,6 +88,16 @@ inline bool getStr(const uint8_t*& p, const uint8_t* end, std::string& out) {
     return true;
 }
 
+inline bool getStrLimited(const uint8_t*& p, const uint8_t* end, std::string& out, size_t maxLen) {
+    uint32_t len = 0;
+    if (!getU32(p, end, len)) return false;
+    if (len > maxLen) return false;
+    if (remaining(p, end) < len) return false;
+    out.assign(reinterpret_cast<const char*>(p), len);
+    p += len;
+    return true;
+}
+
 } // namespace wire
 } // namespace network
 } // namespace vvm

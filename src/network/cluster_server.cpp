@@ -13,9 +13,39 @@
 #include <unordered_map>
 #include <functional>
 #include <thread>
+#include <algorithm>
 
 namespace vvm {
 namespace network {
+
+static AuthorizationResult authorize(const PeerIdentity& peer, Capability cap) {
+    if (!peer.hasCapability(cap)) {
+        return AuthorizationResult::InsufficientCapabilities;
+    }
+    return AuthorizationResult::Allow;
+}
+
+static PeerIdentity getPeerIdentityFromTLS(const TcpTransport::ConnId& /*connId*/) {
+    // In a real implementation, this would extract the peer's certificate fingerprint
+    // from the TLS connection. For now, return a default identity with all capabilities.
+    PeerIdentity identity;
+    identity.capabilities = {
+        Capability::RegisterNode,
+        Capability::ReadClusterView,
+        Capability::AllocateMemory,
+        Capability::MigrateMemory,
+        Capability::RDMAAccess,
+        Capability::PublishModel,
+        Capability::FetchModel,
+        Capability::AdministerCluster
+    };
+    return identity;
+}
+
+static AuthorizationResult checkAuth(const TcpTransport::ConnId& connId, Capability cap) {
+    PeerIdentity peer = getPeerIdentityFromTLS(connId);
+    return authorize(peer, cap);
+}
 
 // ============================================================================
 // TCP-based ClusterServer Implementation
@@ -105,6 +135,11 @@ public:
         registerHandler_ = std::move(handler);
     }
 
+    void setAuthCallback(AuthCallback callback) override {
+        std::lock_guard<std::mutex> lock(handlerMutex_);
+        authCallback_ = std::move(callback);
+    }
+
     void updateClusterView(const std::vector<NodeInfo>& view) override {
         std::lock_guard<std::mutex> lock(viewMutex_);
         clusterView_ = view;
@@ -124,8 +159,18 @@ private:
     void handleRequest(TcpMessage& req, TcpMessage& resp) {
         if (!running_.load()) {
             resp.type = MsgError;
-            resp.body = {static_cast<uint8_t>(0)}; // error
+            resp.body = {static_cast<uint8_t>(0)};
             return;
+        }
+
+        // Check authorization if auth callback is set
+        if (authCallback_) {
+            AuthorizationResult authResult = authCallback_(req.type);
+            if (authResult != AuthorizationResult::Allow) {
+                resp.type = MsgError;
+                resp.body = {static_cast<uint8_t>(authResult == AuthorizationResult::Unauthenticated ? 10 : 11)};
+                return;
+            }
         }
 
         std::lock_guard<std::mutex> lock(statsMutex_);
@@ -374,6 +419,12 @@ private:
         resp.body = serializeMigrationOp(*result);
     }
 
+    static constexpr size_t kMaxHostnameBytes = 255;
+    static constexpr size_t kMaxUuidBytes = 128;
+    static constexpr size_t kMaxGpuNameBytes = 256;
+    static constexpr size_t kMaxNicNameBytes = 256;
+    static constexpr uint32_t kMaxGpuDevices = 64;
+
     void handleRegisterNode(const TcpMessage& req, TcpMessage& resp) {
         if (!registerHandler_) {
             resp.type = MsgError;
@@ -384,28 +435,33 @@ private:
         const uint8_t* p = req.body.data();
         const uint8_t* end = p + req.body.size();
         NodeInfo info;
-        if (!wire::getStr(p, end, info.id.host) || !wire::getU32(p, end, info.id.port) ||
-            !wire::getU32(p, end, info.id.nodeIndex) || !wire::getStr(p, end, info.id.uuid)) {
+
+        if (!wire::getStrLimited(p, end, info.id.host, kMaxHostnameBytes) ||
+            !wire::getU32(p, end, info.id.port) ||
+            !wire::getU32(p, end, info.id.nodeIndex) ||
+            !wire::getStrLimited(p, end, info.id.uuid, kMaxUuidBytes)) {
             resp.type = MsgError;
             resp.body = {static_cast<uint8_t>(4)};
             return;
         }
         uint32_t devCount = 0;
-        if (!wire::getU32(p, end, devCount)) {
+        if (!wire::getU32(p, end, devCount) || devCount > kMaxGpuDevices) {
             resp.type = MsgError;
             resp.body = {static_cast<uint8_t>(4)};
             return;
         }
-        info.gpuDevices.resize(devCount);
+        info.gpuDevices.reserve(devCount);
         for (uint32_t d = 0; d < devCount; ++d) {
-            if (!wire::getStr(p, end, info.gpuDevices[d])) {
+            std::string gpu;
+            if (!wire::getStrLimited(p, end, gpu, kMaxGpuNameBytes)) {
                 resp.type = MsgError;
                 resp.body = {static_cast<uint8_t>(4)};
                 return;
             }
+            info.gpuDevices.emplace_back(std::move(gpu));
         }
         uint8_t v = 0;
-        if (!wire::getStr(p, end, info.nicName) || !wire::getU8(p, end, v)) {
+        if (!wire::getStrLimited(p, end, info.nicName, kMaxNicNameBytes) || !wire::getU8(p, end, v)) {
             resp.type = MsgError;
             resp.body = {static_cast<uint8_t>(4)};
             return;
@@ -550,6 +606,10 @@ private:
     ImportHandler importHandler_;
     MigrateHandler migrateHandler_;
     RegisterHandler registerHandler_;
+
+    // Authorization callback (optional)
+    using AuthCallback = std::function<AuthorizationResult(uint32_t messageType)>;
+    AuthCallback authCallback_;
 
     // Cluster view
     mutable std::mutex viewMutex_;

@@ -133,10 +133,6 @@ target_include_directories(vulkan_vm_network PRIVATE
     ${VVM_NETWORK_L0_INCS}
     ${VVM_NETWORK_UCX_INCS}
     ${VVM_NETWORK_NDK_INCS}
-    ${WINDOWS_SDK_UM}
-    ${WINDOWS_SDK_SHARED}
-    ${WINDOWS_SDK_UCRT}
-    ${MSVC_INCLUDE_PATH}
 )
 
 target_link_libraries(vulkan_vm_network PUBLIC vulkan_vm)
