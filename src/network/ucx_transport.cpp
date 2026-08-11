@@ -229,14 +229,17 @@ std::optional<UcxMemoryHandle> UcxTransport::registerHostMemory(
 }
 
 void UcxTransport::deregisterMemory(const UcxMemoryHandle& handle) {
-    if (!handle.memh) return;
-    
-    ucs_status_t status = ucp_mem_unmap(context_, handle.memh);
-    if (status != UCS_OK) {
-        VVM_LOG_WARN("Memory deregistration failed: {}", ucs_status_string(status));
+    if (handle.rkey) {
+        ucp_rkey_destroy(handle.rkey);
     }
-    
-    {
+    if (handle.memh) {
+        ucs_status_t status = ucp_mem_unmap(context_, handle.memh);
+        if (status != UCS_OK) {
+            VVM_LOG_WARN("Memory deregistration failed: {}", ucs_status_string(status));
+        }
+    }
+
+    if (handle.ptr) {
         std::lock_guard<std::mutex> lock(memHandlesMutex_);
         memHandles_.erase(reinterpret_cast<uintptr_t>(handle.ptr));
     }
@@ -462,23 +465,23 @@ std::optional<UcxRmaKey> UcxTransport::packRmaKey(const UcxMemoryHandle& handle)
         return std::nullopt;
     }
 
-    // Pack the rkey for this memory handle
-    ucp_rkey_packed_t* packedRkey = nullptr;
-    ucs_status_t st = ucp_rkey_pack(context_, handle.memh, &packedRkey);
-    if (st != UCS_OK) {
+    // Standard UCX API: ucp_rkey_pack returns a packed buffer + length
+    void* packedBuf = nullptr;
+    size_t packedLen = 0;
+    ucs_status_t st = ucp_rkey_pack(context_, handle.memh, &packedBuf, &packedLen);
+    if (st != UCS_OK || !packedBuf || packedLen == 0) {
         VVM_LOG_ERROR("ucp_rkey_pack failed: {}", ucs_status_string(st));
         return std::nullopt;
     }
 
-    // Extract the packed buffer
     UcxRmaKey rmaKey;
-    rmaKey.packedRkey.assign(packedRkey, packedRkey + packedRkey->length);
+    rmaKey.packedRkey.assign(static_cast<const uint8_t*>(packedBuf),
+                             static_cast<const uint8_t*>(packedBuf) + packedLen);
     rmaKey.remoteAddr = reinterpret_cast<uint64_t>(handle.ptr);
     rmaKey.size = handle.size;
     rmaKey.deviceIndex = handle.deviceIndex;
 
-    // Release the temporary packed structure
-    ucp_rkey_buffer_release(packedRkey);
+    ucp_rkey_buffer_release(packedBuf);
 
     VVM_LOG_DEBUG("Packed RMA key for handle ptr={}, size={}, rkey_len={}",
                   handle.ptr, handle.size, rmaKey.packedRkey.size());
@@ -503,12 +506,13 @@ std::optional<UcxMemoryHandle> UcxTransport::unpackRmaKey(
     }
 
     UcxMemoryHandle handle;
-    handle.memh = rkey;  // Store unpacked rkey as memh for RMA operations
+    handle.memh = nullptr;          // peer does not own a local memh for this
+    handle.rkey = rkey;             // correct type for ucp_put/get
     handle.ptr = reinterpret_cast<void*>(rmaKey.remoteAddr);
     handle.size = rmaKey.size;
     handle.isGpuMemory = (rmaKey.deviceIndex != 0);
     handle.deviceIndex = rmaKey.deviceIndex;
-    handle.packedRkey = rmaKey.packedRkey;  // Keep for potential re-packing
+    handle.packedRkey = rmaKey.packedRkey;
     handle.remoteAddr = rmaKey.remoteAddr;
     handle.rkeyValid = true;
 
@@ -552,32 +556,34 @@ bool UcxTransport::putAsync(const UcxEndpoint& endpoint,
                             const UcxMemoryHandle& remoteMem,
                             size_t size,
                             std::function<void(bool)> callback) {
-    
-    if (!endpoint.ep || !localMem.memh || !remoteMem.rkeyValid || !remoteMem.memh) {
-        VVM_LOG_WARN("putAsync: invalid parameters (ep={} local_memh={} remote_rkey={} remote_memh={})",
-                     endpoint.ep != nullptr, localMem.memh != nullptr, 
-                     remoteMem.rkeyValid, remoteMem.memh != nullptr);
+
+    if (!endpoint.ep || !localMem.ptr || !remoteMem.rkeyValid || !remoteMem.rkey) {
+        VVM_LOG_WARN("putAsync: invalid parameters (ep={} local_ptr={} remote_rkeyValid={} remote_rkey={})",
+                     endpoint.ep != nullptr, localMem.ptr != nullptr,
+                     remoteMem.rkeyValid, remoteMem.rkey != nullptr);
         return false;
     }
-    
+
     auto* reqCtx = new RequestContext{std::move(callback)};
     // ucp_put_nb: local buffer -> remote address using remote rkey
-    void* request = ucp_put_nb(endpoint.ep, localMem.ptr, size, 
-                               remoteMem.remoteAddr, remoteMem.memh,
+    void* request = ucp_put_nb(endpoint.ep, localMem.ptr, size,
+                               remoteMem.remoteAddr, remoteMem.rkey,
                                ucpRmaCallback, reqCtx);
-    
+
     if (UCS_PTR_IS_ERR(request)) {
         VVM_LOG_ERROR("ucp_put_nb failed: {}", ucs_status_string(UCS_PTR_STATUS(request)));
         delete reqCtx;
         return false;
     }
-    
-    if (request != nullptr) {
-        // Request completed immediately - invoke callback before freeing
+
+    if (request == nullptr) {
+        // Completed synchronously
         if (reqCtx->callback) reqCtx->callback(true);
-        ucp_request_free(request);
         delete reqCtx;
+        return true;
     }
+
+    // In progress — callback owns reqCtx and must free the request
     return true;
 }
 
@@ -586,32 +592,34 @@ bool UcxTransport::getAsync(const UcxEndpoint& endpoint,
                             const UcxMemoryHandle& remoteMem,
                             size_t size,
                             std::function<void(bool)> callback) {
-    
-    if (!endpoint.ep || !localMem.memh || !remoteMem.rkeyValid || !remoteMem.memh) {
-        VVM_LOG_WARN("getAsync: invalid parameters (ep={} local_memh={} remote_rkey={} remote_memh={})",
-                     endpoint.ep != nullptr, localMem.memh != nullptr,
-                     remoteMem.rkeyValid, remoteMem.memh != nullptr);
+
+    if (!endpoint.ep || !localMem.ptr || !remoteMem.rkeyValid || !remoteMem.rkey) {
+        VVM_LOG_WARN("getAsync: invalid parameters (ep={} local_ptr={} remote_rkeyValid={} remote_rkey={})",
+                     endpoint.ep != nullptr, localMem.ptr != nullptr,
+                     remoteMem.rkeyValid, remoteMem.rkey != nullptr);
         return false;
     }
-    
+
     auto* reqCtx = new RequestContext{std::move(callback)};
     // ucp_get_nb: remote address -> local buffer using remote rkey
     void* request = ucp_get_nb(endpoint.ep, localMem.ptr, size,
-                               remoteMem.remoteAddr, remoteMem.memh,
+                               remoteMem.remoteAddr, remoteMem.rkey,
                                ucpRmaCallback, reqCtx);
-    
+
     if (UCS_PTR_IS_ERR(request)) {
         VVM_LOG_ERROR("ucp_get_nb failed: {}", ucs_status_string(UCS_PTR_STATUS(request)));
         delete reqCtx;
         return false;
     }
-    
-    if (request != nullptr) {
-        // Request completed immediately - invoke callback before freeing
+
+    if (request == nullptr) {
+        // Completed synchronously
         if (reqCtx->callback) reqCtx->callback(true);
-        ucp_request_free(request);
         delete reqCtx;
+        return true;
     }
+
+    // In progress — callback owns reqCtx and must free the request
     return true;
 }
 
@@ -619,26 +627,28 @@ bool UcxTransport::tagSendAsync(const UcxEndpoint& endpoint,
                                 const void* buffer, size_t size,
                                 uint64_t tag,
                                 std::function<void(bool)> callback) {
-    
+
     if (!endpoint.ep) return false;
-    
+
     auto* reqCtx = new RequestContext{std::move(callback)};
-    ucs_status_ptr_t request = ucp_tag_send_nb(endpoint.ep, buffer, size, 
+    ucs_status_ptr_t request = ucp_tag_send_nb(endpoint.ep, buffer, size,
                                                ucp_dt_make_contig(1), tag,
                                                ucpSendCallback, reqCtx);
-    
+
     if (UCS_PTR_IS_ERR(request)) {
         VVM_LOG_ERROR("ucp_tag_send_nb failed: {}", ucs_status_string(UCS_PTR_STATUS(request)));
         delete reqCtx;
         return false;
     }
-    
-    if (request != nullptr) {
-        // Request completed immediately - invoke callback before freeing
+
+    if (request == nullptr) {
+        // Completed synchronously
         if (reqCtx->callback) reqCtx->callback(true);
-        ucp_request_free(request);
         delete reqCtx;
+        return true;
     }
+
+    // In progress — callback owns reqCtx and must free the request
     return true;
 }
 
@@ -646,26 +656,29 @@ bool UcxTransport::tagRecvAsync(const UcxEndpoint& endpoint,
                                 void* buffer, size_t size,
                                 uint64_t tag,
                                 std::function<void(bool)> callback) {
-    
-    if (!endpoint.ep) return false;
-    
+
+    if (!endpoint.ep || !worker_) return false;
+
     auto* reqCtx = new RequestContext{std::move(callback)};
+    // Note: tag_recv is posted on the worker, not the endpoint.
     ucs_status_ptr_t request = ucp_tag_recv_nb(worker_, buffer, size,
                                                ucp_dt_make_contig(1), tag, 0,
                                                ucpRecvCallback, reqCtx);
-    
+
     if (UCS_PTR_IS_ERR(request)) {
         VVM_LOG_ERROR("ucp_tag_recv_nb failed: {}", ucs_status_string(UCS_PTR_STATUS(request)));
         delete reqCtx;
         return false;
     }
-    
-    if (request != nullptr) {
-        // Request completed immediately - invoke callback before freeing
+
+    if (request == nullptr) {
+        // Completed synchronously
         if (reqCtx->callback) reqCtx->callback(true);
-        ucp_request_free(request);
         delete reqCtx;
+        return true;
     }
+
+    // In progress — callback owns reqCtx and must free the request
     return true;
 }
 
@@ -681,15 +694,17 @@ void UcxTransport::ucpSendCallback(void* request, ucs_status_t status, void* use
         ctx->callback(status == UCS_OK);
     }
     delete ctx;
+    if (request) ucp_request_free(request);
 }
 
 void UcxTransport::ucpRecvCallback(void* request, ucs_status_t status,
-                                   ucp_tag_recv_info_t* info, void* userData) {
+                                   ucp_tag_recv_info_t* /*info*/, void* userData) {
     auto* ctx = static_cast<RequestContext*>(userData);
     if (ctx && ctx->callback) {
         ctx->callback(status == UCS_OK);
     }
     delete ctx;
+    if (request) ucp_request_free(request);
 }
 
 void UcxTransport::ucpRmaCallback(void* request, ucs_status_t status, void* userData) {
@@ -698,6 +713,7 @@ void UcxTransport::ucpRmaCallback(void* request, ucs_status_t status, void* user
         ctx->callback(status == UCS_OK);
     }
     delete ctx;
+    if (request) ucp_request_free(request);
 }
 
 // ============================================================================
