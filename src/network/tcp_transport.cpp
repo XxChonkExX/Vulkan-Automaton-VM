@@ -628,6 +628,11 @@ std::vector<uint8_t> serializeAllocationDesc(const RemoteAllocationDesc& desc) {
     detail::putU8(b, desc.hasRdmaAddr ? 1 : 0);
     detail::putU64(b, desc.rdmaAddr);
     detail::putU32(b, desc.rkey);
+    detail::putU8(b, desc.hasUcxAddr ? 1 : 0);
+    detail::putBytes(b, desc.ucxWorkerAddr);
+    detail::putBytes(b, desc.ucxPackedRkey);
+    detail::putU64(b, desc.ucxRemoteAddr);
+    detail::putU32(b, desc.ucxDeviceIndex);
     detail::putU8(b, desc.hasHostShadow ? 1 : 0);
     detail::putU32(b, desc.usageFlags);
     detail::putU32(b, desc.memoryTypeIndex);
@@ -640,7 +645,7 @@ std::vector<uint8_t> serializeAllocationDesc(const RemoteAllocationDesc& desc) {
 }
 
 bool deserializeAllocationDesc(const uint8_t*& p, const uint8_t* end, RemoteAllocationDesc& out) {
-    uint8_t rdma = 0, shadow = 0, dedicated = 0;
+    uint8_t rdma = 0, ucx = 0, shadow = 0, dedicated = 0;
     uint32_t handleType = 0;
     if (!deserializeNodeId(p, end, out.owner)) return false;
     if (!detail::getU64(p, end, out.size)) return false;
@@ -648,6 +653,11 @@ bool deserializeAllocationDesc(const uint8_t*& p, const uint8_t* end, RemoteAllo
     if (!detail::getU8(p, end, rdma)) return false;
     if (!detail::getU64(p, end, out.rdmaAddr)) return false;
     if (!detail::getU32(p, end, out.rkey)) return false;
+    if (!detail::getU8(p, end, ucx)) return false;
+    if (!detail::getBytes(p, end, out.ucxWorkerAddr)) return false;
+    if (!detail::getBytes(p, end, out.ucxPackedRkey)) return false;
+    if (!detail::getU64(p, end, out.ucxRemoteAddr)) return false;
+    if (!detail::getU32(p, end, out.ucxDeviceIndex)) return false;
     if (!detail::getU8(p, end, shadow)) return false;
     if (!detail::getU32(p, end, out.usageFlags)) return false;
     if (!detail::getU32(p, end, out.memoryTypeIndex)) return false;
@@ -657,6 +667,7 @@ bool deserializeAllocationDesc(const uint8_t*& p, const uint8_t* end, RemoteAllo
     if (!detail::getU64(p, end, out.timestamp)) return false;
     if (!detail::getStr(p, end, out.allocationName)) return false;
     out.hasRdmaAddr = rdma != 0;
+    out.hasUcxAddr = ucx != 0;
     out.hasHostShadow = shadow != 0;
     out.dedicatedAllocation = dedicated != 0;
     out.handleType = static_cast<ExternalHandleType>(handleType);

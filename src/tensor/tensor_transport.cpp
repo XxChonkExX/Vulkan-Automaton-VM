@@ -447,7 +447,15 @@ public:
                 VVM_LOG_WARN("Network transport initialization failed");
             }
         }
-        
+
+        // Wire UCX transport into the network manager so export/migration
+        // paths can use UCX RMA when both peers support it.
+#if defined(VVM_HAS_UCX)
+        if (ucxTransport_ && networkManager_) {
+            networkManager_->setUcxTransport(ucxTransport_.get());
+        }
+#endif
+
         // Start async processing thread
         if (config_.enableAsyncPipeline) {
             stopAsyncThread_ = false;
@@ -1279,8 +1287,16 @@ if (!loaded) {
             ucxTransport_.reset();
             return false;
         }
-        
-        VVM_LOG_INFO("UCX transport initialized (GPU mem: {}, RNDV: {})", 
+
+        // Start background progress thread so UCX async ops advance without
+        // requiring the caller to manually drive progress().
+        if (config_.enableAsyncPipeline) {
+            if (!ucxTransport_->startProgressThread()) {
+                VVM_LOG_WARN("UCX progress thread failed to start");
+            }
+        }
+
+        VVM_LOG_INFO("UCX transport initialized (GPU mem: {}, RNDV: {})",
                      config_.ucxEnableGPUMem ? "on" : "off",
                      config_.ucxEnableRndv ? "on" : "off");
         return true;
@@ -1347,7 +1363,7 @@ if (!loaded) {
             if (cb) cb(false, "Network not ready or invalid tensor");
             return;
         }
-        
+
         // Export tensor for remote access
         auto rdmaOk = config_.preference == TransportConfig::Preference::RDMAOnly ||
                       config_.enableGPUDirect;
@@ -1356,16 +1372,28 @@ if (!loaded) {
             if (cb) cb(false, "exportForRemote failed");
             return;
         }
-        
+
+        // Augment with UCX transport info if available. This lets the peer
+        // pull data over UCX (InfiniBand/RoCE) instead of verbs/TCP.
+#if defined(VVM_HAS_UCX)
+        if (ucxTransport_ && ucxTransport_->isInitialized()) {
+            auto descCopy = *desc;
+            if (networkManager_->exportForRemoteUcx(descCopy, tensor->allocation, tensor->deviceIndex)) {
+                *desc = std::move(descCopy);
+                VVM_LOG_INFO("sendTensor: UCX export enabled for tensor '{}'", tensor->metadata.name);
+            }
+        }
+#endif
+
         // Parse target node ID
         auto targetNode = vvm::network::NodeId::fromString(targetNodeId);
-        
+
         // Announce the tensor to target node
         if (!networkManager_->announceRemoteTensor(targetNode, tensor->metadata.name, *desc)) {
             if (cb) cb(false, "announceRemoteTensor failed");
             return;
         }
-        
+
         if (cb) cb(true, "");
     }
     
@@ -1374,10 +1402,10 @@ if (!loaded) {
             if (cb) cb(false, "Network not ready or invalid tensor");
             return;
         }
-        
+
         // Parse source node ID
         auto sourceNode = vvm::network::NodeId::fromString(sourceNodeId);
-        
+
         // Wait for tensor announcement from source
         const uint64_t kRecvTimeoutNs = 30ull * 1000 * 1000 * 1000; // 30s
         auto desc = networkManager_->waitRemoteTensor(sourceNode, tensor->metadata.name, kRecvTimeoutNs);
@@ -1385,8 +1413,25 @@ if (!loaded) {
             if (cb) cb(false, "waitRemoteTensor timed out");
             return;
         }
-        
-        // Migrate from remote
+
+        // Prefer UCX path if both sides support it.
+#if defined(VVM_HAS_UCX)
+        if (ucxTransport_ && ucxTransport_->isInitialized() && desc->canUseUcx()) {
+            VVM_LOG_INFO("recvTensor: using UCX path for tensor '{}'", tensor->metadata.name);
+            // Use async pipeline to drive the UCX transfer and completion.
+            enqueueAsync([this, desc = *desc, tensor, cb]() {
+                bool ok = networkManager_->migrateFromRemoteUcx(
+                    desc, tensor->allocation, tensor->deviceIndex,
+                    [cb](bool success) {
+                        if (cb) cb(success, success ? "" : "UCX migrateFromRemoteUcx failed");
+                    });
+                if (!ok && cb) cb(false, "migrateFromRemoteUcx initiation failed");
+            });
+            return;
+        }
+#endif
+
+        // Fall back to RDMA/host-staged path
         auto rdmaOk = config_.preference == TransportConfig::Preference::RDMAOnly ||
                       config_.enableGPUDirect;
         auto op = networkManager_->migrateFromRemote(*desc, tensor->allocation, rdmaOk);
@@ -1394,14 +1439,14 @@ if (!loaded) {
             if (cb) cb(false, "migrateFromRemote failed");
             return;
         }
-        
+
         networkManager_->waitMigration(*op);
-        
+
         // Verify content if checksum provided
         if (tensor->metadata.contentHash != 0) {
             // Would verify content here
         }
-        
+
         if (cb) cb(true, "");
     }
     
@@ -1420,7 +1465,15 @@ if (!loaded) {
     bool supportsNetwork() const override {
         return networkManager_ != nullptr;
     }
-    
+
+    bool supportsUCX() const override {
+#if defined(VVM_HAS_UCX)
+        return ucxTransport_ && ucxTransport_->isInitialized();
+#else
+        return false;
+#endif
+    }
+
 private:
     // ========================================================================
     // Async Processing

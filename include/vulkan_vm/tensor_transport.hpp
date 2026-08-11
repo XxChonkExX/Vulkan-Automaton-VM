@@ -212,6 +212,7 @@ public:
     virtual bool supportsP2P() const = 0;
     virtual bool supportsRDMA() const = 0;
     virtual bool supportsNetwork() const = 0;
+    virtual bool supportsUCX() const = 0;
     
     // Async pipeline
     virtual void enqueueAsync(AsyncOperation op) = 0;

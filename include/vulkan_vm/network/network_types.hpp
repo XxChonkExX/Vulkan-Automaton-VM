@@ -149,7 +149,14 @@ struct RemoteAllocationDesc {
     bool hasRdmaAddr = false;
     uint64_t rdmaAddr = 0;      // VkRemoteAddressNV (8 bytes)
     uint32_t rkey = 0;          // RDMA remote key
-    
+
+    // UCX path: GPU-aware unified transport
+    bool hasUcxAddr = false;
+    std::vector<uint8_t> ucxWorkerAddr;  // UCX worker address blob
+    std::vector<uint8_t> ucxPackedRkey;  // UCX packed RMA key
+    uint64_t ucxRemoteAddr = 0;          // UCX remote virtual address
+    uint32_t ucxDeviceIndex = 0;         // GPU device index for UCX registration
+
     // Fallback: host-staged
     bool hasHostShadow = false;
     
@@ -171,10 +178,11 @@ struct RemoteAllocationDesc {
     std::string allocationName;  // optional debug name
     
     bool isValid() const {
-        return size > 0 && (hasRdmaAddr || hasHostShadow || !externalHandle.empty());
+        return size > 0 && (hasRdmaAddr || hasUcxAddr || hasHostShadow || !externalHandle.empty());
     }
-    
+
     bool canUseRdma() const { return hasRdmaAddr && rkey != 0; }
+    bool canUseUcx() const { return hasUcxAddr && !ucxPackedRkey.empty(); }
     bool canUseHostStaged() const { return hasHostShadow || !externalHandle.empty(); }
 };
 

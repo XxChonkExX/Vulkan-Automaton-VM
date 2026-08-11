@@ -262,12 +262,23 @@ public:
     
     // Progress UCX worker (call periodically or from dedicated thread)
     // MUST be called regularly to advance async operations (tag, RMA, AM).
-    // The caller is responsible for driving progress: either from a dedicated
-    // worker thread (polling with ucp_worker_progress) or by calling progress()
-    // from the application's event loop. Failure to call progress() will stall
+    // If a progress thread is running (startProgressThread()), it drives
+    // progress automatically. Otherwise the caller must call progress()
+    // from their own thread/event loop. Failure to advance progress stalls
     // all async operations indefinitely.
     // Thread-safe: can be called concurrently with async operations.
     void progress();
+
+    // Start a dedicated background progress thread. Spins ucp_worker_progress
+    // in a tight loop with a short sleep. Only one progress thread is created
+    // regardless of workerThreadCount (UCX progress is serial by nature).
+    // Returns false if thread already running or UCX not initialized.
+    bool startProgressThread();
+
+    // Signal the progress thread to stop and join it. Safe to call even if
+    // no progress thread was started. After this, caller must drive progress()
+    // manually or restart the thread.
+    void stopProgressThread();
 
     // Error model: UCX failures return false from async methods and log errors.
     // Callbacks are always invoked exactly once (on success or failure).
@@ -314,11 +325,18 @@ private:
 
     // UCX endpoint error handler (peer reset / connection failure).
     static void epErrorCallback(void* arg, ucp_ep_h ep, ucs_status_t status);
+
+    // Progress thread state
+    std::thread progressThread_;
+    std::atomic<bool> progressThreadStop_{false};
+    bool progressThreadRunning_ = false;
+
+    static void progressThreadLoop(UcxTransport* self);
 };
 
 #else // VVM_HAS_UCX
 
-// Stub when UCX not available
+// Standalone stub types (always available so non-UCX builds can reference them)
 struct UcxWorkerAddress {
     std::vector<uint8_t> bytes;
     bool empty() const { return bytes.empty(); }
@@ -333,27 +351,29 @@ struct UcxRmaKey {
     uint32_t deviceIndex = 0;
 };
 
+struct UcxMemoryHandle {
+    std::vector<uint8_t> packedRkey;
+    uint64_t remoteAddr = 0;
+    bool rkeyValid = false;
+};
+
+struct UcxEndpoint {
+    std::string peerKey;
+    uint32_t remoteNodeId = 0;
+    bool connected = false;
+};
+
 class UcxTransport {
 public:
+    struct UcxTransportConfig {};
+
     UcxTransport() = default;
     ~UcxTransport() = default;
-    
+
     bool initialize(const UcxTransportConfig&) { return false; }
     void shutdown() {}
     bool isInitialized() const { return false; }
-    
-    struct UcxMemoryHandle {
-        std::vector<uint8_t> packedRkey;
-        uint64_t remoteAddr = 0;
-        bool rkeyValid = false;
-    };
-    struct UcxEndpoint {
-        std::string peerKey;
-        uint32_t remoteNodeId = 0;
-        bool connected = false;
-    };
-    struct UcxTransportConfig {};
-    
+
     std::optional<UcxMemoryHandle> registerGpuMemory(void*, size_t, uint32_t) { return std::nullopt; }
     std::optional<UcxMemoryHandle> registerHostMemory(void*, size_t) { return std::nullopt; }
     void deregisterMemory(const UcxMemoryHandle&) {}
@@ -385,7 +405,9 @@ public:
     bool tagSendAsync(const UcxEndpoint&, const void*, size_t, uint64_t, std::function<void(bool)>) { return false; }
     bool tagRecvAsync(const UcxEndpoint&, void*, size_t, uint64_t, std::function<void(bool)>) { return false; }
     void progress() {}
-    
+    bool startProgressThread() { return false; }
+    void stopProgressThread() {}
+
     void* getContext() const { return nullptr; }
     void* getWorker() const { return nullptr; }
 };

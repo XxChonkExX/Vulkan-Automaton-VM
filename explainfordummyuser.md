@@ -189,6 +189,10 @@ config.ucxEnableCudaIpc = true;      // Intra-node GPU IPC
 | `tcp` | TCP/IP fallback |
 | `cuda_ipc` | CUDA IPC (intra-node GPU) |
 
+**Multi-Node Data Path:** When UCX is enabled, `sendTensor()` and `recvTensor()` automatically use UCX RMA (Remote Memory Access) for data transfer over the best available fabric (InfiniBand/RoCE/TCP). The existing TCP control plane still handles discovery and announcement — UCX augments it with worker addresses and RMA keys exchanged transparently. No separate bootstrap needed.
+
+**Progress Thread:** UCX async operations require regular progress. When `enableAsyncPipeline` is true (default), a background progress thread starts automatically — no manual `progress()` calls needed.
+
 **Attribution:** UCX (https://github.com/openucx/ucx) — BSD-3-Clause.
 
 ### GDRCopy-Style Persistent Host Pinning (NDKPI / Windows)

@@ -89,7 +89,11 @@ bool UcxTransport::initialize(const UcxTransportConfig& config) {
 
 void UcxTransport::shutdown() {
     if (!initialized_) return;
-    
+
+    // Stop progress thread before tearing down UCX context. The thread touches
+    // worker_ which ucp_worker_destroy invalidates.
+    stopProgressThread();
+
     // Invalidate the cached local worker address -- the worker is about to be
     // destroyed and any stale blob would be a use-after-free if accidentally
     // exchanged by a peer.
@@ -610,15 +614,6 @@ bool UcxTransport::getAsync(const UcxEndpoint& endpoint,
     }
     return true;
 }
-    
-    if (request != nullptr) {
-        // Request completed immediately - invoke callback before freeing
-        if (reqCtx->callback) reqCtx->callback(true);
-        ucp_request_free(request);
-        delete reqCtx;
-    }
-    return true;
-}
 
 bool UcxTransport::tagSendAsync(const UcxEndpoint& endpoint,
                                 const void* buffer, size_t size,
@@ -703,6 +698,39 @@ void UcxTransport::ucpRmaCallback(void* request, ucs_status_t status, void* user
         ctx->callback(status == UCS_OK);
     }
     delete ctx;
+}
+
+// ============================================================================
+// Progress Thread
+// ============================================================================
+
+bool UcxTransport::startProgressThread() {
+    if (progressThreadRunning_) return false;
+    if (!worker_) return false;
+
+    progressThreadStop_.store(false, std::memory_order_release);
+    progressThread_ = std::thread(progressThreadLoop, this);
+    progressThreadRunning_ = true;
+    return true;
+}
+
+void UcxTransport::stopProgressThread() {
+    if (!progressThreadRunning_) return;
+
+    progressThreadStop_.store(true, std::memory_order_release);
+    if (progressThread_.joinable()) {
+        progressThread_.join();
+    }
+    progressThreadRunning_ = false;
+}
+
+void UcxTransport::progressThreadLoop(UcxTransport* self) {
+    while (!self->progressThreadStop_.load(std::memory_order_acquire)) {
+        ucp_worker_progress(self->worker_);
+        // Yield to avoid burning CPU when idle. UCX progress is edge-triggered
+        // so a short sleep doesn't stall ops meaningfully.
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
 }
 
 } // namespace tensor
