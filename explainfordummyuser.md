@@ -6,6 +6,8 @@
 
 **One header, one library, zero system changes.** It's a library you link into your application — not a driver, not a daemon, not a kernel module.
 
+**Version**: 0.2.0-pre (pre-release)
+
 ---
 
 ## The Primary Feature: GPU Networking & RDMA

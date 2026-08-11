@@ -1,6 +1,7 @@
 #include "vulkan_vm/network/cluster_client.hpp"
 #include "vulkan_vm/network/tcp_transport.hpp"
 #include "vulkan_vm/network/network_types.hpp"
+#include "vulkan_vm/network/wire_format.hpp"
 #include "vulkan_vm/utils.hpp"
 
 #include <memory>
@@ -175,9 +176,7 @@ public:
         auto resp = sendRequest(MsgImport, req, timeoutNs);
         if (!resp || resp->type != MsgImport) return std::nullopt;
 
-        // Note: This would need access to local pool to create allocation
-        // For now, return the descriptor - actual allocation handled by caller
-        return std::nullopt; // Placeholder - actual implementation needs pool access
+        return deserializeImportResponse(resp->body);
     }
 
     std::future<std::optional<Allocation>> importRemoteAsync(
@@ -293,18 +292,44 @@ private:
     // Helper methods
     void registerNode() {
         NodeInfo info;
-        info.id = NodeId{config_.advertiseAddress.empty() ? "127.0.0.1" : config_.advertiseAddress, 
-                         static_cast<uint16_t>(config_.listenAddress.find(':') != std::string::npos ? 
+        info.id = NodeId{config_.advertiseAddress.empty() ? "127.0.0.1" : config_.advertiseAddress,
+                         static_cast<uint16_t>(config_.listenAddress.find(':') != std::string::npos ?
                                              std::stoul(config_.listenAddress.substr(config_.listenAddress.rfind(':') + 1)) : 51010),
                          0, ""};
-        info.gpuDevices = {"GPU0"}; // Placeholder
+        info.gpuDevices = enumerateGpuDevices();
         info.nicName = config_.nicName;
-        info.rdmaCapable = false; // Set based on actual capability
-        info.gpuDirectCapable = false;
+        info.rdmaCapable = config_.enableRdma;
+        info.gpuDirectCapable = config_.enableGpuDirect;
         info.timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
 
         registerNode(info);
+    }
+
+    std::vector<std::string> enumerateGpuDevices() {
+        std::vector<std::string> devices;
+        VkInstance instance = nullptr;
+        VkInstanceCreateInfo instInfo{};
+        instInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+        if (vkCreateInstance(&instInfo, nullptr, &instance) != VK_SUCCESS || !instance) {
+            devices.push_back("GPU0");
+            return devices;
+        }
+        uint32_t count = 0;
+        if (vkEnumeratePhysicalDevices(instance, &count, nullptr) != VK_SUCCESS || count == 0) {
+            vkDestroyInstance(instance, nullptr);
+            devices.push_back("GPU0");
+            return devices;
+        }
+        std::vector<VkPhysicalDevice> phys(count);
+        vkEnumeratePhysicalDevices(instance, &count, phys.data());
+        for (uint32_t i = 0; i < count; ++i) {
+            VkPhysicalDeviceProperties props;
+            vkGetPhysicalDeviceProperties(phys[i], &props);
+            devices.push_back(std::string("GPU") + std::to_string(i) + ":" + props.deviceName);
+        }
+        vkDestroyInstance(instance, nullptr);
+        return devices;
     }
 
     void sendLeaveCluster() {
@@ -317,59 +342,251 @@ private:
     std::optional<TcpMessage> sendRequest(uint32_t type, const TcpMessage& req, uint64_t timeoutNs) {
         if (!connected_ || !controlConnId_) return std::nullopt;
 
-        // Serialize request
-        // For simplicity, using the existing request/response mechanism
-        // In a full implementation, this would use the transport's request/response
+        if (!transport_) return std::nullopt;
 
-        // For now, return empty - this is a simplified implementation
-        VVM_LOG_DEBUG("Sending control request type {}", type);
-        return std::nullopt;
+        auto resp = transport_->request(*controlConnId_, type, req.body,
+                                        static_cast<uint32_t>(timeoutNs / 1000000));
+        if (!resp) return std::nullopt;
+
+        TcpMessage out;
+        out.type = type;
+        out.body = std::move(*resp);
+        return out;
     }
 
-    // Serialization helpers (simplified)
+    // Serialization helpers (wire-format big-endian, bounds-checked)
     std::vector<uint8_t> serializeAllocateRequest(const NodeId& target, VkDeviceSize size,
                                                   VkBufferUsageFlags usage, VkMemoryPropertyFlags flags,
                                                   bool enableRdma) {
         std::vector<uint8_t> data;
-        // Simplified serialization
+        wire::putStr(data, target.host);
+        wire::putU32(data, target.port);
+        wire::putU32(data, target.nodeIndex);
+        wire::putStr(data, target.uuid);
+        wire::putU64(data, static_cast<uint64_t>(size));
+        wire::putU64(data, static_cast<uint64_t>(usage));
+        wire::putU64(data, static_cast<uint64_t>(flags));
+        wire::putU8(data, enableRdma ? 1 : 0);
         return data;
     }
 
     std::optional<RemoteAllocationDesc> deserializeAllocateResponse(const std::vector<uint8_t>& data) {
-        return std::nullopt; // Placeholder
+        RemoteAllocationDesc desc;
+        const uint8_t* p = data.data();
+        const uint8_t* end = p + data.size();
+        if (!wire::getStr(p, end, desc.owner.host)) return std::nullopt;
+        uint32_t port = 0;
+        if (!wire::getU32(p, end, port)) return std::nullopt;
+        desc.owner.port = port;
+        if (!wire::getU32(p, end, desc.owner.nodeIndex)) return std::nullopt;
+        if (!wire::getStr(p, end, desc.owner.uuid)) return std::nullopt;
+        uint64_t size = 0;
+        if (!wire::getU64(p, end, size)) return std::nullopt;
+        desc.size = size;
+        uint64_t flagsVal = 0;
+        if (!wire::getU64(p, end, flagsVal)) return std::nullopt;
+        desc.usageFlags = static_cast<VkBufferUsageFlags>(flagsVal);
+        uint8_t rdma = 0;
+        if (!wire::getU8(p, end, rdma)) return std::nullopt;
+        desc.hasRdmaAddr = (rdma != 0);
+        if (desc.hasRdmaAddr) {
+            if (!wire::getU64(p, end, desc.rdmaAddr)) return std::nullopt;
+            if (!wire::getU32(p, end, desc.rkey)) return std::nullopt;
+        }
+        return desc;
     }
 
     std::vector<uint8_t> serializeExportRequest(uint64_t localAllocId, bool enableRdma, bool forceHostShadow) {
-        return {};
+        std::vector<uint8_t> data;
+        wire::putU64(data, localAllocId);
+        wire::putU8(data, enableRdma ? 1 : 0);
+        wire::putU8(data, forceHostShadow ? 1 : 0);
+        return data;
     }
 
     std::optional<RemoteAllocationDesc> deserializeExportResponse(const std::vector<uint8_t>& data) {
-        return std::nullopt;
+        return deserializeAllocateResponse(data);
+    }
+
+    std::optional<Allocation> deserializeImportResponse(const std::vector<uint8_t>& data) {
+        const uint8_t* p = data.data();
+        const uint8_t* end = p + data.size();
+        uint8_t ok = 0;
+        if (!wire::getU8(p, end, ok)) return std::nullopt;
+        if (ok == 0) return std::nullopt;
+        Allocation alloc;
+        uint64_t size = 0;
+        if (!wire::getU64(p, end, size)) return std::nullopt;
+        alloc.size = size;
+        uint64_t buffer64 = 0;
+        if (!wire::getU64(p, end, buffer64)) return std::nullopt;
+        alloc.buffer = reinterpret_cast<VkBuffer>(static_cast<uintptr_t>(buffer64));
+        uint64_t memory64 = 0;
+        if (!wire::getU64(p, end, memory64)) return std::nullopt;
+        alloc.memory = reinterpret_cast<VkDeviceMemory>(static_cast<uintptr_t>(memory64));
+        uint64_t hostPtr64 = 0;
+        if (!wire::getU64(p, end, hostPtr64)) return std::nullopt;
+        alloc.hostPtr = reinterpret_cast<void*>(static_cast<uintptr_t>(hostPtr64));
+        uint64_t devAddr64 = 0;
+        if (!wire::getU64(p, end, devAddr64)) return std::nullopt;
+        alloc.deviceAddress = devAddr64;
+        uint64_t offset = 0;
+        if (!wire::getU64(p, end, offset)) return std::nullopt;
+        alloc.offset = offset;
+        uint64_t blockIdx = 0;
+        if (!wire::getU64(p, end, blockIdx)) return std::nullopt;
+        alloc.blockIndex = static_cast<uint32_t>(blockIdx);
+        uint64_t usageVal = 0;
+        if (!wire::getU64(p, end, usageVal)) return std::nullopt;
+        alloc.usage = static_cast<VkBufferUsageFlags>(usageVal);
+        uint8_t mapped = 0;
+        if (!wire::getU8(p, end, mapped)) return std::nullopt;
+        alloc.mapped = (mapped != 0);
+        if (!wire::getStr(p, end, alloc.name)) return std::nullopt;
+        return alloc;
     }
 
     std::vector<uint8_t> serializeImportRequest(const RemoteAllocationDesc& desc, VkBufferUsageFlags usage) {
-        return {};
+        std::vector<uint8_t> data;
+        wire::putStr(data, desc.owner.host);
+        wire::putU32(data, desc.owner.port);
+        wire::putU32(data, desc.owner.nodeIndex);
+        wire::putStr(data, desc.owner.uuid);
+        wire::putU64(data, desc.size);
+        wire::putU64(data, static_cast<uint64_t>(usage));
+        wire::putU64(data, static_cast<uint64_t>(desc.usageFlags));
+        wire::putU8(data, desc.hasRdmaAddr ? 1 : 0);
+        if (desc.hasRdmaAddr) {
+            wire::putU64(data, desc.rdmaAddr);
+            wire::putU32(data, desc.rkey);
+        }
+        wire::putU8(data, desc.hasUcxAddr ? 1 : 0);
+        if (desc.hasUcxAddr) {
+            wire::putBytes(data, desc.ucxWorkerAddr);
+            wire::putBytes(data, desc.ucxPackedRkey);
+            wire::putU64(data, desc.ucxRemoteAddr);
+            wire::putU32(data, desc.ucxDeviceIndex);
+        }
+        wire::putU8(data, desc.hasHostShadow ? 1 : 0);
+        wire::putBytes(data, desc.externalHandle);
+        wire::putStr(data, desc.allocationName);
+        return data;
     }
 
     std::vector<uint8_t> serializeMigrateRequest(const RemoteAllocationDesc& source,
                                                  uint64_t destinationAllocId, bool useRdma) {
-        return {};
+        std::vector<uint8_t> data;
+        wire::putStr(data, source.owner.host);
+        wire::putU32(data, source.owner.port);
+        wire::putU32(data, source.owner.nodeIndex);
+        wire::putStr(data, source.owner.uuid);
+        wire::putU64(data, source.size);
+        wire::putU64(data, source.localAllocId);
+        wire::putU8(data, source.hasRdmaAddr ? 1 : 0);
+        if (source.hasRdmaAddr) {
+            wire::putU64(data, source.rdmaAddr);
+            wire::putU32(data, source.rkey);
+        }
+        wire::putU64(data, destinationAllocId);
+        wire::putU8(data, useRdma ? 1 : 0);
+        return data;
     }
 
     std::optional<NetworkMigrationOperation> deserializeMigrateResponse(const std::vector<uint8_t>& data) {
-        return std::nullopt;
+        NetworkMigrationOperation op;
+        const uint8_t* p = data.data();
+        const uint8_t* end = p + data.size();
+        uint64_t opId = 0;
+        if (!wire::getU64(p, end, opId)) return std::nullopt;
+        op.operationId = opId;
+        uint8_t useRdma = 0;
+        if (!wire::getU8(p, end, useRdma)) return std::nullopt;
+        op.useRdma = (useRdma != 0);
+        uint64_t dstId = 0;
+        if (!wire::getU64(p, end, dstId)) return std::nullopt;
+        op.destinationAllocId = dstId;
+        uint8_t completed = 0;
+        if (!wire::getU8(p, end, completed)) return std::nullopt;
+        op.completed = (completed != 0);
+        if (!wire::getStr(p, end, op.errorMessage)) return std::nullopt;
+        return op;
     }
 
     std::vector<uint8_t> serializeNodeInfo(const NodeInfo& info) {
-        return {};
+        std::vector<uint8_t> data;
+        wire::putStr(data, info.id.host);
+        wire::putU32(data, info.id.port);
+        wire::putU32(data, info.id.nodeIndex);
+        wire::putStr(data, info.id.uuid);
+        wire::putU32(data, static_cast<uint32_t>(info.gpuDevices.size()));
+        for (const auto& dev : info.gpuDevices) {
+            wire::putStr(data, dev);
+        }
+        wire::putStr(data, info.nicName);
+        wire::putU8(data, info.rdmaCapable ? 1 : 0);
+        wire::putU8(data, info.gpuDirectCapable ? 1 : 0);
+        wire::putU64(data, info.timestamp);
+        wire::putU64(data, info.caps.totalVram);
+        wire::putU64(data, info.caps.availableVram);
+        wire::putU8(data, info.caps.supportsRdmaAddr ? 1 : 0);
+        wire::putU8(data, info.caps.supportsDmaBuf ? 1 : 0);
+        wire::putU8(data, info.caps.supportsOpaqueFd ? 1 : 0);
+        wire::putU8(data, info.caps.supportsOpaqueWin32 ? 1 : 0);
+        wire::putU8(data, info.caps.supportsD3D12Heap ? 1 : 0);
+        return data;
     }
 
     std::optional<std::vector<NodeInfo>> deserializeNodeList(const std::vector<uint8_t>& data) {
-        return std::nullopt;
+        std::vector<NodeInfo> list;
+        const uint8_t* p = data.data();
+        const uint8_t* end = p + data.size();
+        uint32_t count = 0;
+        if (!wire::getU32(p, end, count)) return std::nullopt;
+        for (uint32_t i = 0; i < count; ++i) {
+            NodeInfo info;
+            if (!wire::getStr(p, end, info.id.host)) return std::nullopt;
+            uint32_t port = 0;
+            if (!wire::getU32(p, end, port)) return std::nullopt;
+            info.id.port = port;
+            if (!wire::getU32(p, end, info.id.nodeIndex)) return std::nullopt;
+            if (!wire::getStr(p, end, info.id.uuid)) return std::nullopt;
+            uint32_t devCount = 0;
+            if (!wire::getU32(p, end, devCount)) return std::nullopt;
+            info.gpuDevices.resize(devCount);
+            for (uint32_t d = 0; d < devCount; ++d) {
+                if (!wire::getStr(p, end, info.gpuDevices[d])) return std::nullopt;
+            }
+            if (!wire::getStr(p, end, info.nicName)) return std::nullopt;
+            uint8_t v = 0;
+            if (!wire::getU8(p, end, v)) return std::nullopt;
+            info.rdmaCapable = (v != 0);
+            if (!wire::getU8(p, end, v)) return std::nullopt;
+            info.gpuDirectCapable = (v != 0);
+            if (!wire::getU64(p, end, info.timestamp)) return std::nullopt;
+            if (!wire::getU64(p, end, info.caps.totalVram)) return std::nullopt;
+            if (!wire::getU64(p, end, info.caps.availableVram)) return std::nullopt;
+            if (!wire::getU8(p, end, v)) return std::nullopt;
+            info.caps.supportsRdmaAddr = (v != 0);
+            if (!wire::getU8(p, end, v)) return std::nullopt;
+            info.caps.supportsDmaBuf = (v != 0);
+            if (!wire::getU8(p, end, v)) return std::nullopt;
+            info.caps.supportsOpaqueFd = (v != 0);
+            if (!wire::getU8(p, end, v)) return std::nullopt;
+            info.caps.supportsOpaqueWin32 = (v != 0);
+            if (!wire::getU8(p, end, v)) return std::nullopt;
+            info.caps.supportsD3D12Heap = (v != 0);
+            list.push_back(std::move(info));
+        }
+        return list;
     }
 
     std::vector<uint8_t> serializeHeartbeat(const NodeId& node) {
-        return {};
+        std::vector<uint8_t> data;
+        wire::putStr(data, node.host);
+        wire::putU32(data, node.port);
+        wire::putU32(data, node.nodeIndex);
+        wire::putStr(data, node.uuid);
+        return data;
     }
 };
 
