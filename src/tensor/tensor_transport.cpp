@@ -56,240 +56,6 @@ size_t packedElemSize(DataType dt) {
     }
 }
 
-// Read one logical element. For packed Int4, index tells which nibble.
-double readElem(DataType dt, const uint8_t* base, size_t index) {
-    if (dt == DataType::Int4) {
-        const uint8_t raw = base[index / 2];
-        const int8_t lo = (raw & 0x8u) ? static_cast<int8_t>(raw | 0xF0u)
-                                       : static_cast<int8_t>(raw & 0x0Fu);
-        const int8_t hi = (raw & 0x80u) ? static_cast<int8_t>(raw >> 4)
-                                        : static_cast<int8_t>(raw & 0xF0u);
-        return static_cast<double>(index % 2 ? hi : lo);
-    }
-    const uint8_t* p = base + index * packedElemSize(dt);
-    switch (dt) {
-        case DataType::Float32: {
-            float v;
-            std::memcpy(&v, p, sizeof(v));
-            return static_cast<double>(v);
-        }
-        case DataType::Float16: {
-            uint16_t h;
-            std::memcpy(&h, p, sizeof(h));
-            const uint32_t sign = (h & 0x8000u) << 16;
-            const uint32_t exp = (h >> 10) & 0x1Fu;
-            const uint32_t man = h & 0x3FFu;
-            uint32_t f;
-            if (exp == 31) {
-                f = sign | 0x7F800000u | (man << 13);
-            } else if (exp == 0) {
-                if (man == 0) {
-                    f = sign;
-                } else {
-                    int e = -14;
-                    uint32_t m = man;
-                    while (!(m & 0x400u)) { m <<= 1; --e; }
-                    f = sign | ((e + 127) << 23) | ((m & 0x3FFu) << 13);
-                }
-            } else {
-                f = sign | ((exp - 15 + 127) << 23) | (man << 13);
-            }
-            float out;
-            std::memcpy(&out, &f, sizeof(out));
-            return static_cast<double>(out);
-        }
-        case DataType::BFloat16: {
-            uint16_t h;
-            std::memcpy(&h, p, sizeof(h));
-            const uint32_t f = static_cast<uint32_t>(h) << 16;
-            float out;
-            std::memcpy(&out, &f, sizeof(out));
-            return static_cast<double>(out);
-        }
-        case DataType::Float8_E4M3: {
-            const uint8_t v = *p;
-            const uint32_t sign = (v & 0x80u) << 24;
-            const uint32_t exp = (v >> 3) & 0xFu;
-            const uint32_t man = v & 0x7u;
-            uint32_t f;
-            if (exp == 15) {
-                f = sign | 0x7F800000u | (man << 23);
-            } else if (exp == 0) {
-                if (man == 0) {
-                    f = sign;
-                } else {
-                    int e = -6;
-                    uint32_t m = man | 0x8u;
-                    while (!(m & 0x8u)) { m <<= 1; --e; }
-                    f = sign | ((e + 127) << 23) | ((m & 0x7u) << 20);
-                }
-            } else {
-                f = sign | ((exp - 3 + 127) << 23) | (man << 20);
-            }
-            float out;
-            std::memcpy(&out, &f, sizeof(out));
-            return static_cast<double>(out);
-        }
-        case DataType::Float8_E5M2: {
-            const uint8_t v = *p;
-            const uint32_t sign = (v & 0x80u) << 24;
-            const uint32_t exp = (v >> 2) & 0x1Fu;
-            const uint32_t man = v & 0x3u;
-            uint32_t f;
-            if (exp == 31) {
-                f = sign | 0x7F800000u | (man << 23);
-            } else if (exp == 0) {
-                if (man == 0) {
-                    f = sign;
-                } else {
-                    int e = -14;
-                    uint32_t m = man;
-                    while (!(m & 0x4u)) { m <<= 1; --e; }
-                    f = sign | ((e + 127) << 23) | ((m & 0x3u) << 21);
-                }
-            } else {
-                f = sign | ((exp - 15 + 127) << 23) | (man << 21);
-            }
-            float out;
-            std::memcpy(&out, &f, sizeof(out));
-            return static_cast<double>(out);
-        }
-        case DataType::Bool: {
-            return (static_cast<int8_t>(*p) != 0) ? 1.0 : 0.0;
-        }
-        case DataType::Int8: return static_cast<double>(*reinterpret_cast<const int8_t*>(p));
-        case DataType::UInt8: return static_cast<double>(*reinterpret_cast<const uint8_t*>(p));
-        case DataType::Int32: return static_cast<double>(*reinterpret_cast<const int32_t*>(p));
-        case DataType::Int64: return static_cast<double>(*reinterpret_cast<const int64_t*>(p));
-        default: return 0.0;
-    }
-}
-
-void writeElem(DataType dt, uint8_t* base, size_t index, double v) {
-    if (dt == DataType::Int4) {
-        // Clamp and sign-pack into the nibble: low nibble element 0, high element 1.
-        int8_t n = static_cast<int8_t>(std::lround(v));
-        if (n < -8) n = -8;
-        if (n > 7) n = 7;
-        const uint8_t nib = static_cast<uint8_t>(n & 0x0Fu);
-        uint8_t& cell = base[index / 2];
-        if (index % 2) { cell = static_cast<uint8_t>((cell & 0x0Fu) | (nib << 4)); }
-        else { cell = static_cast<uint8_t>((cell & 0xF0u) | nib); }
-        return;
-    }
-    uint8_t* p = base + index * packedElemSize(dt);
-    switch (dt) {
-        case DataType::Float32: {
-            const float f = static_cast<float>(v);
-            std::memcpy(p, &f, sizeof(f));
-            break;
-        }
-        case DataType::Float16: {
-            const double d = v;
-            const uint32_t sign = (std::signbit(d) ? 1u : 0u) << 31;
-            const double a = std::fabs(d);
-            uint32_t f;
-            uint32_t exp32;
-            uint32_t man32;
-            std::memcpy(&f, &a, sizeof(f));
-            exp32 = (f >> 23) & 0xFFu;
-            man32 = f & 0x7FFFFFu;
-            uint16_t h;
-            if (exp32 == 0xFFu) {
-                h = static_cast<uint16_t>((sign >> 16) | 0x7C00u | (man32 ? 0x200u : 0u));
-            } else {
-                const int32_t e = static_cast<int32_t>(exp32) - 127 + 15;
-                if (e >= 31) {
-                    h = static_cast<uint16_t>((sign >> 16) | 0x7C00u);
-                } else if (e <= 0) {
-                    if (e < -10) {
-                        h = static_cast<uint16_t>(sign >> 16);
-                    } else {
-                        const uint32_t m = man32 | 0x800000u;
-                        const uint32_t shifted = m >> (13 - e);
-                        if (e <= -25) h = static_cast<uint16_t>(sign >> 16);
-                        else if (m & ((1u << (13 - e)) - 1)) {
-                            h = static_cast<uint16_t>((sign >> 16) | (shifted >> 13) | 0x1u);
-                        } else h = static_cast<uint16_t>((sign >> 16) | (shifted >> 13));
-                    }
-                } else {
-                    h = static_cast<uint16_t>((sign >> 16) | (static_cast<uint32_t>(e) << 10) | (man32 >> 13));
-                }
-            }
-            std::memcpy(p, &h, sizeof(h));
-            break;
-        }
-        case DataType::BFloat16: {
-            const float f = static_cast<float>(v);
-            uint32_t bits;
-            std::memcpy(&bits, &f, sizeof(bits));
-            // Round-to-nearest-even by adding half an ULP in the low 16 bits.
-            const uint32_t rounded = bits + 0x7FFFu + ((bits >> 16) & 1u);
-            uint16_t out = static_cast<uint16_t>(rounded >> 16);
-            std::memcpy(p, &out, sizeof(out));
-            break;
-        }
-        case DataType::Float8_E4M3: {
-            const double d = v;
-            const uint32_t sign = (std::signbit(d) ? 1u : 0u) << 31;
-            const double a = std::fabs(d);
-            if (a == 0.0) { *p = static_cast<uint8_t>(sign >> 24); break; }
-            uint32_t f;
-            std::memcpy(&f, &a, sizeof(f));
-            const int32_t e = static_cast<int32_t>((f >> 23) & 0xFFu) - 127;
-            const uint32_t man = f & 0x7FFFFFu;
-            uint8_t out;
-            if (e > 15) { out = 0xFFu; }             // inf (sat max)
-            else if (e >= 3) {
-                const uint32_t m2 = man >> 20;
-                out = static_cast<uint8_t>(sign | ((static_cast<uint32_t>(e + 3)) << 3) | (m2 & 0x7u));
-            } else if (e >= -6) {
-                const int shift = 20 - (e + 6);
-                const uint32_t m = man | 0x800000u;
-                const uint32_t m2 = shift >= 0 ? (m >> shift) : (m << (-shift));
-                const uint32_t r = shift >= 0 ? (m & ((1u << shift) - 1u)) : 0;
-                out = static_cast<uint8_t>(sign | ((m2 >> 3) & 0x7u) | (r ? 1u : 0u));
-            } else {
-                out = static_cast<uint8_t>(sign);
-            }
-            *p = out;
-            break;
-        }
-        case DataType::Float8_E5M2: {
-            const double d = v;
-            const uint32_t sign = (std::signbit(d) ? 1u : 0u) << 31;
-            if (d == 0.0) { *p = static_cast<uint8_t>(sign >> 24); break; }
-            uint32_t f;
-            const double a = std::fabs(d);
-            std::memcpy(&f, &a, sizeof(f));
-            const int32_t e = static_cast<int32_t>((f >> 23) & 0xFFu) - 127;
-            const uint32_t man = f & 0x7FFFFFu;
-            uint8_t out;
-            if (e > 15) {
-                out = static_cast<uint8_t>(0xFFu);  // saturate to inf (E5M2 max)
-            } else if (e >= -14) {
-                out = static_cast<uint8_t>(sign | ((static_cast<uint32_t>(e + 15)) << 2) | ((man >> 21) & 0x3u));
-            } else {
-                const int shift = -14 - e + 21;
-                const uint32_t m = man | 0x800000u;
-                const uint32_t m2 = m >> shift;
-                out = static_cast<uint8_t>(sign | (m2 & 0x3u));
-            }
-            *p = out;
-            break;
-        }
-        case DataType::Bool: {
-            *p = static_cast<uint8_t>(v != 0.0 ? 1 : 0);
-            break;
-        }
-        case DataType::Int8: *reinterpret_cast<int8_t*>(p) = static_cast<int8_t>(std::lround(v)); break;
-        case DataType::UInt8: *reinterpret_cast<uint8_t*>(p) = static_cast<uint8_t>(std::lround(v)); break;
-        case DataType::Int32: *reinterpret_cast<int32_t*>(p) = static_cast<int32_t>(std::llround(v)); break;
-        case DataType::Int64: *reinterpret_cast<int64_t*>(p) = static_cast<int64_t>(std::llround(v)); break;
-        default: break;
-    }
-}
-
 // Accumulate `src` into `dst` element-wise: dst[i] = dst[i] OP src[i].
 // Bitwise ops run over the raw byte representation of integer types.
 bool combineInto(ReduceOp op, DataType dt, uint8_t* dst, const uint8_t* src,
@@ -362,6 +128,265 @@ void initReduceOp(ReduceOp op, DataType dt, uint8_t* dst, size_t byteCount) {
 } // namespace
 
 // ============================================================================
+// Dtype conversion primitives (declared in tensor_transport.hpp)
+// ============================================================================
+
+double readElem(DataType dt, const uint8_t* base, size_t index) {
+    if (dt == DataType::Int4) {
+        const uint8_t raw = base[index / 2];
+        if (index % 2 == 0) {
+            // Low nibble: bits 0-3, sign bit is bit 3
+            const uint8_t nib = raw & 0x0Fu;
+            const int8_t val = static_cast<int8_t>((nib & 0x8u) ? (nib | 0xF0u) : nib);
+            return static_cast<double>(val);
+        } else {
+            // High nibble: bits 4-7, sign bit is bit 7
+            const uint8_t nib = static_cast<uint8_t>(raw >> 4) & 0x0Fu;
+            const int8_t val = static_cast<int8_t>((nib & 0x8u) ? (nib | 0xF0u) : nib);
+            return static_cast<double>(val);
+        }
+    }
+    const uint8_t* p = base + index * packedElemSize(dt);
+    switch (dt) {
+        case DataType::Float32: {
+            float v;
+            std::memcpy(&v, p, sizeof(v));
+            return static_cast<double>(v);
+        }
+        case DataType::Float16: {
+            uint16_t h;
+            std::memcpy(&h, p, sizeof(h));
+            const uint32_t sign = (h & 0x8000u) << 16;
+            const uint32_t exp = (h >> 10) & 0x1Fu;
+            const uint32_t man = h & 0x3FFu;
+            uint32_t f;
+            if (exp == 31) {
+                f = sign | 0x7F800000u | (man << 13);
+            } else if (exp == 0) {
+                if (man == 0) {
+                    f = sign;
+                } else {
+                    int e = -14;
+                    uint32_t m = man;
+                    while (!(m & 0x400u)) { m <<= 1; --e; }
+                    f = sign | ((e + 127) << 23) | ((m & 0x3FFu) << 13);
+                }
+            } else {
+                f = sign | ((exp - 15 + 127) << 23) | (man << 13);
+            }
+            float out;
+            std::memcpy(&out, &f, sizeof(out));
+            return static_cast<double>(out);
+        }
+        case DataType::BFloat16: {
+            uint16_t h;
+            std::memcpy(&h, p, sizeof(h));
+            const uint32_t f = static_cast<uint32_t>(h) << 16;
+            float out;
+            std::memcpy(&out, &f, sizeof(out));
+            return static_cast<double>(out);
+        }
+        case DataType::Float8_E4M3: {
+            // E4M3: 1 sign, 4 exp (bias=3), 3 mantissa
+            // exp=0: subnormal (man!=0) or zero (man==0)
+            // exp=1..14: normal = (-1)^s * 2^(exp-3) * (1 + man/8)
+            // exp=15: inf (man==0) or NaN (man!=0)
+            const uint8_t v = *p;
+            const uint32_t sign = (v & 0x80u) << 24;
+            const uint32_t exp = (v >> 3) & 0xFu;
+            const uint32_t man = v & 0x7u;
+            uint32_t f;
+            if (exp == 15) {
+                // inf or NaN
+                f = sign | 0x7F800000u | (man << 20);
+            } else if (exp == 0) {
+                if (man == 0) {
+                    f = sign;  // ±0
+                } else {
+                    // Subnormal: value = (-1)^s * 2^(-5) * man
+                    // Normalize: shift man left until leading 1 is at bit 2
+                    int shift = 0;
+                    uint32_t m = man;
+                    while ((m & 0x4u) == 0) { m <<= 1; ++shift; }
+                    // value = (1 + (m&0x3)/4) * 2^(-3-shift)
+                    // Mantissa: (m&0x3) occupies 2 bits → shift to bits 22-21
+                    f = sign | ((124 - shift) << 23) | ((m & 0x3u) << 21);
+                }
+            } else {
+                f = sign | ((exp - 3 + 127) << 23) | (man << 20);
+            }
+            float out;
+            std::memcpy(&out, &f, sizeof(out));
+            return static_cast<double>(out);
+        }
+        case DataType::Float8_E5M2: {
+            // E5M2: 1 sign, 5 exp (bias=15), 2 mantissa
+            // exp=0: subnormal (man!=0) or zero (man==0)
+            // exp=1..30: normal = (-1)^s * 2^(exp-15) * (1 + man/4)
+            // exp=31: inf (man==0) or NaN (man!=0)
+            const uint8_t v = *p;
+            const uint32_t sign = (v & 0x80u) << 24;
+            const uint32_t exp = (v >> 2) & 0x1Fu;
+            const uint32_t man = v & 0x3u;
+            uint32_t f;
+            if (exp == 31) {
+                // inf or NaN
+                f = sign | 0x7F800000u | (man << 21);
+            } else if (exp == 0) {
+                if (man == 0) {
+                    f = sign;  // ±0
+                } else {
+                    // Subnormal: value = (-1)^s * 2^(-14) * man
+                    // Normalize: shift man left until leading 1 is at bit 1
+                    int shift = 0;
+                    uint32_t m = man;
+                    while ((m & 0x2u) == 0) { m <<= 1; ++shift; }
+                    // value = (1 + (m&1)/2) * 2^(-13-shift)
+                    // Mantissa: (m&1) occupies 1 bit → shift to bit 22
+                    f = sign | ((114 - shift) << 23) | ((m & 0x1u) << 22);
+                }
+            } else {
+                f = sign | ((exp - 15 + 127) << 23) | (man << 21);
+            }
+            float out;
+            std::memcpy(&out, &f, sizeof(out));
+            return static_cast<double>(out);
+        }
+        case DataType::Bool: {
+            return (static_cast<int8_t>(*p) != 0) ? 1.0 : 0.0;
+        }
+        case DataType::Int8: return static_cast<double>(*reinterpret_cast<const int8_t*>(p));
+        case DataType::UInt8: return static_cast<double>(*reinterpret_cast<const uint8_t*>(p));
+        case DataType::Int32: return static_cast<double>(*reinterpret_cast<const int32_t*>(p));
+        case DataType::Int64: return static_cast<double>(*reinterpret_cast<const int64_t*>(p));
+        default: return 0.0;
+    }
+}
+
+void writeElem(DataType dt, uint8_t* base, size_t index, double v) {
+    if (dt == DataType::Int4) {
+        int8_t n = static_cast<int8_t>(std::lround(v));
+        if (n < -8) n = -8;
+        if (n > 7) n = 7;
+        const uint8_t nib = static_cast<uint8_t>(n & 0x0Fu);
+        uint8_t& cell = base[index / 2];
+        if (index % 2) { cell = static_cast<uint8_t>((cell & 0x0Fu) | (nib << 4)); }
+        else { cell = static_cast<uint8_t>((cell & 0xF0u) | nib); }
+        return;
+    }
+    uint8_t* p = base + index * packedElemSize(dt);
+    switch (dt) {
+        case DataType::Float32: {
+            const float f = static_cast<float>(v);
+            std::memcpy(p, &f, sizeof(f));
+            break;
+        }
+        case DataType::Float16: {
+            const double d = v;
+            const uint32_t sign = (std::signbit(d) ? 1u : 0u) << 31;
+            const double a = std::fabs(d);
+            uint32_t f;
+            uint32_t exp32;
+            uint32_t man32;
+            std::memcpy(&f, &a, sizeof(f));
+            exp32 = (f >> 23) & 0xFFu;
+            man32 = f & 0x7FFFFFu;
+            uint16_t h;
+            if (exp32 == 0xFFu) {
+                h = static_cast<uint16_t>((sign >> 16) | 0x7C00u | (man32 ? 0x200u : 0u));
+            } else {
+                const int32_t e = static_cast<int32_t>(exp32) - 127 + 15;
+                if (e >= 31) {
+                    h = static_cast<uint16_t>((sign >> 16) | 0x7C00u);
+                } else if (e <= 0) {
+                    if (e < -10) {
+                        h = static_cast<uint16_t>(sign >> 16);
+                    } else {
+                        const uint32_t m = man32 | 0x800000u;
+                        const uint32_t shifted = m >> (13 - e);
+                        if (e <= -25) h = static_cast<uint16_t>(sign >> 16);
+                        else if (m & ((1u << (13 - e)) - 1)) {
+                            h = static_cast<uint16_t>((sign >> 16) | (shifted >> 13) | 0x1u);
+                        } else h = static_cast<uint16_t>((sign >> 16) | (shifted >> 13));
+                    }
+                } else {
+                    h = static_cast<uint16_t>((sign >> 16) | (static_cast<uint32_t>(e) << 10) | (man32 >> 13));
+                }
+            }
+            std::memcpy(p, &h, sizeof(h));
+            break;
+        }
+        case DataType::BFloat16: {
+            const float f = static_cast<float>(v);
+            uint32_t bits;
+            std::memcpy(&bits, &f, sizeof(bits));
+            const uint32_t rounded = bits + 0x7FFFu + ((bits >> 16) & 1u);
+            uint16_t out = static_cast<uint16_t>(rounded >> 16);
+            std::memcpy(p, &out, sizeof(out));
+            break;
+        }
+        case DataType::Float8_E4M3: {
+            const double d = v;
+            const uint32_t sign = (std::signbit(d) ? 1u : 0u) << 31;
+            const double a = std::fabs(d);
+            if (a == 0.0) { *p = static_cast<uint8_t>(sign >> 24); break; }
+            uint32_t f;
+            std::memcpy(&f, &a, sizeof(f));
+            const int32_t e = static_cast<int32_t>((f >> 23) & 0xFFu) - 127;
+            const uint32_t man = f & 0x7FFFFFu;
+            uint8_t out;
+            if (e > 15) { out = 0xFFu; }
+            else if (e >= 3) {
+                const uint32_t m2 = man >> 20;
+                out = static_cast<uint8_t>(sign | ((static_cast<uint32_t>(e + 3)) << 3) | (m2 & 0x7u));
+            } else if (e >= -6) {
+                const int shift = 20 - (e + 6);
+                const uint32_t m = man | 0x800000u;
+                const uint32_t m2 = shift >= 0 ? (m >> shift) : (m << (-shift));
+                const uint32_t r = shift >= 0 ? (m & ((1u << shift) - 1u)) : 0;
+                out = static_cast<uint8_t>(sign | ((m2 >> 3) & 0x7u) | (r ? 1u : 0u));
+            } else {
+                out = static_cast<uint8_t>(sign);
+            }
+            *p = out;
+            break;
+        }
+        case DataType::Float8_E5M2: {
+            const double d = v;
+            const uint32_t sign = (std::signbit(d) ? 1u : 0u) << 31;
+            if (d == 0.0) { *p = static_cast<uint8_t>(sign >> 24); break; }
+            uint32_t f;
+            const double a = std::fabs(d);
+            std::memcpy(&f, &a, sizeof(f));
+            const int32_t e = static_cast<int32_t>((f >> 23) & 0xFFu) - 127;
+            const uint32_t man = f & 0x7FFFFFu;
+            uint8_t out;
+            if (e > 15) {
+                out = static_cast<uint8_t>(0xFFu);
+            } else if (e >= -14) {
+                out = static_cast<uint8_t>(sign | ((static_cast<uint32_t>(e + 15)) << 2) | ((man >> 21) & 0x3u));
+            } else {
+                const int shift = -14 - e + 21;
+                const uint32_t m = man | 0x800000u;
+                const uint32_t m2 = m >> shift;
+                out = static_cast<uint8_t>(sign | (m2 & 0x3u));
+            }
+            *p = out;
+            break;
+        }
+        case DataType::Bool: {
+            *p = static_cast<uint8_t>(v != 0.0 ? 1 : 0);
+            break;
+        }
+        case DataType::Int8: *reinterpret_cast<int8_t*>(p) = static_cast<int8_t>(std::lround(v)); break;
+        case DataType::UInt8: *reinterpret_cast<uint8_t*>(p) = static_cast<uint8_t>(std::lround(v)); break;
+        case DataType::Int32: *reinterpret_cast<int32_t*>(p) = static_cast<int32_t>(std::llround(v)); break;
+        case DataType::Int64: *reinterpret_cast<int64_t*>(p) = static_cast<int64_t>(std::llround(v)); break;
+        default: break;
+    }
+}
+
+// ============================================================================
 // Tensor Shape Static Methods
 // ============================================================================
 
@@ -380,6 +405,7 @@ TensorShape TensorShape::makeContiguous(const std::vector<int64_t>& dims) {
 
 TensorShape TensorShape::makeChannelsLast(const std::vector<int64_t>& dims) {
     // NHWC: [N, H, W, C] -> strides = [H*W*C, W*C, C, 1]
+    // Only valid for rank-4 tensors; returns empty strides otherwise.
     TensorShape shape;
     shape.dims = dims;
     if (dims.size() == 4) {
@@ -393,9 +419,30 @@ TensorShape TensorShape::makeChannelsLast(const std::vector<int64_t>& dims) {
     return shape;
 }
 
+bool TensorShape::isChannelsLast() const {
+    if (dims.size() != 4 || strides.size() != 4) return false;
+    return strides[3] == 1 &&
+           strides[2] == dims[3] &&
+           strides[1] == dims[2] * dims[3] &&
+           strides[0] == dims[1] * dims[2] * dims[3];
+}
+
 TensorShape TensorShape::makeBlocked(const std::vector<int64_t>& dims, int blockSize) {
-    // Simple blocked layout - in practice would be more complex
-    return makeContiguous(dims);
+    // Blocked layout: elements are arranged in blocks of blockSize for
+    // cache-friendly access. Strides account for the block structure.
+    TensorShape shape;
+    shape.dims = dims;
+    if (dims.empty() || blockSize <= 0) return shape;
+
+    // Pad each dimension to a multiple of blockSize
+    shape.strides.resize(dims.size());
+    int64_t stride = 1;
+    for (int i = static_cast<int>(dims.size()) - 1; i >= 0; --i) {
+        int64_t padded = ((dims[i] + blockSize - 1) / blockSize) * blockSize;
+        shape.strides[i] = stride;
+        stride *= padded;
+    }
+    return shape;
 }
 
 // ============================================================================
@@ -732,13 +779,15 @@ public:
     // ========================================================================
     
     bool convertLayoutShader(const TensorHandle& src, const TensorHandle& dst, MemoryLayout targetLayout) {
-        // For now, implement basic NHWC↔NCHW conversion
-        // In production, would have a library of conversion shaders
-        
+        // Only NHWC↔NCHW is supported via shader. Other combinations return false
+        // so callers can fall back to CPU permute or report unsupported conversion.
         if (src->metadata.layout == MemoryLayout::ChannelsLast && targetLayout == MemoryLayout::Contiguous) {
             return runLayoutConversion(src, dst, "NHWC_to_NCHW");
         } else if (src->metadata.layout == MemoryLayout::Contiguous && targetLayout == MemoryLayout::ChannelsLast) {
             return runLayoutConversion(src, dst, "NCHW_to_NHWC");
+        } else if (src->metadata.layout == targetLayout) {
+            // Same layout — no conversion needed, just copy
+            return copyTensor(src, dst);
         }
         
         VVM_LOG_WARN("Layout conversion from {} to {} not yet implemented",
@@ -1022,45 +1071,40 @@ public:
     VkShaderModule createLayoutConversionShader(VkDevice device, const std::string& shaderName) {
         // Load compiled SPIR-V shader from file
         // The shader is compiled at build time by glslangValidator
-        
-        std::string shaderPath;
-        if (shaderName == "NHWC_to_NCHW" || shaderName == "NCHW_to_NHWC") {
-            shaderPath = "shaders/layout_conversion.spv";
-        } else {
+
+        if (shaderName != "NHWC_to_NCHW" && shaderName != "NCHW_to_NHWC") {
             VVM_LOG_WARN("Unknown layout conversion shader: {}", shaderName);
             return VK_NULL_HANDLE;
         }
-        
-        // Try to load from build directory first, then source directory
-        std::vector<std::string> searchPaths = {
-            "shaders/layout_conversion.spv",  // Build directory
-            "../shaders/layout_conversion.spv",  // From build dir to source
-            "shaders/layout_conversion.spv"   // Current directory
-        };
-        
+
+        // Build search paths: config dir first, then standard locations
+        std::vector<std::string> searchPaths;
+        if (!config_.shaderDirectory.empty()) {
+            searchPaths.push_back(config_.shaderDirectory + "/layout_conversion.spv");
+        }
+        searchPaths.push_back("shaders/layout_conversion.spv");
+        searchPaths.push_back("../shaders/layout_conversion.spv");
+
         std::vector<uint32_t> spirvCode;
-        bool loaded = false;
-        
         for (const auto& path : searchPaths) {
             std::ifstream file(path, std::ios::binary | std::ios::ate);
             if (file.is_open()) {
                 std::streamsize size = file.tellg();
                 file.seekg(0, std::ios::beg);
-                
+
                 if (size > 0 && size % 4 == 0) {
                     spirvCode.resize(size / 4);
                     file.read(reinterpret_cast<char*>(spirvCode.data()), size);
                     if (file) {
                         VVM_LOG_INFO("Loaded layout conversion shader from: {}", path);
-                        loaded = true;
                         break;
                     }
                 }
                 file.close();
             }
         }
-        
-if (!loaded) {
+
+        if (spirvCode.empty()) {
             // No synthetic fallback: a no-op module would let the caller
             // believe the layout was converted while the data stays in the
             // source order. Fail loudly; callers switch to the CPU fallback.
@@ -1494,9 +1538,17 @@ if (!loaded) {
     }
     
     bool supportsRDMA() const override {
+        // RDMA transport available (verbs/NDKPI) — may be host-staged or GPU-direct
         return config_.enableGPUDirect && poolManager_ && poolManager_->getInstances().size() > 0;
     }
-    
+
+    bool supportsGpuDirect() const override {
+        // True GPU-direct RDMA requires both RDMA and a GPU with BAR mapping
+        if (!supportsRDMA()) return false;
+        if (!networkManager_) return false;
+        return networkManager_->rdmaAvailable();
+    }
+
     bool supportsNetwork() const override {
         return networkManager_ != nullptr;
     }
@@ -1507,6 +1559,10 @@ if (!loaded) {
 #else
         return false;
 #endif
+    }
+
+    std::string collectiveBackendName() const override {
+        return "HostStagedFallback";
     }
 
 private:

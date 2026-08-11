@@ -604,6 +604,21 @@ public:
 #endif
     }
 
+    // Verify ALPN negotiation matched expected protocol. Call after handshake.
+    bool verifyAlpn(const std::string& expectedProto) const {
+#if defined(VVM_NETWORK_HAS_TLS)
+        if (expectedProto.empty()) return true;  // no ALPN requirement
+        const unsigned char* selected = nullptr;
+        unsigned int selectedLen = 0;
+        SSL_get0_alpn_selected(ssl_, &selected, &selectedLen);
+        if (selectedLen == 0) return false;
+        return selectedLen == expectedProto.size() &&
+               std::memcmp(selected, expectedProto.data(), selectedLen) == 0;
+#else
+        return true;
+#endif
+    }
+
     int read(void* buf, int len) {
 #if defined(VVM_NETWORK_HAS_TLS)
         if (!ssl_) return -1;
@@ -1334,6 +1349,17 @@ void TcpTransport::serveConnection(uint64_t connId, uintptr_t sRaw) {
             }
             return;
         }
+        // Enforce ALPN protocol negotiation
+        if (!tlsConn->verifyAlpn(impl_->tlsConfig.alpnProtocols)) {
+            VVM_LOG_ERROR("TLS ALPN negotiation failed for conn {} (expected '{}')",
+                          connId, impl_->tlsConfig.alpnProtocols);
+            closeSocket(s);
+            {
+                std::lock_guard<std::mutex> lock(impl_->connsMutex);
+                impl_->conns.erase(connId);
+            }
+            return;
+        }
     }
 
     std::vector<uint8_t> header(kHeaderSize);
@@ -1540,6 +1566,13 @@ std::optional<TcpTransport::ConnId> TcpTransport::connect(const std::string& hos
         tlsConn = std::make_unique<TlsConnection>(impl_->tlsContext->context(), s);
         if (!tlsConn->connect(host)) {
             VVM_LOG_ERROR("TLS handshake failed for {}:{}", host, port);
+            closeSocket(s);
+            return std::nullopt;
+        }
+        // Enforce ALPN protocol negotiation
+        if (!tlsConn->verifyAlpn(impl_->tlsConfig.alpnProtocols)) {
+            VVM_LOG_ERROR("TLS ALPN negotiation failed for {}:{} (expected '{}')",
+                          host, port, impl_->tlsConfig.alpnProtocols);
             closeSocket(s);
             return std::nullopt;
         }

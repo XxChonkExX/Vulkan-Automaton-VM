@@ -69,6 +69,13 @@ inline bool checkedMulSizeT(size_t a, size_t b, size_t& result) {
     return true;
 }
 
+// Read one logical element from a packed buffer. For Int4, index selects
+// the nibble (index/2 cell, low/high by index%2).
+double readElem(DataType dt, const uint8_t* base, size_t index);
+
+// Write one logical element into a packed buffer. For Int4, packs nibbles.
+void writeElem(DataType dt, uint8_t* base, size_t index, double v);
+
 // ============================================================================
 // Memory Layout
 // ============================================================================
@@ -89,8 +96,11 @@ struct TensorShape {
     std::vector<int64_t> strides;  // optional, empty = contiguous
 
     static TensorShape makeContiguous(const std::vector<int64_t>& dims);
-    static TensorShape makeChannelsLast(const std::vector<int64_t>& dims);  // NHWC
+    static TensorShape makeChannelsLast(const std::vector<int64_t>& dims);  // NHWC (rank-4 only)
     static TensorShape makeBlocked(const std::vector<int64_t>& dims, int blockSize);
+
+    // Returns true if this shape has valid NHWC channels-last strides.
+    bool isChannelsLast() const;
 
     // Returns the total number of elements, or 0 if the shape is invalid
     // (negative dims or overflow). Use isValid() to distinguish.
@@ -168,6 +178,10 @@ struct TransportConfig {
     bool ucxEnableRndv = true;    // Rendezvous protocol
     size_t ucxRndvThreshold = 8192;
     bool ucxEnableCudaIpc = true;
+
+    // Shader directory for layout conversion SPIR-V kernels.
+    // If empty, searches: current dir, ../shaders/, then falls back to embedded.
+    std::string shaderDirectory;
 };
 
 // ============================================================================
@@ -234,16 +248,24 @@ public:
     virtual bool joinCluster(const std::string& bootstrapAddress) = 0;
     virtual std::string getLocalNodeId() const = 0;
     
-    // Send/recv by tensor name
+    // Send/recv by tensor name.
+    // sendTensor() exports and announces the tensor to the target node (callback
+    // fires when announcement succeeds). The remote peer then pulls the data
+    // via recvTensor() + migrateFromRemote(). This is a pull-based model.
     virtual void sendTensor(const TensorHandle& tensor, const std::string& targetNodeId, CompletionCallback cb) = 0;
     virtual void recvTensor(const TensorHandle& tensor, const std::string& sourceNodeId, CompletionCallback cb) = 0;
     
     // Capabilities
     virtual bool supportsP2P() const = 0;
     virtual bool supportsRDMA() const = 0;
+    virtual bool supportsGpuDirect() const = 0;
     virtual bool supportsNetwork() const = 0;
     virtual bool supportsUCX() const = 0;
     
+    // Collective backend query — returns a human-readable name of the
+    // implementation (e.g. "HostStagedFallback") for diagnostics/benchmarking.
+    virtual std::string collectiveBackendName() const = 0;
+
     // Async pipeline
     virtual void enqueueAsync(AsyncOperation op) = 0;
     virtual void flushAsync() = 0;
