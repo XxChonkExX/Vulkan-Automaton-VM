@@ -1,0 +1,19 @@
+#version 450
+// relu.comp — elementwise ReLU
+//   push-constants: N (element count)
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer X { float x_data[]; };
+layout (binding = 1) writeonly buffer Y { float y_data[]; };
+
+layout (push_constant) uniform Push {
+    uint N;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.N) return;
+    float v = x_data[i];
+    y_data[i] = v > 0.0 ? v : 0.0;
+}

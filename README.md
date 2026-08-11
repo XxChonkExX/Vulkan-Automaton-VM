@@ -749,6 +749,101 @@ peer_alloc = peer_pool.import_memory(exported, usage)
 
 **Note**: `allocate_tensor()` returns an int64 tensor containing the Vulkan allocation metadata (buffer handle, memory handle, offset, size, device address, host pointer, block index). This metadata tensor can be passed to `deallocate_tensor()` to release the allocation.
 
+### Experimental: Custom Autograd Functions & LoRA (v0.3.0-dev)
+
+> **⚠️ EXPERIMENTAL** — The following APIs are available in `v0.3.0-dev` builds but are **not yet stabilized**. They may change without notice. Use in production at your own risk.
+
+The `vulkanvm_torch` module now exposes **custom autograd Functions** that integrate with PyTorch's `loss.backward()` / `optimizer.step()` pipeline. The forward path runs on Vulkan compute shaders when a compute-capable pool is available; otherwise it falls back to ATen CPU/GPU kernels so the extension remains useful in CI/headless environments.
+
+**Autograd Operations:**
+```python
+import vulkanvm_torch as vvm
+import torch
+
+# Custom autograd functions (gradients flow through Vulkan compute or ATen fallback)
+x = torch.randn(2, 3, 768, requires_grad=True)
+w = torch.randn(768, 768, requires_grad=True)
+b = torch.randn(768, requires_grad=True)
+
+# Linear with custom backward
+y = vvm.vulkan_linear(x, w, b)
+loss = y.mean()
+loss.backward()  # gradients computed via custom backward
+
+# Activation functions
+y = vvm.vulkan_gelu(x, approximate=False)      # exact erf or tanh approx
+y = vvm.vulkan_relu(x)
+y = vvm.vulkan_silu(x)                         # SiLU / Swish
+y = vvm.vulkan_softmax(x, dim=-1)
+
+# LayerNorm (last dimension)
+w_ln = torch.ones(768)
+b_ln = torch.zeros(768)
+y = vvm.vulkan_layernorm(x, w_ln, b_ln, 768)
+
+# Scaled-dot-product attention (B, H, T, D)
+q = torch.randn(2, 8, 10, 64, requires_grad=True)
+k = torch.randn(2, 8, 10, 64, requires_grad=True)
+v = torch.randn(2, 8, 10, 64, requires_grad=True)
+mask = torch.triu(torch.full((10, 10), float('-inf')), diagonal=1)
+y = vvm.vulkan_attention(q, k, v, scale=0.125, mask=mask)
+
+# Cross-entropy loss
+logits = torch.randn(32, 1000, requires_grad=True)
+target = torch.randint(0, 1000, (32,))
+loss = vvm.vulkan_cross_entropy(logits, target)
+```
+
+**LoRA (Low-Rank Adaptation) Registry:**
+```python
+# Create LoRA adapter (in-process registry, no language boundary per call)
+adapter = vvm.lora_create("my_adapter", in_features=768, out_features=768, rank=16, alpha=1.0)
+
+# Merge/unmerge onto base weight
+base_weight = torch.randn(768, 768)
+vvm.lora_merge_into_base("my_adapter", base_weight)
+vvm.lora_unmerge_from_base("my_adapter")
+
+# AdamW optimizer step on adapter A/B matrices
+vvm.lora_adamw_step("my_adapter", lr=1e-3, beta0=0.9, beta1=0.999, eps=1e-8, weight_decay=0.01)
+vvm.lora_zero_grad("my_adapter")
+
+# Export/import state dict
+state = vvm.lora_export_state("my_adapter")
+vvm.lora_import_state("my_adapter", state)
+```
+
+**Layer Factories (GPT-2 style initialization):**
+```python
+# Returns (weight, bias, grad_accumulator) tuples
+w, b, g = vvm.make_linear(768, 768)           # (out_f, in_f)
+w, b = vvm.make_layernorm(768)
+w = vvm.make_embedding(50257, 768)
+w, b = vvm.make_conv2d(3, 64, 7, 7)           # Kaiming uniform
+w, b = vvm.make_qkv(768)                      # GPT-2 fused QKV (3*dim, dim)
+w, b = vvm.make_mlp_up(768)                   # MLP up-proj (4*dim, dim)
+w, b = vvm.make_mlp_down(768)                 # MLP down-proj (dim, 4*dim)
+w = vvm.make_position_embeddings(1024, 768)   # sinusoidal
+```
+
+**AdamW Optimizer Registry (manual optimizer loop):**
+```python
+# Register parameters by string key
+w = torch.randn(768, 768, requires_grad=True)
+vvm.adamw_register_param("layer1.weight", w)
+
+# Step
+vvm.adamw_step(["layer1.weight"], lr=1e-3, beta0=0.9, beta1=0.999, eps=1e-8, weight_decay=0.01)
+vvm.adamw_zero_grad(["layer1.weight"])
+```
+
+**Known Limitations (Experimental):**
+- Vulkan compute shader dispatch requires a pool created with a compute queue (`PoolConfig::enableCompute = true`). Without it, all ops fall back to ATen CPU/GPU.
+- Some compute shaders (`attention`, `layernorm`, `rmsnorm`, `rope`, `softmax`) are still being validated for numerical parity with ATen.
+- LoRA registry is in-process only; no persistence across process restarts yet.
+- `vulkanvm_compute.cpp` (Vulkan compute dispatch bridge) is not yet integrated — forward/backward uses ATen fallback.
+- API surface may change; no semantic versioning guarantees until `v0.3.0` stable release.
+
 ### ONNX Runtime (`vulkanvm_onnx`)
 
 ```python

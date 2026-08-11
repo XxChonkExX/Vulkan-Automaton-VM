@@ -2,8 +2,11 @@ cmake_minimum_required(VERSION 3.20)
 
 # Set Windows SDK version BEFORE project() to avoid defaulting to unavailable 10.0.28000.0
 if(WIN32)
-    set(CMAKE_SYSTEM_VERSION "10.0.22621.0" CACHE STRING "Windows SDK version" FORCE)
-    set(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION "10.0.22621.0" CACHE STRING "Windows SDK version" FORCE)
+    set(CMAKE_SYSTEM_VERSION "10.0.26100.0" CACHE STRING "Windows SDK version" FORCE)
+    set(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION "10.0.26100.0" CACHE STRING "Windows SDK version" FORCE)
+    # Explicitly set RC compiler and MT (manifest tool) to avoid SDK 10.0.28000.0 which lacks them
+    set(CMAKE_RC_COMPILER "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/rc.exe" CACHE STRING "Windows RC compiler" FORCE)
+    set(CMAKE_MT "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/mt.exe" CACHE STRING "Windows Manifest Tool" FORCE)
 endif()
 
 project(VulkanVM LANGUAGES CXX VERSION 0.2.0)

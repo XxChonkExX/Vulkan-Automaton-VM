@@ -9,6 +9,7 @@ from setuptools.command.build_ext import build_ext
 
 # Get PyTorch paths
 import torch
+from torch.utils.cpp_extension import include_paths, library_paths
 
 class CMakeExtension(Extension):
     def __init__(self, name, sourcedir=''):
@@ -31,12 +32,15 @@ class CMakeBuild(build_ext):
             '-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=' + extdir,
             '-DPYTHON_EXECUTABLE=' + sys.executable,
             '-DCMAKE_BUILD_TYPE=Release',
+            # Force Windows SDK version BEFORE project() call in CMakeLists.txt
+            '-DCMAKE_SYSTEM_VERSION=10.0.22621.0',
+            '-DCMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION=10.0.22621.0',
         ]
 
         # PyTorch paths
         cmake_args += [
-            '-DTORCH_INCLUDE_DIRS=' + ';'.join(torch.utils.cpp_extension.include_paths()),
-            '-DTORCH_LIBRARY_DIRS=' + ';'.join(torch.utils.cpp_extension.library_paths()),
+            '-DTORCH_INCLUDE_DIRS=' + ';'.join(include_paths()),
+            '-DTORCH_LIBRARY_DIRS=' + ';'.join(library_paths()),
         ]
 
         # VulkanVM install path
@@ -58,7 +62,7 @@ class CMakeBuild(build_ext):
         if not os.path.exists(self.build_temp):
             os.makedirs(self.build_temp)
 
-        subprocess.check_call(['cmake', ext.sourcedir] + cmake_args, cwd=self.build_temp, env=env)
+        subprocess.check_call(['cmake', '-G', 'Visual Studio 17 2022', '-A', 'x64', ext.sourcedir] + cmake_args, cwd=self.build_temp, env=env)
         subprocess.check_call(['cmake', '--build', '.'] + build_args, cwd=self.build_temp)
 
 # Read version

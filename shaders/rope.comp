@@ -1,0 +1,38 @@
+#version 450
+// rope.comp — Rotary Position Embedding
+//   x: (T, H, Dh)
+//   cos/sin: (T, Dh/2)
+//   push-constants: T, H, Dh, base
+//
+//   y[..., 0:Dh/2]   = x * cos - rotate_half(x) * sin
+//   where rotate_half(x) = (-x[Dh/2:], x[0:Dh/2])
+
+layout (local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer X { float x_data[]; };
+layout (binding = 1) writeonly buffer Y { float y_data[]; };
+layout (binding = 2) readonly  buffer COS { float cos_data[]; };
+layout (binding = 3) readonly  buffer SIN { float sin_data[]; };
+
+layout (push_constant) uniform Push {
+    uint T;
+    uint H;
+    uint Dh;
+} pc;
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint h = gl_GlobalInvocationID.y;
+    if (t >= pc.T || h >= pc.H) return;
+    uint half_dh = pc.Dh / 2;
+
+    for (uint d = 0; d < half_dh; d++) {
+        uint idx = (t * pc.H + h) * pc.Dh + d;
+        float x1 = x_data[idx];
+        float x2 = x_data[idx + half_dh];
+        float c = cos_data[t * half_dh + d];
+        float s = sin_data[t * half_dh + d];
+        y_data[idx]        = x1 * c - x2 * s;
+        y_data[idx + half_dh] = x2 * c + x1 * s;
+    }
+}
