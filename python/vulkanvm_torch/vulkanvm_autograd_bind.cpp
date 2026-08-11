@@ -131,8 +131,8 @@ VulkanConv2dFn_apply(torch::Tensor input,
                      std::vector<int64_t> padding,
                      std::vector<int64_t> dilation,
                      int64_t groups) {
-  return autograd::VulkanConv2dFn::apply(input, weight, bias,
-                                         stride, padding, dilation, groups);
+  return torch::conv2d(input, weight, bias.defined() ? bias : torch::Tensor(),
+                       stride, padding, dilation, groups);
 }
 
 // -----------------------------------------------------------------------------
@@ -248,11 +248,19 @@ void register_vulkanvm_autograd_bindings(py::module_& m) {
   m.def("vulkan_cross_entropy", &VulkanCrossEntropyFn_apply,
         py::arg("logits"), py::arg("target"),
         "VulkanVM custom-autograd cross-entropy loss");
-  m.def("vulkan_conv2d",      &VulkanConv2dFn_apply,
+  m.def("vulkan_conv2d",      [](torch::Tensor input, torch::Tensor weight,
+                                 torch::Tensor bias,
+                                 std::vector<int64_t> stride,
+                                 std::vector<int64_t> padding,
+                                 std::vector<int64_t> dilation,
+                                 int64_t groups) {
+      return torch::conv2d(input, weight, bias.defined() ? bias : torch::Tensor(),
+                           stride, padding, dilation, groups);
+    },
         py::arg("input"), py::arg("weight"), py::arg("bias"),
         py::arg("stride"), py::arg("padding"), py::arg("dilation"),
         py::arg("groups"),
-        "VulkanVM custom-autograd Conv2d (forward ATen, custom backward)");
+        "ATen conv2d with built-in autograd");
 
   // ---- LoRA registry -------------------------------------------------------
   m.def("lora_create", &lora_create,

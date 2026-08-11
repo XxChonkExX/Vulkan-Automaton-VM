@@ -128,7 +128,9 @@ class AdamWRegistry {
       s.v.mul_(beta1).addcmul_(g, g, 1.0 - beta1);
       auto m_hat = s.m / (1.0 - std::pow(beta0, s.step + 1));
       auto v_hat = s.v / (1.0 - std::pow(beta1, s.step + 1));
-      p.addcmul_(m_hat, v_hat.sqrt().add_(eps), -lr);
+      // Use NoGradGuard and .data to avoid in-place on leaf tensor
+      torch::NoGradGuard no_grad;
+      p.data().addcmul_(m_hat, v_hat.sqrt().add_(eps), -lr);
       ++s.step;
     }
   }
