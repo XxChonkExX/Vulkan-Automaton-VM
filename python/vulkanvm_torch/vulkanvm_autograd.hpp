@@ -283,7 +283,7 @@ class VulkanAttentionFn : public Function<VulkanAttentionFn> {
 // ---------------------------------------------------------------------------
 
 class VulkanLoraLinearFn : public Function<VulkanLoraLinearFn> {
- public:
+  public:
   static torch::Tensor forward(AutogradContext* ctx,
                                torch::Tensor input,
                                torch::Tensor weight,
@@ -295,10 +295,10 @@ class VulkanLoraLinearFn : public Function<VulkanLoraLinearFn> {
     ctx->saved_data["scale"] = scale;
     ctx->saved_data["has_bias"] = bias.defined();
 
-    auto out = input.mm(weight.t());
+    auto out = input.matmul(weight.t());
     if (bias.defined()) out += bias.unsqueeze(0).expand_as(out);
     if (lora_a.defined() && lora_b.defined()) {
-      auto lora = input.mm(lora_a.t()).mm(lora_b.t()) * scale;
+      auto lora = input.matmul(lora_a.t()).matmul(lora_b.t()) * scale;
       out = out + lora;
     }
     return out;
@@ -313,17 +313,17 @@ class VulkanLoraLinearFn : public Function<VulkanLoraLinearFn> {
     double scale = ctx->saved_data["scale"].toDouble();
     auto dy = grad_outputs[0];
 
-    auto dx = dy.mm(weight);
-    auto dW = dy.t().mm(input);
+    auto dx = dy.matmul(weight);
+    auto dW = dy.transpose(-2, -1).matmul(input);
     auto db = ctx->saved_data["has_bias"].toBool() ? dy.sum(0) : torch::Tensor();
 
     torch::Tensor dA, dB;
     if (lora_a.defined() && lora_b.defined()) {
-      auto xa = input.mm(lora_a.t());           // (N, r)
-      auto dL = dy * scale;                     // (N, out)
-      dB = dL.t().mm(xa);                       // (out, r)
-      dA = (dL.mm(lora_b)).t().mm(input);       // (r, in)
-      dx = dx + dL.mm(lora_b).mm(lora_a);
+      auto xa = input.matmul(lora_a.t());           // (..., r)
+      auto dL = dy * scale;                         // (..., out)
+      dB = dL.transpose(-2, -1).matmul(xa);         // (..., out, r)
+      dA = (dL.matmul(lora_b)).transpose(-2, -1).matmul(input);  // (..., r, in)
+      dx = dx + dL.matmul(lora_b).matmul(lora_a);
     }
     return {dx, dW, db, dA, dB, torch::Tensor()};
   }
@@ -368,54 +368,7 @@ class VulkanCrossEntropyFn : public Function<VulkanCrossEntropyFn> {
 };
 
 // ---------------------------------------------------------------------------
-// Conv2d (forward only via ATen fallback; backward gives grads)
-//   input: (N, C_in, H, W), weight: (C_out, C_in/groups, kH, kW)
+// Conv2d - use ATen's built-in autograd (no custom Function needed)
 // ---------------------------------------------------------------------------
-
-class VulkanConv2dFn : public Function<VulkanConv2dFn> {
- public:
-  static torch::Tensor forward(AutogradContext* ctx,
-                               torch::Tensor input,
-                               torch::Tensor weight,
-                               torch::Tensor bias,
-                               std::vector<int64_t> stride,
-                               std::vector<int64_t> padding,
-                               std::vector<int64_t> dilation,
-                               int64_t groups) {
-    ctx->save_for_backward({input, weight});
-    ctx->saved_data["stride"]   = stride;
-    ctx->saved_data["padding"]  = padding;
-    ctx->saved_data["dilation"] = dilation;
-    ctx->saved_data["groups"]   = groups;
-    ctx->saved_data["has_bias"] = bias.defined();
-    return torch::conv2d(input, weight, bias.defined() ? bias : torch::Tensor(),
-                         stride, padding, dilation, groups);
-  }
-
-  static tensor_list backward(AutogradContext* ctx, tensor_list grad_outputs) {
-    auto saved = ctx->get_saved_variables();
-    auto input  = saved[0];
-    auto weight = saved[1];
-    auto dy = grad_outputs[0];
-    auto stride   = c10::IntArrayRef(ctx->saved_data["stride"].toIntVector());
-    auto padding  = c10::IntArrayRef(ctx->saved_data["padding"].toIntVector());
-    auto dilation = c10::IntArrayRef(ctx->saved_data["dilation"].toIntVector());
-    int64_t groups = ctx->saved_data["groups"].toInt();
-    bool has_bias  = ctx->saved_data["has_bias"].toBool();
-
-    auto dx = torch::conv_transpose2d(dy, weight, /*bias=*/torch::Tensor(),
-                                      stride, padding, c10::IntArrayRef{0, 0},
-                                      groups, dilation);
-    auto dW = torch::conv2d(input, dy, /*bias=*/torch::Tensor(),
-                            /*stride=*/dilation, padding, stride, groups)
-                  .narrow(0, 0, weight.size(0));
-    dW = dW.transpose(0, 1).contiguous();
-    torch::Tensor db;
-    if (has_bias) db = dy.sum({0, 2, 3});
-    return {dx, dW, db,
-            torch::Tensor(), torch::Tensor(), torch::Tensor(),
-            torch::Tensor(), torch::Tensor()};
-  }
-};
 
 }  // namespace vvm_torch::autograd
