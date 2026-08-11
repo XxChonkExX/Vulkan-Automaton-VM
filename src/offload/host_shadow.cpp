@@ -3,9 +3,11 @@
 #include "vulkan_vm/utils.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <thread>
+#include <unordered_map>
 
 #ifdef VVM_PLATFORM_LINUX
 #include <sys/mman.h>
@@ -112,6 +114,11 @@ bool HostShadowManager::createShadowBuffer() {
     VkResult mapRes = vkMapMemory(device_, shadowBuffer_.memory, 0, VK_WHOLE_SIZE, 0, &shadowBuffer_.mappedPtr);
     if (mapRes != VK_SUCCESS) {
         VVM_LOG_ERROR("Failed to map shadow memory: {}", vkResultToString(mapRes));
+        vkUnmapMemory(device_, shadowBuffer_.memory);
+        vkFreeMemory(device_, shadowBuffer_.memory, nullptr);
+        shadowBuffer_.memory = VK_NULL_HANDLE;
+        vkDestroyBuffer(device_, shadowBuffer_.buffer, nullptr);
+        shadowBuffer_.buffer = VK_NULL_HANDLE;
         return false;
     }
     VVM_LOG_INFO("Shadow memory mapped at {}", shadowBuffer_.mappedPtr);
@@ -136,7 +143,13 @@ void HostShadowManager::destroyShadowBuffer() {
 }
 
 VkDeviceSize HostShadowManager::alignUp(VkDeviceSize value, VkDeviceSize alignment) {
-    return (value + alignment - 1) & ~(alignment - 1);
+    if (alignment == 0) return value;
+    if ((alignment & (alignment - 1)) != 0) return value;
+    VkDeviceSize remainder = value & (alignment - 1);
+    if (remainder == 0) return value;
+    VkDeviceSize delta = alignment - remainder;
+    if (value > std::numeric_limits<VkDeviceSize>::max() - delta) return value;
+    return value + delta;
 }
 
 std::optional<VkDeviceSize> HostShadowManager::allocateRegion(VkDeviceSize size) {
@@ -309,10 +322,11 @@ MigrationEngine::~MigrationEngine() {
 }
 
 std::optional<MigrationContext*> MigrationEngine::acquireContext() {
+    std::lock_guard<std::mutex> lock(contextMutex_);
     for (uint32_t i = 0; i < maxConcurrent_; ++i) {
         uint32_t idx = (nextContext_ + i) % maxConcurrent_;
         auto& ctx = contexts_[idx];
-        
+
         if (!ctx.inUse) {
             VkResult res = vkGetFenceStatus(device_, ctx.fence);
             if (res == VK_SUCCESS) {
@@ -333,43 +347,40 @@ void MigrationEngine::releaseContext(MigrationContext* ctx) {
     ctx->timelineValue = 0;
 }
 
-void MigrationEngine::submitCopy(MigrationContext* ctx, const MigrationRequest& req) {
+bool MigrationEngine::submitCopy(MigrationContext* ctx, const MigrationRequest& req) {
     VVM_LOG_INFO("submitCopy: ctx={}, toHost={}, size={}, deviceBuf={}, hostBuf={}, srcOffset={}, dstOffset={}",
-                 ctx, req.toHost, req.size, req.allocation->buffer, req.hostShadowBuffer, req.srcOffset, req.dstOffset);
-    
-    if (!req.allocation || !req.allocation->buffer) {
-        VVM_LOG_ERROR("Device allocation buffer is NULL!");
-        return;
+                 ctx, req.toHost, req.size, req.allocation ? req.allocation->buffer : VK_NULL_HANDLE,
+                 req.hostShadowBuffer, req.srcOffset, req.dstOffset);
+
+    if (!ctx || !req.allocation || !req.allocation->buffer || !req.hostShadowBuffer) {
+        VVM_LOG_ERROR("submitCopy: null parameter (ctx={}, allocation={}, hostShadowBuffer={})",
+                      reinterpret_cast<const void*>(ctx),
+                      req.allocation ? reinterpret_cast<const void*>(req.allocation->buffer) : nullptr,
+                      reinterpret_cast<const void*>(req.hostShadowBuffer));
+        return false;
     }
-    if (!req.hostShadowBuffer) {
-        VVM_LOG_ERROR("Host shadow buffer is NULL!");
-        return;
-    }
-    
+
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VkResult res = vkBeginCommandBuffer(ctx->cmdBuffer, &beginInfo);
     if (res != VK_SUCCESS) {
         VVM_LOG_ERROR("vkBeginCommandBuffer failed: {}", vkResultToString(res));
-        return;
+        return false;
     }
-    
+
     VkBufferCopy copyRegion{};
     copyRegion.srcOffset = req.srcOffset;
     copyRegion.dstOffset = req.dstOffset;
     copyRegion.size = req.size;
-    
+
     VkBuffer deviceBuf = req.allocation->buffer;
     VkBuffer hostBuf = req.hostShadowBuffer;
-    
+
     if (req.toHost) {
-        // Device -> Host: src is allocation buffer, dst is shadow buffer
         VVM_LOG_INFO("Copying device->host: src={}, dst={}, size={}", deviceBuf, hostBuf, req.size);
         vkCmdCopyBuffer(ctx->cmdBuffer, deviceBuf, hostBuf, 1, &copyRegion);
-        
-        // Barrier: ensure transfer write to shadow buffer is visible to
-        // subsequent host access (HOST_COHERENT mapped memory) or GPU reads.
+
         VkBufferMemoryBarrier barrier{};
         barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
         barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -384,12 +395,9 @@ void MigrationEngine::submitCopy(MigrationContext* ctx, const MigrationRequest& 
                              VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              0, 0, nullptr, 1, &barrier, 0, nullptr);
     } else {
-        // Host -> Device: src is shadow buffer, dst is allocation buffer
         VVM_LOG_INFO("Copying host->device: src={}, dst={}, size={}", hostBuf, deviceBuf, req.size);
         vkCmdCopyBuffer(ctx->cmdBuffer, hostBuf, deviceBuf, 1, &copyRegion);
-        
-        // Barrier: ensure transfer write to allocation buffer is visible to
-        // subsequent GPU operations (compute, graphics, etc.).
+
         VkBufferMemoryBarrier barrier{};
         barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
         barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -404,23 +412,25 @@ void MigrationEngine::submitCopy(MigrationContext* ctx, const MigrationRequest& 
                              VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              0, 0, nullptr, 1, &barrier, 0, nullptr);
     }
-    
+
     VkResult endRes = vkEndCommandBuffer(ctx->cmdBuffer);
     if (endRes != VK_SUCCESS) {
         VVM_LOG_ERROR("vkEndCommandBuffer failed: {}", vkResultToString(endRes));
-        return;
+        return false;
     }
-    
-    // Submit with timeline semaphore
-    timelineValue_++;
-    ctx->timelineValue = timelineValue_;
-    
+
+    {
+        std::lock_guard<std::mutex> lock(contextMutex_);
+        timelineValue_++;
+        ctx->timelineValue = timelineValue_;
+    }
+
     VkTimelineSemaphoreSubmitInfo timelineInfo{};
     timelineInfo.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
     timelineInfo.waitSemaphoreValueCount = 0;
     timelineInfo.signalSemaphoreValueCount = 1;
     timelineInfo.pSignalSemaphoreValues = &ctx->timelineValue;
-    
+
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.pNext = &timelineInfo;
@@ -428,52 +438,47 @@ void MigrationEngine::submitCopy(MigrationContext* ctx, const MigrationRequest& 
     submitInfo.pCommandBuffers = &ctx->cmdBuffer;
     submitInfo.signalSemaphoreCount = 1;
     submitInfo.pSignalSemaphores = &timelineSemaphore_;
-    
+
     if (ctx->waitSemaphore) {
         submitInfo.waitSemaphoreCount = 1;
         submitInfo.pWaitSemaphores = &ctx->waitSemaphore;
         submitInfo.pWaitDstStageMask = &req.waitStage;
     }
-    
-    if (ctx->signalSemaphore) {
-        submitInfo.signalSemaphoreCount++;
-        // Would need array for multiple semaphores
-    }
-    
+
     VkResult queueRes = vkQueueSubmit(transferQueue_, 1, &submitInfo, ctx->fence);
     if (queueRes != VK_SUCCESS) {
         VVM_LOG_ERROR("vkQueueSubmit failed: {}", vkResultToString(queueRes));
-    } else {
-        VVM_LOG_INFO("vkQueueSubmit succeeded, fence={}", ctx->fence);
+        return false;
     }
+
+    VVM_LOG_INFO("vkQueueSubmit succeeded, fence={}", ctx->fence);
+    return true;
 }
 
 std::optional<MigrationOperation> MigrationEngine::submitMigration(const MigrationRequest& req) {
     auto ctxOpt = acquireContext();
     if (!ctxOpt) return std::nullopt;
-    
+
     MigrationContext* ctx = *ctxOpt;
-    submitCopy(ctx, req);
-    
-    // IMPORTANT: do NOT releaseContext(ctx) here. The fence in ctx->fence is
-    // now in flight on the GPU, and the caller of this function will receive
-    // a MigrationOperation that references ctx->fence. If we released the
-    // context back to the pool synchronously, a subsequent submitMigration
-    // could acquire this same context, call vkResetFences on a fence that
-    // some other caller is still waiting on, and silently satisfy their
-    // waitMigration with an unrelated submission's completion. The context
-    // is released lazily by waitMigration/pollMigration below once the
-    // caller is done observing the fence.
-    
+
+    if (!submitCopy(ctx, req)) {
+        releaseContext(ctx);
+        return std::nullopt;
+    }
+
     MigrationOperation op;
+    op.id = nextOpId_++;
     op.allocation = req.allocation;
     op.toHost = req.toHost;
     op.completionFence = ctx->fence;
     op.signalSemaphore = timelineSemaphore_;
     op.waitSemaphore = ctx->waitSemaphore;
-    op.owningContext = ctx;   // opaque handle the caller doesn't touch
-    
-    pendingOps_.push_back(op);
+    op.owningContext = ctx;
+
+    {
+        std::lock_guard<std::mutex> lock(pendingOpsMutex_);
+        pendingOps_[op.id] = op;
+    }
     return op;
 }
 
@@ -481,31 +486,34 @@ void MigrationEngine::waitMigration(const MigrationOperation& op) {
     if (op.completionFence) {
         vkWaitForFences(device_, 1, &op.completionFence, VK_TRUE, UINT64_MAX);
     }
-    // Invoke completion callback (e.g., shadow region cleanup) after fence signals.
     if (op.onComplete) {
         op.onComplete();
     }
-    // Now that the caller is done observing the fence, release the context
-    // back to the free pool. Safe: the GPU work has completed (fence is
-    // signaled).  Any subsequent acquireContext() will see inUse == false and
-    // vkGetFenceStatus() == VK_SUCCESS, and reset the fence for reuse.
     if (op.owningContext) {
         releaseContext(static_cast<MigrationContext*>(op.owningContext));
     }
+    removePendingOp(op.id);
 }
 
 bool MigrationEngine::pollMigration(const MigrationOperation& op) {
     if (!op.completionFence) {
         if (op.onComplete) op.onComplete();
         if (op.owningContext) releaseContext(static_cast<MigrationContext*>(op.owningContext));
+        removePendingOp(op.id);
         return true;
     }
     if (vkGetFenceStatus(device_, op.completionFence) == VK_SUCCESS) {
         if (op.onComplete) op.onComplete();
         if (op.owningContext) releaseContext(static_cast<MigrationContext*>(op.owningContext));
+        removePendingOp(op.id);
         return true;
     }
     return false;
+}
+
+void MigrationEngine::removePendingOp(MigrationId id) {
+    std::lock_guard<std::mutex> lock(pendingOpsMutex_);
+    pendingOps_.erase(id);
 }
 
 void MigrationEngine::flush() {
@@ -527,6 +535,7 @@ void MigrationEngine::waitIdle() {
 }
 
 uint32_t MigrationEngine::getPendingCount() const {
+    std::lock_guard<std::mutex> lock(pendingOpsMutex_);
     return static_cast<uint32_t>(pendingOps_.size());
 }
 
@@ -535,15 +544,16 @@ uint32_t MigrationEngine::getPendingCount() const {
 // ============================================================================
 
 OffloadManager::OffloadManager(UnifiedMemoryPool* pool, const OffloadConfig& config)
-    : pool_(pool), config_(config) {
+    : pool_(pool), config_(config),
+      completionThread_([this](std::stop_token st) { processCompletions(); }) {
     VVM_LOG_INFO("OffloadManager: pool={}, transferQueue={}, transferQueueFamily={}",
                  pool, config.transferQueue, config.transferQueueFamily);
-    
+
     try {
         shadowManager_ = std::make_unique<HostShadowManager>(
             pool->getPhysicalDevice(),
             pool->getDevice(), config);
-        VVM_LOG_INFO("HostShadowManager created, buffer={}, size={}", 
+        VVM_LOG_INFO("HostShadowManager created, buffer={}, size={}",
                      shadowManager_->getBuffer(), shadowManager_->getSize());
     } catch (const std::exception& e) {
         VVM_LOG_ERROR("Exception creating HostShadowManager: {}", e.what());
@@ -552,21 +562,42 @@ OffloadManager::OffloadManager(UnifiedMemoryPool* pool, const OffloadConfig& con
         VVM_LOG_ERROR("Unknown exception creating HostShadowManager");
         throw;
     }
-    
+
     VkQueue transferQueue = config.transferQueue;
     uint32_t transferQueueFamily = config.transferQueueFamily;
-    
-    VVM_LOG_INFO("Creating MigrationEngine with transferQueue={}, queueFamily={}", 
+
+    VVM_LOG_INFO("Creating MigrationEngine with transferQueue={}, queueFamily={}",
                  transferQueue, transferQueueFamily);
-    fflush(stderr);
-    
+
     migrationEngine_ = std::make_unique<MigrationEngine>(
         pool->getDevice(), transferQueue, transferQueueFamily, 4);
     VVM_LOG_INFO("MigrationEngine created");
 }
 
 OffloadManager::~OffloadManager() {
+    shutdown_.store(true, std::memory_order_release);
+    completionCv_.notify_all();
+    if (completionThread_.joinable()) {
+        completionThread_.request_stop();
+        completionThread_.join();
+    }
     waitAll();
+}
+
+void OffloadManager::processCompletions() {
+    while (!shutdown_.load(std::memory_order_acquire)) {
+        std::function<void()> task;
+        {
+            std::unique_lock<std::mutex> lock(completionMutex_);
+            completionCv_.wait(lock, [this] {
+                return !completionQueue_.empty() || shutdown_.load(std::memory_order_acquire);
+            });
+            if (completionQueue_.empty()) continue;
+            task = std::move(completionQueue_.front());
+            completionQueue_.erase(completionQueue_.begin());
+        }
+        if (task) task();
+    }
 }
 
 std::optional<MigrationOperation> OffloadManager::offload(Allocation& alloc) {
@@ -712,14 +743,15 @@ bool OffloadManager::waitSync(MigrationOperation& op, uint64_t timeoutNs) {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    // Timed out while the GPU copy is still in flight. Hand the fence wait,
-    // completion callback (shadow region release) and context cleanup to a
-    // detached worker so nothing leaks, but report the timeout to the caller.
     VVM_LOG_WARN("sync migration did not complete within timeout; finishing in background");
-    std::thread([this, op]() mutable {
-        migrationEngine_->waitMigration(op);
-        finishSync();
-    }).detach();
+    {
+        std::lock_guard<std::mutex> lock(completionMutex_);
+        completionQueue_.push_back([this, op]() mutable {
+            migrationEngine_->waitMigration(op);
+            finishSync();
+        });
+    }
+    completionCv_.notify_one();
     return false;
 }
 

@@ -4,7 +4,11 @@
 // Includes core.hpp for Allocation, MigrationOperation, etc.
 
 #include "vulkan_vm/core.hpp"
+#include <condition_variable>
+#include <functional>
+#include <future>
 #include <mutex>
+#include <thread>
 
 namespace vvm {
 
@@ -121,39 +125,39 @@ struct MigrationContext {
     bool inUse = false;
 };
 
-// Thread Safety: MigrationEngine is NOT thread-safe. All methods must be
-// externally synchronized. The maxConcurrent parameter controls internal
-// command buffer/fence pool size, not thread concurrency.
+// Thread Safety: MigrationEngine is internally synchronized. Context pool,
+// timeline semaphore, and pending-operations map are protected by mutexes.
+// Public methods are safe to call from multiple threads.
+
+using MigrationId = uint64_t;
 
 class MigrationEngine {
 public:
-    MigrationEngine(VkDevice device, VkQueue transferQueue, uint32_t queueFamily, 
+    MigrationEngine(VkDevice device, VkQueue transferQueue, uint32_t queueFamily,
                     uint32_t maxConcurrent = 4);
     ~MigrationEngine();
-    
+
     MigrationEngine(const MigrationEngine&) = delete;
     MigrationEngine& operator=(const MigrationEngine&) = delete;
-    
-    // Submit migration: device -> host (offload) or host -> device (reload)
+
     struct MigrationRequest {
         Allocation* allocation = nullptr;
         VkDeviceSize srcOffset = 0;
-        VkDeviceSize dstOffset = 0;  // in host shadow
+        VkDeviceSize dstOffset = 0;
         VkDeviceSize size = 0;
-        bool toHost = true;  // true = device->host, false = host->device
+        bool toHost = true;
         VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
         VkPipelineStageFlags signalStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        VkBuffer hostShadowBuffer = VK_NULL_HANDLE;  // Host shadow buffer for copy
+        VkBuffer hostShadowBuffer = VK_NULL_HANDLE;
     };
-    
+
     std::optional<MigrationOperation> submitMigration(const MigrationRequest& req);
     void waitMigration(const MigrationOperation& op);
     bool pollMigration(const MigrationOperation& op);
-    
-    // Flush pending migrations
+
     void flush();
     void waitIdle();
-    
+
     uint32_t getPendingCount() const;
 
 private:
@@ -161,18 +165,22 @@ private:
     VkQueue transferQueue_;
     uint32_t queueFamily_;
     uint32_t maxConcurrent_;
-    
+
     std::vector<MigrationContext> contexts_;
-    std::vector<MigrationOperation> pendingOps_;
+    std::unordered_map<MigrationId, MigrationOperation> pendingOps_;
+    mutable std::mutex pendingOpsMutex_;
+    std::atomic<MigrationId> nextOpId_{1};
     uint32_t nextContext_ = 0;
     uint64_t timelineValue_ = 0;
+    mutable std::mutex contextMutex_;
     VkSemaphore timelineSemaphore_ = VK_NULL_HANDLE;
     VkCommandPool cmdPool_ = VK_NULL_HANDLE;
     VkFence contextFence_ = VK_NULL_HANDLE;
-    
+
     std::optional<MigrationContext*> acquireContext();
     void releaseContext(MigrationContext* ctx);
-    void submitCopy(MigrationContext* ctx, const MigrationRequest& req);
+    bool submitCopy(MigrationContext* ctx, const MigrationRequest& req);
+    void removePendingOp(MigrationId id);
 };
 
 // ============================================================================
@@ -219,20 +227,22 @@ private:
     std::unique_ptr<HostShadowManager> shadowManager_;
     std::unique_ptr<MigrationEngine> migrationEngine_;
     
-    // Protects all mutable state
     mutable std::mutex mutex_;
-    
     Stats stats_;
     mutable std::mutex statsMutex_;
 
-    // Caller must hold mutex_.
+    std::vector<std::function<void()>> completionQueue_;
+    std::mutex completionMutex_;
+    std::condition_variable completionCv_;
+    std::jthread completionThread_;
+    std::atomic<bool> shutdown_{false};
+
     std::optional<MigrationOperation> offloadLocked(Allocation& alloc);
     std::optional<MigrationOperation> reloadLocked(Allocation& alloc);
 
-    // Bounded wait for a migration. Returns false if the timeout expired
-    // (completion is finished by a detached worker so cleanup still runs).
     bool waitSync(MigrationOperation& op, uint64_t timeoutNs);
     void finishSync();
+    void processCompletions();
 };
 
 } // namespace vvm

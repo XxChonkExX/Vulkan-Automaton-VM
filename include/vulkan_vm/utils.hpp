@@ -687,6 +687,44 @@ private:
     std::function<void(LogLevel, const std::string&)> callback_;
 };
 
+// ============================================================================
+// Vulkan Result Checking
+// ============================================================================
+
+// Convert VkResult to human-readable string
+inline std::string vkResultToString(VkResult result);
+
+// Macro for checking Vulkan results in functions that can return std::optional<T>
+// Usage: VVM_VK_CHECK(vkCreateBuffer(...)); - returns std::nullopt on failure
+#define VVM_VK_CHECK(expr) \
+    do { \
+        VkResult _vk_result = (expr); \
+        if (_vk_result != VK_SUCCESS) { \
+            VVM_LOG_ERROR("Vulkan error: {} ({}) at {}:{}", vkResultToString(_vk_result), static_cast<int>(_vk_result), __FILE__, __LINE__); \
+            return std::nullopt; \
+        } \
+    } while (false)
+
+// Macro for checking Vulkan results in void functions
+#define VVM_VK_CHECK_VOID(expr) \
+    do { \
+        VkResult _vk_result = (expr); \
+        if (_vk_result != VK_SUCCESS) { \
+            VVM_LOG_ERROR("Vulkan error: {} ({}) at {}:{}", vkResultToString(_vk_result), static_cast<int>(_vk_result), __FILE__, __LINE__); \
+            return; \
+        } \
+    } while (false)
+
+// Macro for checking Vulkan results in functions returning bool
+#define VVM_VK_CHECK_BOOL(expr) \
+    do { \
+        VkResult _vk_result = (expr); \
+        if (_vk_result != VK_SUCCESS) { \
+            VVM_LOG_ERROR("Vulkan error: {} ({}) at {}:{}", vkResultToString(_vk_result), static_cast<int>(_vk_result), __FILE__, __LINE__); \
+            return false; \
+        } \
+    } while (false)
+
 #define VVM_LOG_TRACE(...)  vvm::Logger::instance().log(vvm::LogLevel::Trace, __VA_ARGS__)
 #define VVM_LOG_DEBUG(...)  vvm::Logger::instance().log(vvm::LogLevel::Debug, __VA_ARGS__)
 #define VVM_LOG_INFO(...)   vvm::Logger::instance().log(vvm::LogLevel::Info, __VA_ARGS__)

@@ -37,13 +37,15 @@ BuddyAllocator::BuddyAllocator(VkDeviceSize blockSize, VkDeviceSize minSize, boo
 }
 
 int BuddyAllocator::sizeToOrder(VkDeviceSize size) const {
-    size = nextPowerOfTwo(size);
-    if (size < minSize_) size = minSize_;
-    if (size > blockSize_) return -1;
+    auto rounded = ceilPowerOfTwo(size);
+    if (!rounded) return -1;
+    VkDeviceSize roundedSize = *rounded;
+    if (roundedSize < minSize_) roundedSize = minSize_;
+    if (roundedSize > blockSize_) return -1;
 
     int order = 0;
     VkDeviceSize s = minSize_;
-    while (s < size) {
+    while (s < roundedSize) {
         s <<= 1;
         ++order;
     }

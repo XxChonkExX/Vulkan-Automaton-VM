@@ -90,15 +90,18 @@ public:
             uint64_t destinationAllocId,
             bool useRdma)>;
     
-    using RegisterHandler = std::function<
+using RegisterHandler = std::function<
         std::optional<std::vector<NodeInfo>>(
             const NodeInfo& info)>;
+
+    using AuthCallback = std::function<AuthorizationResult(uint32_t messageType)>;
     
     virtual void setAllocateHandler(AllocateHandler handler) = 0;
     virtual void setExportHandler(ExportHandler handler) = 0;
     virtual void setImportHandler(ImportHandler handler) = 0;
     virtual void setMigrateHandler(MigrateHandler handler) = 0;
     virtual void setRegisterHandler(RegisterHandler handler) = 0;
+    virtual void setAuthCallback(AuthCallback callback) = 0;
     
     // ========================================================================
     // Cluster state

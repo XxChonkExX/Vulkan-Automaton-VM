@@ -443,13 +443,14 @@ struct TlsContext {
 
         // ALPN
         if (!config.alpnProtocols.empty()) {
+            std::vector<unsigned char> alpnWire = encodeAlpnProtocols(config.alpnProtocols);
             SSL_CTX_set_alpn_select_cb(ctx, [](SSL* ssl, const unsigned char** out, unsigned char* outlen, const unsigned char* in, unsigned int inlen, void* arg) -> int {
-                const char* proto = static_cast<const char*>(arg);
-                if (SSL_select_next_proto(const_cast<unsigned char**>(out), outlen, reinterpret_cast<const unsigned char*>(proto), strlen(proto), in, inlen) == OPENSSL_NPN_NEGOTIATED) {
+                const std::vector<unsigned char>* protos = static_cast<const std::vector<unsigned char>*>(arg);
+                if (SSL_select_next_proto(const_cast<unsigned char**>(out), outlen, protos->data(), static_cast<unsigned int>(protos->size()), in, inlen) == OPENSSL_NPN_NEGOTIATED) {
                     return SSL_TLSEXT_ERR_OK;
                 }
                 return SSL_TLSEXT_ERR_NOACK;
-            }, const_cast<char*>(config.alpnProtocols.c_str()));
+            }, new std::vector<unsigned char>(std::move(alpnWire)));
         }
 
         enabled = true;
@@ -492,7 +493,8 @@ struct TlsContext {
 
         // ALPN
         if (!config.alpnProtocols.empty()) {
-            SSL_CTX_set_alpn_protos(ctx, reinterpret_cast<const unsigned char*>(config.alpnProtocols.c_str()), config.alpnProtocols.size());
+            std::vector<unsigned char> alpnWire = encodeAlpnProtocols(config.alpnProtocols);
+            SSL_CTX_set_alpn_protos(ctx, alpnWire.data(), static_cast<unsigned int>(alpnWire.size()));
         }
 
         enabled = true;
@@ -517,6 +519,22 @@ struct TlsContext {
 
 private:
 #if defined(VVM_NETWORK_HAS_TLS)
+    static std::vector<unsigned char> encodeAlpnProtocols(const std::string& protocols) {
+        std::vector<unsigned char> result;
+        size_t start = 0;
+        while (start < protocols.size()) {
+            size_t end = protocols.find(',', start);
+            if (end == std::string::npos) end = protocols.size();
+            std::string proto = protocols.substr(start, end - start);
+            if (!proto.empty() && proto.size() <= 255) {
+                result.push_back(static_cast<unsigned char>(proto.size()));
+                result.insert(result.end(), proto.begin(), proto.end());
+            }
+            start = end + 1;
+        }
+        return result;
+    }
+
     static std::string getOpenSslError() {
         std::string err;
         unsigned long e;
@@ -597,8 +615,17 @@ public:
     bool connect(const std::string& host) {
 #if defined(VVM_NETWORK_HAS_TLS)
         if (!ssl_) return false;
+        if (!SSL_set1_host(ssl_, host.c_str())) {
+            return false;
+        }
         SSL_set_tlsext_host_name(ssl_, host.c_str());
-        return SSL_connect(ssl_) > 0;
+        if (SSL_connect(ssl_) <= 0) {
+            return false;
+        }
+        if (SSL_get_verify_result(ssl_) != X509_V_OK) {
+            return false;
+        }
+        return true;
 #else
         return false;
 #endif

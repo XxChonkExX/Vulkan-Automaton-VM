@@ -247,5 +247,46 @@ bool deserializeNodeList(const std::vector<uint8_t>& data, std::vector<NodeInfo>
 std::vector<uint8_t> serializeAllocationDesc(const RemoteAllocationDesc& desc);
 bool deserializeAllocationDesc(const uint8_t*& p, const uint8_t* end, RemoteAllocationDesc& out);
 
+// ============================================================================
+// Authentication / Authorization
+// ============================================================================
+
+enum class Capability {
+    RegisterNode,
+    ReadClusterView,
+    AllocateMemory,
+    MigrateMemory,
+    RDMAAccess,
+    PublishModel,
+    FetchModel,
+    AdministerCluster
+};
+
+struct PeerIdentity {
+    NodeId node;
+    std::string certificateFingerprint;  // SHA-256 of peer's TLS certificate
+    std::vector<Capability> capabilities;
+    
+    bool hasCapability(Capability cap) const {
+        return std::find(capabilities.begin(), capabilities.end(), cap) != capabilities.end();
+    }
+};
+
+enum class AuthorizationResult {
+    Allow,
+    Deny,
+    Unauthenticated,
+    InsufficientCapabilities
+};
+
+AuthorizationResult authorize(const PeerIdentity& peer, Capability requiredCap);
+
+// For internal use - default policy that allows all if no auth configured
+inline AuthorizationResult defaultAuthorize(const PeerIdentity& peer, Capability cap) {
+    (void)peer;
+    (void)cap;
+    return AuthorizationResult::Allow;
+}
+
 } // namespace network
 } // namespace vvm
