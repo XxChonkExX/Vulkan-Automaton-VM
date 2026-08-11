@@ -39,7 +39,7 @@ inline size_t dataTypeSize(DataType dt) {
         case DataType::Float16: return 2;
         case DataType::BFloat16: return 2;
         case DataType::Int8: return 1;
-        case DataType::Int4: return 1;  // packed
+        case DataType::Int4: return 1;  // packed: 2 elements per byte (see bytesForElements)
         case DataType::UInt8: return 1;
         case DataType::Int32: return 4;
         case DataType::Int64: return 8;
@@ -48,6 +48,25 @@ inline size_t dataTypeSize(DataType dt) {
         case DataType::Bool: return 1;
     }
     return 4;
+}
+
+// Compute storage bytes for a given element count, handling packed types.
+// For Int4, two elements occupy one byte (rounded up).
+inline size_t bytesForElements(DataType dt, size_t elements) {
+    switch (dt) {
+        case DataType::Int4:
+            return (elements + 1) / 2;
+        default:
+            return elements * dataTypeSize(dt);
+    }
+}
+
+// Safe multiplication with overflow check. Returns false if overflow would occur.
+inline bool checkedMulSizeT(size_t a, size_t b, size_t& result) {
+    if (a != 0 && b > (std::numeric_limits<size_t>::max)() / a)
+        return false;
+    result = a * b;
+    return true;
 }
 
 // ============================================================================
@@ -68,19 +87,30 @@ enum class MemoryLayout {
 struct TensorShape {
     std::vector<int64_t> dims;
     std::vector<int64_t> strides;  // optional, empty = contiguous
-    
+
     static TensorShape makeContiguous(const std::vector<int64_t>& dims);
     static TensorShape makeChannelsLast(const std::vector<int64_t>& dims);  // NHWC
     static TensorShape makeBlocked(const std::vector<int64_t>& dims, int blockSize);
-    
+
+    // Returns the total number of elements, or 0 if the shape is invalid
+    // (negative dims or overflow). Use isValid() to distinguish.
     size_t numel() const {
         size_t n = 1;
-        for (auto d : dims) n *= d;
+        for (auto d : dims) {
+            if (d <= 0) return 0;
+            if (!checkedMulSizeT(n, static_cast<size_t>(d), n)) return 0;
+        }
         return n;
     }
-    
+
+    // Returns true if all dimensions are positive and numel won't overflow.
+    bool isValid() const {
+        return numel() > 0 || dims.empty();
+    }
+
     size_t byteSize(DataType dtype) const {
-        return numel() * dataTypeSize(dtype);
+        size_t n = numel();
+        return bytesForElements(dtype, n);
     }
 };
 

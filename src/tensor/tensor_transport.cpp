@@ -630,10 +630,14 @@ public:
     }
     
     // Copy a slice of a tensor
-    bool copyTensorPartial(const TensorHandle& src, const TensorHandle& dst, 
+    bool copyTensorPartial(const TensorHandle& src, const TensorHandle& dst,
                            size_t srcOffset, size_t dstOffset, size_t size) override {
         if (!isReady() || !src || !dst) return false;
-        if (srcOffset + size > src->metadata.bytes() || dstOffset + size > dst->metadata.bytes()) {
+        // Subtraction-based bounds check avoids integer overflow on offset + size
+        const size_t srcBytes = src->metadata.bytes();
+        const size_t dstBytes = dst->metadata.bytes();
+        if (size > srcBytes || srcOffset > srcBytes - size ||
+            size > dstBytes || dstOffset > dstBytes - size) {
             VVM_LOG_ERROR("copyTensorPartial: offset + size exceeds tensor bounds");
             return false;
         }
@@ -1240,11 +1244,17 @@ if (!loaded) {
         // Each participant keeps the chunk of the reduced result that belongs to
         // its rank in this team. The caller's output device determines its rank.
         size_t rank = 0;
+        bool foundRank = false;
         for (size_t i = 0; i < deviceIndices.size(); ++i) {
-            if (deviceIndices[i] == output->allocation.blockIndex) {
+            if (deviceIndices[i] == output->deviceIndex) {
                 rank = i;
+                foundRank = true;
                 break;
             }
+        }
+        if (!foundRank) {
+            VVM_LOG_ERROR("reduceScatter: output device {} not found in deviceIndices", output->deviceIndex);
+            return false;
         }
 
         if (!hostToGpu(output, 0, acc.data() + rank * chunkSize, chunkSize)) {
@@ -1442,9 +1452,34 @@ if (!loaded) {
 
         networkManager_->waitMigration(*op);
 
-        // Verify content if checksum provided
+        // Verify content integrity if checksum provided
         if (tensor->metadata.contentHash != 0) {
-            // Would verify content here
+            const size_t bytes = tensor->metadata.bytes();
+            auto& pool = poolManager_->getPool(tensor->deviceIndex);
+            vvm::AllocDesc stageDesc;
+            stageDesc.size = bytes;
+            stageDesc.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            stageDesc.memoryUsage = vvm::MemoryUsage::GpuToCpu;
+            stageDesc.mapped = true;
+            stageDesc.name = "verify-staging";
+            auto stage = pool.allocate(stageDesc);
+            if (stage && stage->hostPtr) {
+                if (pool.copyBuffer(tensor->allocation, *stage, 0, 0, bytes)) {
+                    // FNV-1a hash for verification
+                    uint64_t hash = 0xcbf29ce484222325ull;
+                    for (size_t i = 0; i < bytes; ++i) {
+                        hash ^= static_cast<uint8_t*>(stage->hostPtr)[i];
+                        hash *= 0x100000001b3ull;
+                    }
+                    if (hash != tensor->metadata.contentHash) {
+                        VVM_LOG_ERROR("recvTensor: content hash mismatch for tensor '{}'", tensor->metadata.name);
+                        pool.deallocate(std::move(*stage));
+                        if (cb) cb(false, "content hash verification failed");
+                        return;
+                    }
+                }
+                pool.deallocate(std::move(*stage));
+            }
         }
 
         if (cb) cb(true, "");
@@ -1482,22 +1517,25 @@ private:
     void asyncProcessingLoop() {
         while (!stopAsyncThread_) {
             std::unique_lock<std::mutex> lock(asyncMutex_);
-            if (asyncCV_.wait_for(lock, std::chrono::milliseconds(10), 
+            if (asyncCV_.wait_for(lock, std::chrono::milliseconds(10),
                                   [this] { return stopAsyncThread_ || !asyncQueue_.empty(); })) {
                 if (stopAsyncThread_) break;
-                
+
                 while (!asyncQueue_.empty()) {
                     auto op = asyncQueue_.front();
                     asyncQueue_.pop();
                     lock.unlock();
-                    
-                    // Process async operation
+
+                    // Process async operation. Wrap in try/catch to guarantee
+                    // completion callbacks are always invoked exactly once.
                     try {
                         op();
                     } catch (const std::exception& e) {
                         VVM_LOG_ERROR("Async operation threw: {}", e.what());
+                    } catch (...) {
+                        VVM_LOG_ERROR("Async operation threw unknown exception");
                     }
-                    
+
                     lock.lock();
                 }
                 // Queue drained: wake flushAsync() waiters.
@@ -1528,6 +1566,14 @@ private:
     void enqueueAsync(AsyncOperation op) override {
         {
             std::lock_guard<std::mutex> lock(asyncMutex_);
+            // Backpressure: cap queue depth to prevent unbounded memory growth.
+            // maxInFlightTransfers * 2 gives headroom for pipelined operations.
+            const size_t maxDepth = static_cast<size_t>(std::max(1u, config_.maxInFlightTransfers)) * 2;
+            if (asyncQueue_.size() >= maxDepth) {
+                VVM_LOG_WARN("enqueueAsync: queue depth {} capped at {}, dropping operation",
+                             asyncQueue_.size(), maxDepth);
+                return;
+            }
             asyncQueue_.push(std::move(op));
         }
         if (!asyncThread_.joinable()) {

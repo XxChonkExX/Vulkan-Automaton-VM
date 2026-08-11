@@ -164,7 +164,46 @@ struct NetHeader {
     uint64_t streamLen;
 };
 
+// Validate message type is known to the protocol
+bool isValidMessageType(uint32_t type) {
+    switch (type) {
+        case MsgRegisterNode:
+        case MsgGetClusterView:
+        case MsgAllocate:
+        case MsgExport:
+        case MsgImport:
+        case MsgMigratePull:
+        case MsgMigratePush:
+        case MsgHeartbeat:
+        case MsgLeaveCluster:
+        case MsgDeallocate:
+        case MsgModelList:
+        case MsgModelManifest:
+        case MsgModelChunk:
+        case MsgTensorAnnounce:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Validate flags are within the known set
+bool isValidFlags(uint32_t flags) {
+    switch (flags) {
+        case TcpFlagsRequest:
+        case TcpFlagsResponse:
+        case TcpFlagsError:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool isValidHeaderLengths(const NetHeader& h, const NetworkConfig& netConfig) {
+    // Validate message type and flags semantics
+    if (!isValidMessageType(h.type)) return false;
+    if (!isValidFlags(h.flags)) return false;
+
     // First check config limits (settable per-connection)
     if (static_cast<uint64_t>(h.bodyLen) > netConfig.maxBodySize) return false;
     if (h.streamLen > netConfig.maxStreamSize) return false;
@@ -333,11 +372,10 @@ bool writeAll(SocketType s, const void* buf, size_t len) {
 // TLS Support
 // ============================================================================
 
-// TLS context - single definition with conditional compilation inside methods
+// TLS context — holds only the shared SSL_CTX*. SSL* is per-connection.
 struct TlsContext {
 #if defined(VVM_NETWORK_HAS_TLS)
     SSL_CTX* ctx = nullptr;
-    SSL* ssl = nullptr;
 #endif
     bool enabled = false;
     bool serverMode = false;
@@ -350,11 +388,6 @@ struct TlsContext {
 
     void cleanup() {
 #if defined(VVM_NETWORK_HAS_TLS)
-        if (ssl) {
-            SSL_shutdown(ssl);
-            SSL_free(ssl);
-            ssl = nullptr;
-        }
         if (ctx) {
             SSL_CTX_free(ctx);
             ctx = nullptr;
@@ -390,6 +423,12 @@ struct TlsContext {
         }
         if (!SSL_CTX_check_private_key(ctx)) {
             lastError = "Private key does not match certificate";
+            return false;
+        }
+
+        // Require CA for peer verification — fail closed if missing
+        if (config.verifyPeer && config.caPath.empty()) {
+            lastError = "TLS peer verification requires a CA path";
             return false;
         }
 
@@ -437,14 +476,18 @@ struct TlsContext {
 
         SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
 
+        // Require CA for peer verification — fail closed if missing
+        if (config.verifyPeer && config.caPath.empty()) {
+            lastError = "TLS peer verification requires a CA path";
+            return false;
+        }
+
         if (!config.caPath.empty()) {
             if (SSL_CTX_load_verify_locations(ctx, config.caPath.c_str(), nullptr) <= 0) {
                 lastError = "Failed to load CA file: " + getOpenSslError();
                 return false;
             }
             SSL_CTX_set_verify(ctx, config.verifyPeer ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, nullptr);
-        } else {
-            SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
         }
 
         // ALPN
@@ -461,74 +504,16 @@ struct TlsContext {
 #endif
     }
 
-    bool accept(SocketType sock) {
+    // Get the shared SSL_CTX* for creating per-connection SSL objects.
 #if defined(VVM_NETWORK_HAS_TLS)
-        if (!enabled || !ctx) return false;
-        ssl = SSL_new(ctx);
-        if (!ssl) {
-            lastError = "Failed to create SSL";
-            return false;
-        }
-        SSL_set_fd(ssl, static_cast<int>(sock));
-        if (SSL_accept(ssl) <= 0) {
-            lastError = "SSL_accept failed: " + getOpenSslError();
-            return false;
-        }
-        return true;
+    SSL_CTX* context() const {
+        return ctx;
+    }
 #else
-        lastError = "TLS not compiled in";
-        return false;
-#endif
+    void* context() const {
+        return nullptr;
     }
-
-    bool connect(SocketType sock, const std::string& host) {
-#if defined(VVM_NETWORK_HAS_TLS)
-        if (!enabled || !ctx) return false;
-        ssl = SSL_new(ctx);
-        if (!ssl) {
-            lastError = "Failed to create SSL";
-            return false;
-        }
-        SSL_set_fd(ssl, static_cast<int>(sock));
-        SSL_set_tlsext_host_name(ssl, host.c_str());
-        if (SSL_connect(ssl) <= 0) {
-            lastError = "SSL_connect failed: " + getOpenSslError();
-            return false;
-        }
-        return true;
-#else
-        lastError = "TLS not compiled in";
-        return false;
 #endif
-    }
-
-    int read(void* buf, int len) {
-#if defined(VVM_NETWORK_HAS_TLS)
-        if (!ssl) return -1;
-        return SSL_read(ssl, buf, len);
-#else
-        lastError = "TLS not compiled in";
-        return -1;
-#endif
-    }
-
-    int write(const void* buf, int len) {
-#if defined(VVM_NETWORK_HAS_TLS)
-        if (!ssl) return -1;
-        return SSL_write(ssl, buf, len);
-#else
-        lastError = "TLS not compiled in";
-        return -1;
-#endif
-    }
-
-    void shutdown() {
-#if defined(VVM_NETWORK_HAS_TLS)
-        if (ssl) {
-            SSL_shutdown(ssl);
-        }
-#endif
-    }
 
 private:
 #if defined(VVM_NETWORK_HAS_TLS)
@@ -543,6 +528,114 @@ private:
         }
         return err;
     }
+#endif
+};
+
+// Per-connection TLS wrapper. Each connection gets its own SSL* object.
+// When VVM_NETWORK_HAS_TLS is not defined, this is a no-op wrapper.
+class TlsConnection {
+public:
+#if defined(VVM_NETWORK_HAS_TLS)
+    TlsConnection(SSL_CTX* ctx, SocketType sock) : socket_(sock) {
+        ssl_ = SSL_new(ctx);
+        if (ssl_) {
+            SSL_set_fd(ssl_, static_cast<int>(sock));
+        }
+    }
+#else
+    TlsConnection(void* /*ctx*/, SocketType sock) : socket_(sock) {}
+#endif
+
+    ~TlsConnection() {
+        reset();
+    }
+
+    // Non-copyable, movable
+    TlsConnection(const TlsConnection&) = delete;
+    TlsConnection& operator=(const TlsConnection&) = delete;
+#if defined(VVM_NETWORK_HAS_TLS)
+    TlsConnection(TlsConnection&& other) noexcept
+        : socket_(other.socket_), ssl_(other.ssl_) {
+        other.ssl_ = nullptr;
+    }
+    TlsConnection& operator=(TlsConnection&& other) noexcept {
+        if (this != &other) {
+            reset();
+            socket_ = other.socket_;
+            ssl_ = other.ssl_;
+            other.ssl_ = nullptr;
+        }
+        return *this;
+    }
+#else
+    TlsConnection(TlsConnection&& other) noexcept : socket_(other.socket_) {}
+    TlsConnection& operator=(TlsConnection&& other) noexcept {
+        if (this != &other) {
+            socket_ = other.socket_;
+        }
+        return *this;
+    }
+#endif
+
+    bool isValid() const {
+#if defined(VVM_NETWORK_HAS_TLS)
+        return ssl_ != nullptr;
+#else
+        return false;
+#endif
+    }
+
+    bool accept() {
+#if defined(VVM_NETWORK_HAS_TLS)
+        if (!ssl_) return false;
+        return SSL_accept(ssl_) > 0;
+#else
+        return false;
+#endif
+    }
+
+    bool connect(const std::string& host) {
+#if defined(VVM_NETWORK_HAS_TLS)
+        if (!ssl_) return false;
+        SSL_set_tlsext_host_name(ssl_, host.c_str());
+        return SSL_connect(ssl_) > 0;
+#else
+        return false;
+#endif
+    }
+
+    int read(void* buf, int len) {
+#if defined(VVM_NETWORK_HAS_TLS)
+        if (!ssl_) return -1;
+        return SSL_read(ssl_, buf, len);
+#else
+        return -1;
+#endif
+    }
+
+    int write(const void* buf, int len) {
+#if defined(VVM_NETWORK_HAS_TLS)
+        if (!ssl_) return -1;
+        return SSL_write(ssl_, buf, len);
+#else
+        return -1;
+#endif
+    }
+
+    void reset() {
+#if defined(VVM_NETWORK_HAS_TLS)
+        if (ssl_) {
+            SSL_shutdown(ssl_);
+            SSL_free(ssl_);
+            ssl_ = nullptr;
+        }
+#endif
+    }
+
+private:
+    SocketType socket_ = kInvalidSocket;
+#if defined(VVM_NETWORK_HAS_TLS)
+    SSL* ssl_ = nullptr;
 #endif
 };
 
@@ -581,6 +674,7 @@ bool deserializeNodeInfo(const uint8_t*& p, const uint8_t* end, NodeInfo& out) {
     if (!deserializeNodeId(p, end, out.id)) return false;
     uint32_t gpuCount = 0;
     if (!detail::getU32(p, end, gpuCount)) return false;
+    if (gpuCount > 64) return false;  // cap GPUs per node
     out.gpuDevices.clear();
     for (uint32_t i = 0; i < gpuCount; ++i) {
         std::string gpu;
@@ -612,6 +706,8 @@ bool deserializeNodeList(const std::vector<uint8_t>& data, std::vector<NodeInfo>
     const uint8_t* end = p + data.size();
     uint32_t count = 0;
     if (!detail::getU32(p, end, count)) return false;
+    // Cap semantic count to prevent pathological memory allocation
+    if (count > 4096) return false;
     out.clear();
     for (uint32_t i = 0; i < count; ++i) {
         NodeInfo info;
@@ -684,6 +780,7 @@ struct TcpTransport::Impl {
         SocketType socket = kInvalidSocket;
         std::chrono::steady_clock::time_point lastActivity;
         bool isServerSide = false;
+        std::unique_ptr<TlsConnection> tlsConn;  // per-connection TLS state
     };
     
     // ----- server -----
@@ -949,14 +1046,15 @@ struct TcpTransport::Impl {
 
     ~Impl() { stop(); }
 
-    // TLS-aware read/write
-    bool writeAllTls(SocketType s, const void* buf, size_t len) {
-        if (tlsContext && tlsContext->enabled) {
+    // TLS-aware read/write — uses per-connection TlsConnection when provided,
+    // otherwise falls back to raw socket I/O.
+    bool writeAllTls(SocketType s, const void* buf, size_t len, TlsConnection* tlsConn = nullptr) {
+        if (tlsConn && tlsConn->isValid()) {
             const char* p = static_cast<const char*>(buf);
             size_t remaining = len;
             while (remaining > 0) {
                 int chunk = static_cast<int>(remaining > static_cast<size_t>(INT_MAX) ? static_cast<size_t>(INT_MAX) : remaining);
-                int n = tlsContext->write(p, chunk);
+                int n = tlsConn->write(p, chunk);
                 if (n <= 0) return false;
                 p += n;
                 remaining -= static_cast<size_t>(n);
@@ -967,13 +1065,13 @@ struct TcpTransport::Impl {
         }
     }
 
-    bool readAllTls(SocketType s, void* buf, size_t len) {
-        if (tlsContext && tlsContext->enabled) {
+    bool readAllTls(SocketType s, void* buf, size_t len, TlsConnection* tlsConn = nullptr) {
+        if (tlsConn && tlsConn->isValid()) {
             char* p = static_cast<char*>(buf);
             size_t remaining = len;
             while (remaining > 0) {
                 int chunk = static_cast<int>(remaining > static_cast<size_t>(INT_MAX) ? static_cast<size_t>(INT_MAX) : remaining);
-                int n = tlsContext->read(p, chunk);
+                int n = tlsConn->read(p, chunk);
                 if (n <= 0) return false;
                 p += n;
                 remaining -= static_cast<size_t>(n);
@@ -1223,10 +1321,12 @@ void TcpTransport::acceptLoop() {
 void TcpTransport::serveConnection(uint64_t connId, uintptr_t sRaw) {
     SocketType s = static_cast<SocketType>(sRaw);
 
-    // TLS handshake for server
+    // TLS handshake for server — create per-connection SSL object
+    std::unique_ptr<TlsConnection> tlsConn;
     if (impl_->tlsContext && impl_->tlsContext->enabled && impl_->tlsContext->serverMode) {
-        if (!impl_->tlsContext->accept(s)) {
-            VVM_LOG_ERROR("TLS handshake failed: {}", impl_->tlsContext->lastError);
+        tlsConn = std::make_unique<TlsConnection>(impl_->tlsContext->context(), s);
+        if (!tlsConn->accept()) {
+            VVM_LOG_ERROR("TLS handshake failed for conn {}", connId);
             closeSocket(s);
             {
                 std::lock_guard<std::mutex> lock(impl_->connsMutex);
@@ -1248,7 +1348,7 @@ void TcpTransport::serveConnection(uint64_t connId, uintptr_t sRaw) {
             }
         }
 
-        if (!impl_->readAllTls(s, header.data(), header.size())) break;
+        if (!impl_->readAllTls(s, header.data(), header.size(), tlsConn.get())) break;
 
         NetHeader nh{};
         if (!decodeHeader(header.data(), header.size(), nh)) break;
@@ -1265,7 +1365,7 @@ void TcpTransport::serveConnection(uint64_t connId, uintptr_t sRaw) {
         req.seq = nh.seq;
         if (nh.bodyLen > 0) {
             req.body.resize(nh.bodyLen);
-            if (!impl_->readAllTls(s, req.body.data(), nh.bodyLen)) break;
+            if (!impl_->readAllTls(s, req.body.data(), nh.bodyLen, tlsConn.get())) break;
         }
 
         TcpMessage resp;
@@ -1312,7 +1412,7 @@ void TcpTransport::serveConnection(uint64_t connId, uintptr_t sRaw) {
                 uint64_t remaining = nh.streamLen;
                 while (remaining > 0) {
                     uint64_t slice = remaining < kStreamSliceSize ? remaining : kStreamSliceSize;
-                    if (!impl_->readAllTls(s, drain.data(), static_cast<size_t>(slice))) break;
+                    if (!impl_->readAllTls(s, drain.data(), static_cast<size_t>(slice), tlsConn.get())) break;
                     remaining -= slice;
                 }
             }
@@ -1339,8 +1439,8 @@ void TcpTransport::serveConnection(uint64_t connId, uintptr_t sRaw) {
         out.seq = resp.seq;
         out.streamLen = respStreamLen;
         std::vector<uint8_t> outHeader = encodeHeader(out);
-        if (!impl_->writeAllTls(s, outHeader.data(), outHeader.size())) break;
-        if (!resp.body.empty() && !impl_->writeAllTls(s, resp.body.data(), resp.body.size())) break;
+        if (!impl_->writeAllTls(s, outHeader.data(), outHeader.size(), tlsConn.get())) break;
+        if (!resp.body.empty() && !impl_->writeAllTls(s, resp.body.data(), resp.body.size(), tlsConn.get())) break;
         if (sliceOut) {
             bool streamOk = false;
             if (resp.streamWindowProvide) {
@@ -1351,7 +1451,7 @@ void TcpTransport::serveConnection(uint64_t connId, uintptr_t sRaw) {
             if (!streamOk) break;
             if (resp.streamCleanup) resp.streamCleanup();
         } else if (!resp.stream.empty()) {
-            if (!impl_->writeAllTls(s, resp.stream.data(), resp.stream.size())) break;
+            if (!impl_->writeAllTls(s, resp.stream.data(), resp.stream.size(), tlsConn.get())) break;
         }
     }
 
@@ -1434,10 +1534,12 @@ std::optional<TcpTransport::ConnId> TcpTransport::connect(const std::string& hos
         return std::nullopt;
     }
 
-    // TLS handshake for client
+    // TLS handshake for client — create per-connection SSL object
+    std::unique_ptr<TlsConnection> tlsConn;
     if (impl_->tlsContext && impl_->tlsContext->enabled && !impl_->tlsContext->serverMode) {
-        if (!impl_->tlsContext->connect(s, host)) {
-            VVM_LOG_ERROR("TLS handshake failed: {}", impl_->tlsContext->lastError);
+        tlsConn = std::make_unique<TlsConnection>(impl_->tlsContext->context(), s);
+        if (!tlsConn->connect(host)) {
+            VVM_LOG_ERROR("TLS handshake failed for {}:{}", host, port);
             closeSocket(s);
             return std::nullopt;
         }
@@ -1448,7 +1550,7 @@ std::optional<TcpTransport::ConnId> TcpTransport::connect(const std::string& hos
     uint64_t id = impl_->nextConnId++;
     {
         std::lock_guard<std::mutex> lock(impl_->connsMutex);
-        impl_->conns[id] = {s, std::chrono::steady_clock::now(), false};
+        impl_->conns[id] = {s, std::chrono::steady_clock::now(), false, std::move(tlsConn)};
     }
     VVM_LOG_INFO("Connected to {}:{} (conn {})", host, port, id);
     return id;
@@ -1456,11 +1558,13 @@ std::optional<TcpTransport::ConnId> TcpTransport::connect(const std::string& hos
 
 std::optional<TcpMessage> TcpTransport::request(ConnId id, const TcpMessage& req, const StreamIO* streamIO) {
     SocketType s = kInvalidSocket;
+    TlsConnection* tlsConn = nullptr;
     {
         std::lock_guard<std::mutex> lock(impl_->connsMutex);
         auto it = impl_->conns.find(id);
         if (it == impl_->conns.end()) return std::nullopt;
         s = it->second.socket;
+        tlsConn = it->second.tlsConn.get();
         it->second.lastActivity = std::chrono::steady_clock::now();
     }
 
@@ -1479,11 +1583,11 @@ std::optional<TcpMessage> TcpTransport::request(ConnId id, const TcpMessage& req
     out.streamLen = reqStreamLen;
     std::vector<uint8_t> outHeader = encodeHeader(out);
 
-    if (!impl_->writeAllTls(s, outHeader.data(), outHeader.size())) {
+    if (!impl_->writeAllTls(s, outHeader.data(), outHeader.size(), tlsConn)) {
         disconnect(id);
         return std::nullopt;
     }
-    if (!req.body.empty() && !impl_->writeAllTls(s, req.body.data(), req.body.size())) {
+    if (!req.body.empty() && !impl_->writeAllTls(s, req.body.data(), req.body.size(), tlsConn)) {
         disconnect(id);
         return std::nullopt;
     }
@@ -1498,14 +1602,14 @@ std::optional<TcpMessage> TcpTransport::request(ConnId id, const TcpMessage& req
             return std::nullopt;
         }
     } else if (!req.stream.empty()) {
-        if (!impl_->writeAllTls(s, req.stream.data(), req.stream.size())) {
+        if (!impl_->writeAllTls(s, req.stream.data(), req.stream.size(), tlsConn)) {
             disconnect(id);
             return std::nullopt;
         }
     }
 
     std::vector<uint8_t> header(kHeaderSize);
-    if (!impl_->readAllTls(s, header.data(), header.size())) {
+    if (!impl_->readAllTls(s, header.data(), header.size(), tlsConn)) {
         disconnect(id);
         return std::nullopt;
     }
@@ -1526,7 +1630,7 @@ std::optional<TcpMessage> TcpTransport::request(ConnId id, const TcpMessage& req
     resp.seq = nh.seq;
     if (nh.bodyLen > 0) {
         resp.body.resize(nh.bodyLen);
-        if (!impl_->readAllTls(s, resp.body.data(), nh.bodyLen)) {
+        if (!impl_->readAllTls(s, resp.body.data(), nh.bodyLen, tlsConn)) {
             disconnect(id);
             return std::nullopt;
         }
@@ -1548,7 +1652,7 @@ std::optional<TcpMessage> TcpTransport::request(ConnId id, const TcpMessage& req
             resp.streamLen = nh.streamLen;
         } else {
             resp.stream.resize(nh.streamLen);
-            if (!impl_->readAllTls(s, resp.stream.data(), resp.stream.size())) {
+            if (!impl_->readAllTls(s, resp.stream.data(), resp.stream.size(), tlsConn)) {
                 disconnect(id);
                 return std::nullopt;
             }
