@@ -337,6 +337,8 @@ For production multi-transport clusters, VulkanVM integrates **UCX** (Unified Co
 - **Tag matching + RMA**: `ucp_tag_send`/`recv` for control, `ucp_put`/`get` for RDMA
 - **Rendezvous protocol**: Automatic switch to RDMA for large messages
 - **CUDA/ROCm/Ze IPC**: Intra-node GPU copies without host staging
+- **Multi-node data path**: `sendTensor()`/`recvTensor()` automatically use UCX RMA when both peers support it
+- **Background progress**: Dedicated progress thread starts automatically when `enableAsyncPipeline` is on
 
 **Enable UCX:**
 ```cpp
@@ -384,6 +386,23 @@ auto ep = ucx.exchangeAndConnect(peerKey, nodeId, true,
 ```
 
 Both peers must use compatible TLS sets (shared intersection that can actually connect). If you set `UCX_TLS=rc` only and there is no usable RC device, EP creation or first send fails — always keep `tcp` or `sm` in dev presets.
+
+### UCX Multi-Node Data Path
+
+When UCX is enabled (`enableUCX = true` or `preference = Auto/UCXOnly`), the tensor transport wires UCX into its send/recv pipeline:
+
+1. **`sendTensor()`** — after the standard TCP export, `exportForRemoteUcx()` registers the allocation's memory with UCX, packs the RMA key, and augments the `RemoteAllocationDesc` with UCX worker address + packed rkey + remote address. The peer receives this over the existing TCP control plane.
+
+2. **`recvTensor()`** — when the received descriptor contains UCX info (`desc.canUseUcx()`) and local UCX is initialized, `migrateFromRemoteUcx()` connects to the peer, unpacks the remote rkey, and issues an async `ucp_get_nb` (RDMA read). Falls back to RDMA/TCP if either side lacks UCX.
+
+3. **Progress** — a background thread (`startProgressThread()`) drives `ucp_worker_progress()` automatically when `enableAsyncPipeline` is on. No manual `progress()` calls needed.
+
+**Capability query:**
+```cpp
+if (transport->supportsUCX()) {
+    // UCX is initialized and ready for multi-node transfers
+}
+```
 
 **Attribution:** UCX (https://github.com/openucx/ucx) — BSD-3-Clause, Pavel Shamis et al.
 

@@ -4,6 +4,7 @@
 #include "vulkan_vm/network/network_types.hpp"
 #include "vulkan_vm/network/tcp_transport.hpp"
 #include "vulkan_vm/network/rdma_transport.hpp"
+#include "vulkan_vm/ucx_transport.hpp"
 
 #if defined(VVM_NETWORK_HAS_GRPC)
 #include "vulkan_vm/network/cluster_client.hpp"
@@ -131,7 +132,16 @@ public:
         const Allocation& alloc,
         bool enableRdma = true,
         bool forceHostShadow = false);
-    
+
+    // Augment an existing RemoteAllocationDesc with UCX transport info.
+    // Registers the allocation's memory with UCX and fills ucxWorkerAddr,
+    // ucxPackedRkey, ucxRemoteAddr. Returns true on success. The descriptor
+    // is modified in-place. Pass the same alloc that was passed to
+    // exportForRemote() so UCX can register the correct memory region.
+    bool exportForRemoteUcx(RemoteAllocationDesc& desc,
+                            const Allocation& alloc,
+                            uint32_t deviceIndex);
+
     // ========================================================================
     // Import remote allocation
     // ========================================================================
@@ -162,7 +172,18 @@ public:
         Allocation& destination,
         bool useRdma = true,
         uint64_t timeoutNs = UINT64_MAX);
-    
+
+    // UCX pull: register destination with UCX, unpack remote's rkey, use
+    // ucp_get_nb to pull data over UCX (InfiniBand/RoCE/TCP). Returns the
+    // local UCX memory handle for deregistration. The caller drives progress
+    // (or relies on the progress thread) and invokes the completion callback
+    // when done.
+    bool migrateFromRemoteUcx(
+        const RemoteAllocationDesc& source,
+        Allocation& destination,
+        uint32_t deviceIndex,
+        std::function<void(bool)> callback);
+
     // Push local data to remote allocation
     std::optional<NetworkMigrationOperation> migrateToRemote(
         Allocation& source,
@@ -258,7 +279,16 @@ public:
     bool rdmaAvailable() const {
         return rdmaTransport_ != nullptr && rdmaTransport_->isReady();
     }
-    
+
+    // True when UCX transport is available for GPU-aware networking.
+    bool ucxAvailable() const {
+        return ucxTransport_ && ucxTransport_->isInitialized();
+    }
+
+    // Set the UCX transport handle for UCX-enabled export/migration.
+    // Pointer is non-owning; caller must outlive this manager.
+    void setUcxTransport(vvm::tensor::UcxTransport* ucx) { ucxTransport_ = ucx; }
+
 private:
     friend class ClusterClient;
     friend class ClusterServer;
@@ -395,7 +425,23 @@ private:
     std::optional<RdmaConnection> ensureRdmaConnection(const NodeId& peer);
     // Tear down all host-shadow exports (stop()/cleanup()).
     void releaseAllRdmaExports();
-    
+
+    // UCX transport (owned by TensorTransportImpl, non-owning handle here).
+    // Set via setUcxTransport() to enable UCX export/migration paths.
+    vvm::tensor::UcxTransport* ucxTransport_ = nullptr;
+
+    // UCX endpoint cache: peer node ID string -> UCX endpoint.
+    mutable std::mutex ucxEndpointsMutex_;
+    std::unordered_map<std::string, vvm::tensor::UcxEndpoint> ucxEndpoints_;
+
+    // UCX memory handle tracking for cleanup.
+    mutable std::mutex ucxMemMutex_;
+    std::vector<vvm::tensor::UcxMemoryHandle> ucxMemHandles_;
+
+    // Get or create a UCX endpoint to the peer identified by node ID string.
+    std::optional<vvm::tensor::UcxEndpoint> ensureUcxEndpoint(const std::string& nodeIdStr,
+                                                  const std::string& peerWorkerAddr);
+
     // Host-staged fallback
     std::optional<NetworkMigrationOperation> migrateHostStaged(
         const RemoteAllocationDesc& source,

@@ -1166,6 +1166,185 @@ void MultiNodePoolManager::migrateFromRemoteAsync(
 }
 
 // ============================================================================
+// UCX Transport Integration
+// ============================================================================
+// UCX provides a unified, multi-transport GPU-aware communication path
+// (InfiniBand/RoCE/TCP/shared-memory). These methods wire UCX into the
+// existing export/migration flow: the TCP control plane still carries the
+// RemoteAllocationDesc (now augmented with UCX worker-address + RMA-key),
+// but the actual data movement uses UCX RMA (ucp_get/ucp_put) instead of
+// verbs or host-staged TCP.
+// ============================================================================
+
+#if defined(VVM_HAS_UCX)
+
+bool MultiNodePoolManager::exportForRemoteUcx(RemoteAllocationDesc& desc,
+                                               const Allocation& alloc,
+                                               uint32_t deviceIndex) {
+    if (!ucxTransport_ || !ucxTransport_->isInitialized()) return false;
+
+    // Register the allocation's memory with UCX. For GPU allocations we pass
+    // the host-visible staging pointer (if available) since Vulkan GPU
+    // pointers are not directly consumable by UCX without CUDA/ROCm interop.
+    // UCX treats this as host memory; the RMA path still benefits from
+    // InfiniBand/RoCE zero-copy on the wire.
+    void* regPtr = alloc.hostPtr;
+    if (!regPtr) {
+        VVM_LOG_WARN("exportForRemoteUcx: allocation has no host pointer, skipping UCX export");
+        return false;
+    }
+
+    auto memHandle = ucxTransport_->registerHostMemory(regPtr, alloc.size);
+    if (!memHandle) {
+        VVM_LOG_WARN("exportForRemoteUcx: failed to register memory with UCX");
+        return false;
+    }
+
+    // Pack the RMA key so the remote peer can unpack it and access our memory.
+    auto rmaKey = ucxTransport_->packRmaKey(*memHandle);
+    if (!rmaKey) {
+        VVM_LOG_WARN("exportForRemoteUcx: failed to pack RMA key");
+        return false;
+    }
+
+    // Get our local worker address for the peer to connect to.
+    auto workerAddr = ucxTransport_->getLocalAddress();
+    if (!workerAddr) {
+        VVM_LOG_WARN("exportForRemoteUcx: failed to get local worker address");
+        return false;
+    }
+
+    // Fill in UCX fields in the descriptor.
+    desc.hasUcxAddr = true;
+    desc.ucxWorkerAddr = workerAddr->bytes;
+    desc.ucxPackedRkey = rmaKey->packedRkey;
+    desc.ucxRemoteAddr = rmaKey->remoteAddr;
+    desc.ucxDeviceIndex = deviceIndex;
+
+    // Track the memory handle for later cleanup.
+    {
+        std::lock_guard<std::mutex> lock(ucxMemMutex_);
+        ucxMemHandles_.push_back(*memHandle);
+    }
+
+    VVM_LOG_INFO("exportForRemoteUcx: UCX export ready (size={}, remote_addr={:#x})",
+                 alloc.size, static_cast<unsigned long long>(rmaKey->remoteAddr));
+    return true;
+}
+
+std::optional<UcxEndpoint> MultiNodePoolManager::ensureUcxEndpoint(
+    const std::string& nodeIdStr,
+    const std::string& peerWorkerAddr) {
+
+    // Check cache first.
+    {
+        std::lock_guard<std::mutex> lock(ucxEndpointsMutex_);
+        auto it = ucxEndpoints_.find(nodeIdStr);
+        if (it != ucxEndpoints_.end() && it->second.connected) {
+            return it->second;
+        }
+    }
+
+    // Parse the worker address blob.
+    UcxWorkerAddress addr;
+    addr.bytes.assign(peerWorkerAddr.begin(), peerWorkerAddr.end());
+
+    auto ep = ucxTransport_->connectToAddress(addr, nodeIdStr);
+    if (ep) {
+        std::lock_guard<std::mutex> lock(ucxEndpointsMutex_);
+        ucxEndpoints_[nodeIdStr] = *ep;
+    }
+    return ep;
+}
+
+bool MultiNodePoolManager::migrateFromRemoteUcx(
+    const RemoteAllocationDesc& source,
+    Allocation& destination,
+    uint32_t deviceIndex,
+    std::function<void(bool)> callback) {
+
+    if (!source.canUseUcx()) {
+        if (callback) callback(false);
+        return false;
+    }
+
+    // Connect to the remote peer using its worker address from the descriptor.
+    std::string nodeIdStr = source.owner.toString();
+    auto ep = ensureUcxEndpoint(nodeIdStr,
+        std::string(source.ucxWorkerAddr.begin(), source.ucxWorkerAddr.end()));
+    if (!ep || !ep->connected) {
+        VVM_LOG_ERROR("migrateFromRemoteUcx: failed to connect to peer {}", nodeIdStr);
+        if (callback) callback(false);
+        return false;
+    }
+
+    // Register the local destination memory with UCX.
+    void* regPtr = destination.hostPtr;
+    if (!regPtr) {
+        VVM_LOG_ERROR("migrateFromRemoteUcx: destination has no host pointer");
+        if (callback) callback(false);
+        return false;
+    }
+
+    auto localMem = ucxTransport_->registerHostMemory(regPtr, destination.size);
+    if (!localMem) {
+        VVM_LOG_ERROR("migrateFromRemoteUcx: failed to register local memory");
+        if (callback) callback(false);
+        return false;
+    }
+
+    // Unpack the remote's RMA key (sent over TCP in the descriptor).
+    UcxRmaKey rmaKey;
+    rmaKey.packedRkey = source.ucxPackedRkey;
+    rmaKey.remoteAddr = source.ucxRemoteAddr;
+    rmaKey.size = source.size;
+
+    auto remoteMem = ucxTransport_->unpackRmaKey(*ep, rmaKey);
+    if (!remoteMem) {
+        VVM_LOG_ERROR("migrateFromRemoteUcx: failed to unpack remote RMA key");
+        if (callback) callback(false);
+        return false;
+    }
+
+    // Issue an async UCX get (RDMA read) to pull data from remote.
+    bool ok = ucxTransport_->getAsync(*ep, *localMem, *remoteMem, source.size, [callback](bool success) {
+        if (callback) callback(success);
+    });
+
+    if (!ok) {
+        VVM_LOG_ERROR("migrateFromRemoteUcx: getAsync failed");
+        if (callback) callback(false);
+        return false;
+    }
+
+    // Track local memory handle for cleanup.
+    {
+        std::lock_guard<std::mutex> lock(ucxMemMutex_);
+        ucxMemHandles_.push_back(*localMem);
+    }
+
+    VVM_LOG_INFO("migrateFromRemoteUcx: UCX get issued (size={})", source.size);
+    return true;
+}
+
+#else // VVM_HAS_UCX stubs
+
+bool MultiNodePoolManager::exportForRemoteUcx(RemoteAllocationDesc&,
+                                               const Allocation&,
+                                               uint32_t) {
+    return false;
+}
+
+bool MultiNodePoolManager::migrateFromRemoteUcx(const RemoteAllocationDesc&,
+                                                  Allocation&,
+                                                  uint32_t,
+                                                  std::function<void(bool)>) {
+    return false;
+}
+
+#endif // VVM_HAS_UCX
+
+// ============================================================================
 // Remote tensor announcement (GPU-to-GPU VRAM share over TCP)
 // ============================================================================
 
