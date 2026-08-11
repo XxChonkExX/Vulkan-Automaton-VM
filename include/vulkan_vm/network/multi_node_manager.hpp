@@ -1,16 +1,8 @@
 #pragma once
 
-#include "vulkan_vm/core.hpp"
+#include "vulkan_vm/vulkan_vm.hpp"
 #include "vulkan_vm/network/network_types.hpp"
 #include "vulkan_vm/network/tcp_transport.hpp"
-#include "vulkan_vm/network/rdma_transport.hpp"
-#include "vulkan_vm/ucx_transport.hpp"
-
-#if defined(VVM_NETWORK_HAS_GRPC)
-#include "vulkan_vm/network/cluster_client.hpp"
-#include "vulkan_vm/network/cluster_server.hpp"
-#endif
-
 #include <memory>
 #include <vector>
 #include <optional>
@@ -18,7 +10,6 @@
 #include <string>
 #include <functional>
 #include <mutex>
-#include <condition_variable>
 #include <unordered_map>
 #include <atomic>
 #include <thread>
@@ -132,16 +123,7 @@ public:
         const Allocation& alloc,
         bool enableRdma = true,
         bool forceHostShadow = false);
-
-    // Augment an existing RemoteAllocationDesc with UCX transport info.
-    // Registers the allocation's memory with UCX and fills ucxWorkerAddr,
-    // ucxPackedRkey, ucxRemoteAddr. Returns true on success. The descriptor
-    // is modified in-place. Pass the same alloc that was passed to
-    // exportForRemote() so UCX can register the correct memory region.
-    bool exportForRemoteUcx(RemoteAllocationDesc& desc,
-                            const Allocation& alloc,
-                            uint32_t deviceIndex);
-
+    
     // ========================================================================
     // Import remote allocation
     // ========================================================================
@@ -172,18 +154,7 @@ public:
         Allocation& destination,
         bool useRdma = true,
         uint64_t timeoutNs = UINT64_MAX);
-
-    // UCX pull: register destination with UCX, unpack remote's rkey, use
-    // ucp_get_nb to pull data over UCX (InfiniBand/RoCE/TCP). Returns the
-    // local UCX memory handle for deregistration. The caller drives progress
-    // (or relies on the progress thread) and invokes the completion callback
-    // when done.
-    bool migrateFromRemoteUcx(
-        const RemoteAllocationDesc& source,
-        Allocation& destination,
-        uint32_t deviceIndex,
-        std::function<void(bool)> callback);
-
+    
     // Push local data to remote allocation
     std::optional<NetworkMigrationOperation> migrateToRemote(
         Allocation& source,
@@ -218,25 +189,6 @@ public:
     
     // Look up a registered (remote-visible) allocation by its local id.
     std::optional<Allocation> getRegisteredAllocation(uint64_t localAllocId) const;
-
-    // ========================================================================
-    // Remote tensor announcement (GPU-to-GPU VRAM share over TCP)
-    // ========================================================================
-
-    // Advertise a tensor (by name) to a specific peer. The peer receives a
-    // RemoteAllocationDesc it can use to pull the VRAM with migrateFromRemote.
-    bool announceRemoteTensor(
-        const NodeId& target,
-        const std::string& name,
-        const RemoteAllocationDesc& desc);
-
-    // Wait until a peer announces a tensor with the given name; returns its
-    // descriptor. Blocks up to timeoutNs. The tensor then stays in the peer's
-    // VRAM and can be pulled with migrateFromRemote().
-    std::optional<RemoteAllocationDesc> waitRemoteTensor(
-        const NodeId& source,
-        const std::string& name,
-        uint64_t timeoutNs = UINT64_MAX);
     
     // Manual cluster operations
     bool registerWithCluster();
@@ -275,20 +227,6 @@ public:
     // Get network config
     const NetworkConfig& getNetworkConfig() const { return networkConfig_; }
     
-    // True when a usable RDMA transport is active (verbs built in + live NIC).
-    bool rdmaAvailable() const {
-        return rdmaTransport_ != nullptr && rdmaTransport_->isReady();
-    }
-
-    // True when UCX transport is available for GPU-aware networking.
-    bool ucxAvailable() const {
-        return ucxTransport_ && ucxTransport_->isInitialized();
-    }
-
-    // Set the UCX transport handle for UCX-enabled export/migration.
-    // Pointer is non-owning; caller must outlive this manager.
-    void setUcxTransport(vvm::tensor::UcxTransport* ucx) { ucxTransport_ = ucx; }
-
 private:
     friend class ClusterClient;
     friend class ClusterServer;
@@ -303,42 +241,9 @@ private:
     void cleanup();
     
     // Network components
-#if defined(VVM_NETWORK_HAS_GRPC)
     std::unique_ptr<ClusterClient> clusterClient_;   // optional gRPC client (when built with gRPC)
     std::unique_ptr<ClusterServer> clusterServer_;   // optional gRPC server (when built with gRPC)
-#else
-    // Minimal stubs when gRPC not available
-    class ClusterClient {
-    public:
-        ClusterClient() = default;
-        virtual ~ClusterClient() = default;
-    };
-    class ClusterServer {
-    public:
-        ClusterServer() = default;
-        virtual ~ClusterServer() = default;
-    };
-    std::unique_ptr<ClusterClient> clusterClient_;
-    std::unique_ptr<ClusterServer> clusterServer_;
-#endif
     std::unique_ptr<RdmaTransport> rdmaTransport_;   // optional verbs transport (when built with libibverbs)
-
-#if defined(VVM_NETWORK_HAS_VERBS)
-    // One in-flight RDMA "host shadow" export: a host staging buffer holding a
-    // copy of the exported data, kept RDMA-addressable by a registered MR.
-    struct RdmaExport {
-        RdmaMemoryRegion region;   // verbs MR over hostShadow.hostPtr
-        Allocation hostShadow;     // host copy of the exported data
-        VkDeviceSize size = 0;
-    };
-    // Key = pendingKey(localNodeId_, allocId).
-    std::unordered_map<std::string, RdmaExport> rdmaShadowExports_;
-    mutable std::mutex rdmaShadowMutex_;
-
-    // Persistent RDMA connections: peer.toString() -> connection.
-    std::unordered_map<std::string, RdmaConnection> rdmaConnections_;
-    mutable std::mutex rdmaConnectionsMutex_;
-#endif
 
     // TCP host-staged control + data plane (always available)
     std::unique_ptr<TcpTransport> tcpTransport_;
@@ -351,15 +256,15 @@ private:
     VkQueue transferQueue_ = VK_NULL_HANDLE;
     uint32_t transferQueueFamily_ = UINT32_MAX;
 
-    // Windowed copy contexts for double-buffered migration pipeline
+    // Pre-allocated command buffer/fence pool for async copies (avoids per-copy alloc)
     struct CopyContext {
         VkCommandBuffer cmdBuffer = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
         bool inUse = false;
     };
     std::vector<CopyContext> copyContexts_;
-    uint32_t maxCopyContexts_ = 0;
-    mutable std::mutex copyContextsMutex_;
+    std::mutex copyContextsMutex_;
+    uint32_t maxCopyContexts_ = 8;  // configurable via NetworkConfig
 
     // Allocation registry: localAllocId -> Allocation (for remote access)
     std::unordered_map<uint64_t, Allocation> remoteAllocs_;
@@ -373,13 +278,6 @@ private:
     // Heartbeat
     std::thread heartbeatThread_;
     std::atomic<bool> stopHeartbeat_{false};
-    mutable std::mutex heartbeatMutex_;
-    mutable std::condition_variable heartbeatCV_;
-
-    // Pending remote tensor announcements: key = "sourceNode|name" -> descriptor
-    std::unordered_map<std::string, RemoteAllocationDesc> pendingRemoteTensors_;
-    mutable std::mutex remoteTensorsMutex_;
-    std::condition_variable remoteTensorsCV_;
     
     // Local pools (one per GPU)
     std::vector<UnifiedMemoryPool> localPools_;
@@ -398,7 +296,10 @@ private:
     std::unordered_map<uint64_t, ActiveMigration> activeMigrations_;
     mutable std::mutex migrationsMutex_;
     uint64_t nextMigrationId_ = 1;
-
+    
+    // Migration callback type
+    using MigrationCallback = std::function<void(const NetworkMigrationOperation&)>;
+    
     // Cluster state
     std::vector<NodeInfo> clusterView_;
     mutable std::mutex clusterViewMutex_;
@@ -407,9 +308,6 @@ private:
     // Stats
     mutable std::mutex statsMutex_;
     NetworkStats networkStats_;
-    // Adaptive pipeline state (guarded by statsMutex_): measured transfer
-    // throughput used to size staging windows on the next migration.
-    uint64_t lastThroughputBytesPerSec_ = 0;
     
     // Internal helpers
     std::optional<Allocation> createLocalAllocationForImport(
@@ -418,30 +316,7 @@ private:
     
     bool registerMemoryForRdma(const Allocation& alloc, uint64_t& outRdmaAddr, uint32_t& outRkey);
     void unregisterMemoryForRdma(const Allocation& alloc);
-
-    // Release the host-shadow export (MR + staging) for a local allocation id.
-    void releaseRdmaExport(uint64_t localAllocId);
-    // Return (and cache) an established RDMA connection to the peer node.
-    std::optional<RdmaConnection> ensureRdmaConnection(const NodeId& peer);
-    // Tear down all host-shadow exports (stop()/cleanup()).
-    void releaseAllRdmaExports();
-
-    // UCX transport (owned by TensorTransportImpl, non-owning handle here).
-    // Set via setUcxTransport() to enable UCX export/migration paths.
-    vvm::tensor::UcxTransport* ucxTransport_ = nullptr;
-
-    // UCX endpoint cache: peer node ID string -> UCX endpoint.
-    mutable std::mutex ucxEndpointsMutex_;
-    std::unordered_map<std::string, vvm::tensor::UcxEndpoint> ucxEndpoints_;
-
-    // UCX memory handle tracking for cleanup.
-    mutable std::mutex ucxMemMutex_;
-    std::vector<vvm::tensor::UcxMemoryHandle> ucxMemHandles_;
-
-    // Get or create a UCX endpoint to the peer identified by node ID string.
-    std::optional<vvm::tensor::UcxEndpoint> ensureUcxEndpoint(const std::string& nodeIdStr,
-                                                  const std::string& peerWorkerAddr);
-
+    
     // Host-staged fallback
     std::optional<NetworkMigrationOperation> migrateHostStaged(
         const RemoteAllocationDesc& source,
@@ -461,18 +336,6 @@ private:
                           VkDeviceSize dstOffset, VkDeviceSize size);
     bool runCopy(VkBuffer srcBuffer, VkBuffer dstBuffer,
                  VkDeviceSize srcOffset, VkDeviceSize dstOffset, VkDeviceSize size);
-
-    // Windowed-copy primitives for the double-buffered migration pipeline.
-    VkFence submitCopyAsync(VkBuffer srcBuffer, VkBuffer dstBuffer,
-                            VkDeviceSize srcOffset, VkDeviceSize dstOffset,
-                            VkDeviceSize size, VkCommandBuffer& outCmd);
-    void releaseAsyncCopy(VkCommandBuffer cmd, VkFence fence);
-    bool waitFence(VkFence fence);
-    uint32_t adaptiveWindowBytes(uint64_t totalBytes) const;
-    uint32_t adaptivePipelineDepth() const;
-    void recordTransferRate(uint64_t bytes, std::chrono::steady_clock::duration elapsed);
-
-    friend struct WindowPipe;
 
     uint64_t registerAllocation(Allocation&& alloc);
     std::optional<Allocation> findAllocation(uint64_t localAllocId);

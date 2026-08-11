@@ -1,25 +1,58 @@
 #include "vulkan_vm/network/multi_node_manager.hpp"
 #include "vulkan_vm/network/tcp_transport.hpp"
 #include "vulkan_vm/network/network_types.hpp"
-#include "vulkan_vm/core.hpp"
+#include "vulkan_vm/cross_gpu/external_memory.hpp"
+#include "vulkan_vm/vulkan_vm.hpp"
 #include "vulkan_vm/utils.hpp"
-#include "vulkan_vm/constants.hpp"
 
-#if defined(VVM_NETWORK_HAS_GRPC)
-#include "vulkan_vm/network/cluster_client.hpp"
-#include "vulkan_vm/network/cluster_server.hpp"
+#if defined(VVM_PLATFORM_LINUX)
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <unistd.h>
 #endif
 
-#if defined(VVM_NETWORK_HAS_VERBS)
-#include "vulkan_vm/network/rdma_transport.hpp"
+// Helper to auto-detect primary LAN IP (Linux)
+#if defined(VVM_PLATFORM_LINUX)
+static std::string getPrimaryLanIp() {
+    struct ifaddrs* ifaddr = nullptr;
+    if (getifaddrs(&ifaddr) != 0) return "127.0.0.1";
+    
+    std::string bestIp = "127.0.0.1";
+    for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+        if (!(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK)) continue;
+        
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &((struct sockaddr_in*)ifa->ifa_addr)->sin_addr, ip, sizeof(ip));
+        
+        // Prefer non-link-local addresses
+        struct in_addr addr;
+        inet_pton(AF_INET, ip, &addr);
+        uint32_t addr32 = ntohl(addr.s_addr);
+        
+        // Skip link-local (169.254.x.x) and loopback
+        if ((addr32 & 0xFFFF0000) == 0xA9FE0000) continue;
+        if ((addr32 & 0xFF000000) == 0x7F000000) continue;
+        
+        // Return first valid LAN IP
+        freeifaddrs(ifaddr);
+        return ip;
+    }
+    freeifaddrs(ifaddr);
+    return bestIp;
+}
+#elif defined(VVM_PLATFORM_WINDOWS)
+static std::string getPrimaryLanIp() {
+    // Windows: use GetAdaptersAddresses or fallback
+    return "127.0.0.1";  // TODO: implement Windows IP detection
+}
+#else
+static std::string getPrimaryLanIp() {
+    return "127.0.0.1";
+}
 #endif
-
-#include <algorithm>
-#include <array>
-#include <chrono>
-#include <cstring>
-#include <random>
-#include <thread>
 
 namespace vvm {
 namespace network {
@@ -89,7 +122,8 @@ MultiNodePoolManager::MultiNodePoolManager(
     uint16_t listenPort = 0;
     parseListenAddress(networkConfig_.listenAddress, listenHost, listenPort);
     tcpPort_ = listenPort;
-    localHost_ = networkConfig_.advertiseAddress.empty() ? "127.0.0.1" : networkConfig_.advertiseAddress;
+    // Use advertiseAddress if set, otherwise auto-detect LAN IP
+    localHost_ = networkConfig_.advertiseAddress.empty() ? getPrimaryLanIp() : networkConfig_.advertiseAddress;
 
     // Parse seed nodes into host:port endpoints
     for (const auto& seed : networkConfig_.seedNodes) {
@@ -124,7 +158,6 @@ MultiNodePoolManager::MultiNodePoolManager(MultiNodePoolManager&& other) noexcep
     , localHost_(std::move(other.localHost_))
     , seedEndpoints_(std::move(other.seedEndpoints_))
     , copyCmdPool_(other.copyCmdPool_)
-    , copyContexts_(std::move(other.copyContexts_))
     , transferQueue_(other.transferQueue_)
     , transferQueueFamily_(other.transferQueueFamily_)
     , remoteAllocs_(std::move(other.remoteAllocs_))
@@ -159,7 +192,6 @@ MultiNodePoolManager& MultiNodePoolManager::operator=(MultiNodePoolManager&& oth
         localHost_ = std::move(other.localHost_);
         seedEndpoints_ = std::move(other.seedEndpoints_);
         copyCmdPool_ = other.copyCmdPool_;
-        copyContexts_ = std::move(other.copyContexts_);
         transferQueue_ = other.transferQueue_;
         transferQueueFamily_ = other.transferQueueFamily_;
         remoteAllocs_ = std::move(other.remoteAllocs_);
@@ -213,16 +245,12 @@ bool MultiNodePoolManager::initialize() {
 #endif
 
 #if defined(VVM_NETWORK_HAS_VERBS)
-    if (networkConfig_.enableRdma) {
-        rdmaTransport_ = RdmaTransport::create(networkConfig_,
-                                               localDeviceConfigs_[0].physicalDevice,
-                                               localDeviceConfigs_[0].device);
-        if (!rdmaTransport_ || !rdmaTransport_->initialize()) {
-            VVM_LOG_WARN("RDMA transport initialization failed, using host-staged fallback only");
-            rdmaTransport_.reset();
-        }
-    } else {
-        VVM_LOG_INFO("RDMA transport disabled (enableRdma=false)");
+    rdmaTransport_ = RdmaTransport::create(networkConfig_,
+                                           localDeviceConfigs_[0].physicalDevice,
+                                           localDeviceConfigs_[0].device);
+    if (!rdmaTransport_ || !rdmaTransport_->initialize()) {
+        VVM_LOG_WARN("RDMA transport initialization failed, using host-staged fallback only");
+        rdmaTransport_.reset();
     }
 #endif
 
@@ -246,13 +274,7 @@ void MultiNodePoolManager::cleanup() {
 
     // Destroy copy engine
     if (copyCmdPool_ != VK_NULL_HANDLE && !localPools_.empty()) {
-        VkDevice device = localPools_[0].getDevice();
-        for (auto& ctx : copyContexts_) {
-            if (ctx.cmdBuffer) vkFreeCommandBuffers(device, copyCmdPool_, 1, &ctx.cmdBuffer);
-            if (ctx.fence) vkDestroyFence(device, ctx.fence, nullptr);
-        }
-        copyContexts_.clear();
-        vkDestroyCommandPool(device, copyCmdPool_, nullptr);
+        vkDestroyCommandPool(localPools_[0].getDevice(), copyCmdPool_, nullptr);
         copyCmdPool_ = VK_NULL_HANDLE;
     }
 
@@ -261,10 +283,7 @@ void MultiNodePoolManager::cleanup() {
     if (clusterClient_) clusterClient_->disconnect();
 #endif
 #if defined(VVM_NETWORK_HAS_VERBS)
-    if (rdmaTransport_) {
-        releaseAllRdmaExports();
-        rdmaTransport_->shutdown();
-    }
+    if (rdmaTransport_) rdmaTransport_->shutdown();
 #endif
 
     // Destroy local pools
@@ -286,7 +305,7 @@ bool MultiNodePoolManager::start() {
         onTcpRequest(request, response);
     };
 
-    if (!tcpTransport_->start(listenHost, listenPort, std::move(handler), networkConfig_)) {
+    if (!tcpTransport_->start(listenHost, listenPort, std::move(handler))) {
         VVM_LOG_ERROR("Failed to start TCP server on {}:{}", listenHost, listenPort);
         tcpTransport_.reset();
         return false;
@@ -314,7 +333,6 @@ void MultiNodePoolManager::stop() {
     leaveCluster();
 
     stopHeartbeat_ = true;
-    heartbeatCV_.notify_all();
     if (heartbeatThread_.joinable()) heartbeatThread_.join();
 
     if (tcpTransport_) {
@@ -338,19 +356,6 @@ void MultiNodePoolManager::stop() {
             }
         }
     }
-
-#if defined(VVM_NETWORK_HAS_VERBS)
-    if (rdmaTransport_) {
-        releaseAllRdmaExports();
-        {
-            std::lock_guard<std::mutex> lock(rdmaConnectionsMutex_);
-            for (auto& [key, conn] : rdmaConnections_) {
-                rdmaTransport_->disconnect(conn);
-            }
-            rdmaConnections_.clear();
-        }
-    }
-#endif
 
     running_ = false;
     VVM_LOG_INFO("MultiNodePoolManager stopped");
@@ -413,7 +418,7 @@ bool MultiNodePoolManager::deallocateRemote(const RemoteAllocationDesc& desc) {
         req.type = MsgDeallocate;
         req.flags = TcpFlagsRequest;
         std::vector<uint8_t> body;
-        vvm::detail::putU64(body, desc.localAllocId);
+        detail::putU64(body, desc.localAllocId);
         req.body = std::move(body);
         auto resp = tcpTransport_->request(conn, req);
         return resp.has_value() && resp->flags != TcpFlagsError;
@@ -461,10 +466,10 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::allocateRemote(
     }
 
     std::vector<uint8_t> body;
-    vvm::detail::putU64(body, size);
-    vvm::detail::putU32(body, usage);
-    vvm::detail::putU32(body, flags);
-    vvm::detail::putU8(body, enableRdma ? 1 : 0);
+    detail::putU64(body, size);
+    detail::putU32(body, usage);
+    detail::putU32(body, flags);
+    detail::putU8(body, enableRdma ? 1 : 0);
 
     TcpMessage req;
     req.type = MsgAllocate;
@@ -480,7 +485,7 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::allocateRemote(
     const uint8_t* p = resp->body.data();
     const uint8_t* end = p + resp->body.size();
     uint8_t success = 0;
-    if (!vvm::detail::getU8(p, end, success) || success == 0) {
+    if (!detail::getU8(p, end, success) || success == 0) {
         VVM_LOG_ERROR("allocateRemote: remote node refused allocation");
         return std::nullopt;
     }
@@ -519,44 +524,13 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
 
     // GPU-direct path (only when verbs + GPUDirect are available)
 #if defined(VVM_NETWORK_HAS_VERBS)
-    std::optional<RdmaExport> pendingRdmaExport;
     if (enableRdma && rdmaTransport_ && !forceHostShadow) {
-        // 1) True GPU-direct, only when the vendor produces a usable
-        //    (remote-address, rkey) pair for the GPU memory itself.
         uint64_t rdmaAddr = 0;
         uint32_t rkey = 0;
-        if (registerMemoryForRdma(alloc, rdmaAddr, rkey) && rdmaAddr != 0 && rkey != 0) {
+        if (registerMemoryForRdma(alloc, rdmaAddr, rkey)) {
             netDesc.hasRdmaAddr = true;
             netDesc.rdmaAddr = rdmaAddr;
             netDesc.rkey = rkey;
-            VVM_LOG_INFO("exportForRemote: GPU-direct RDMA for alloc size {} (addr={:#x})",
-                         alloc.size, static_cast<unsigned long long>(rdmaAddr));
-        } else {
-            // 2) Host shadow: copy the data into host memory ONCE, register that
-            // buffer as an RDMA MR and publish (addr, rkey). Peers then pull or
-            // push the data straight over RDMA; the TCP control path stays as a
-            // fallback keyed on localAllocId (the owner keeps a GPU allocation
-            // registered even in this mode).
-            auto shadow = createStaging(alloc.size);
-            bool copied = false;
-            if (shadow) copied = copyDeviceToHost(alloc, 0, *shadow, alloc.size);
-            if (copied) {
-                if (auto region = rdmaTransport_->registerHostMemory(
-                        shadow->hostPtr, static_cast<size_t>(alloc.size))) {
-                    RdmaExport exp;
-                    exp.region = *region;
-                    exp.hostShadow = std::move(*shadow);
-                    exp.size = alloc.size;
-                    netDesc.hasRdmaAddr = true;
-                    netDesc.rdmaAddr = reinterpret_cast<uint64_t>(region->addr);
-                    netDesc.rkey = region->rkey;
-                    netDesc.hasHostShadow = true;
-                    pendingRdmaExport = std::move(exp);
-                }
-            }
-            if (shadow && !pendingRdmaExport) {
-                localPools_[0].deallocate(std::move(*shadow));
-            }
         }
     }
 #else
@@ -564,7 +538,7 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
     (void)forceHostShadow;
 #endif
 
-// Host-staged fallback
+    // Host-staged fallback
     std::optional<Allocation> promoted;
     std::optional<ExternalMemoryInfo> exportInfo;
     if (!netDesc.hasRdmaAddr) {
@@ -576,7 +550,6 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
         // external handle.
         const Allocation* exportSrc = &alloc;
         if (alloc.blockIndex != UINT32_MAX) {
-            VVM_LOG_INFO("exportForRemote: promoting sub-allocated allocation to dedicated exportable");
             promoted = localPools_[0].allocateDedicatedExportable(
                 alloc.size,
                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -585,17 +558,12 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
                 VVM_LOG_ERROR("exportForRemote: failed to promote sub-allocated allocation to dedicated");
                 return std::nullopt;
             }
-            VVM_LOG_INFO("exportForRemote: promotion succeeded, promoted blockIndex={}, hostPtr={}", 
-                         promoted->blockIndex, promoted->hostPtr ? "non-null" : "null");
             bool copied = false;
             if (alloc.hostPtr && promoted->hostPtr) {
                 std::memcpy(promoted->hostPtr, alloc.hostPtr, static_cast<size_t>(alloc.size));
                 copied = true;
-                VVM_LOG_INFO("exportForRemote: memcpy copy succeeded");
             } else {
-                VVM_LOG_INFO("exportForRemote: using runCopy for GPU copy");
                 copied = runCopy(alloc.buffer, promoted->buffer, 0, 0, alloc.size);
-                VVM_LOG_INFO("exportForRemote: runCopy returned {}", copied);
             }
             if (!copied) {
                 VVM_LOG_ERROR("exportForRemote: failed to copy data into dedicated allocation");
@@ -608,23 +576,29 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
         // Export the actual handle from the export source. The ExternalMemoryInfo
         // OWNS the handle; we keep it alive in a process-local registry so a
         // same-process import can consume it (cross-process hosts stage data).
+        vvm::ExternalHandleType exportType = vvm::ExternalHandleType::None;
         #ifdef VVM_PLATFORM_LINUX
-        VVM_LOG_INFO("exportForRemote: calling exportMemory on Linux");
-        exportInfo = localPools_[0].exportMemory(*exportSrc, vvm::ExternalHandleType::OpaqueFd);
-        #elif defined(VVM_PLATFORM_WINDOWS)
-        VVM_LOG_INFO("exportForRemote: calling exportMemory on Windows");
-        exportInfo = localPools_[0].exportMemory(*exportSrc, vvm::ExternalHandleType::OpaqueWin32);
-        #endif
-        VVM_LOG_INFO("exportForRemote: exportMemory returned {}", exportInfo ? "success" : "failed");
-        if (!exportInfo) {
-            VVM_LOG_ERROR("exportForRemote: failed to export handle for allocation");
-            return std::nullopt;
+        {
+            // Determine best export handle type based on GPU vendor
+            VkPhysicalDevice physDev = localPools_[0].getPhysicalDevice();
+            VkPhysicalDeviceProperties props{};
+            vkGetPhysicalDeviceProperties(physDev, &props);
+            
+            // AMD/Intel on Linux: prefer DMA-BUF for better cross-vendor compatibility
+            // NVIDIA: OPAQUE_FD is fine
+            if (props.vendorID == 0x1002 || props.vendorID == 0x8086) {
+                exportType = vvm::ExternalHandleType::DmaBuf;
+            } else {
+                exportType = vvm::ExternalHandleType::OpaqueFd;
+            }
         }
-        #ifdef VVM_PLATFORM_LINUX
-        netDesc.handleType = vvm::ExternalHandleType::OpaqueFd;
-#else
-        netDesc.handleType = vvm::ExternalHandleType::OpaqueWin32;
-#endif
+        exportInfo = localPools_[0].exportMemory(*exportSrc, exportType);
+        netDesc.handleType = exportInfo ? exportType : netDesc.handleType;
+        #elif defined(VVM_PLATFORM_WINDOWS)
+        exportInfo = localPools_[0].exportMemory(*exportSrc, vvm::ExternalHandleType::OpaqueWin32);
+        netDesc.handleType = exportInfo ? vvm::ExternalHandleType::OpaqueWin32
+                                        : netDesc.handleType;
+        #endif
         if (!exportInfo) {
             VVM_LOG_ERROR("exportForRemote: failed to export handle for allocation");
             return std::nullopt;
@@ -639,7 +613,6 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
     // address it and remote read-back sees the exported data.
     uint64_t allocId = 0;
     if (promoted) {
-        VVM_LOG_INFO("exportForRemote: registering promoted allocation");
         allocId = registerAllocation(std::move(*promoted));
     } else if (auto existing = findAllocIdByBuffer(alloc.buffer)) {
         allocId = *existing;
@@ -647,25 +620,14 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
         allocId = registerAllocation(Allocation(alloc));  // copy for registry
     }
     netDesc.localAllocId = allocId;
-    VVM_LOG_INFO("exportForRemote: returning desc with allocId={}", allocId);
 
     // Keep the exported handle alive so a same-process peer can import it
-    // zero-copy. Ownership moves to the importing peer (consumed by
-    // createLocalAllocationForImport) or is closed when the export is
-    // deallocated / the manager stops.
+    // zero-copy. Ownership moves to the importing peer (or is closed when the
+    // export is deallocated / the manager stops).
     if (exportInfo) {
         std::lock_guard<std::mutex> lock(g_pendingExportsMutex);
         g_pendingExports[pendingKey(localNodeId_, allocId)] = std::move(*exportInfo);
     }
-
-#if defined(VVM_NETWORK_HAS_VERBS)
-    if (pendingRdmaExport) {
-        std::lock_guard<std::mutex> lock(rdmaShadowMutex_);
-        rdmaShadowExports_[pendingKey(localNodeId_, allocId)] = std::move(*pendingRdmaExport);
-VVM_LOG_INFO("exportForRemote: RDMA host shadow registered for alloc {} (addr={:#x}, rkey={})",
-                         allocId, static_cast<unsigned long long>(netDesc.rdmaAddr), netDesc.rkey);
-    }
-#endif
 
     return netDesc;
 }
@@ -676,41 +638,10 @@ std::optional<Allocation> MultiNodePoolManager::importRemote(
 
 #if defined(VVM_NETWORK_HAS_VERBS)
     if (desc.canUseRdma() && rdmaTransport_) {
-        // GPU-direct import: register local GPU memory and RDMA read from remote
-        auto localAlloc = localPools_.empty()
-            ? std::nullopt
-            : localPools_.front().allocate(desc.size, usage, 
-                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (!localAlloc) {
-            VVM_LOG_WARN("importRemote: failed to allocate local GPU memory, falling back to host-staged");
-        } else {
-            auto conn = ensureRdmaConnection(desc.owner);
-            if (conn) {
-                auto destRegion = rdmaTransport_->registerGpuMemory(
-                    localAlloc->memory, localAlloc->offset, localAlloc->size, localAlloc->buffer);
-                if (destRegion && destRegion->lkey != 0) {
-                    VVM_LOG_DEBUG("importRemote: GPU-direct RDMA read for allocId={}", desc.localAllocId);
-                    bool ok = rdmaTransport_->rdmaRead(
-                        *conn, *destRegion, desc.rdmaAddr, desc.rkey, desc.size, 
-                        std::chrono::milliseconds(30000).count());
-                    if (ok) {
-                        VVM_LOG_INFO("importRemote: GPU-direct import succeeded for allocId={}", desc.localAllocId);
-                        return localAlloc;
-                    } else {
-                        VVM_LOG_WARN("importRemote: GPU-direct RDMA read failed, falling back to host-staged");
-                    }
-                } else {
-                    VVM_LOG_WARN("importRemote: failed to register local GPU memory for RDMA, falling back to host-staged");
-                }
-            } else {
-                VVM_LOG_WARN("importRemote: failed to establish RDMA connection to {}, falling back to host-staged", desc.owner.toString());
-            }
-        }
+        VVM_LOG_DEBUG("GPU-direct import not fully implemented, using host-staged");
     }
 #endif
 
-    // Fallback: host-staged import
-    VVM_LOG_DEBUG("importRemote: using host-staged fallback for allocId={}", desc.localAllocId);
     return createLocalAllocationForImport(desc, usage);
 }
 
@@ -724,87 +655,6 @@ std::future<std::optional<Allocation>> MultiNodePoolManager::importRemoteAsync(
 }
 
 // ============================================================================
-// Double-buffered migration pipeline
-// ============================================================================
-
-// Two-to-four-window host staging pipeline: chunk i lands in hostPtr[i % d],
-// one fence per window guards reuse, and per-chunk GPU copies run while
-// later chunks are still on the wire. Only used when a transfer is large
-// enough to warrant it; small transfers keep the single-buffer legacy path.
-struct WindowPipe {
-    MultiNodePoolManager* mgr = nullptr;
-    uint32_t depth = 0;                 // 0 = not initialized (use legacy path)
-    uint64_t windowBytes = 0;
-    uint64_t totalBytes = 0;
-    std::array<std::optional<Allocation>, 4> stag;
-    std::array<VkFence, 4> fence{};
-    std::vector<std::pair<VkCommandBuffer, VkFence>> pending;
-
-    bool init(MultiNodePoolManager* m, uint64_t total, uint32_t buffers, uint64_t winBytes) {
-        if (total < winBytes || winBytes == 0) return false;
-        mgr = m;
-        totalBytes = total;
-        windowBytes = winBytes;
-        depth = (std::clamp)(buffers, 2u, 4u);
-        for (uint32_t i = 0; i < depth; ++i) {
-            uint64_t sz = (i == 0) ? total : windowBytes;
-            stag[i] = m->createStaging(sz);
-            if (!stag[i]) {
-                drain();
-                return false;
-            }
-        }
-        return true;
-    }
-
-    // Wait until the window that receives chunk idx is safe to refill, i.e.
-    // the GPU copy that last consumed it has finished. Near-instant when the
-    // GPU kept up with the wire.
-    bool waitReusable(uint64_t chunkIdx) {
-        if (chunkIdx < depth) return true;
-        VkFence f = fence[chunkIdx % depth];
-        return f == VK_NULL_HANDLE || mgr->waitFence(f);
-    }
-
-    // Submit an async copy consuming chunk idx's staging window.
-    bool submit(uint64_t chunkIdx, VkBuffer src, VkBuffer dst,
-                VkDeviceSize srcOff, VkDeviceSize dstOff, VkDeviceSize len) {
-        VkCommandBuffer cmd = VK_NULL_HANDLE;
-        VkFence f = mgr->submitCopyAsync(src, dst, srcOff, dstOff, len, cmd);
-        if (f == VK_NULL_HANDLE) return false;
-        fence[chunkIdx % depth] = f;
-        pending.emplace_back(cmd, f);
-        return true;
-    }
-
-    // Block until the copy for chunk idx is resident (send paths).
-    bool waitReady(uint64_t chunkIdx) {
-        VkFence f = fence[chunkIdx % depth];
-        return f != VK_NULL_HANDLE && mgr->waitFence(f);
-    }
-
-    void drain() {
-        for (auto& [cmd, f] : pending) mgr->releaseAsyncCopy(cmd, f);
-        pending.clear();
-        fence.fill(VK_NULL_HANDLE);
-        for (auto& s : stag) {
-            if (s) mgr->getLocalPool().deallocate(std::move(*s));
-            s.reset();
-        }
-    }
-
-    ~WindowPipe() { drain(); }
-};
-
-// Shared state for streamed MsgMigratePush requests, carried across the
-// prepare/finalize handler phases via TcpMessage::streamContext.
-struct PushState {
-    std::shared_ptr<WindowPipe> pipe;      // windowed mode
-    std::shared_ptr<Allocation> staging;   // legacy mode
-    std::shared_ptr<Allocation> target;    // destination allocation
-};
-
-// ============================================================================
 // Migration
 // ============================================================================
 
@@ -816,53 +666,7 @@ std::optional<NetworkMigrationOperation> MultiNodePoolManager::migrateFromRemote
 
 #if defined(VVM_NETWORK_HAS_VERBS)
     if (source.canUseRdma() && useRdma && rdmaTransport_) {
-        auto conn = ensureRdmaConnection(source.owner);
-        if (conn) {
-            bool ok = false;
-            // Direct GPU pull: only when the destination GPU provides a usable
-            // local MR (addr + lkey). Currently only host-shadow is registered.
-            auto destRegion = rdmaTransport_->registerGpuMemory(
-                destination.memory, destination.offset, destination.size, destination.buffer);
-            if (destRegion && destRegion->lkey != 0 && destRegion->addr != nullptr) {
-                ok = rdmaTransport_->rdmaRead(*conn, *destRegion, source.rdmaAddr,
-                                              source.rkey, source.size, timeoutNs);
-            }
-            // Host-staged pull over RDMA.
-            if (!ok) {
-                auto staging = createStaging(source.size);
-                if (staging) {
-                    auto stagingRegion = rdmaTransport_->registerHostMemory(
-                        staging->hostPtr, static_cast<size_t>(source.size));
-                    if (stagingRegion) {
-                        ok = rdmaTransport_->rdmaRead(*conn, *stagingRegion, source.rdmaAddr,
-                                                      source.rkey, source.size, timeoutNs);
-                        if (ok) ok = copyHostToDevice(*staging, destination, 0, source.size);
-                    }
-                }
-            }
-            if (ok) {
-                NetworkMigrationOperation op;
-                op.operationId = nextMigrationId_++;
-                op.source = source;
-                op.destinationAllocId = destination.deviceAddress;
-                op.useRdma = true;
-                op.timeoutNs = timeoutNs;
-                op.bytesTransferred = source.size;
-                op.completed = true;
-                {
-                    std::lock_guard<std::mutex> lock(statsMutex_);
-                    networkStats_.bytesReceivedRdma += source.size;
-                    networkStats_.completedMigrations++;
-                }
-                VVM_LOG_INFO("migrateFromRemote: pulled {} bytes from {} over RDMA", source.size, source.owner.toString());
-                return op;
-            }
-            VVM_LOG_WARN("migrateFromRemote: RDMA read to {} failed, falling back to host-staged TCP",
-                         source.owner.toString());
-        } else {
-            VVM_LOG_WARN("migrateFromRemote: RDMA connect to {} failed, falling back to host-staged TCP",
-                         source.owner.toString());
-        }
+        VVM_LOG_WARN("GPU-direct RDMA read not implemented, using host-staged path");
     }
 #else
     (void)useRdma;
@@ -879,48 +683,27 @@ std::optional<NetworkMigrationOperation> MultiNodePoolManager::migrateFromRemote
         return std::nullopt;
     }
 
-    auto tStart = std::chrono::steady_clock::now();
-
-    // Windowed double-buffered pull: chunk i is copied into the destination
-    // GPU allocation while chunk i+1 is still on the wire. Small transfers
-    // fall back to a single full-sized staging buffer.
-    WindowPipe pipe;
-    std::optional<Allocation> staging;
-    StreamIO streamIO;
-    if (networkConfig_.enableAdaptiveWindow && pipe.init(this, source.size, adaptivePipelineDepth(), adaptiveWindowBytes(source.size))) {
-        streamIO.onWindowAcquire = [&](uint64_t chunkIdx, void** dst, uint64_t want, uint64_t& got) -> bool {
-            if (!pipe.waitReusable(chunkIdx)) return false;
-            uint64_t off = chunkIdx * kTransferChunk;
-            if (off >= source.size) return false;
-            uint64_t n = (std::min)(want, source.size - off);
-            if (n == 0) return false;
-            *dst = pipe.stag[chunkIdx % pipe.depth]->hostPtr;
-            got = n;
-            return true;
-        };
-        streamIO.onWindowConsumed = [&](uint64_t chunkIdx, uint64_t len) -> bool {
-            return pipe.submit(chunkIdx, pipe.stag[chunkIdx % pipe.depth]->buffer,
-                               destination.buffer, 0, chunkIdx * kTransferChunk, len);
-        };
-    } else {
-        staging = createStaging(source.size);
-        if (!staging) {
-            VVM_LOG_ERROR("migrateFromRemote: failed to allocate staging buffer");
-            return std::nullopt;
-        }
-        streamIO.readBuffer = staging->hostPtr;
-        streamIO.readLen = source.size;
+    // Stage received bytes into a host-visible buffer, then copy to device
+    auto staging = createStaging(source.size);
+    if (!staging) {
+        VVM_LOG_ERROR("migrateFromRemote: failed to allocate staging buffer");
+        return std::nullopt;
     }
 
     std::vector<uint8_t> body;
-    vvm::detail::putU64(body, source.localAllocId);
-    vvm::detail::putU64(body, 0);  // srcOffset within allocation
-    vvm::detail::putU64(body, source.size);
+    detail::putU64(body, source.localAllocId);
+    detail::putU64(body, 0);  // srcOffset within allocation
+    detail::putU64(body, source.size);
 
     TcpMessage req;
     req.type = MsgMigratePull;
     req.flags = TcpFlagsRequest;
     req.body = std::move(body);
+
+    // Slice mode: stream the pulled data straight into the staging buffer.
+    StreamIO streamIO;
+    streamIO.readBuffer = staging->hostPtr;
+    streamIO.readLen = source.size;
 
     auto resp = tcpTransport_->request(conn, req, &streamIO);
     if (!resp || resp->flags == TcpFlagsError) {
@@ -934,16 +717,10 @@ std::optional<NetworkMigrationOperation> MultiNodePoolManager::migrateFromRemote
         return std::nullopt;
     }
 
-    bool copied = true;
-    if (pipe.depth > 0) {
-        pipe.drain();  // waits all pipelined copies (copies ran while receiving)
-    } else {
-        copied = copyHostToDevice(*staging, destination, 0, source.size);
-        if (!copied) VVM_LOG_ERROR("migrateFromRemote: staging -> device copy failed");
+    if (!copyHostToDevice(*staging, destination, 0, source.size)) {
+        VVM_LOG_ERROR("migrateFromRemote: staging -> device copy failed");
+        return std::nullopt;
     }
-    if (!copied) return std::nullopt;
-
-    recordTransferRate(source.size, std::chrono::steady_clock::now() - tStart);
 
     NetworkMigrationOperation op;
     op.operationId = nextMigrationId_++;
@@ -972,55 +749,7 @@ std::optional<NetworkMigrationOperation> MultiNodePoolManager::migrateToRemote(
 
 #if defined(VVM_NETWORK_HAS_VERBS)
     if (destination.canUseRdma() && useRdma && rdmaTransport_) {
-        auto conn = ensureRdmaConnection(destination.owner);
-        if (conn) {
-            bool ok = false;
-            // Direct GPU push when the source GPU has a usable local MR.
-            auto srcRegion = rdmaTransport_->registerGpuMemory(
-                source.memory, source.offset, source.size, source.buffer);
-            if (srcRegion && srcRegion->lkey != 0 && srcRegion->addr != nullptr) {
-                ok = rdmaTransport_->rdmaWrite(*conn, *srcRegion, destination.rdmaAddr,
-                                               destination.rkey, source.size, timeoutNs);
-            }
-            // Host-staged push over RDMA.
-            if (!ok) {
-                auto staging = createStaging(source.size);
-                if (staging) {
-                    if (!copyDeviceToHost(source, 0, *staging, source.size)) {
-                        VVM_LOG_ERROR("migrateToRemote: device -> staging copy failed before RDMA write");
-                    } else {
-                        auto stagingRegion = rdmaTransport_->registerHostMemory(
-                            staging->hostPtr, static_cast<size_t>(source.size));
-                        if (stagingRegion) {
-                            ok = rdmaTransport_->rdmaWrite(*conn, *stagingRegion, destination.rdmaAddr,
-                                                           destination.rkey, source.size, timeoutNs);
-                        }
-                    }
-                }
-            }
-            if (ok) {
-                NetworkMigrationOperation op;
-                op.operationId = nextMigrationId_++;
-                op.source = destination;
-                op.destinationAllocId = source.deviceAddress;
-                op.useRdma = true;
-                op.timeoutNs = timeoutNs;
-                op.bytesTransferred = source.size;
-                op.completed = true;
-                {
-                    std::lock_guard<std::mutex> lock(statsMutex_);
-                    networkStats_.bytesSentRdma += source.size;
-                    networkStats_.completedMigrations++;
-                }
-                VVM_LOG_INFO("migrateToRemote: pushed {} bytes to {} over RDMA", source.size, destination.owner.toString());
-                return op;
-            }
-            VVM_LOG_WARN("migrateToRemote: RDMA write to {} failed, falling back to host-staged TCP",
-                         destination.owner.toString());
-        } else {
-            VVM_LOG_WARN("migrateToRemote: RDMA connect to {} failed, falling back to host-staged TCP",
-                         destination.owner.toString());
-        }
+        VVM_LOG_WARN("GPU-direct RDMA write not implemented, using host-staged path");
     }
 #else
     (void)useRdma;
@@ -1031,58 +760,31 @@ std::optional<NetworkMigrationOperation> MultiNodePoolManager::migrateToRemote(
         return std::nullopt;
     }
 
-    auto tStart = std::chrono::steady_clock::now();
+    // Stage device memory into a host-visible buffer
+    auto staging = createStaging(source.size);
+    if (!staging) {
+        VVM_LOG_ERROR("migrateToRemote: failed to allocate staging buffer");
+        return std::nullopt;
+    }
 
-    // Windowed double-buffered push: chunks are copied out of the source GPU
-    // allocation in windows while the wire drains previous windows. Small
-    // transfers fall back to a single full-sized staging buffer.
-    WindowPipe pipe;
-    std::optional<Allocation> staging;
-    StreamIO streamIO;
-    if (networkConfig_.enableAdaptiveWindow && pipe.init(this, source.size, adaptivePipelineDepth(), adaptiveWindowBytes(source.size))) {
-        bool fullCopyDone = false;
-        streamIO.onWindowProvide = [&](uint64_t chunkIdx, const void** src, uint64_t want, uint64_t& got) -> bool {
-            if (!pipe.waitReusable(chunkIdx)) return false;
-            uint64_t off = chunkIdx * kTransferChunk;
-            if (off >= source.size) return false;
-            uint64_t n = (std::min)(want, source.size - off);
-            if (n == 0) return false;
-
-            if (!fullCopyDone) {
-                if (!pipe.submit(0, source.buffer, pipe.stag[0]->buffer, 0, 0, source.size)) {
-                    return false;
-                }
-                if (!pipe.waitReady(0)) return false;
-                fullCopyDone = true;
-            }
-
-            *src = static_cast<const uint8_t*>(pipe.stag[0]->hostPtr) + off;
-            got = n;
-            return true;
-        };
-        streamIO.writeLen = source.size;  // advertises the stream length to the wire
-    } else {
-        staging = createStaging(source.size);
-        if (!staging) {
-            VVM_LOG_ERROR("migrateToRemote: failed to allocate staging buffer");
-            return std::nullopt;
-        }
-        if (!copyDeviceToHost(source, 0, *staging, source.size)) {
-            VVM_LOG_ERROR("migrateToRemote: device -> staging copy failed");
-            return std::nullopt;
-        }
-        streamIO.writeBuffer = staging->hostPtr;
-        streamIO.writeLen = source.size;
+    if (!copyDeviceToHost(source, 0, *staging, source.size)) {
+        VVM_LOG_ERROR("migrateToRemote: device -> staging copy failed");
+        return std::nullopt;
     }
 
     std::vector<uint8_t> body;
-    vvm::detail::putU64(body, destination.localAllocId);
-    vvm::detail::putU64(body, destination.size);
+    detail::putU64(body, destination.localAllocId);
+    detail::putU64(body, destination.size);
 
     TcpMessage req;
     req.type = MsgMigratePush;
     req.flags = TcpFlagsRequest;
     req.body = std::move(body);
+
+    // Slice mode: stream the staged data out of the staging buffer directly.
+    StreamIO streamIO;
+    streamIO.writeBuffer = staging->hostPtr;
+    streamIO.writeLen = source.size;
 
     auto conn = getPeerConnection(destination.owner.host, destination.owner.port);
     if (conn == 0) {
@@ -1095,10 +797,6 @@ std::optional<NetworkMigrationOperation> MultiNodePoolManager::migrateToRemote(
         VVM_LOG_ERROR("migrateToRemote: push request failed for {} bytes", source.size);
         return std::nullopt;
     }
-
-    if (pipe.depth > 0) pipe.drain();
-
-    recordTransferRate(source.size, std::chrono::steady_clock::now() - tStart);
 
     NetworkMigrationOperation op;
     op.operationId = nextMigrationId_++;
@@ -1163,251 +861,6 @@ void MultiNodePoolManager::migrateFromRemoteAsync(
         }
         activeMigrations_.erase(id);
     }
-}
-
-// ============================================================================
-// UCX Transport Integration
-// ============================================================================
-// UCX provides a unified, multi-transport GPU-aware communication path
-// (InfiniBand/RoCE/TCP/shared-memory). These methods wire UCX into the
-// existing export/migration flow: the TCP control plane still carries the
-// RemoteAllocationDesc (now augmented with UCX worker-address + RMA-key),
-// but the actual data movement uses UCX RMA (ucp_get/ucp_put) instead of
-// verbs or host-staged TCP.
-// ============================================================================
-
-#if defined(VVM_HAS_UCX)
-
-bool MultiNodePoolManager::exportForRemoteUcx(RemoteAllocationDesc& desc,
-                                               const Allocation& alloc,
-                                               uint32_t deviceIndex) {
-    if (!ucxTransport_ || !ucxTransport_->isInitialized()) return false;
-
-    // Register the allocation's memory with UCX. For GPU allocations we pass
-    // the host-visible staging pointer (if available) since Vulkan GPU
-    // pointers are not directly consumable by UCX without CUDA/ROCm interop.
-    // UCX treats this as host memory; the RMA path still benefits from
-    // InfiniBand/RoCE zero-copy on the wire.
-    void* regPtr = alloc.hostPtr;
-    if (!regPtr) {
-        VVM_LOG_WARN("exportForRemoteUcx: allocation has no host pointer, skipping UCX export");
-        return false;
-    }
-
-    auto memHandle = ucxTransport_->registerHostMemory(regPtr, alloc.size);
-    if (!memHandle) {
-        VVM_LOG_WARN("exportForRemoteUcx: failed to register memory with UCX");
-        return false;
-    }
-
-    // Pack the RMA key so the remote peer can unpack it and access our memory.
-    auto rmaKey = ucxTransport_->packRmaKey(*memHandle);
-    if (!rmaKey) {
-        VVM_LOG_WARN("exportForRemoteUcx: failed to pack RMA key");
-        return false;
-    }
-
-    // Get our local worker address for the peer to connect to.
-    auto workerAddr = ucxTransport_->getLocalAddress();
-    if (!workerAddr) {
-        VVM_LOG_WARN("exportForRemoteUcx: failed to get local worker address");
-        return false;
-    }
-
-    // Fill in UCX fields in the descriptor.
-    desc.hasUcxAddr = true;
-    desc.ucxWorkerAddr = workerAddr->bytes;
-    desc.ucxPackedRkey = rmaKey->packedRkey;
-    desc.ucxRemoteAddr = rmaKey->remoteAddr;
-    desc.ucxDeviceIndex = deviceIndex;
-
-    // Track the memory handle for later cleanup.
-    {
-        std::lock_guard<std::mutex> lock(ucxMemMutex_);
-        ucxMemHandles_.push_back(*memHandle);
-    }
-
-    VVM_LOG_INFO("exportForRemoteUcx: UCX export ready (size={}, remote_addr={:#x})",
-                 alloc.size, static_cast<unsigned long long>(rmaKey->remoteAddr));
-    return true;
-}
-
-std::optional<UcxEndpoint> MultiNodePoolManager::ensureUcxEndpoint(
-    const std::string& nodeIdStr,
-    const std::string& peerWorkerAddr) {
-
-    // Check cache first.
-    {
-        std::lock_guard<std::mutex> lock(ucxEndpointsMutex_);
-        auto it = ucxEndpoints_.find(nodeIdStr);
-        if (it != ucxEndpoints_.end() && it->second.connected) {
-            return it->second;
-        }
-    }
-
-    // Parse the worker address blob.
-    UcxWorkerAddress addr;
-    addr.bytes.assign(peerWorkerAddr.begin(), peerWorkerAddr.end());
-
-    auto ep = ucxTransport_->connectToAddress(addr, nodeIdStr);
-    if (ep) {
-        std::lock_guard<std::mutex> lock(ucxEndpointsMutex_);
-        ucxEndpoints_[nodeIdStr] = *ep;
-    }
-    return ep;
-}
-
-bool MultiNodePoolManager::migrateFromRemoteUcx(
-    const RemoteAllocationDesc& source,
-    Allocation& destination,
-    uint32_t deviceIndex,
-    std::function<void(bool)> callback) {
-
-    if (!source.canUseUcx()) {
-        if (callback) callback(false);
-        return false;
-    }
-
-    // Connect to the remote peer using its worker address from the descriptor.
-    std::string nodeIdStr = source.owner.toString();
-    auto ep = ensureUcxEndpoint(nodeIdStr,
-        std::string(source.ucxWorkerAddr.begin(), source.ucxWorkerAddr.end()));
-    if (!ep || !ep->connected) {
-        VVM_LOG_ERROR("migrateFromRemoteUcx: failed to connect to peer {}", nodeIdStr);
-        if (callback) callback(false);
-        return false;
-    }
-
-    // Register the local destination memory with UCX.
-    void* regPtr = destination.hostPtr;
-    if (!regPtr) {
-        VVM_LOG_ERROR("migrateFromRemoteUcx: destination has no host pointer");
-        if (callback) callback(false);
-        return false;
-    }
-
-    auto localMem = ucxTransport_->registerHostMemory(regPtr, destination.size);
-    if (!localMem) {
-        VVM_LOG_ERROR("migrateFromRemoteUcx: failed to register local memory");
-        if (callback) callback(false);
-        return false;
-    }
-
-    // Unpack the remote's RMA key (sent over TCP in the descriptor).
-    UcxRmaKey rmaKey;
-    rmaKey.packedRkey = source.ucxPackedRkey;
-    rmaKey.remoteAddr = source.ucxRemoteAddr;
-    rmaKey.size = source.size;
-
-    auto remoteMem = ucxTransport_->unpackRmaKey(*ep, rmaKey);
-    if (!remoteMem) {
-        VVM_LOG_ERROR("migrateFromRemoteUcx: failed to unpack remote RMA key");
-        if (callback) callback(false);
-        return false;
-    }
-
-    // Issue an async UCX get (RDMA read) to pull data from remote.
-    bool ok = ucxTransport_->getAsync(*ep, *localMem, *remoteMem, source.size, [callback](bool success) {
-        if (callback) callback(success);
-    });
-
-    if (!ok) {
-        VVM_LOG_ERROR("migrateFromRemoteUcx: getAsync failed");
-        if (callback) callback(false);
-        return false;
-    }
-
-    // Track local memory handle for cleanup.
-    {
-        std::lock_guard<std::mutex> lock(ucxMemMutex_);
-        ucxMemHandles_.push_back(*localMem);
-    }
-
-    VVM_LOG_INFO("migrateFromRemoteUcx: UCX get issued (size={})", source.size);
-    return true;
-}
-
-#else // VVM_HAS_UCX stubs
-
-bool MultiNodePoolManager::exportForRemoteUcx(RemoteAllocationDesc&,
-                                               const Allocation&,
-                                               uint32_t) {
-    return false;
-}
-
-bool MultiNodePoolManager::migrateFromRemoteUcx(const RemoteAllocationDesc&,
-                                                  Allocation&,
-                                                  uint32_t,
-                                                  std::function<void(bool)>) {
-    return false;
-}
-
-#endif // VVM_HAS_UCX
-
-// ============================================================================
-// Remote tensor announcement (GPU-to-GPU VRAM share over TCP)
-// ============================================================================
-
-static std::string remoteTensorKey(const NodeId& node, const std::string& name) {
-    return node.toString() + "|" + name;
-}
-
-bool MultiNodePoolManager::announceRemoteTensor(
-    const NodeId& target,
-    const std::string& name,
-    const RemoteAllocationDesc& desc) {
-
-    std::vector<uint8_t> body;
-    vvm::detail::putStr(body, name);
-    auto bytes = serializeAllocationDesc(desc);
-    body.insert(body.end(), bytes.begin(), bytes.end());
-
-    TcpMessage req;
-    req.type = MsgTensorAnnounce;
-    req.flags = TcpFlagsRequest;
-    req.body = std::move(body);
-
-    auto conn = getPeerConnection(target.host, target.port);
-    if (conn == 0) {
-        VVM_LOG_ERROR("announceRemoteTensor: no connection to {}", target.toString());
-        return false;
-    }
-
-    auto resp = tcpTransport_->request(conn, req, nullptr);
-    if (!resp || resp->flags == TcpFlagsError) {
-        VVM_LOG_ERROR("announceRemoteTensor: peer {} rejected announcement '{}'",
-                      target.toString(), name);
-        return false;
-    }
-    VVM_LOG_INFO("announceRemoteTensor: announced '{}' ({} bytes) to {}", name, desc.size, target.toString());
-    return true;
-}
-
-std::optional<RemoteAllocationDesc> MultiNodePoolManager::waitRemoteTensor(
-    const NodeId& source,
-    const std::string& name,
-    uint64_t timeoutNs) {
-
-    const std::string key = remoteTensorKey(source, name);
-    std::unique_lock<std::mutex> lock(remoteTensorsMutex_);
-
-    auto pred = [&] { return pendingRemoteTensors_.count(key) > 0; };
-    if (timeoutNs == UINT64_MAX) {
-        remoteTensorsCV_.wait(lock, pred);
-    } else {
-        auto timeout = std::chrono::nanoseconds(timeoutNs);
-        if (!remoteTensorsCV_.wait_for(lock, timeout, pred)) {
-            VVM_LOG_ERROR("waitRemoteTensor: timed out waiting for '{}' from {}", name, source.toString());
-            return std::nullopt;
-        }
-    }
-
-    auto it = pendingRemoteTensors_.find(key);
-    if (it == pendingRemoteTensors_.end()) return std::nullopt;
-    RemoteAllocationDesc desc = it->second;
-    pendingRemoteTensors_.erase(it);
-    VVM_LOG_INFO("waitRemoteTensor: got '{}' ({} bytes) from {}", name, desc.size, source.toString());
-    return desc;
 }
 
 // ============================================================================
@@ -1560,7 +1013,7 @@ bool MultiNodePoolManager::initCopyEngine() {
 
     VkCommandPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    poolInfo.flags = 0;
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolInfo.queueFamilyIndex = transferQueueFamily_;
 
     VkResult res = vkCreateCommandPool(localPools_[0].getDevice(), &poolInfo, nullptr, &copyCmdPool_);
@@ -1568,37 +1021,6 @@ bool MultiNodePoolManager::initCopyEngine() {
         VVM_LOG_ERROR("initCopyEngine: failed to create command pool: {}", vkResultToString(res));
         return false;
     }
-
-    // Pre-allocate command buffers and fences for async copy operations
-    VkDevice device = localPools_[0].getDevice();
-    maxCopyContexts_ = std::clamp(networkConfig_.streamPipelineBuffers * 2,
-                                   constants::kMinCopyContexts,
-                                   constants::kMaxCopyContexts);
-    copyContexts_.resize(maxCopyContexts_);
-    
-    VkCommandBufferAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocInfo.commandPool = copyCmdPool_;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
-
-    VkFenceCreateInfo fenceInfo{};
-    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-
-    for (auto& ctx : copyContexts_) {
-        VkResult r = vkAllocateCommandBuffers(device, &allocInfo, &ctx.cmdBuffer);
-        if (r != VK_SUCCESS) {
-            VVM_LOG_ERROR("initCopyEngine: failed to allocate command buffer: {}", vkResultToString(r));
-            return false;
-        }
-        r = vkCreateFence(device, &fenceInfo, nullptr, &ctx.fence);
-        if (r != VK_SUCCESS) {
-            VVM_LOG_ERROR("initCopyEngine: failed to create fence: {}", vkResultToString(r));
-            return false;
-        }
-    }
-
     return true;
 }
 
@@ -1631,7 +1053,7 @@ bool MultiNodePoolManager::runCopy(VkBuffer srcBuffer, VkBuffer dstBuffer,
                                    VkDeviceSize srcOffset, VkDeviceSize dstOffset,
                                    VkDeviceSize size) {
     if (copyCmdPool_ == VK_NULL_HANDLE || srcBuffer == VK_NULL_HANDLE || dstBuffer == VK_NULL_HANDLE) {
-        VVM_LOG_ERROR("runCopy: invalid copy context (pool={} src={} dst={})",
+        VVM_LOG_ERROR("runCopy: invalid copy context (pool=%p src=%p dst=%p)",
                       copyCmdPool_, srcBuffer, dstBuffer);
         return false;
     }
@@ -1682,21 +1104,7 @@ bool MultiNodePoolManager::runCopy(VkBuffer srcBuffer, VkBuffer dstBuffer,
 
     VkResult res = vkQueueSubmit(transferQueue_, 1, &submitInfo, fence);
     if (res == VK_SUCCESS) {
-        // Use a 10-second timeout instead of infinite wait to prevent hangs
-        // if the GPU fails to signal the fence (driver issue, queue starvation, etc.)
-        constexpr uint64_t kCopyTimeoutNs = constants::kCopyTimeoutNs;  // 10 seconds
-        VkResult waitRes = vkWaitForFences(device, 1, &fence, VK_TRUE, kCopyTimeoutNs);
-        if (waitRes == VK_TIMEOUT) {
-            VVM_LOG_ERROR("runCopy: fence wait timed out after 10 seconds (GPU copy may be stuck)");
-            vkDestroyFence(device, fence, nullptr);
-            vkFreeCommandBuffers(device, copyCmdPool_, 1, &cmdBuffer);
-            return false;
-        } else if (waitRes != VK_SUCCESS) {
-            VVM_LOG_ERROR("runCopy: vkWaitForFences failed: {}", vkResultToString(waitRes));
-            vkDestroyFence(device, fence, nullptr);
-            vkFreeCommandBuffers(device, copyCmdPool_, 1, &cmdBuffer);
-            return false;
-        }
+        vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
     } else {
         VVM_LOG_ERROR("runCopy: vkQueueSubmit failed: {}", vkResultToString(res));
     }
@@ -1704,160 +1112,6 @@ bool MultiNodePoolManager::runCopy(VkBuffer srcBuffer, VkBuffer dstBuffer,
     vkDestroyFence(device, fence, nullptr);
     vkFreeCommandBuffers(device, copyCmdPool_, 1, &cmdBuffer);
     return res == VK_SUCCESS;
-}
-
-VkFence MultiNodePoolManager::submitCopyAsync(VkBuffer srcBuffer, VkBuffer dstBuffer,
-                                              VkDeviceSize srcOffset, VkDeviceSize dstOffset,
-                                              VkDeviceSize size, VkCommandBuffer& outCmd) {
-    outCmd = VK_NULL_HANDLE;
-    if (copyCmdPool_ == VK_NULL_HANDLE || srcBuffer == VK_NULL_HANDLE || dstBuffer == VK_NULL_HANDLE) {
-        VVM_LOG_ERROR("submitCopyAsync: invalid copy context (pool={} src={} dst={})",
-                      copyCmdPool_, srcBuffer, dstBuffer);
-        return VK_NULL_HANDLE;
-    }
-    VkDevice device = localPools_[0].getDevice();
-
-    // Acquire a pre-allocated context
-    CopyContext* ctx = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(copyContextsMutex_);
-        for (auto& c : copyContexts_) {
-            VkResult res = vkGetFenceStatus(device, c.fence);
-            if (res == VK_SUCCESS) {
-                vkResetFences(device, 1, &c.fence);
-                vkResetCommandBuffer(c.cmdBuffer, 0);
-                c.inUse = true;
-                ctx = &c;
-                break;
-            }
-        }
-    }
-    if (!ctx) {
-        VVM_LOG_WARN("submitCopyAsync: no available copy context, waiting...");
-        return VK_NULL_HANDLE;
-    }
-
-    outCmd = ctx->cmdBuffer;
-
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    VkBufferCopy region{};
-    region.srcOffset = srcOffset;
-    region.dstOffset = dstOffset;
-    region.size = size;
-    if (vkBeginCommandBuffer(outCmd, &beginInfo) != VK_SUCCESS) {
-        ctx->inUse = false;
-        outCmd = VK_NULL_HANDLE;
-        return VK_NULL_HANDLE;
-    }
-    vkCmdCopyBuffer(outCmd, srcBuffer, dstBuffer, 1, &region);
-    if (vkEndCommandBuffer(outCmd) != VK_SUCCESS) {
-        ctx->inUse = false;
-        outCmd = VK_NULL_HANDLE;
-        return VK_NULL_HANDLE;
-    }
-
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &outCmd;
-    VkResult res = vkQueueSubmit(transferQueue_, 1, &submitInfo, ctx->fence);
-    if (res != VK_SUCCESS) {
-        VVM_LOG_ERROR("submitCopyAsync: vkQueueSubmit failed: {}", vkResultToString(res));
-        ctx->inUse = false;
-        outCmd = VK_NULL_HANDLE;
-        return VK_NULL_HANDLE;
-    }
-    return ctx->fence;
-}
-
-void MultiNodePoolManager::releaseAsyncCopy(VkCommandBuffer cmd, VkFence fence) {
-    if (fence == VK_NULL_HANDLE) return;
-    VkDevice device = localPools_[0].getDevice();
-    constexpr uint64_t kCopyTimeoutNs = constants::kCopyTimeoutNs;  // 10 seconds
-    VkResult waitRes = vkWaitForFences(device, 1, &fence, VK_TRUE, kCopyTimeoutNs);
-    if (waitRes == VK_TIMEOUT) {
-        VVM_LOG_ERROR("releaseAsyncCopy: fence wait timed out (GPU copy may be stuck)");
-    } else if (waitRes != VK_SUCCESS) {
-        VVM_LOG_ERROR("releaseAsyncCopy: vkWaitForFences failed: {}", vkResultToString(waitRes));
-    }
-    
-    // Return the context to the pool
-    {
-        std::lock_guard<std::mutex> lock(copyContextsMutex_);
-        for (auto& c : copyContexts_) {
-            if (c.fence == fence && c.cmdBuffer == cmd) {
-                c.inUse = false;
-                break;
-            }
-        }
-    }
-}
-
-bool MultiNodePoolManager::waitFence(VkFence fence) {
-    if (fence == VK_NULL_HANDLE) return true;
-    // The transfer queue is shared with the other direction's pipeline, so a
-    // naive fixed-timeout wait can spuriously fail mid-stream and poison the
-    // connection. Poll generously instead.
-    constexpr uint64_t kCopyBudgetNs = constants::kCopyBudgetNs;  // 60 seconds
-    auto t0 = std::chrono::steady_clock::now();
-    while (true) {
-        VkResult res = vkWaitForFences(localPools_[0].getDevice(), 1, &fence, VK_TRUE, 100ull * 1000 * 1000);
-        if (res == VK_SUCCESS) return true;
-        if (res != VK_TIMEOUT) {
-            VVM_LOG_ERROR("waitFence: vkWaitForFences failed: {}", vkResultToString(res));
-            return false;
-        }
-        if (std::chrono::steady_clock::now() - t0 > std::chrono::nanoseconds(kCopyBudgetNs)) {
-            VVM_LOG_ERROR("waitFence: fence wait timed out after 60 seconds (GPU copy may be stuck)");
-            return false;
-        }
-    }
-}
-
-uint32_t MultiNodePoolManager::adaptiveWindowBytes(uint64_t totalBytes) const {
-    constexpr uint64_t kMinWin = 4ull * 1024 * 1024;
-    constexpr uint64_t kMaxWin = 16ull * 1024 * 1024;
-    uint64_t win = networkConfig_.streamWindowBytes != 0
-                       ? networkConfig_.streamWindowBytes
-                       : 8ull * 1024 * 1024;
-    if (networkConfig_.enableAdaptiveWindow) {
-        uint64_t rate = 0;
-        {
-            std::lock_guard<std::mutex> lock(statsMutex_);
-            rate = lastThroughputBytesPerSec_;
-        }
-        if (rate > 0) {
-            // Hold roughly 250us of line time per window (a LAN round-trip).
-            // Fast links grow toward the 16MB ceiling; slow/high-latency
-            // links shrink back to the 4MB floor so GPU-poor peers still
-            // make forward progress.
-            uint64_t sized = rate / 4000u;  // bytes per 250us
-            win = (std::clamp)(sized, kMinWin, kMaxWin);
-        }
-    }
-    return static_cast<uint32_t>((std::min)(win, (std::max)(totalBytes, uint64_t{1})));
-}
-
-uint32_t MultiNodePoolManager::adaptivePipelineDepth() const {
-    uint32_t d = (std::clamp)(networkConfig_.streamPipelineBuffers, 2u, 4u);
-    uint64_t rate = 0;
-    {
-        std::lock_guard<std::mutex> lock(statsMutex_);
-        rate = lastThroughputBytesPerSec_;
-    }
-    // Low-bandwidth links get the deepest pipeline so more data stays in
-    // flight under latency.
-    if (rate > 0 && rate < 50ull * 1024 * 1024) d = (std::max)(d, 3u);
-    return d;
-}
-
-void MultiNodePoolManager::recordTransferRate(uint64_t bytes, std::chrono::steady_clock::duration elapsed) {
-    double secs = std::chrono::duration<double>(elapsed).count();
-    if (secs <= 0.0 || bytes == 0) return;
-    std::lock_guard<std::mutex> lock(statsMutex_);
-    lastThroughputBytesPerSec_ = static_cast<uint64_t>(static_cast<double>(bytes) / secs);
 }
 
 uint64_t MultiNodePoolManager::registerAllocation(Allocation&& alloc) {
@@ -1886,9 +1140,6 @@ bool MultiNodePoolManager::unregisterAllocation(uint64_t localAllocId) {
         std::lock_guard<std::mutex> lock(allocsMutex_);
         if (remoteAllocs_.erase(localAllocId) == 0) return false;
     }
-#if defined(VVM_NETWORK_HAS_VERBS)
-    releaseRdmaExport(localAllocId);
-#endif
     // Close any pending exported handle for this allocation.
     std::lock_guard<std::mutex> lock(g_pendingExportsMutex);
     g_pendingExports.erase(pendingKey(localNodeId_, localAllocId));
@@ -1927,11 +1178,8 @@ TcpTransport::ConnId MultiNodePoolManager::getPeerConnection(const std::string& 
 
 void MultiNodePoolManager::heartbeatLoop() {
     while (!stopHeartbeat_) {
-        {
-            std::unique_lock<std::mutex> lock(heartbeatMutex_);
-            heartbeatCV_.wait_for(lock, networkConfig_.heartbeatInterval,
-                                  [this] { return stopHeartbeat_.load(); });
-        }
+        std::this_thread::sleep_for(networkConfig_.heartbeatInterval);
+
         if (stopHeartbeat_ || !tcpTransport_) break;
 
         auto body = serializeNodeId(localNodeId_);
@@ -2031,10 +1279,10 @@ void MultiNodePoolManager::onTcpRequest(TcpMessage& request, TcpMessage& respons
             uint64_t size = 0;
             uint32_t usage = 0, flags = 0;
             uint8_t enableRdma = 0;
-            if (!vvm::detail::getU64(p, end, size) ||
-                !vvm::detail::getU32(p, end, usage) ||
-                !vvm::detail::getU32(p, end, flags) ||
-                !vvm::detail::getU8(p, end, enableRdma)) {
+            if (!detail::getU64(p, end, size) ||
+                !detail::getU32(p, end, usage) ||
+                !detail::getU32(p, end, flags) ||
+                !detail::getU8(p, end, enableRdma)) {
                 response = makeResponse(request.type, TcpFlagsError);
                 return;
             }
@@ -2042,56 +1290,56 @@ void MultiNodePoolManager::onTcpRequest(TcpMessage& request, TcpMessage& respons
             auto desc = handleAllocateRequest(requester, size, usage, flags, enableRdma != 0);
             response = makeResponse(request.type, TcpFlagsResponse);
             if (desc) {
-                vvm::detail::putU8(response.body, 1);
+                detail::putU8(response.body, 1);
                 auto bytes = serializeAllocationDesc(*desc);
                 response.body.insert(response.body.end(), bytes.begin(), bytes.end());
             } else {
-                vvm::detail::putU8(response.body, 0);
+                detail::putU8(response.body, 0);
             }
             break;
         }
         case MsgExport: {
             uint64_t localAllocId = 0;
             uint8_t enableRdma = 0, forceHostShadow = 0;
-            if (!vvm::detail::getU64(p, end, localAllocId) ||
-                !vvm::detail::getU8(p, end, enableRdma) ||
-                !vvm::detail::getU8(p, end, forceHostShadow)) {
+            if (!detail::getU64(p, end, localAllocId) ||
+                !detail::getU8(p, end, enableRdma) ||
+                !detail::getU8(p, end, forceHostShadow)) {
                 response = makeResponse(request.type, TcpFlagsError);
                 return;
             }
             auto desc = handleExportRequest(localNodeId_, localAllocId, enableRdma != 0, forceHostShadow != 0);
             response = makeResponse(request.type, TcpFlagsResponse);
             if (desc) {
-                vvm::detail::putU8(response.body, 1);
+                detail::putU8(response.body, 1);
                 auto bytes = serializeAllocationDesc(*desc);
                 response.body.insert(response.body.end(), bytes.begin(), bytes.end());
             } else {
-                vvm::detail::putU8(response.body, 0);
+                detail::putU8(response.body, 0);
             }
             break;
         }
         case MsgImport: {
             RemoteAllocationDesc desc;
             uint32_t usage = 0;
-            if (!deserializeAllocationDesc(p, end, desc) || !vvm::detail::getU32(p, end, usage)) {
+            if (!deserializeAllocationDesc(p, end, desc) || !detail::getU32(p, end, usage)) {
                 response = makeResponse(request.type, TcpFlagsError);
                 return;
             }
             auto alloc = handleImportRequest(localNodeId_, desc, usage);
             response = makeResponse(request.type, TcpFlagsResponse);
             if (alloc) {
-                vvm::detail::putU8(response.body, 1);
-                vvm::detail::putU64(response.body, registerAllocation(std::move(*alloc)));
+                detail::putU8(response.body, 1);
+                detail::putU64(response.body, registerAllocation(std::move(*alloc)));
             } else {
-                vvm::detail::putU8(response.body, 0);
+                detail::putU8(response.body, 0);
             }
             break;
         }
         case MsgMigratePull: {
             uint64_t localAllocId = 0, srcOffset = 0, size = 0;
-            if (!vvm::detail::getU64(p, end, localAllocId) ||
-                !vvm::detail::getU64(p, end, srcOffset) ||
-                !vvm::detail::getU64(p, end, size)) {
+            if (!detail::getU64(p, end, localAllocId) ||
+                !detail::getU64(p, end, srcOffset) ||
+                !detail::getU64(p, end, size)) {
                 response = makeResponse(request.type, TcpFlagsError);
                 return;
             }
@@ -2101,44 +1349,6 @@ void MultiNodePoolManager::onTcpRequest(TcpMessage& request, TcpMessage& respons
                 VVM_LOG_ERROR("MigratePull: unknown allocation {}", localAllocId);
                 response = makeResponse(request.type, TcpFlagsError);
                 return;
-            }
-
-            // Windowed serve: chunk i+1 is copied out of the device while
-            // chunk i streams over the wire. Falls back to a full staging
-            // buffer for small transfers.
-            auto serveAlloc = std::make_shared<Allocation>(*alloc);
-            auto pipe = std::make_shared<WindowPipe>();
-            if (networkConfig_.enableAdaptiveWindow && pipe->init(this, size, adaptivePipelineDepth(), adaptiveWindowBytes(size))) {
-                bool fullCopyDone = false;
-                response = makeResponse(request.type, TcpFlagsResponse);
-                response.streamLen = size;
-                response.streamWindowProvide = [pipe, serveAlloc, srcOffset, total = size, &fullCopyDone](
-                    uint64_t chunkIdx, const void** src, uint64_t want, uint64_t& got) -> bool {
-                    if (!pipe->waitReusable(chunkIdx)) return false;
-                    uint64_t off = chunkIdx * kTransferChunk;
-                    if (off >= total) return false;
-                    uint64_t n = (std::min)(want, total - off);
-                    if (n == 0) return false;
-
-if (!fullCopyDone) {
-                        VkDeviceSize fullSize = total;
-                        if (!pipe->submit(0, serveAlloc->buffer,
-                                          pipe->stag[0]->buffer,
-                                          srcOffset, 0, fullSize)) {
-                            return false;
-                        }
-                        if (!pipe->waitReady(0)) return false;
-                        fullCopyDone = true;
-                    }
-
-                    *src = static_cast<const uint8_t*>(pipe->stag[0]->hostPtr) + off;
-                    got = n;
-                    return true;
-                };
-                response.streamCleanup = [pipe]() { pipe->drain(); };
-                VVM_LOG_INFO("MigratePull: serving {} bytes for allocation {} (windowed, full-copy)",
-                             size, localAllocId);
-                break;
             }
 
             auto staging = createStaging(size);
@@ -2162,7 +1372,7 @@ if (!fullCopyDone) {
         }
         case MsgMigratePush: {
             uint64_t localAllocId = 0, size = 0;
-            if (!vvm::detail::getU64(p, end, localAllocId) || !vvm::detail::getU64(p, end, size)) {
+            if (!detail::getU64(p, end, localAllocId) || !detail::getU64(p, end, size)) {
                 response = makeResponse(request.type, TcpFlagsError);
                 return;
             }
@@ -2175,92 +1385,40 @@ if (!fullCopyDone) {
             }
 
             if (!request.streamReceived) {
-                // Prepare phase: set up the receive pipeline (windowed) or a
-                // single full-sized sink (legacy), shared across both phases.
-                auto state = std::make_shared<PushState>();
-                state->target = std::make_shared<Allocation>(*alloc);
-                request.streamContext = state.get();
-                request.streamSinkCleanup = [state]() mutable { (void)state; };
-                response.streamSinkCleanup = [state]() mutable { (void)state; };
-
-                auto pipe = std::make_shared<WindowPipe>();
-                if (networkConfig_.enableAdaptiveWindow && pipe->init(this, size, adaptivePipelineDepth(), adaptiveWindowBytes(size))) {
-                    state->pipe = pipe;
-                    response = makeResponse(request.type, TcpFlagsResponse);
-                    response.streamWindowAcquire = [state](uint64_t chunkIdx, void** dst,
-                                                           uint64_t want, uint64_t& got) -> bool {
-                        WindowPipe& p = *state->pipe;
-                        if (!p.waitReusable(chunkIdx)) return false;
-                        uint64_t off = chunkIdx * kTransferChunk;
-                        if (off >= p.totalBytes) return false;
-                        uint64_t n = (std::min)(want, p.totalBytes - off);
-                        if (n == 0) return false;
-                        // All chunks land in the single stag[0] at the correct offset
-                        *dst = static_cast<uint8_t*>(p.stag[0]->hostPtr) + off;
-                        got = n;
-                        return true;
-                    };
-                    response.streamWindowConsumed = [state](uint64_t chunkIdx, uint64_t len) -> bool {
-                        // Windowed receive: just acknowledge the chunk; actual GPU copy
-                        // happens in bulk at finalize to avoid device loss on Arc.
-                        return true;
-                    };
-                    VVM_LOG_INFO("MigratePush: receiving {} bytes for allocation {} (windowed, bulk-copy)",
-                                 size, localAllocId);
-                    return;
-                }
-
-                // Legacy sink mode: single full-sized staging buffer that the
-                // transport streams into directly.
+                // Prepare phase: allocate the sink the incoming stream is staged into.
                 auto rawStaging = createStaging(size);
                 if (!rawStaging) {
                     response = makeResponse(request.type, TcpFlagsError);
                     return;
                 }
+                // Shared ownership keeps the staging alive across both handler
+                // phases; the raw Allocation* is stable because shared_ptr
+                // never moves the pointee.
                 auto staging = std::make_shared<Allocation>(std::move(*rawStaging));
-                state->staging = staging;
+                request.streamContext = staging.get();
                 request.streamSink = staging->hostPtr;
-                response.streamSink = staging->hostPtr;
-                return;
-            }
-
-            // Finalize phase: the full stream has arrived.
-            auto* statePtr = static_cast<PushState*>(request.streamContext);
-            if (statePtr == nullptr) {
-                VVM_LOG_ERROR("MigratePush: missing push state on finalize");
-                response = makeResponse(request.type, TcpFlagsError);
-                return;
-            }
-            PushState& state = *statePtr;  // kept alive by the cleanup lambdas
-
-            if (state.pipe) {
-                if (!copyHostToDevice(*state.pipe->stag[0], *state.target, 0, size)) {
-                    VVM_LOG_ERROR("MigratePush: host -> device bulk copy failed");
-                    response = makeResponse(request.type, TcpFlagsError);
-                    return;
-                }
-                state.pipe->drain();
+                request.streamSinkCleanup = [staging]() mutable { (void)staging; };
                 response = makeResponse(request.type, TcpFlagsResponse);
-                vvm::detail::putU8(response.body, 1);
-                VVM_LOG_INFO("MigratePush: received {} bytes for allocation {} (windowed, bulk-copy)",
-                             size, localAllocId);
-                break;
+                response.streamSink = staging->hostPtr;
+                response.streamSinkCleanup = [staging]() mutable { (void)staging; };
+                return;
             }
 
-            if (state.staging == nullptr || state.staging->hostPtr == nullptr) {
+            auto* staging = static_cast<Allocation*>(request.streamContext);
+            if (staging == nullptr || staging->hostPtr == nullptr) {
                 VVM_LOG_ERROR("MigratePush: missing staging buffer on finalize");
                 response = makeResponse(request.type, TcpFlagsError);
                 return;
             }
 
-            if (!copyHostToDevice(*state.staging, *state.target, 0, size)) {
+            if (!copyHostToDevice(*staging, *alloc, 0, size)) {
                 VVM_LOG_ERROR("MigratePush: host -> device copy failed");
                 response = makeResponse(request.type, TcpFlagsError);
                 return;
             }
 
             response = makeResponse(request.type, TcpFlagsResponse);
-            vvm::detail::putU8(response.body, 1);
+            detail::putU8(response.body, 1);
             VVM_LOG_INFO("MigratePush: received {} bytes for allocation {}", size, localAllocId);
             break;
         }
@@ -2293,7 +1451,7 @@ if (!fullCopyDone) {
         }
         case MsgDeallocate: {
             uint64_t localAllocId = 0;
-            if (!vvm::detail::getU64(p, end, localAllocId)) {
+            if (!detail::getU64(p, end, localAllocId)) {
                 response = makeResponse(request.type, TcpFlagsError);
                 return;
             }
@@ -2305,25 +1463,7 @@ if (!fullCopyDone) {
                 VVM_LOG_WARN("Deallocate: unknown allocation {}", localAllocId);
             }
             response = makeResponse(request.type, TcpFlagsResponse);
-            vvm::detail::putU8(response.body, 1);
-            break;
-        }
-        case MsgTensorAnnounce: {
-            std::string name;
-            RemoteAllocationDesc desc;
-            if (!vvm::detail::getStr(p, end, name) ||
-                !deserializeAllocationDesc(p, end, desc)) {
-                response = makeResponse(request.type, TcpFlagsError);
-                return;
-            }
-            {
-                std::lock_guard<std::mutex> lock(remoteTensorsMutex_);
-                pendingRemoteTensors_[remoteTensorKey(desc.owner, name)] = desc;
-            }
-            remoteTensorsCV_.notify_all();
-            VVM_LOG_INFO("TensorAnnounce: stored '{}' ({} bytes) from {}", name, desc.size, desc.owner.toString());
-            response = makeResponse(request.type, TcpFlagsResponse);
-            vvm::detail::putU8(response.body, 1);
+            detail::putU8(response.body, 1);
             break;
         }
         default:
@@ -2354,8 +1494,8 @@ std::optional<Allocation> MultiNodePoolManager::createLocalAllocationForImport(
             ext.size = desc.size;
             auto imported = localPools_[0].importMemory(std::move(ext), usage);
             if (imported) {
-VVM_LOG_INFO("importRemote: zero-copy handle import for allocId={} succeeded",
-                         desc.localAllocId);
+                VVM_LOG_INFO("importRemote: zero-copy handle import for allocId=%llu succeeded",
+                             desc.localAllocId);
                 return imported;
             }
             VVM_LOG_WARN("importRemote: same-process handle import failed; "
@@ -2375,7 +1515,9 @@ VVM_LOG_INFO("importRemote: zero-copy handle import for allocId={} succeeded",
     // Cross-machine peers must use host-staged copies. Reject any network-received
     // handle values to prevent FD/HANDLE injection attacks.
     if (!desc.externalHandle.empty()) {
-        VVM_LOG_WARN("importRemote: rejecting {} byte external handle received over network (OS handles are process-relative and cannot be transferred via TCP; use host-staged migration instead)",
+        VVM_LOG_WARN("importRemote: rejecting %zu-byte external handle received over network "
+                     "(OS handles are process-relative and cannot be transferred via TCP; "
+                     "use host-staged migration instead)",
                      desc.externalHandle.size());
     }
 
@@ -2395,63 +1537,7 @@ bool MultiNodePoolManager::registerMemoryForRdma(const Allocation& alloc, uint64
 }
 
 void MultiNodePoolManager::unregisterMemoryForRdma(const Allocation& alloc) {
-    if (auto id = findAllocIdByBuffer(alloc.buffer)) {
-        releaseRdmaExport(*id);
-    }
-}
-
-void MultiNodePoolManager::releaseRdmaExport(uint64_t localAllocId) {
-    RdmaExport exp;
-    bool found = false;
-    {
-        std::lock_guard<std::mutex> lock(rdmaShadowMutex_);
-        auto it = rdmaShadowExports_.find(pendingKey(localNodeId_, localAllocId));
-        if (it != rdmaShadowExports_.end()) {
-            exp = std::move(it->second);
-            rdmaShadowExports_.erase(it);
-            found = true;
-        }
-    }
-    if (!found) return;
-    if (rdmaTransport_) rdmaTransport_->unregisterMemory(exp.region);
-    if (!localPools_.empty()) localPools_[0].deallocate(std::move(exp.hostShadow));
-    VVM_LOG_INFO("releaseRdmaExport: freed RDMA host shadow for alloc {}", localAllocId);
-}
-
-void MultiNodePoolManager::releaseAllRdmaExports() {
-    std::vector<RdmaExport> items;
-    {
-        std::lock_guard<std::mutex> lock(rdmaShadowMutex_);
-        for (auto& [key, exp] : rdmaShadowExports_) {
-            items.push_back(std::move(exp));
-        }
-        rdmaShadowExports_.clear();
-    }
-    for (auto& exp : items) {
-        if (rdmaTransport_) rdmaTransport_->unregisterMemory(exp.region);
-        if (!localPools_.empty()) localPools_[0].deallocate(std::move(exp.hostShadow));
-    }
-}
-
-std::optional<RdmaConnection> MultiNodePoolManager::ensureRdmaConnection(const NodeId& peer) {
-    if (!rdmaTransport_) return std::nullopt;
-    std::string key = peer.toString();
-    {
-        std::lock_guard<std::mutex> lock(rdmaConnectionsMutex_);
-        auto it = rdmaConnections_.find(key);
-        if (it != rdmaConnections_.end() && it->second.connected) return it->second;
-    }
-    auto conn = rdmaTransport_->connect(peer.host, peer.port + kRdmaPortOffset, peer.nodeIndex);
-    if (!conn) {
-        VVM_LOG_WARN("ensureRdmaConnection: failed to establish RDMA to {}", key);
-        return std::nullopt;
-    }
-    {
-        std::lock_guard<std::mutex> lock(rdmaConnectionsMutex_);
-        rdmaConnections_[key] = *conn;
-    }
-    VVM_LOG_INFO("ensureRdmaConnection: established RDMA to {}", key);
-    return conn;
+    (void)alloc;
 }
 #else
 bool MultiNodePoolManager::registerMemoryForRdma(const Allocation& alloc, uint64_t& outRdmaAddr, uint32_t& outRkey) {
@@ -2463,18 +1549,6 @@ bool MultiNodePoolManager::registerMemoryForRdma(const Allocation& alloc, uint64
 
 void MultiNodePoolManager::unregisterMemoryForRdma(const Allocation& alloc) {
     (void)alloc;
-}
-
-void MultiNodePoolManager::releaseRdmaExport(uint64_t localAllocId) {
-    (void)localAllocId;
-}
-
-void MultiNodePoolManager::releaseAllRdmaExports() {
-}
-
-std::optional<RdmaConnection> MultiNodePoolManager::ensureRdmaConnection(const NodeId& peer) {
-    (void)peer;
-    return std::nullopt;
 }
 #endif
 
@@ -2505,19 +1579,13 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::handleAllocateRequest(
     VVM_LOG_INFO("Allocate request from {}: {} bytes", requester.toString(), size);
 
     auto alloc = allocateLocal(size, usage, flags, false);
-    if (!alloc) {
-        VVM_LOG_ERROR("allocateLocal failed for {} bytes", size);
-        return std::nullopt;
-    }
-    VVM_LOG_INFO("Allocate local succeeded, size={}", alloc->size);
+    if (!alloc) return std::nullopt;
 
     auto desc = exportForRemote(*alloc, enableRdma, false);
     if (!desc) {
-        VVM_LOG_ERROR("exportForRemote failed");
         localPools_[0].deallocate(std::move(*alloc));
         return std::nullopt;
     }
-    VVM_LOG_INFO("exportForRemote succeeded, allocId={}", desc->localAllocId);
     return desc;
 }
 

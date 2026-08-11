@@ -21,10 +21,27 @@ add_executable(network_test network_test.cpp)
 target_link_libraries(network_test PRIVATE vulkan_vm vulkan_vm_network)
 target_include_directories(network_test PRIVATE ${EXAMPLE_EXTRA_INCLUDES})
 
+# Remote network test (Windows client -> Evo-X2 server over LAN)
+add_executable(network_remote_test network_remote_test.cpp)
+target_link_libraries(network_remote_test PRIVATE vulkan_vm vulkan_vm_network)
+target_include_directories(network_remote_test PRIVATE ${EXAMPLE_EXTRA_INCLUDES})
+
 # Tensor network test (GPU-to-GPU VRAM share cross-vendor over TCP) - DISABLED (WIP)
 # add_executable(tensor_network_test tensor_network_test.cpp)
 # target_link_libraries(tensor_network_test PRIVATE vulkan_vm vulkan_vm_network)
 # target_include_directories(tensor_network_test PRIVATE ${EXAMPLE_EXTRA_INCLUDES})
+
+# Cross-machine tensor network tests (Windows client <-> Evo-X2 Linux server)
+if(WIN32)
+    add_executable(tensor_client_test tensor_client_test.cpp)
+    target_link_libraries(tensor_client_test PRIVATE vulkan_vm vulkan_vm_network)
+    target_include_directories(tensor_client_test PRIVATE ${EXAMPLE_EXTRA_INCLUDES})
+else()
+    # Linux server test
+    add_executable(tensor_server_test tensor_server_test.cpp)
+    target_link_libraries(tensor_server_test PRIVATE vulkan_vm vulkan_vm_network)
+    target_include_directories(tensor_server_test PRIVATE ${EXAMPLE_EXTRA_INCLUDES})
+endif()
 
 # Offload/reload verification test (device <-> host shadow round-trip)
 add_executable(offload_test offload_test.cpp)

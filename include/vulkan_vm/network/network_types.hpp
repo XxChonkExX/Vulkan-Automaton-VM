@@ -27,47 +27,20 @@ struct NetworkConfig {
     bool enableRdma = true;
     bool enableGpuDirect = true;        // NVIDIA GPUDirect / AMD ROCm RDMA
     bool enableRdmaWrite = true;        // use RDMA_WRITE (vs RDMA_READ)
-    uint32_t rdmaMtu = constants::kDefaultRdmaMtu;            // MTU for RDMA (1024/2048/4096)
+    uint32_t rdmaMtu = 4096;            // MTU for RDMA (1024/2048/4096)
     
     // Fallback
     bool enableHostStagedFallback = true;
     uint32_t hostStagedThreads = 4;     // threads for host-staged copies
-
-    // Streaming pipeline (double-buffered TCP migrations). Larger windows
-    // and deeper pipelines push the upper end on fast links; the transport
-    // shrinks the window from measured throughput on slow/high-latency
-    // links so GPU-poor peers still make forward progress.
-    uint32_t streamWindowBytes = constants::kDefaultStreamWindowBytes;   // staging buffer size per window (0 = 8MB default)
-    uint32_t streamPipelineBuffers = constants::kDefaultPipelineBuffers;             // windows in flight (clamped to 2..4)
-    // EXPERIMENTAL (opt-in): the windowed double-buffered push/pull pipeline.
-    // Default OFF - migrations use the proven single full-sized staging path.
-    // Enable only for staging/fabric experiments; not yet validated on real
-    // multi-IP fabrics or all drivers.
-    bool enableAdaptiveWindow = false;
-    
-    // Message size limits (hard caps for untrusted peers)
-    uint64_t maxBodySize = constants::kDefaultMaxBodySize;    // 1 GiB max message body
-    uint64_t maxStreamSize = constants::kDefaultMaxStreamSize; // 16 GiB max stream
-    
-    // Connection-level limits for untrusted peers
-    uint32_t maxConcurrentStreams = constants::kDefaultMaxConcurrentStreams;               // max concurrent streams per connection
-    uint64_t maxBytesPerSecond = constants::kDefaultMaxBytesPerSecond;                  // 0 = unlimited (bytes/sec rate limit)
-    uint32_t maxMessageRate = constants::kDefaultMaxMessageRate;                  // max messages per second
-    
-    // Authentication (for untrusted peers)
-    bool requireAuthentication = false;              // require mTLS or token auth
-    std::string authToken = "";                      // shared secret for token auth
     
     // Timeouts
-    std::chrono::milliseconds connectTimeout{constants::kDefaultConnectTimeoutMs};
-    std::chrono::milliseconds rpcTimeout{constants::kDefaultRpcTimeoutMs};
-    std::chrono::milliseconds migrationTimeout{constants::kDefaultMigrationTimeoutMs};
-    std::chrono::milliseconds heartbeatInterval{constants::kDefaultHeartbeatIntervalMs};
-    std::chrono::milliseconds connectionIdleTimeout{constants::kDefaultConnectionIdleTimeoutMs};  // 5 min default idle timeout
+    std::chrono::milliseconds connectTimeout{5000};
+    std::chrono::milliseconds rpcTimeout{30000};
+    std::chrono::milliseconds migrationTimeout{60000};
+    std::chrono::milliseconds heartbeatInterval{5000};
     
     // Security (optional)
     bool useTls = false;
-    bool requireTlsForRemote = true;      // require TLS for non-localhost peers (opt-out for dev)
     std::string tlsCertPath = "";
     std::string tlsKeyPath = "";
     std::string tlsCaPath = "";
@@ -83,24 +56,6 @@ struct NetworkConfig {
         return true;
     }
 };
-
-// Returns true if the given host is a localhost/loopback address (127.0.0.1,
-// "localhost", "::1", etc.). Used to auto-decide whether TLS is required.
-inline bool isLocalhostAddress(const std::string& host) {
-    if (host.empty() || host == "localhost" || host == "127.0.0.1" ||
-        host == "::1" || host == "[::1]") {
-        return true;
-    }
-    return false;
-}
-
-// Returns true if TLS is required for the given peer host. When
-// requireTlsForRemote is set, TLS is required for any non-localhost host.
-inline bool isTlsRequiredForPeer(const NetworkConfig& cfg, const std::string& peerHost) {
-    if (!cfg.useTls) return false;
-    if (cfg.requireTlsForRemote && !isLocalhostAddress(peerHost)) return true;
-    return false;
-}
 
 // ============================================================================
 // Node identification
@@ -149,14 +104,7 @@ struct RemoteAllocationDesc {
     bool hasRdmaAddr = false;
     uint64_t rdmaAddr = 0;      // VkRemoteAddressNV (8 bytes)
     uint32_t rkey = 0;          // RDMA remote key
-
-    // UCX path: GPU-aware unified transport
-    bool hasUcxAddr = false;
-    std::vector<uint8_t> ucxWorkerAddr;  // UCX worker address blob
-    std::vector<uint8_t> ucxPackedRkey;  // UCX packed RMA key
-    uint64_t ucxRemoteAddr = 0;          // UCX remote virtual address
-    uint32_t ucxDeviceIndex = 0;         // GPU device index for UCX registration
-
+    
     // Fallback: host-staged
     bool hasHostShadow = false;
     
@@ -178,11 +126,10 @@ struct RemoteAllocationDesc {
     std::string allocationName;  // optional debug name
     
     bool isValid() const {
-        return size > 0 && (hasRdmaAddr || hasUcxAddr || hasHostShadow || !externalHandle.empty());
+        return size > 0 && (hasRdmaAddr || hasHostShadow || !externalHandle.empty());
     }
-
+    
     bool canUseRdma() const { return hasRdmaAddr && rkey != 0; }
-    bool canUseUcx() const { return hasUcxAddr && !ucxPackedRkey.empty(); }
     bool canUseHostStaged() const { return hasHostShadow || !externalHandle.empty(); }
 };
 
@@ -246,47 +193,6 @@ bool deserializeNodeList(const std::vector<uint8_t>& data, std::vector<NodeInfo>
 
 std::vector<uint8_t> serializeAllocationDesc(const RemoteAllocationDesc& desc);
 bool deserializeAllocationDesc(const uint8_t*& p, const uint8_t* end, RemoteAllocationDesc& out);
-
-// ============================================================================
-// Authentication / Authorization
-// ============================================================================
-
-enum class Capability {
-    RegisterNode,
-    ReadClusterView,
-    AllocateMemory,
-    MigrateMemory,
-    RDMAAccess,
-    PublishModel,
-    FetchModel,
-    AdministerCluster
-};
-
-struct PeerIdentity {
-    NodeId node;
-    std::string certificateFingerprint;  // SHA-256 of peer's TLS certificate
-    std::vector<Capability> capabilities;
-    
-    bool hasCapability(Capability cap) const {
-        return std::find(capabilities.begin(), capabilities.end(), cap) != capabilities.end();
-    }
-};
-
-enum class AuthorizationResult {
-    Allow,
-    Deny,
-    Unauthenticated,
-    InsufficientCapabilities
-};
-
-AuthorizationResult authorize(const PeerIdentity& peer, Capability requiredCap);
-
-// For internal use - default policy that allows all if no auth configured
-inline AuthorizationResult defaultAuthorize(const PeerIdentity& peer, Capability cap) {
-    (void)peer;
-    (void)cap;
-    return AuthorizationResult::Allow;
-}
 
 } // namespace network
 } // namespace vvm
