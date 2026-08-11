@@ -1,0 +1,59 @@
+#version 450
+// softmax.comp — softmax over the last dimension (D)
+//   x: (M, D), y: (M, D)
+//   push-constants: M, D
+
+layout (local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer X { float x_data[]; };
+layout (binding = 1) writeonly buffer Y { float y_data[]; };
+
+layout (push_constant) uniform Push {
+    uint M;
+    uint D;
+} pc;
+
+shared float sh_red[32];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.M) return;
+    uint tid = gl_LocalInvocationID.x;
+
+    // 1) max
+    float local_max = -1e30;
+    for (uint i = tid; i < pc.D; i += gl_WorkGroupSize.x) {
+        local_max = max(local_max, x_data[row * pc.D + i]);
+    }
+    sh_red[tid] = local_max;
+    barrier();
+    memoryBarrierShared();
+    for (uint s = gl_WorkGroupSize.x / 2; s > 0; s /= 2) {
+        if (tid < s) sh_red[tid] = max(sh_red[tid], sh_red[tid + s]);
+        barrier();
+        memoryBarrierShared();
+    }
+    float gmax = sh_red[0];
+    barrier();
+
+    // 2) exp sum
+    float local_sum = 0.0;
+    for (uint i = tid; i < pc.D; i += gl_WorkGroupSize.x) {
+        local_sum += exp(x_data[row * pc.D + i] - gmax);
+    }
+    sh_red[tid] = local_sum;
+    barrier();
+    memoryBarrierShared();
+    for (uint s = gl_WorkGroupSize.x / 2; s > 0; s /= 2) {
+        if (tid < s) sh_red[tid] += sh_red[tid + s];
+        barrier();
+        memoryBarrierShared();
+    }
+    float gsum = sh_red[0];
+    barrier();
+
+    // 3) normalize
+    for (uint i = tid; i < pc.D; i += gl_WorkGroupSize.x) {
+        y_data[row * pc.D + i] = exp(x_data[row * pc.D + i] - gmax) / gsum;
+    }
+}

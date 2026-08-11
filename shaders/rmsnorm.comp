@@ -1,0 +1,49 @@
+#version 450
+// rmsnorm.comp — RMSNorm over the last dimension D
+//   y = x / rms(x) * w  (+ b if has_bias != 0)
+//   push-constants: M, D, eps, has_bias
+
+layout (local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer X { float x_data[]; };
+layout (binding = 1) readonly  buffer W { float w_data[]; };
+layout (binding = 2) readonly  buffer B { float b_data[]; };
+layout (binding = 3) writeonly buffer Y { float y_data[]; };
+
+layout (push_constant) uniform Push {
+    uint M;
+    uint D;
+    float eps;
+    uint has_bias;
+} pc;
+
+shared float sh_red[32];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.M) return;
+    uint tid = gl_LocalInvocationID.x;
+
+    float local_ss = 0.0;
+    for (uint i = tid; i < pc.D; i += gl_WorkGroupSize.x) {
+        float v = x_data[row * pc.D + i];
+        local_ss += v * v;
+    }
+    sh_red[tid] = local_ss;
+    barrier();
+    memoryBarrierShared();
+    for (uint s = gl_WorkGroupSize.x / 2; s > 0; s /= 2) {
+        if (tid < s) sh_red[tid] += sh_red[tid + s];
+        barrier();
+        memoryBarrierShared();
+    }
+    float rms = sqrt(sh_red[0] / float(pc.D) + pc.eps);
+    float rstd = 1.0 / rms;
+    barrier();
+
+    for (uint i = tid; i < pc.D; i += gl_WorkGroupSize.x) {
+        float out_val = x_data[row * pc.D + i] * rstd * w_data[i];
+        if (pc.has_bias != 0u) out_val += b_data[i];
+        y_data[row * pc.D + i] = out_val;
+    }
+}

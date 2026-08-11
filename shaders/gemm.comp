@@ -1,0 +1,35 @@
+#version 450
+// gemm.comp — naive GEMM y = A @ B^T + c
+//   A: (M, K) row-major storage buffer
+//   B: (N, K)
+//   C: (N)
+//   Y: (M, N)
+//   push-constants: M, N, K, has_bias
+
+layout (local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A { float a_data[]; };
+layout (binding = 1) readonly buffer B { float b_data[]; };
+layout (binding = 2) readonly buffer C { float c_data[]; };
+layout (binding = 3) writeonly buffer Y { float y_data[]; };
+
+layout (push_constant) uniform Push {
+    uint M;
+    uint N;
+    uint K;
+    uint has_bias;
+} pc;
+
+void main() {
+    uint m = gl_GlobalInvocationID.x;
+    uint n = gl_GlobalInvocationID.y;
+    if (m >= pc.M || n >= pc.N) return;
+    float sum = 0.0;
+    for (uint k = 0; k < pc.K; k++) {
+        float a = a_data[m * pc.K + k];
+        float b = b_data[n * pc.K + k];
+        sum += a * b;
+    }
+    if (pc.has_bias != 0u) sum += c_data[n];
+    y_data[m * pc.N + n] = sum;
+}

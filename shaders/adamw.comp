@@ -1,0 +1,41 @@
+#version 450
+// adamw.comp — fused AdamW update in-place
+//   p, g, m, v are aligned same-length buffers
+//   push-constants:
+//       N, step, lr, beta0, beta1, eps, weight_decay, bias_c0, bias_c1
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) buffer P { float p_data[]; };
+layout (binding = 1) buffer G { float g_data[]; };
+layout (binding = 2) buffer M { float m_data[]; };
+layout (binding = 3) buffer V { float v_data[]; };
+
+layout (push_constant) uniform Push {
+    uint   N;
+    int    step;       // current step (0-indexed)
+    float  lr;
+    float  beta0;
+    float  beta1;
+    float  eps;
+    float  weight_decay;
+    float  bias_c0;   // 1 - beta0^(step+1)
+    float  bias_c1;   // 1 - beta1^(step+1)
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.N) return;
+
+    float p = p_data[i];
+    float g = g_data[i] + p * pc.weight_decay;
+    float m_new = pc.beta0 * m_data[i] + (1.0 - pc.beta0) * g;
+    float v_new = pc.beta1 * v_data[i] + (1.0 - pc.beta1) * g * g;
+
+    m_data[i] = m_new;
+    v_data[i] = v_new;
+
+    float m_hat = m_new / pc.bias_c0;
+    float v_hat = v_new / pc.bias_c1;
+    p_data[i] = p - pc.lr * m_hat / (sqrt(v_hat) + pc.eps);
+}

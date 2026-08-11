@@ -1,0 +1,63 @@
+#version 450
+// attention.comp — single-head scaled-dot-product attention
+//   q: (H, T, Dh), k: (H, T, Dh), v: (H, T, Dh)
+//   y: (H, T, Dh)   attn: (H, T, T) (optional scratch buffer)
+//   push-constants: H, T, Dh, scale, has_causal_mask
+
+layout (local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer Q { float q_data[]; };
+layout (binding = 1) readonly  buffer K { float k_data[]; };
+layout (binding = 2) readonly  buffer V { float v_data[]; };
+layout (binding = 3) writeonly buffer Y { float y_data[]; };
+
+layout (push_constant) uniform Push {
+    uint H;
+    uint T;
+    uint Dh;
+    float scale;
+    uint has_causal;
+} pc;
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint t_q = gl_GlobalInvocationID.y;
+    if (h >= pc.H || t_q >= pc.T) return;
+
+    // 1) compute scores for this (h, t_q, t_k) row
+    float scores[1024];   // up to T=1024
+    float maxv = -1e30;
+    for (uint t_k = 0; t_k < pc.T; t_k++) {
+        if (pc.has_causal != 0u && t_k > t_q) {
+            scores[t_k] = -1e30;
+            continue;
+        }
+        float s = 0.0;
+        for (uint d = 0; d < pc.Dh; d++) {
+            float qv = q_data[(h * pc.T + t_q) * pc.Dh + d];
+            float kv = k_data[(h * pc.T + t_k) * pc.Dh + d];
+            s += qv * kv;
+        }
+        scores[t_k] = s * pc.scale;
+        if (scores[t_k] > maxv) maxv = scores[t_k];
+    }
+
+    // 2) softmax
+    float sum = 0.0;
+    for (uint t_k = 0; t_k < pc.T; t_k++) {
+        scores[t_k] = exp(scores[t_k] - maxv);
+        sum += scores[t_k];
+    }
+    if (sum > 0.0) sum = 1.0 / sum;
+
+    // 3) accumulate output
+    for (uint d = 0; d < pc.Dh; d++) {
+        float acc = 0.0;
+        for (uint t_k = 0; t_k < pc.T; t_k++) {
+            float w = scores[t_k] * sum;
+            float vv = v_data[(h * pc.T + t_k) * pc.Dh + d];
+            acc += w * vv;
+        }
+        y_data[(h * pc.T + t_q) * pc.Dh + d] = acc;
+    }
+}

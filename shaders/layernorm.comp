@@ -1,0 +1,73 @@
+#version 450
+// layernorm.comp — LayerNorm over the last dimension D
+//   x: (M, D), y: (M, D), w: (D), b: (D)
+//   push-constants: M, D, has_bias
+
+layout (local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer X { float x_data[]; };
+layout (binding = 1) readonly  buffer W { float w_data[]; };
+layout (binding = 2) readonly  buffer B { float b_data[]; };
+layout (binding = 3) writeonly buffer Y { float y_data[]; };
+
+layout (push_constant) uniform Push {
+    uint M;
+    uint D;
+    uint has_bias;
+} pc;
+
+shared float shared_sum[1024];   // up to D=1024 per row
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.M) return;
+    uint local_id = gl_LocalInvocationID.x;
+
+    // 1) compute mean
+    float sum = 0.0;
+    for (uint i = local_id; i < pc.D; i += gl_WorkGroupSize.x) {
+        sum += x_data[row * pc.D + i];
+        shared_sum[i] = x_data[row * pc.D + i];
+    }
+    // workgroup reduction (naive)
+    barrier();
+    memoryBarrierShared();
+    for (uint s = 1; s < gl_WorkGroupSize.x; s *= 2) {
+        uint idx = (local_id + s) % gl_WorkGroupSize.x;
+        if (local_id + s < pc.D && idx < pc.D) {
+            shared_sum[local_id] += shared_sum[idx];
+        }
+        barrier();
+        memoryBarrierShared();
+    }
+    float mean = shared_sum[0] / float(pc.D);
+    barrier();
+
+    // 2) variance
+    float var = 0.0;
+    for (uint i = local_id; i < pc.D; i += gl_WorkGroupSize.x) {
+        float d = x_data[row * pc.D + i] - mean;
+        var += d * d;
+    }
+    shared_sum[local_id] = var;
+    barrier();
+    memoryBarrierShared();
+    for (uint s = 1; s < gl_WorkGroupSize.x; s *= 2) {
+        uint idx = (local_id + s) % gl_WorkGroupSize.x;
+        if (local_id + s < pc.D && idx < pc.D) {
+            shared_sum[local_id] += shared_sum[idx];
+        }
+        barrier();
+        memoryBarrierShared();
+    }
+    float rstd = 1.0 / sqrt(shared_sum[0] / float(pc.D) + 1e-5);
+    barrier();
+
+    // 3) normalize & affine
+    for (uint i = local_id; i < pc.D; i += gl_WorkGroupSize.x) {
+        float normed = (x_data[row * pc.D + i] - mean) * rstd;
+        float out_val = normed * w_data[i];
+        if (pc.has_bias != 0u) out_val += b_data[i];
+        y_data[row * pc.D + i] = out_val;
+    }
+}
