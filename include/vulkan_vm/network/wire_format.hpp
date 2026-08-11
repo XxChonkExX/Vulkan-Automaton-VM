@@ -47,8 +47,13 @@ inline bool getU8(const uint8_t*& p, const uint8_t* end, uint8_t& out) {
     return true;
 }
 
+// Remaining bytes in the buffer — avoids pointer arithmetic UB.
+inline size_t remaining(const uint8_t* p, const uint8_t* end) {
+    return static_cast<size_t>(end - p);
+}
+
 inline bool getU32(const uint8_t*& p, const uint8_t* end, uint32_t& out) {
-    if (p + 4 > end) return false;
+    if (remaining(p, end) < 4) return false;
     out = (static_cast<uint32_t>(p[0]) << 24) |
           (static_cast<uint32_t>(p[1]) << 16) |
           (static_cast<uint32_t>(p[2]) << 8) |
@@ -58,7 +63,7 @@ inline bool getU32(const uint8_t*& p, const uint8_t* end, uint32_t& out) {
 }
 
 inline bool getU64(const uint8_t*& p, const uint8_t* end, uint64_t& out) {
-    if (p + 8 > end) return false;
+    if (remaining(p, end) < 8) return false;
     out = 0;
     for (int i = 0; i < 8; ++i) out = (out << 8) | p[i];
     p += 8;
@@ -68,7 +73,7 @@ inline bool getU64(const uint8_t*& p, const uint8_t* end, uint64_t& out) {
 inline bool getBytes(const uint8_t*& p, const uint8_t* end, std::vector<uint8_t>& out) {
     uint32_t len = 0;
     if (!getU32(p, end, len)) return false;
-    if (p + len > end) return false;
+    if (remaining(p, end) < len) return false;
     out.assign(p, p + len);
     p += len;
     return true;
@@ -77,7 +82,7 @@ inline bool getBytes(const uint8_t*& p, const uint8_t* end, std::vector<uint8_t>
 inline bool getStr(const uint8_t*& p, const uint8_t* end, std::string& out) {
     uint32_t len = 0;
     if (!getU32(p, end, len)) return false;
-    if (p + len > end) return false;
+    if (remaining(p, end) < len) return false;
     out.assign(reinterpret_cast<const char*>(p), len);
     p += len;
     return true;
