@@ -101,7 +101,8 @@ struct UcxEndpoint {
 // ============================================================================
 
 struct UcxMemoryHandle {
-    ucp_mem_h memh = nullptr;
+    ucp_mem_h memh = nullptr;     // local registration (owner side)
+    ucp_rkey_h rkey = nullptr;    // unpacked remote key (peer side, for RMA)
     void* ptr = nullptr;
     size_t size = 0;
     bool isGpuMemory = false;
@@ -111,7 +112,7 @@ struct UcxMemoryHandle {
     // Filled by packRkey() on the owner, consumed by unpackRkey() on the peer.
     std::vector<uint8_t> packedRkey;  // result of ucp_rkey_pack
     uint64_t remoteAddr = 0;          // remote virtual address (ptr on peer)
-    bool rkeyValid = false;           // whether packedRkey/remoteAddr are set
+    bool rkeyValid = false;           // whether rkey / remoteAddr are usable for put/get
 };
 
 // RMA key exchange result: contains packed rkey + remote address for a memory region.
@@ -399,7 +400,7 @@ public:
                                                    const UcxMemoryHandle&,
                                                    bool,
                                                    const std::function<bool(const UcxRmaKey&)>&,
-                                                   std::function<bool(UcxRmaKey&)>&) { return std::nullopt; }
+                                                   const std::function<bool(UcxRmaKey&)>&) { return std::nullopt; }
     bool putAsync(const UcxEndpoint&, const UcxMemoryHandle&, const UcxMemoryHandle&, size_t, std::function<void(bool)>) { return false; }
     bool getAsync(const UcxEndpoint&, const UcxMemoryHandle&, const UcxMemoryHandle&, size_t, std::function<void(bool)>) { return false; }
     bool tagSendAsync(const UcxEndpoint&, const void*, size_t, uint64_t, std::function<void(bool)>) { return false; }

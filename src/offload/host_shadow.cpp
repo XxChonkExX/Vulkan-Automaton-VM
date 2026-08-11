@@ -163,13 +163,23 @@ std::optional<VkDeviceSize> HostShadowManager::allocateRegion(VkDeviceSize size)
 void HostShadowManager::freeRegion(VkDeviceSize offset, VkDeviceSize size) {
     std::lock_guard<std::mutex> lock(mutex_);
     size = alignUp(size, 4096);
+
+    // Guard against underflow from double-free or mismatched size
+    if (shadowBuffer_.used >= size) {
+        shadowBuffer_.used -= size;
+    } else {
+        VVM_LOG_ERROR("HostShadowManager::freeRegion: used underflow "
+                      "(used={}, free_size={}, offset={})",
+                      shadowBuffer_.used, size, offset);
+        shadowBuffer_.used = 0;
+    }
+
     shadowBuffer_.freeRanges.emplace_back(offset, size);
-    shadowBuffer_.used -= size;
-    
+
     // Merge adjacent ranges
     std::sort(shadowBuffer_.freeRanges.begin(), shadowBuffer_.freeRanges.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
-    
+
     std::vector<std::pair<VkDeviceSize, VkDeviceSize>> merged;
     for (const auto& range : shadowBuffer_.freeRanges) {
         if (!merged.empty() && merged.back().first + merged.back().second == range.first) {
