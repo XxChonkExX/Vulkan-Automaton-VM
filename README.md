@@ -24,6 +24,30 @@
 ### Build & Cleanup
 - Removed orphaned `src/core/unified_memory_pool.cpp.tmp` (was not referenced by CMake).
 
+### Vulkan API Hardening
+- **VVM_VK_CHECK macros**: `VVM_VK_CHECK()`, `VVM_VK_CHECK_VOID()`, `VVM_VK_CHECK_BOOL()` for consistent Vulkan result checking with automatic error logging and early return.
+- **RAII handles**: `UniqueHandle<VkHandle, std::function>` wrappers for all Vulkan objects (Buffer, DeviceMemory, CommandPool, Fence, Semaphore, QueryPool) with automatic cleanup.
+- **vkResultToString()**: Human-readable error strings for all Vulkan result codes.
+
+### Buddy Allocator Hardening
+- **ceilPowerOfTwo()**: Overflow-safe power-of-two rounding with `std::optional` return, rejects sizes > 2^63.
+- Checked integer arithmetic in `alignUp()` to prevent wraparound.
+
+### Device-Address Validation
+- `TensorTransport::initialize()` now explicitly validates `VK_KHR_buffer_device_address` support on all devices before proceeding.
+
+### Offload Sync Fix
+- `OffloadManager::waitSync()` now uses a `std::jthread` completion queue instead of detached threads, eliminating use-after-free risk on timeout.
+
+### TLS & Network Hardening
+- **Hostname verification**: `SSL_set1_host()` + `SSL_get_verify_result()` for proper certificate hostname checking.
+- **ALPN wire encoding**: `encodeAlpnProtocols()` for correct length-prefixed protocol list (RFC 7301).
+- **RPC field limits**: Bounded string/vector parsing with `wire::getStrLimited()` and semantic limits (max 64 GPU devices, 255B hostname, 128B UUID, 256B GPU/NIC names).
+
+### CMake Improvements
+- Removed hardcoded Windows SDK/MSVC paths — lets toolchain detection handle it.
+- Broke `vulkan_vm` ↔ `vulkan_vm_network` circular dependency. Consumers now link both explicitly if networking is needed.
+
 ---
 
 ## Table of Contents
