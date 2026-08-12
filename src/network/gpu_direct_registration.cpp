@@ -20,6 +20,8 @@ namespace detail {
 // Intel Level Zero path (Windows) - OPAQUE_WIN32 export
 // ============================================================================
 
+#if defined(_WIN32) && defined(VVM_HAS_LEVEL_ZERO)
+
 static std::once_flag s_zeInitFlag;
 static bool s_zeAvailable = false;
 static ze_driver_handle_t s_zeDriver = nullptr;
@@ -28,7 +30,7 @@ static bool initLevelZero() {
     std::call_once(s_zeInitFlag, []() {
         ze_result_t res = zeInit(ZE_INIT_FLAG_GPU_ONLY);
         if (res != ZE_RESULT_SUCCESS) {
-            VVM_LOG_WARN("Level Zero init failed: {:#x}", res);
+            VVM_LOG_WARN("Level Zero init failed: {}", res);
             return;
         }
         uint32_t count = 0;
@@ -102,7 +104,7 @@ std::optional<GpuDirectRegistration> registerIntelLevelZero(const GpuDirectConfi
     if (vkGetMemoryRemoteAddressNV) {
         VkResult r = vkGetMemoryRemoteAddressNV(config.vkDevice, &remoteInfo, &reg.remoteAddress);
         if (r == VK_SUCCESS) {
-            VVM_LOG_INFO("Intel L0: got RDMA remote address {:#x}", reinterpret_cast<uint64_t>(reg.remoteAddress));
+            VVM_LOG_INFO("Intel L0: got RDMA remote address {}", reg.remoteAddress);
         }
     }
 
@@ -119,11 +121,66 @@ void unregisterIntelLevelZero(const GpuDirectRegistration& reg) {
     VVM_LOG_INFO("Intel Level Zero GPU-direct unregistered");
 }
 
+#else
+std::optional<GpuDirectRegistration> registerIntelLevelZero(const GpuDirectConfig&) {
+    return std::nullopt;
+}
+void unregisterIntelLevelZero(const GpuDirectRegistration&) {}
+#endif
+
 // ============================================================================
 // AMD ROCm path (Linux) - DMA-BUF import/export
 // ============================================================================
 
 #if defined(__linux__)
+#include <dlfcn.h>
+#include <unistd.h>
+
+// ============================================================================
+// Minimal HIP external-memory ABI declarations.
+//
+// Declared locally (instead of including ROCm headers) so the verbs DMA-BUF
+// path builds on stock Ubuntu with no ROCm/HIP installed. Struct layout
+// matches ROCm's hip_runtime_api.h (type / handle union / size / flags /
+// reserved tail); libamdhip64.so is dlopen'd at runtime, so these must be
+// ABI-compatible with the installed HIP version, not header-identical.
+// ============================================================================
+
+typedef int hipError_t;
+static constexpr hipError_t hipSuccess = 0;
+typedef void* hipExternalMemory_t;
+
+typedef enum hipExternalMemoryHandleType_enum {
+    hipExternalMemoryHandleTypeOpaqueFd = 1,
+    hipExternalMemoryHandleTypeOpaqueWin32 = 2,
+    hipExternalMemoryHandleTypeOpaqueWin32Kmt = 3,
+    hipExternalMemoryHandleTypeDmaBuf = 4,
+    hipExternalMemoryHandleTypeD3D12Heap = 5,
+    hipExternalMemoryHandleTypeD3D12Resource = 6,
+    hipExternalMemoryHandleTypeD3D11Resource = 7,
+    hipExternalMemoryHandleTypeD3D11ResourceKmt = 8,
+    hipExternalMemoryHandleTypeNvSciBuf = 9
+} hipExternalMemoryHandleType;
+
+typedef struct hipExternalMemoryHandleDesc_st {
+    hipExternalMemoryHandleType type;
+    union {
+        int fd;
+        void* win32Handle;
+        const void* name;
+    } handle;
+    unsigned long long size;
+    unsigned int flags;
+    unsigned int reserved[16];
+} hipExternalMemoryHandleDesc;
+
+typedef struct hipExternalMemoryBufferDesc_st {
+    unsigned long long offset;
+    unsigned long long size;
+    unsigned int flags;
+    unsigned int reserved[16];
+} hipExternalMemoryBufferDesc;
+
 static std::once_flag s_hipInitFlag;
 static bool s_hipAvailable = false;
 
@@ -196,7 +253,7 @@ std::optional<GpuDirectRegistration> registerAmdRocm(const GpuDirectConfig& conf
     reg.dmaBufFd = dmaBufFd;
 
     hipExternalMemoryHandleDesc desc{};
-    desc.type = HIP_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF;
+    desc.type = hipExternalMemoryHandleTypeDmaBuf;
     desc.handle.fd = dmaBufFd;
     desc.size = config.size;
     desc.flags = 0;
@@ -235,7 +292,7 @@ std::optional<GpuDirectRegistration> registerAmdRocm(const GpuDirectConfig& conf
     if (vkGetMemoryRemoteAddressNV) {
         VkResult r = vkGetMemoryRemoteAddressNV(config.vkDevice, &remoteInfo, &reg.remoteAddress);
         if (r == VK_SUCCESS) {
-            VVM_LOG_INFO("AMD ROCm: got RDMA remote address {:#x}", reinterpret_cast<uint64_t>(reg.remoteAddress));
+            VVM_LOG_INFO("AMD ROCm: got RDMA remote address {}", reg.remoteAddress);
         }
     }
 
@@ -313,7 +370,7 @@ std::optional<GpuDirectRegistration> registerGpuMemoryForRdmaVendor(
             return detail::registerAmdRocm(config);
 
         default:
-            VVM_LOG_WARN("Unknown GPU vendor {:#x} for GPUDirect", config.vendorId);
+            VVM_LOG_WARN("Unknown GPU vendor {} for GPUDirect", config.vendorId);
             return std::nullopt;
     }
 }

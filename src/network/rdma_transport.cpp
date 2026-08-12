@@ -233,14 +233,14 @@ public:
         auto reg = registerGpuMemoryForRdmaVendor(gpuConfig);
         if (vendorId_ == 0x10DE) {
             if (!reg || !reg->valid) {
-                VVM_LOG_WARN("NVIDIA GPU-direct registration failed for vendor {:#x}", vendorId_);
+                VVM_LOG_WARN("NVIDIA GPU-direct registration failed for vendor {}", vendorId_);
                 return std::nullopt;
             }
         } else if (reg && reg->valid) {
-            VVM_LOG_INFO("Vendor registration succeeded for {:#x} (dma-buf fd={})",
+            VVM_LOG_INFO("Vendor registration succeeded for {} (dma-buf fd={})",
                          vendorId_, reg->dmaBufFd);
         } else {
-            VVM_LOG_WARN("Vendor registration unavailable for {:#x} (continuing with verbs DMA-BUF)",
+            VVM_LOG_WARN("Vendor registration unavailable for {} (continuing with verbs DMA-BUF)",
                          vendorId_);
         }
 
@@ -275,7 +275,7 @@ public:
                 std::lock_guard<std::mutex> lock(regionsMutex_);
                 registeredRegions_[mr] = region;
             }
-            VVM_LOG_INFO("NVIDIA GPUDirect registered: rdmaAddr={:#x}, lkey={}, rkey={}",
+            VVM_LOG_INFO("NVIDIA GPUDirect registered: rdmaAddr={}, lkey={}, rkey={}",
                          region.rdmaAddr, region.lkey, region.rkey);
             return region;
         } else if (vendorId_ == 0x8086) {
@@ -414,7 +414,7 @@ public:
             return region;
         }
 
-        VVM_LOG_WARN("registerGpuMemory: unsupported vendor {:#x}", vendorId_);
+        VVM_LOG_WARN("registerGpuMemory: unsupported vendor {}", vendorId_);
         return std::nullopt;
     }
 

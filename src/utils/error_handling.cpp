@@ -73,13 +73,13 @@ void printMemoryTypes(const VkPhysicalDeviceMemoryProperties& props) {
     VVM_LOG_INFO("Memory Heaps ({}):", props.memoryHeapCount);
     for (uint32_t i = 0; i < props.memoryHeapCount; ++i) {
         const auto& heap = props.memoryHeaps[i];
-        VVM_LOG_INFO("  Heap {}: {} MB, flags: {:#x}", i, heap.size / (1024*1024), heap.flags);
+        VVM_LOG_INFO("  Heap {}: {} MB, flags: {}", i, heap.size / (1024*1024), heap.flags);
     }
     
     VVM_LOG_INFO("Memory Types ({}):", props.memoryTypeCount);
     for (uint32_t i = 0; i < props.memoryTypeCount; ++i) {
         const auto& type = props.memoryTypes[i];
-        VVM_LOG_INFO("  Type {}: heap={}, flags={:#x}", i, type.heapIndex, type.propertyFlags);
+        VVM_LOG_INFO("  Type {}: heap={}, flags={}", i, type.heapIndex, type.propertyFlags);
     }
 }
 
@@ -93,7 +93,7 @@ void printQueueFamilies(VkPhysicalDevice physicalDevice) {
     VVM_LOG_INFO("Queue Families ({}):", count);
     for (uint32_t i = 0; i < count; ++i) {
         const auto& fam = families[i];
-        VVM_LOG_INFO("  Family {}: count={}, flags={:#x}", i, fam.queueCount, fam.queueFlags);
+        VVM_LOG_INFO("  Family {}: count={}, flags={}", i, fam.queueCount, fam.queueFlags);
     }
 }
 
