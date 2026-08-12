@@ -338,7 +338,7 @@ int main(int argc, char** argv) {
             for (const auto& node : view) {
                 if (node.id.toString() != nodeId) {
                     std::cout << "  Announcing tensor to " << node.id.toString() << "\n";
-                    transport->sendTensor(*serverTensor, node.id.toString(), 
+                    transport->sendTensor(serverTensor, node.id.toString(), 
                         [](bool ok, const std::string& err) {
                             if (!ok) std::cerr << "  announce failed: " << err << "\n";
                         });

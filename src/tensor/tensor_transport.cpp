@@ -1641,6 +1641,13 @@ public:
         return "";
     }
     
+    std::vector<vvm::network::NodeInfo> getClusterView() const override {
+        if (networkManager_) {
+            return networkManager_->getClusterView();
+        }
+        return {};
+    }
+    
     // Send/recv by tensor name
     void sendTensor(const TensorHandle& tensor, const std::string& targetNodeId, CompletionCallback cb) override {
         if (!networkManager_ || !tensor) {
