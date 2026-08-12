@@ -7,7 +7,7 @@
 > **Cross-Machine GPU Sharing (NEW)**: Verified working between Windows (Intel Arc B70) and Linux (AMD Strix Halo) over TCP. See [docs/cross_machine_gpu_sharing.md](docs/cross_machine_gpu_sharing.md) for setup guide.
 
 Notice! Help wanted desperately-
-Alot of this code hinges upon hardware that I do not own. Nvidia in particular. I have tested AMD pretty thoroughly with my 7900xtx and Strix Halo, Intel B70 tested for multi-pool but it needs network testing and Nvidia definitely needs some love since I am too poor to pay the Nvidia tax :(  Tenstorrent cards are loosely supported and I have built a Vulkan ICD to play nice; I have submitted to TT (honestly I do not know if it is a steaming pile of 5#!7 or not) but if you need it to test let me know and I will ship it your way. This repo is solid but highly highly experimental in several aspects. Local power! Homebrewed with love. -Mike/ChonkE
+Alot of this code hinges upon hardware that I do not own. Nvidia in particular. I have tested AMD with my 7900xtx and Strix Halo, Intel B70 tested for multi-pool but it needs network testing and Nvidia definitely needs some love since I am too poor to pay the Nvidia tax :(  Tenstorrent cards are loosely supported and I have built a Vulkan ICD to play nice; I have submitted to TT (honestly I do not know if it is a steaming pile of 5#!7 or not) but if you need it to test let me know and I will ship it your way. This repo is solid but highly highly experimental in several aspects. Local power! Homebrewed with love. -Mike/ChonkE
 ---
 
 ## Table of Contents
