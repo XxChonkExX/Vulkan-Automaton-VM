@@ -35,6 +35,7 @@
 #   --server-ip <ip> Server address for client (default: 192.168.0.117)
 #   --size-mb <n>    Tensor size in MB (default: 16)
 #   --rdma-nic <n>   RDMA device name (default: rxe0)
+#   --announce-count <n> Server announces n times then exits (0 = infinite, default)
 #   --build-dir <d>  Build directory (default: build_rdma)
 #   --repo <dir>     Repo root (default: parent of script dir)
 # ============================================================================
@@ -53,6 +54,7 @@ LOCAL_PORT=51005
 SERVER_IP=192.168.0.117
 SIZE_MB=16
 RDMA_NIC=rxe0
+ANNOUNCE_COUNT=0
 
 log()  { echo -e "\033[1;32m[+] $*\033[0m"; }
 warn() { echo -e "\033[1;33m[!] $*\033[0m"; }
@@ -67,6 +69,7 @@ parse_args() {
             --server-ip)  SERVER_IP="$2"; shift 2 ;;
             --size-mb)    SIZE_MB="$2"; shift 2 ;;
             --rdma-nic)   RDMA_NIC="$2"; shift 2 ;;
+            --announce-count) ANNOUNCE_COUNT="$2"; shift 2 ;;
             --build-dir)  BUILD_DIR="$2"; shift 2 ;;
             --repo)       REPO="$2"; shift 2 ;;
             *) warn "Unknown option: $1"; shift ;;
@@ -271,7 +274,12 @@ run_server() {
     log "Starting server: port=$PORT size=${SIZE_MB}MB rdma-nic=$RDMA_NIC"
     log "Log: $logfile  (Ctrl+C to stop)"
     echo
-    "$exe" --port "$PORT" --size-mb "$SIZE_MB" --rdma-nic "$RDMA_NIC" --verbose 2>&1 | tee "$logfile"
+    local extra=()
+    if [[ "$ANNOUNCE_COUNT" -gt 0 ]]; then
+        extra+=(--announce-count "$ANNOUNCE_COUNT")
+        log "Server will announce $ANNOUNCE_COUNT times then exit"
+    fi
+    "$exe" --port "$PORT" --size-mb "$SIZE_MB" --rdma-nic "$RDMA_NIC" --verbose "${extra[@]}" 2>&1 | tee "$logfile"
     verify_log "$logfile"
 }
 

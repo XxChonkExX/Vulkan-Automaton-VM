@@ -24,6 +24,7 @@ using namespace vvm::tensor;
 static std::atomic<bool> g_running{true};
 static bool g_verbose = false;
 static int g_announce_count = 0;
+static int g_announce_limit = 0;  // 0 = infinite
 static int g_send_success = 0;
 static int g_send_fail = 0;
 
@@ -267,8 +268,10 @@ int main(int argc, char** argv) {
             tensorSizeMB = std::stoull(argv[++i]);
         } else if (arg == "--rdma-nic" && i + 1 < argc) {
             rdmaNic = argv[++i];
+        } else if (arg == "--announce-count" && i + 1 < argc) {
+            g_announce_limit = std::stoi(argv[++i]);
         } else if (arg == "--help" || arg == "-h") {
-            std::cout << "Usage: " << argv[0] << " [--port <port>] [--size-mb <size>] [--rdma-nic <device>] [--verbose]\n";
+            std::cout << "Usage: " << argv[0] << " [--port <port>] [--size-mb <size>] [--rdma-nic <device>] [--announce-count <n>] [--verbose]\n";
             return 0;
         }
     }
@@ -380,6 +383,9 @@ int main(int argc, char** argv) {
             for (const auto& node : view) {
                 if (node.id.toString() != nodeId) {
                     g_announce_count++;
+                    if (g_announce_limit > 0 && g_announce_count >= g_announce_limit) {
+                        g_running = false;
+                    }
                     LOG_VERBOSE("Announcing tensor to " << node.id.toString() << " (attempt #" << g_announce_count << ")");
                     
                     try {
