@@ -363,7 +363,13 @@ int main(int argc, char** argv) {
     // Test 2: Allocate tensor on client, recv from server
     std::cout << "\n--- Test 2: Client receives tensor from Server (VRAM over TCP) ---\n";
     
-    auto recvTensor = transport->allocateTensor(meta, 0);
+    // Use the server's tensor name
+    vvm::tensor::TensorMetadata serverMeta;
+    serverMeta.dtype = vvm::tensor::DataType::Float32;
+    serverMeta.name = "server_to_client_tensor";
+    serverMeta.shape = vvm::tensor::TensorShape::makeContiguous({1, 4, 1024, 1024});
+    
+    auto recvTensor = transport->allocateTensor(serverMeta, 0);
     if (!recvTensor) {
         std::cerr << "FAIL: allocate recv tensor\n";
         ++failures;

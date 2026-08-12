@@ -283,6 +283,48 @@ int main(int argc, char** argv) {
     std::cout << "Server ready. Waiting for client...\n";
     std::cout << "Press Ctrl+C to exit.\n\n";
 
+    // Allocate a server tensor and announce it for clients to pull
+    const VkDeviceSize kBytes = 16ull * 1024 * 1024;
+    vvm::tensor::TensorMetadata serverMeta;
+    serverMeta.dtype = vvm::tensor::DataType::Float32;
+    serverMeta.name = "server_to_client_tensor";
+    serverMeta.shape = vvm::tensor::TensorShape::makeContiguous({1, 4, 1024, 1024});
+
+    auto serverTensor = transport->allocateTensor(serverMeta, 0);
+    if (!serverTensor) {
+        std::cerr << "FAIL: allocate server tensor\n";
+        transport->shutdown();
+        destroyTestDevice();
+        return 1;
+    }
+
+    // Fill server tensor with pattern via staging
+    auto& pool = transport->getPoolManager()->getPool(0);
+    auto staging = pool.allocate(
+        kBytes,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    
+    if (!staging || !staging->hostPtr) {
+        std::cerr << "FAIL: staging buffer for server tensor\n";
+        transport->shutdown();
+        destroyTestDevice();
+        return 1;
+    }
+
+    // Fill with 0xA5 pattern
+    std::memset(staging->hostPtr, 0xA5, static_cast<size_t>(kBytes));
+    if (!deviceCopy(s_dev.device, s_dev.transferQueue, staging->buffer, serverTensor->allocation.buffer, kBytes)) {
+        std::cerr << "FAIL: fill server tensor VRAM\n";
+        pool.deallocate(std::move(*staging));
+        transport->shutdown();
+        destroyTestDevice();
+        return 1;
+    }
+    pool.deallocate(std::move(*staging));
+    
+    std::cout << "Server tensor 'server_to_client_tensor' allocated and filled with 0xA5\n";
+
     // Keep running - wait for Ctrl+C
     std::signal(SIGINT, [](int) { g_running = false; });
     std::thread([&]() {
