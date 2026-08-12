@@ -1624,13 +1624,87 @@ public:
             if (!initNetworkTransport()) return false;
         }
         
-        // Parse bootstrap address and connect
-        // For simplicity, assume bootstrapAddress is "host:port"
-        vvm::network::NetworkConfig netConfig;
-        netConfig.seedNodes = { bootstrapAddress };
+        // Parse bootstrap address "host:port" or "host:port#idx"
+        std::string host = bootstrapAddress;
+        uint16_t port = 0;
+        size_t colon = bootstrapAddress.rfind(':');
+        size_t hash = bootstrapAddress.rfind('#');
         
-        networkManager_->registerWithCluster();
-        VVM_LOG_INFO("Joined cluster via {}", bootstrapAddress);
+        if (colon != std::string::npos) {
+            host = bootstrapAddress.substr(0, colon);
+            std::string portStr = bootstrapAddress.substr(colon + 1);
+            if (hash != std::string::npos && hash > colon) {
+                portStr = bootstrapAddress.substr(colon + 1, hash - colon - 1);
+            }
+            try {
+                port = static_cast<uint16_t>(std::stoul(portStr));
+            } catch (...) {
+                VVM_LOG_ERROR("joinCluster: invalid port in bootstrap address {}", bootstrapAddress);
+                return false;
+            }
+        } else {
+            VVM_LOG_ERROR("joinCluster: invalid bootstrap address format {}", bootstrapAddress);
+            return false;
+        }
+        
+        // Connect to bootstrap node and register
+        auto conn = networkManager_->getPeerConnection(host, port);
+        if (conn == 0) {
+            VVM_LOG_ERROR("joinCluster: cannot connect to bootstrap {}:{}", host, port);
+            return false;
+        }
+        
+        // Build node info for registration
+        vvm::network::NodeInfo info;
+        info.id = networkManager_->getLocalNodeId();
+        info.nicName = "";
+        info.rdmaCapable = networkManager_->rdmaAvailable();
+        info.gpuDirectCapable = false;
+        info.timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        
+        for (size_t i = 0; i < devices_.size(); ++i) {
+            VkPhysicalDeviceProperties props{};
+            vkGetPhysicalDeviceProperties(devices_[i].physicalDevice, &props);
+            info.gpuDevices.push_back(props.deviceName);
+        }
+        
+        auto body = serializeNodeInfo(info);
+        
+        vvm::network::TcpMessage req;
+        req.type = vvm::network::MsgRegisterNode;
+        req.flags = vvm::network::TcpFlagsRequest;
+        req.body = body;
+        
+        auto resp = networkManager_->getTcpTransport()->request(conn, req);
+        if (!resp || resp->flags == vvm::network::TcpFlagsError) {
+            VVM_LOG_ERROR("joinCluster: registration rejected by {}:{}", host, port);
+            return false;
+        }
+        
+        // Merge the returned cluster view
+        std::vector<vvm::network::NodeInfo> view;
+        if (deserializeNodeList(resp->body, view)) {
+            // Add self to view if not present
+            bool foundSelf = false;
+            for (const auto& node : view) {
+                if (node.id.toString() == networkManager_->getLocalNodeId().toString()) {
+                    foundSelf = true;
+                    break;
+                }
+            }
+            if (!foundSelf) {
+                view.push_back(info);
+            }
+            
+            // Update network manager's cluster view directly
+            {
+                std::lock_guard<std::mutex> lock(networkManager_->clusterViewMutex());
+                networkManager_->clusterView() = view;
+            }
+        }
+        
+        VVM_LOG_INFO("Joined cluster via {} ({} nodes visible)", bootstrapAddress, view.size());
         return true;
     }
     
