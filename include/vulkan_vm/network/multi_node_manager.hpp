@@ -338,9 +338,6 @@ private:
     mutable std::mutex migrationsMutex_;
     uint64_t nextMigrationId_ = 1;
     
-    // Migration callback type
-    using MigrationCallback = std::function<void(const NetworkMigrationOperation&)>;
-    
     // Cluster state
     std::vector<NodeInfo> clusterView_;
     mutable std::mutex clusterViewMutex_;

@@ -14,9 +14,12 @@
 #include <thread>
 #include <chrono>
 #include <cstring>
+#include <csignal>
 
 using namespace vvm;
 using namespace vvm::tensor;
+
+static std::atomic<bool> g_running{true};
 
 static void fillPattern(void* buf, VkDeviceSize size, uint8_t val) {
     std::memset(buf, val, static_cast<size_t>(size));
@@ -281,17 +284,16 @@ int main(int argc, char** argv) {
     std::cout << "Press Ctrl+C to exit.\n\n";
 
     // Keep running - wait for Ctrl+C
-    std::atomic<bool> running = true;
+    std::signal(SIGINT, [](int) { g_running = false; });
     std::thread([&]() {
-        while (running) {
+        while (g_running) {
             std::this_thread::sleep_for(std::chrono::seconds(10));
             std::cout << "  [heartbeat] Server running on " << nodeId << "\n";
         }
     }).detach();
 
     // Wait for interrupt
-    std::signal(SIGINT, [](int) { running = false; });
-    while (running) {
+    while (g_running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
