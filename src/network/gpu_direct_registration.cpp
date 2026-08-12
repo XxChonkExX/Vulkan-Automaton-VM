@@ -28,7 +28,7 @@ static bool initLevelZero() {
     std::call_once(s_zeInitFlag, []() {
         ze_result_t res = zeInit(ZE_INIT_FLAG_GPU_ONLY);
         if (res != ZE_RESULT_SUCCESS) {
-            VVM_LOG_WARN("Level Zero init failed: 0x{:x}", res);
+            VVM_LOG_WARN("Level Zero init failed: {:#x}", res);
             return;
         }
         uint32_t count = 0;
@@ -102,7 +102,7 @@ std::optional<GpuDirectRegistration> registerIntelLevelZero(const GpuDirectConfi
     if (vkGetMemoryRemoteAddressNV) {
         VkResult r = vkGetMemoryRemoteAddressNV(config.vkDevice, &remoteInfo, &reg.remoteAddress);
         if (r == VK_SUCCESS) {
-            VVM_LOG_INFO("Intel L0: got RDMA remote address 0x{:x}", reinterpret_cast<uint64_t>(reg.remoteAddress));
+            VVM_LOG_INFO("Intel L0: got RDMA remote address {:#x}", reinterpret_cast<uint64_t>(reg.remoteAddress));
         }
     }
 
@@ -235,7 +235,7 @@ std::optional<GpuDirectRegistration> registerAmdRocm(const GpuDirectConfig& conf
     if (vkGetMemoryRemoteAddressNV) {
         VkResult r = vkGetMemoryRemoteAddressNV(config.vkDevice, &remoteInfo, &reg.remoteAddress);
         if (r == VK_SUCCESS) {
-            VVM_LOG_INFO("AMD ROCm: got RDMA remote address 0x{:x}", reinterpret_cast<uint64_t>(reg.remoteAddress));
+            VVM_LOG_INFO("AMD ROCm: got RDMA remote address {:#x}", reinterpret_cast<uint64_t>(reg.remoteAddress));
         }
     }
 

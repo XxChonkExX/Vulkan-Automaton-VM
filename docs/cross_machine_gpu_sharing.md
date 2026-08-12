@@ -2,6 +2,27 @@
 
 VulkanVM supports sharing GPU memory across machines over TCP. This enables distributed AI inference where tensors can be transferred between GPUs on different computers.
 
+## Automated AMD RDMA Test
+
+For testing the **AMD vendor-specific GPU-direct RDMA path** (DMA-BUF export → `ibv_reg_dmabuf_mr` verbs registration) over the network, use `scripts/test_amd_rdma.sh`:
+
+```bash
+# On BOTH machines (once):
+sudo ./scripts/test_amd_rdma.sh setup     # deps + Soft-RoCE (rxe) link
+sudo ./scripts/test_amd_rdma.sh build     # configure + build tests
+sudo ./scripts/test_amd_rdma.sh env       # verify RDMA devices + GPU
+
+# On Evo-X2 (server):
+./scripts/test_amd_rdma.sh server --port 51000
+
+# On Ubuntu client:
+./scripts/test_amd_rdma.sh client --server 192.168.0.117 --port 51000 --local-port 51005
+```
+
+The script verifies the log for `VerbsRdmaTransport initialized`, `AMD GPUDirect via ibv_reg_dmabuf_mr` (or the mmap fallback), and `migrateFromRemote: pulled`.
+
+**Kernel note**: `rdma_rxe` dma-buf support landed in kernel 6.19. On older kernels the AMD path uses the `DMA-BUF mmap fallback` (works fine on Strix Halo's unified memory). Soft-RoCE requires native Linux — WSL2 kernels do not include `rdma_rxe`.
+
 ## Architecture
 
 ```
@@ -44,6 +65,7 @@ cmake --build build --target tensor_server_test tensor_client_test
 |------|---------|-------------|
 | `--port` | 51000 | TCP port to listen on |
 | `--size-mb` | 16 | Size of test tensor in MB |
+| `--rdma-nic` | auto | RDMA device to use (e.g. `rxe0`) |
 | `--verbose` | off | Enable detailed operation logging |
 | `--help` | | Show help |
 
@@ -54,6 +76,7 @@ cmake --build build --target tensor_server_test tensor_client_test
 | `--server` | 192.168.0.117 | Server IP address |
 | `--port` | 51000 | Server port |
 | `--local-port` | 51005 | Local listen port |
+| `--rdma-nic` | auto | RDMA device to use (e.g. `rxe0`) |
 | `--help` | | Show help |
 
 ## Requirements
@@ -62,7 +85,8 @@ cmake --build build --target tensor_server_test tensor_client_test
 - **Vulkan**: GPU with `VK_KHR_external_memory` support
 - **Linux**: `VK_KHR_external_memory_fd` for DMA-BUF/OPAQUE_FD export
 - **Windows**: `VK_KHR_external_memory_win32` for OPAQUE_WIN32 export
-- **Firewall**: Allow inbound TCP on the chosen port
+- **Firewall**: Allow inbound TCP on the chosen port (and port + 1 for the RDMA listener)
+- **RDMA path**: `rdma-core` + `libibverbs-dev` / `librdmacm-dev`; Soft-RoCE (`rdma_rxe`) when no InfiniBand NIC — see `scripts/test_amd_rdma.sh setup`
 
 ## Transport Path Selection
 
@@ -71,9 +95,14 @@ VulkanVM automatically selects the best transport path:
 | Priority | Path | Requirements |
 |----------|------|--------------|
 | 1 | P2P | Same machine, driver support |
-| 2 | RDMA | InfiniBand/RoCE hardware + `nvidia-peermem` |
+| 2 | RDMA | Verbs transport (`librdmacm`) + GPU registration |
 | 3 | Host-Staged | Always available (TCP) |
 | 4 | UCX | UCX build + GPU memory registration |
+
+The GPU-direct RDMA registration is **vendor-specific**:
+- **AMD (0x1002)**: DMA-BUF export + `ibv_reg_dmabuf_mr` (mmap fallback on kernels < 6.19); ROCm/HIP optional for compute-side import
+- **NVIDIA (0x10DE)**: `vkGetMemoryRemoteAddressNV` + `nvidia-peermem`
+- **Intel (0x8086)**: Level Zero / DMA-BUF
 
 For cross-machine without RDMA, **Host-Staged TCP** is used (4 MB chunks).
 
@@ -81,9 +110,8 @@ For cross-machine without RDMA, **Host-Staged TCP** is used (4 MB chunks).
 
 | Client | Server | Status |
 |--------|--------|--------|
-| Windows (Intel Arc B70) | Linux/AMD Strix Halo | ✅ Working |
-| Windows (AMD 7900 XTX) | Linux/AMD Strix Halo | 🔜 Pending |
-| WSL/Ubuntu | Linux/AMD Strix Halo | 🔜 Pending (SoftRoCE) |
+| Windows (Intel Arc B70) | Linux/AMD Strix Halo | ✅ Working (host-staged TCP) |
+| Ubuntu (AMD 7900 XTX) | Linux/AMD Strix Halo | 🔜 Pending (GPU-direct RDMA via SoftRoCE) |
 
 ## Troubleshooting
 
@@ -105,5 +133,5 @@ For cross-machine without RDMA, **Host-Staged TCP** is used (4 MB chunks).
 
 ## See Also
 
-- `docs/network.md` - Protocol specification
-- `docs/rdma.md` - RDMA setup guide
+- `scripts/test_amd_rdma.sh` - Automated AMD GPU-direct RDMA network test
+- `scripts/softroce_persist.sh` - Soft-RoCE link persistence (systemd)

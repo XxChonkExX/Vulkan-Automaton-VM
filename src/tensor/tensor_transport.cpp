@@ -1597,6 +1597,7 @@ public:
         vvm::network::NetworkConfig netConfig;
         netConfig.listenAddress = "0.0.0.0:" + std::to_string(config_.networkPort);
         netConfig.useTls = config_.enableTLS;
+        netConfig.nicName = config_.rdmaNicName;
         
         if (config_.enableTLS) {
             netConfig.tlsCertPath = config_.tlsCertPath;
@@ -1657,7 +1658,7 @@ public:
         // Build node info for registration
         vvm::network::NodeInfo info;
         info.id = networkManager_->getLocalNodeId();
-        info.nicName = "";
+        info.nicName = config_.rdmaNicName;
         info.rdmaCapable = networkManager_->rdmaAvailable();
         info.gpuDirectCapable = false;
         info.timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(

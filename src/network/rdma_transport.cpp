@@ -225,15 +225,30 @@ public:
         gpuConfig.nicName = config_.nicName;
         gpuConfig.vendorId = vendorId_;
 
+        // Vendor registration (ROCm/HIP for AMD, Level Zero for Intel) is
+        // best-effort: it provides a HIP/ZE handle for compute-side import,
+        // but the verbs DMA-BUF registration below is what enables RDMA.
+        // Only NVIDIA requires the vendor path as a hard prerequisite
+        // (vkGetMemoryRemoteAddressNV + peermem MR).
         auto reg = registerGpuMemoryForRdmaVendor(gpuConfig);
-        if (!reg || !reg->valid) {
-            VVM_LOG_WARN("GPU-direct registration failed for vendor {:#x}", vendorId_);
-            return std::nullopt;
+        if (vendorId_ == 0x10DE) {
+            if (!reg || !reg->valid) {
+                VVM_LOG_WARN("NVIDIA GPU-direct registration failed for vendor {:#x}", vendorId_);
+                return std::nullopt;
+            }
+        } else if (reg && reg->valid) {
+            VVM_LOG_INFO("Vendor registration succeeded for {:#x} (dma-buf fd={})",
+                         vendorId_, reg->dmaBufFd);
+        } else {
+            VVM_LOG_WARN("Vendor registration unavailable for {:#x} (continuing with verbs DMA-BUF)",
+                         vendorId_);
         }
 
         RdmaMemoryRegion region;
         region.length = size;
-        region.rdmaAddr = reinterpret_cast<uint64_t>(reg->remoteAddress);
+        region.rdmaAddr = (reg && reg->valid)
+            ? reinterpret_cast<uint64_t>(reg->remoteAddress)
+            : 0;
         region.ownsMemory = false;
         region.vkMemory = memory;
         region.vkBuffer = buffer;
