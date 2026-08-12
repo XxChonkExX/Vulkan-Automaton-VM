@@ -247,6 +247,7 @@ public:
     // Multi-node network
     virtual bool joinCluster(const std::string& bootstrapAddress) = 0;
     virtual std::string getLocalNodeId() const = 0;
+    virtual std::vector<vvm::network::NodeInfo> getClusterView() const = 0;
     
     // Send/recv by tensor name.
     // sendTensor() exports and announces the tensor to the target node (callback
