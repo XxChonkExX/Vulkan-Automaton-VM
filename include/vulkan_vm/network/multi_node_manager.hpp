@@ -341,6 +341,10 @@ private:
     // Cluster state
     std::vector<NodeInfo> clusterView_;
     mutable std::mutex clusterViewMutex_;
+    
+    // Announced remote tensors (name -> descriptor)
+    std::unordered_map<std::string, RemoteAllocationDesc> announcedTensors_;
+    
     bool running_ = false;
     
     // Stats
@@ -387,6 +391,7 @@ private:
     std::optional<RemoteAllocationDesc> handleExportRequest(const NodeId& owner, uint64_t localAllocId, bool enableRdma, bool forceHostShadow);
     std::optional<Allocation> handleImportRequest(const NodeId& owner, const RemoteAllocationDesc& desc, VkBufferUsageFlags usage);
     std::optional<NetworkMigrationOperation> handleMigrateRequest(const RemoteAllocationDesc& source, uint64_t destinationAllocId, bool useRdma, uint64_t timeoutNs);
+    void handleTensorAnnounce(const std::vector<uint8_t>& body);
     void heartbeatLoop();
     void mergeClusterView(const std::vector<NodeInfo>& view);
     void parseListenAddress(const std::string& listenAddress, std::string& outHost, uint16_t& outPort);
