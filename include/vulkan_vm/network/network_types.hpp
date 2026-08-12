@@ -39,6 +39,10 @@ struct NetworkConfig {
     std::chrono::milliseconds migrationTimeout{60000};
     std::chrono::milliseconds heartbeatInterval{5000};
     
+    // TCP transport limits
+    uint64_t maxBodySize = 1024 * 1024 * 1024;  // 1 GB max body size
+    uint64_t maxStreamSize = 1024 * 1024 * 1024;  // 1 GB max stream size
+    
     // Security (optional)
     bool useTls = false;
     std::string tlsCertPath = "";
@@ -105,6 +109,13 @@ struct RemoteAllocationDesc {
     uint64_t rdmaAddr = 0;      // VkRemoteAddressNV (8 bytes)
     uint32_t rkey = 0;          // RDMA remote key
     
+    // UCX path: GPU-aware unified transport
+    bool hasUcxAddr = false;
+    std::vector<uint8_t> ucxWorkerAddr;  // UCX worker address blob
+    std::vector<uint8_t> ucxPackedRkey;  // UCX packed RMA key
+    uint64_t ucxRemoteAddr = 0;          // UCX remote virtual address
+    uint32_t ucxDeviceIndex = 0;         // GPU device index for UCX registration
+    
     // Fallback: host-staged
     bool hasHostShadow = false;
     
@@ -130,6 +141,7 @@ struct RemoteAllocationDesc {
     }
     
     bool canUseRdma() const { return hasRdmaAddr && rkey != 0; }
+    bool canUseUcx() const { return hasUcxAddr && !ucxPackedRkey.empty(); }
     bool canUseHostStaged() const { return hasHostShadow || !externalHandle.empty(); }
 };
 

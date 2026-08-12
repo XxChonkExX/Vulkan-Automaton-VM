@@ -19,6 +19,14 @@ namespace network {
 // Forward declare
 class MultiNodePoolManager;
 
+// Authorization result for gRPC callbacks
+enum class AuthorizationResult {
+    Success = 0,
+    Unauthorized = 1,
+    InvalidRequest = 2,
+    InternalError = 3
+};
+
 // ============================================================================
 // Forward declaration for generated gRPC
 // ============================================================================

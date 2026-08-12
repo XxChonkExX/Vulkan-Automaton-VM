@@ -216,11 +216,6 @@ static vvm::network::NetworkConfig makeNetConfig(const std::string& listen, cons
     cfg.enableRdma = false;
     cfg.enableGpuDirect = false;
     cfg.enableHostStagedFallback = true;
-    // Opt-in smoke path for the experimental windowed push/pull pipeline.
-    if (std::getenv("VVM_TEST_WINDOWED")) {
-        cfg.enableAdaptiveWindow = true;
-        cfg.streamPipelineBuffers = 4;
-    }
     return cfg;
 }
 
