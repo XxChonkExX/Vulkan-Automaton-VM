@@ -8,7 +8,7 @@
 
 ---
 Notice! Help wanted desperately-
-Alot of this hinges upon hardware that I do not own. Nvidia in particular. I have tested AMD with my 7900xtx and Strix Halo, Intel B70 tested for multi-pool but it needs network testing and Nvidia definitely needs some love since I am too poor to pay the Nvidia tax :( I have not tested the Android AIHardwareBuffer at all aside from the internal and smoke. I will plug my phone in to the PC one of these days..... Tenstorrent cards are loosely supported and I have built a Vulkan ICD to play nice; I have submitted to TT (honestly I do not know if it is a steaming pile of 5#!7 or not) but if you need it to test let me know and I will ship it your way. This repo is solid but highly highly experimental in several aspects. Local power! Homebrewed with love. -Mike/ChonkE
+Alot of this hinges upon hardware that I do not own. Nvidia in particular. I have tested AMD with my 7900xtx and Strix Halo, Intel B70 tested for multi-pool but it needs network testing and Nvidia definitely needs some love since I am too poor to pay the Nvidia tax :( I have not tested the Android AHardwareBuffer at all aside from the internal and smoke. I will plug my phone in to the PC one of these days..... Tenstorrent cards are loosely supported and I have built a Vulkan ICD to play nice; I have submitted to TT (honestly I do not know if it is a steaming pile of 5#!7 or not) but if you need it to test let me know and I will ship it your way. This repo is solid but highly highly experimental in several aspects. Local power! Homebrewed with love. -Mike/ChonkE
 ---
 
 ## Table of Contents
