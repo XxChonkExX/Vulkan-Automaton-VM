@@ -4,6 +4,8 @@
 
 **Version**: 0.2.0-pre (pre-release)
 
+> **Cross-Machine GPU Sharing (NEW)**: Verified working between Windows (Intel Arc B70) and Linux (AMD Strix Halo) over TCP. See [docs/cross_machine_gpu_sharing.md](docs/cross_machine_gpu_sharing.md) for setup guide.
+
 ---
 
 ## Changelog — v0.2.0-pre
