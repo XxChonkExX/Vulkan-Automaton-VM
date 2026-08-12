@@ -17,6 +17,8 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <unistd.h>
+#elif defined(VVM_PLATFORM_WINDOWS)
+#include <ws2tcpip.h>
 #endif
 
 #if defined(VVM_PLATFORM_WINDOWS)
