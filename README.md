@@ -8,50 +8,6 @@
 
 ---
 
-## Changelog — v0.2.0-pre
-
-### Cluster Control Plane — Fully Implemented
-- **ClusterClient**: All RPC serialization/deserialization now uses the canonical wire format (big-endian, bounds-checked). `allocateRemote`, `exportRemote`, `importRemote`, `migrate`, `registerNode`, `heartbeat`, and `getClusterView` are fully wired through the TCP transport.
-- **ClusterServer**: All RPC handlers (`handleAllocate`, `handleExport`, `handleImport`, `handleMigrate`, `handleRegisterNode`) now deserialize requests, invoke registered callbacks, and serialize responses.
-- **Node enumeration**: `registerNode()` now enumerates actual Vulkan physical devices at runtime instead of returning a hardcoded `{"GPU0"}` placeholder.
-- **sendRequest()**: Now uses `TcpTransport::request()` for actual request/response RPC instead of returning `nullopt`.
-
-### Tensor Transport — Cross-Device Layout Conversion
-- **Cross-device NHWC↔NCHW**: `copyWithLayoutConversion()` now works across different GPUs. When source and destination are on different devices, the conversion uses a host-visible staging buffer on the source device, performs the layout permute in CPU memory, then copies to the destination device — all without falling back to `false`.
-
-### Python Bindings Cleanup
-- **PyTorch**: Removed CUDA device placeholder from `allocate_tensor`. The returned tensor is now a pure metadata handle (int64 tensor with buffer/memory/offset/size/address/blockIndex) without any CUDA device dependency.
-- **ONNX**: `Compile()` now documents the CPU execution fallback instead of a TODO stub.
-
-### Build & Cleanup
-- Removed orphaned `src/core/unified_memory_pool.cpp.tmp` (was not referenced by CMake).
-
-### Vulkan API Hardening
-- **VVM_VK_CHECK macros**: `VVM_VK_CHECK()`, `VVM_VK_CHECK_VOID()`, `VVM_VK_CHECK_BOOL()` for consistent Vulkan result checking with automatic error logging and early return.
-- **RAII handles**: `UniqueHandle<VkHandle, std::function>` wrappers for all Vulkan objects (Buffer, DeviceMemory, CommandPool, Fence, Semaphore, QueryPool) with automatic cleanup.
-- **vkResultToString()**: Human-readable error strings for all Vulkan result codes.
-
-### Buddy Allocator Hardening
-- **ceilPowerOfTwo()**: Overflow-safe power-of-two rounding with `std::optional` return, rejects sizes > 2^63.
-- Checked integer arithmetic in `alignUp()` to prevent wraparound.
-
-### Device-Address Validation
-- `TensorTransport::initialize()` now explicitly validates `VK_KHR_buffer_device_address` support on all devices before proceeding.
-
-### Offload Sync Fix
-- `OffloadManager::waitSync()` now uses a `std::jthread` completion queue instead of detached threads, eliminating use-after-free risk on timeout.
-
-### TLS & Network Hardening
-- **Hostname verification**: `SSL_set1_host()` + `SSL_get_verify_result()` for proper certificate hostname checking.
-- **ALPN wire encoding**: `encodeAlpnProtocols()` for correct length-prefixed protocol list (RFC 7301).
-- **RPC field limits**: Bounded string/vector parsing with `wire::getStrLimited()` and semantic limits (max 64 GPU devices, 255B hostname, 128B UUID, 256B GPU/NIC names).
-
-### CMake Improvements
-- Removed hardcoded Windows SDK/MSVC paths — lets toolchain detection handle it.
-- Broke `vulkan_vm` ↔ `vulkan_vm_network` circular dependency. Consumers now link both explicitly if networking is needed.
-
----
-
 ## Table of Contents
 
 1. [Quick Start — GPU Networking](#quick-start--gpu-networking)
@@ -61,6 +17,8 @@
    - [GPU-Direct RDMA Vendor Paths](#gpu-direct-rdma-vendor-paths)
    - [Windows NDKPI / Linux Verbs](#windows-ndkpi--linux-verbs)
    - [SoftRoCE (Linux Software RDMA)](#softroce-linux-software-rdma)
+   - [UCX (Unified Communication X) Transport](#ucx-unified-communication-x-transport)
+   - [GDRCopy-Style Persistent Host Pinning](#gdrcopy-style-persistent-host-pinning-ndkpi--windows)
 3. [ModelHub & Shard Placement](#modelhub--shard-placement)
    - [Model Registry & Distribution](#modelhub--model-weight-distribution)
    - [Capacity-First Shard Placement](#shard-placement-api)
@@ -76,6 +34,7 @@
 10. [Building](#building)
 11. [Hardware Compatibility](#hardware-compatibility)
 12. [License & Credits](#license--credits)
+13. [Changelog — v0.2.0-pre](#changelog--v020-pre)
 
 ---
 
@@ -1056,3 +1015,47 @@ Don't let the name fool you — under the hood it's a production-grade, hardened
 - **GitHub Issues** — Bug reports, feature requests
 
 *VulkanVM — Making GPUs play nice since 2026.*
+
+---
+
+## Changelog — v0.2.0-pre
+
+### Cluster Control Plane — Fully Implemented
+- **ClusterClient**: All RPC serialization/deserialization now uses the canonical wire format (big-endian, bounds-checked). `allocateRemote`, `exportRemote`, `importRemote`, `migrate`, `registerNode`, `heartbeat`, and `getClusterView` are fully wired through the TCP transport.
+- **ClusterServer**: All RPC handlers (`handleAllocate`, `handleExport`, `handleImport`, `handleMigrate`, `handleRegisterNode`) now deserialize requests, invoke registered callbacks, and serialize responses.
+- **Node enumeration**: `registerNode()` now enumerates actual Vulkan physical devices at runtime instead of returning a hardcoded `{"GPU0"}` placeholder.
+- **sendRequest()**: Now uses `TcpTransport::request()` for actual request/response RPC instead of returning `nullopt`.
+
+### Tensor Transport — Cross-Device Layout Conversion
+- **Cross-device NHWC↔NCHW**: `copyWithLayoutConversion()` now works across different GPUs. When source and destination are on different devices, the conversion uses a host-visible staging buffer on the source device, performs the layout permute in CPU memory, then copies to the destination device — all without falling back to `false`.
+
+### Python Bindings Cleanup
+- **PyTorch**: Removed CUDA device placeholder from `allocate_tensor`. The returned tensor is now a pure metadata handle (int64 tensor with buffer/memory/offset/size/address/blockIndex) without any CUDA device dependency.
+- **ONNX**: `Compile()` now documents the CPU execution fallback instead of a TODO stub.
+
+### Build & Cleanup
+- Removed orphaned `src/core/unified_memory_pool.cpp.tmp` (was not referenced by CMake).
+
+### Vulkan API Hardening
+- **VVM_VK_CHECK macros**: `VVM_VK_CHECK()`, `VVM_VK_CHECK_VOID()`, `VVM_VK_CHECK_BOOL()` for consistent Vulkan result checking with automatic error logging and early return.
+- **RAII handles**: `UniqueHandle<VkHandle, std::function>` wrappers for all Vulkan objects (Buffer, DeviceMemory, CommandPool, Fence, Semaphore, QueryPool) with automatic cleanup.
+- **vkResultToString()**: Human-readable error strings for all Vulkan result codes.
+
+### Buddy Allocator Hardening
+- **ceilPowerOfTwo()**: Overflow-safe power-of-two rounding with `std::optional` return, rejects sizes > 2^63.
+- Checked integer arithmetic in `alignUp()` to prevent wraparound.
+
+### Device-Address Validation
+- `TensorTransport::initialize()` now explicitly validates `VK_KHR_buffer_device_address` support on all devices before proceeding.
+
+### Offload Sync Fix
+- `OffloadManager::waitSync()` now uses a `std::jthread` completion queue instead of detached threads, eliminating use-after-free risk on timeout.
+
+### TLS & Network Hardening
+- **Hostname verification**: `SSL_set1_host()` + `SSL_get_verify_result()` for proper certificate hostname checking.
+- **ALPN wire encoding**: `encodeAlpnProtocols()` for correct length-prefixed protocol list (RFC 7301).
+- **RPC field limits**: Bounded string/vector parsing with `wire::getStrLimited()` and semantic limits (max 64 GPU devices, 255B hostname, 128B UUID, 256B GPU/NIC names).
+
+### CMake Improvements
+- Removed hardcoded Windows SDK/MSVC paths — lets toolchain detection handle it.
+- Broke `vulkan_vm` ↔ `vulkan_vm_network` circular dependency. Consumers now link both explicitly if networking is needed.

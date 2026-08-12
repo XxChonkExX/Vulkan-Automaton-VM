@@ -1,4 +1,4 @@
-# VulkanVM — A Practical Introduction
+# VulkanVM — A Practical Introduction (With a Relay Race Analogy)
 
 ## What Is VulkanVM?
 
@@ -10,36 +10,43 @@
 
 ---
 
-## The Primary Feature: GPU Networking & RDMA
+## The Relay Race Analogy: How GPU Data Actually Moves
 
-VulkanVM's networking stack is a **production-grade multi-node GPU fabric** that moves tensor VRAM across machines with zero-copy where hardware allows, automatic fallback where it doesn't.
+Imagine a **4×400m relay race** where the baton is your tensor data. Each runner is a hardware domain. The handoff zones are where data crosses boundaries — and each handoff costs a "penalty lap" (latency, copies, CPU involvement).
 
-### What It Solves
-
-| Problem | Solution |
-|---------|----------|
-| **GPU↔GPU across machines** | TCP host-staged (always works), RDMA (Linux), GPU-Direct RDMA (bypass CPU) |
-| **Different GPU vendors** | Universal translator: NVIDIA DMA-BUF/D3D12, AMD/Intel OPAQUE_WIN32/DMA-BUF, Intel Level Zero |
-| **No RNIC hardware** | SoftRoCE (Linux `rxe` kernel module) — RDMA over standard Ethernet |
-| **Windows RDMA** | NDKPI (`IND2Provider`) — kernel-bypass Network Direct |
-| **Model distribution** | Hugging Face–style registry + capacity-first shard placement |
-
-### Transport Priority (Auto-Selected)
-
-```cpp
-TransportConfig config;
-config.preference = TransportConfig::Preference::Auto;  // P2P → RDMA → HostStaged → Network
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    THE GPU NETWORK RELAY RACE                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   GPU A VRAM          PCIe              Host RAM             PCIe         GPU B VRAM
+│   ┌──────────┐      ┌────────┐       ┌─────────────┐      ┌────────┐    ┌──────────┐
+│   │  Tensor  │─────▶│  DMA   │──────▶│  Staging    │─────▶│  DMA   │────▶│  Tensor  │
+│   │  (Baton) │      │ Engine │       │  (Handoff)  │      │ Engine │    │  (Baton) │
+│   └──────────┘      └────────┘       └─────────────┘      └────────┘    └──────────┘
+│        │                │                   │                  │             │
+│        │  ZERO PENALTY  │  PENALTY LAP     │  PENALTY LAP     │  ZERO       │
+│        │  (GPU-direct)  │  (Host staging)  │  (Host staging)  │  PENALTY    │
+│        │                │                  │                  │  (GPU-direct)│
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-| Priority | Path | Mechanism | Staging? |
-|----------|------|-----------|----------|
-| 1 | **P2P** | `VK_EXTERNAL_MEMORY` + `vkCmdCopyBuffer` | ❌ |
-| 2 | **RDMA** | GPU-Direct: `ibv_reg_dmabuf_mr` / NDKPI | ❌ |
-| 3 | **AHardwareBuffer** | Android: `VK_ANDROID_external_memory_android_hardware_buffer` | ❌ |
-| 4 | **Host-Staged** | 4 MiB chunks via host memory | ✅ |
-| 5 | **Network** | TCP/RDMA multi-node | ✅ |
+### The Four Handoff Lanes (Priority Order)
 
-**Protocol hardening**: 1 GiB body / 16 GiB stream caps (configurable per-connection), **absolute unconditional hard caps** enforced on every receive path, connection drop on violation.
+| Lane | Name | What Happens | Penalty Laps |
+|------|------|--------------|--------------|
+| **1** | **P2P** | GPU A → GPU B directly via `VK_EXTERNAL_MEMORY` + `vkCmdCopyBuffer` | **0** — Baton never leaves the track |
+| **2** | **RDMA** | NIC reads GPU A VRAM → network → NIC writes GPU B VRAM (`ibv_reg_dmabuf_mr`) | **0** — Baton teleports via NIC |
+| **3** | **AHardwareBuffer** | Android zero-copy via `VK_ANDROID_external_memory_android_hardware_buffer` | **0** — Special track for mobile |
+| **4** | **Host-Staged** | GPU A → PCIe → Host RAM (4 MB chunks) → PCIe → GPU B | **2** — Two penalty laps (out to host, back to GPU) |
+| **5** | **Network (TCP)** | Host-staged + TCP sockets across machines | **2+** — Penalty laps + network latency |
+
+**VulkanVM auto-picks the fastest available lane:**
+```cpp
+TransportConfig config;
+config.preference = TransportConfig::Preference::Auto;  // Tries Lane 1 → 2 → 3 → 4 → 5
+```
 
 ---
 
@@ -94,7 +101,7 @@ meta.name = "conv_weight";
 
 auto tensor = transport->allocateTensor(meta, 0);
 
-// 6. Multi-node send/recv (auto-picks best path)
+// 6. Multi-node send/recv (auto-picks best lane)
 transport->sendTensor(tensor, "192.168.1.10:51001#0", 
     [](bool ok, const std::string& err) { /* done */ });
 
@@ -107,7 +114,7 @@ transport->allReduce({t0, t1, t2}, ReduceOp::Sum, {0, 1, 2});
 
 ---
 
-## GPU-Direct RDMA Vendor Paths
+## GPU-Direct RDMA Vendor Paths (The "Zero Penalty" Lanes)
 
 For NIC-attached GPU memory DMA (bypassing host CPU entirely):
 
@@ -153,7 +160,7 @@ hipExternalMemoryGetMappedBuffer(&mappedPtr, extMem, &bufDesc);
 
 ---
 
-## SoftRoCE (Linux Software RDMA)
+## SoftRoCE (Linux Software RDMA) — Lane 2 Without Special Hardware
 
 No RNIC? No problem. Kernel `rxe` module enables verbs/RDMA over standard Ethernet.
 
@@ -166,57 +173,6 @@ ibv_devices     # lists rxe0, rxe1
 ```
 
 **Verified:** `tensor_network_test` passes on WSL2 (kernel 6.18.40) with `rxe0` + `rxe1`. On native Linux with physical RNIC, same code uses hardware RDMA. Without SoftRoCE/RNIC → falls back to host-staged TCP (always available).
-
-### UCX (Unified Communication X) Transport
-
-For production clusters, UCX provides a **unified transport layer** that auto-selects the best path: InfiniBand/RoCE verbs → TCP → shared memory → GPU memory (CUDA/ROCm/Level Zero).
-
-```cpp
-TransportConfig config;
-config.enableUCX = true;
-config.ucxTLS = "rc,ud,sm,tcp";      // IB verbs, datagram, shmem, TCP
-config.ucxNetDevices = "mlx5_0:1";   // NIC selection
-config.ucxEnableGPUMem = true;       // GPU memory registration
-config.ucxEnableRndv = true;         // Rendezvous for large msgs
-config.ucxRndvThreshold = 8192;      // bytes
-config.ucxEnableCudaIpc = true;      // Intra-node GPU IPC
-```
-
-**UCX TLS (Transport Layers):**
-| TLS | Description |
-|-----|-------------|
-| `rc` | Reliable Connected (InfiniBand/RoCE) |
-| `ud` | Unreliable Datagram |
-| `sm` | Shared Memory (intra-node) |
-| `tcp` | TCP/IP fallback |
-| `cuda_ipc` | CUDA IPC (intra-node GPU) |
-
-**Multi-Node Data Path:** When UCX is enabled, `sendTensor()` and `recvTensor()` automatically use UCX RMA (Remote Memory Access) for data transfer over the best available fabric (InfiniBand/RoCE/TCP). The existing TCP control plane still handles discovery and announcement — UCX augments it with worker addresses and RMA keys exchanged transparently. No separate bootstrap needed.
-
-**Progress Thread:** UCX async operations require regular progress. When `enableAsyncPipeline` is true (default), a background progress thread starts automatically — no manual `progress()` calls needed.
-
-**Attribution:** UCX (https://github.com/openucx/ucx) — BSD-3-Clause.
-
-### GDRCopy-Style Persistent Host Pinning (NDKPI / Windows)
-
-For high-frequency RDMA on Windows NDKPI, VulkanVM implements **persistent host memory pinning** inspired by NVIDIA's GDRCopy. This avoids repeated registration overhead on hot paths.
-
-```cpp
-// Pin host memory for repeated RDMA use (ref-counted)
-rdmaTransport->pinPersistentHostMemory(ptr, size);
-
-// Release persistent pin (decrements ref count; actual deregister at 0)
-rdmaTransport->releasePersistentHostMemory(ptr);
-```
-
-**How it works:**
-- First pin → creates `IND2MemoryRegion` + `Register`
-- Subsequent pins → increments ref count, reuses registration
-- Release → decrements ref count; actual `Deregister` only at 0
-
-**Use case:** Pre-pin staging buffers during init, reuse for thousands of RDMA ops.
-
-**Attribution:** Pattern inspired by GDRCopy (https://github.com/NVIDIA/gdrcopy) — MIT, NVIDIA.
 
 ---
 
