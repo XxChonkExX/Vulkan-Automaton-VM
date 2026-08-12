@@ -265,6 +265,12 @@ public:
     // Get local node ID
     const NodeId& getLocalNodeId() const { return localNodeId_; }
     
+    // Access internal components (for TensorTransport integration)
+    class TcpTransport* getTcpTransport() const { return tcpTransport_.get(); }
+    TcpTransport::ConnId getPeerConnection(const std::string& host, uint16_t port);
+    std::mutex& clusterViewMutex() { return clusterViewMutex_; }
+    std::vector<NodeInfo>& clusterView() { return clusterView_; }
+    
     // Get network config
     const NetworkConfig& getNetworkConfig() const { return networkConfig_; }
     
@@ -384,7 +390,10 @@ private:
     bool unregisterAllocation(uint64_t localAllocId);
     std::optional<uint64_t> findAllocIdByBuffer(VkBuffer buffer);
 
-    TcpTransport::ConnId getPeerConnection(const std::string& host, uint16_t port);
+private:
+    friend class ClusterClient;
+    friend class ClusterServer;
+    
     void onTcpRequest(TcpMessage& request, TcpMessage& response);
     std::optional<std::vector<NodeInfo>> handleRegisterRequest(const NodeInfo& info);
     std::optional<RemoteAllocationDesc> handleAllocateRequest(const NodeId& requester, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags flags, bool enableRdma);
