@@ -23,9 +23,32 @@ The script verifies the log for `VerbsRdmaTransport initialized`, `AMD GPUDirect
 
 `--announce-count N` makes the server exit after announcing N tensors (bounded run for scripts/CI). Without it the server runs until Ctrl-C and the client exits after its tests.
 
-**Kernel note**: `rdma_rxe` dma-buf support landed in kernel 6.19. On older kernels the AMD path uses the `DMA-BUF mmap fallback` (works fine on Strix Halo's unified memory). Soft-RoCE requires native Linux — WSL2 kernels do not include `rdma_rxe`.
+**Kernel note (important)**: `rdma_rxe` dma-buf MR support (`ibv_reg_dmabuf_mr` on rxe) is **not in any released kernel** — the patchset has been under upstream review (RFC v4 Feb 2026, latest posting Mar 2026) and an independent implementation proved rxe is fundamentally a CPU `memcpy` driver that needs CPU-accessible `struct page`s. So on stock kernels the AMD path uses the `DMA-BUF mmap fallback` — which works well on Strix Halo (unified memory, amdgpu exports dma-bufs with CPU-accessible pages via HMM/GTT). On a **discrete** GPU (e.g. 7900 XTX), amdgpu VRAM dma-bufs are not CPU-accessible either — expect slow/fallback behavior there; the realistic GPU-direct target is the X2 APU.
 
-**WSL2 note**: The data-plane export step (`allocateDedicatedExportable` → `vkAllocateMemory`) fails with `VK_ERROR_OUT_OF_DEVICE_MEMORY` on WSL2's virtual GPU (`wslgd`) even at 1 MiB — the wslgd driver rejects exportable dedicated allocations. Cluster join, announce, and recv flows work in WSL; the full transfer must be verified on native Linux.
+**WSL2 note**: The data-plane export step (`allocateDedicatedExportable` → `vkAllocateMemory`) fails with `VK_ERROR_OUT_OF_DEVICE_MEMORY` on WSL2's virtual GPU (`wslgd`) even at 1 MiB — the wslgd driver rejects exportable dedicated allocations. Cluster join, announce, and recv flows work in WSL. The verbs/RDMA data path can still be exercised in WSL2 by building a custom kernel with `rdma_rxe` (see below) — host-memory RDMA works, GPU dma-buf export does not.
+
+## WSL2 development environment (optional)
+
+Stock WSL2 kernels lack `rdma_rxe`. `scripts/wsl2_rxe_kernel.sh` builds a custom kernel (based on `microsoft/WSL2-Linux-Kernel`) with Soft-RoCE enabled:
+
+```bash
+./scripts/wsl2_rxe_kernel.sh prepare    # kernel build deps + rdma-core + perftest
+./scripts/wsl2_rxe_kernel.sh build      # clone + enable CONFIG_RDMA_RXE + build
+./scripts/wsl2_rxe_kernel.sh install    # copy bzImage + set kernel= in .wslconfig
+# from Windows PowerShell:
+wsl --shutdown
+# reopen the distro, then:
+./scripts/wsl2_rxe_kernel.sh verify     # modprobe rdma_rxe + rxe0 over eth0 + GID check
+./scripts/wsl2_rxe_kernel.sh loopback   # veth pair + ib_write_bw self-test
+```
+
+What this enables in WSL2:
+- Full verbs/rdma_cm data path over **host memory** — test the transport against the X2 without a native Ubuntu install
+- `ib_write_bw`-style validation (`perftest`) before running the VulkanVM tests
+
+What it does NOT enable in WSL2:
+- GPU dma-buf export (wslgd limitation above) — the AMD GPU-direct path still needs native Linux
+- `rdma_rxe` dma-buf MRs (not in any kernel, see above)
 
 ## Architecture
 
@@ -147,4 +170,5 @@ For cross-machine without RDMA, **Host-Staged TCP** is used (4 MB chunks).
 ## See Also
 
 - `scripts/test_amd_rdma.sh` - Automated AMD GPU-direct RDMA network test
+- `scripts/wsl2_rxe_kernel.sh` - Build a WSL2 kernel with Soft-RoCE (`rdma_rxe`)
 - `scripts/softroce_persist.sh` - Soft-RoCE link persistence (systemd)
