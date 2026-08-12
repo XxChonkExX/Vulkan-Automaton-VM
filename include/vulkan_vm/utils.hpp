@@ -309,6 +309,7 @@ inline UniqueQueryPool makeUniqueQueryPool(VkDevice device, VkQueryPool pool) {
 // ============================================================================
 
 enum class ExternalHandleType {
+    None,                  // No handle type (used as sentinel/default)
     OpaqueFd,              // Linux: VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT
     OpaqueWin32,           // Windows: VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
     D3D12Heap,             // Windows: VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT

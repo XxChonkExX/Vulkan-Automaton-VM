@@ -24,6 +24,9 @@ namespace network {
 class ClusterClient;
 class ClusterServer;
 class RdmaTransport;
+#if defined(VVM_HAS_UCX)
+class UcxTransport;
+#endif
 
 // ============================================================================
 // MultiNodePoolManager
@@ -36,6 +39,9 @@ public:
         const std::vector<vvm::DeviceConfig>& localDevices,
         const vvm::PoolConfig& poolConfig,
         const NetworkConfig& networkConfig);
+    
+    // Check if RDMA is available
+    bool rdmaAvailable() const;
     
     // Non-copyable, movable
     MultiNodePoolManager(const MultiNodePoolManager&) = delete;
@@ -189,6 +195,41 @@ public:
     
     // Look up a registered (remote-visible) allocation by its local id.
     std::optional<Allocation> getRegisteredAllocation(uint64_t localAllocId) const;
+    
+    // ========================================================================
+    // UCX Transport Integration (only available when UCX is built)
+    // ========================================================================
+    
+    #if defined(VVM_HAS_UCX)
+    // Set UCX transport for GPU-aware RMA
+    void setUcxTransport(vvm::network::UcxTransport* ucxTransport);
+    
+    // UCX-enabled export: registers GPU memory with UCX and returns RMA keys
+    std::optional<bool> exportForRemoteUcx(
+        const RemoteAllocationDesc& desc,
+        const Allocation& alloc,
+        uint32_t deviceIndex);
+    
+    // UCX-enabled migration: pulls data via UCX RMA (GPU-aware)
+    std::optional<NetworkMigrationOperation> migrateFromRemoteUcx(
+        const RemoteAllocationDesc& source,
+        Allocation& destination,
+        bool useRdma = true,
+        uint64_t timeoutNs = UINT64_MAX);
+    
+    // Wait for UCX migration completion
+    void waitUcxMigration(NetworkMigrationOperation& op);
+    #endif
+    
+    // ========================================================================
+    // Cluster name-based operations (used by TensorTransport)
+    // ========================================================================
+    
+    // Announce a tensor name is available on this node for remote pull
+    bool announceRemoteTensor(const NodeId& targetNode, const std::string& tensorName, const RemoteAllocationDesc& desc);
+    
+    // Wait for a tensor announcement from a remote node
+    std::optional<RemoteAllocationDesc> waitRemoteTensor(const NodeId& sourceNode, const std::string& tensorName, uint64_t timeoutNs);
     
     // Manual cluster operations
     bool registerWithCluster();

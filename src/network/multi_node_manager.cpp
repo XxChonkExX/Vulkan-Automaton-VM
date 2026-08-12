@@ -5,6 +5,12 @@
 #include "vulkan_vm/vulkan_vm.hpp"
 #include "vulkan_vm/utils.hpp"
 
+#include <random>
+#include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <thread>
+
 #if defined(VVM_PLATFORM_LINUX)
 #include <ifaddrs.h>
 #include <net/if.h>
@@ -305,7 +311,7 @@ bool MultiNodePoolManager::start() {
         onTcpRequest(request, response);
     };
 
-    if (!tcpTransport_->start(listenHost, listenPort, std::move(handler))) {
+    if (!tcpTransport_->start(listenHost, listenPort, std::move(handler), networkConfig_)) {
         VVM_LOG_ERROR("Failed to start TCP server on {}:{}", listenHost, listenPort);
         tcpTransport_.reset();
         return false;
@@ -418,7 +424,7 @@ bool MultiNodePoolManager::deallocateRemote(const RemoteAllocationDesc& desc) {
         req.type = MsgDeallocate;
         req.flags = TcpFlagsRequest;
         std::vector<uint8_t> body;
-        detail::putU64(body, desc.localAllocId);
+        vvm::detail::putU64(body, desc.localAllocId);
         req.body = std::move(body);
         auto resp = tcpTransport_->request(conn, req);
         return resp.has_value() && resp->flags != TcpFlagsError;
@@ -466,10 +472,10 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::allocateRemote(
     }
 
     std::vector<uint8_t> body;
-    detail::putU64(body, size);
-    detail::putU32(body, usage);
-    detail::putU32(body, flags);
-    detail::putU8(body, enableRdma ? 1 : 0);
+    vvm::detail::putU64(body, size);
+    vvm::detail::putU32(body, usage);
+    vvm::detail::putU32(body, flags);
+    vvm::detail::putU8(body, enableRdma ? 1 : 0);
 
     TcpMessage req;
     req.type = MsgAllocate;
@@ -485,7 +491,7 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::allocateRemote(
     const uint8_t* p = resp->body.data();
     const uint8_t* end = p + resp->body.size();
     uint8_t success = 0;
-    if (!detail::getU8(p, end, success) || success == 0) {
+    if (!vvm::detail::getU8(p, end, success) || success == 0) {
         VVM_LOG_ERROR("allocateRemote: remote node refused allocation");
         return std::nullopt;
     }
@@ -691,9 +697,9 @@ std::optional<NetworkMigrationOperation> MultiNodePoolManager::migrateFromRemote
     }
 
     std::vector<uint8_t> body;
-    detail::putU64(body, source.localAllocId);
-    detail::putU64(body, 0);  // srcOffset within allocation
-    detail::putU64(body, source.size);
+    vvm::detail::putU64(body, source.localAllocId);
+    vvm::detail::putU64(body, 0);  // srcOffset within allocation
+    vvm::detail::putU64(body, source.size);
 
     TcpMessage req;
     req.type = MsgMigratePull;
@@ -773,8 +779,8 @@ std::optional<NetworkMigrationOperation> MultiNodePoolManager::migrateToRemote(
     }
 
     std::vector<uint8_t> body;
-    detail::putU64(body, destination.localAllocId);
-    detail::putU64(body, destination.size);
+    vvm::detail::putU64(body, destination.localAllocId);
+    vvm::detail::putU64(body, destination.size);
 
     TcpMessage req;
     req.type = MsgMigratePush;
@@ -1279,10 +1285,10 @@ void MultiNodePoolManager::onTcpRequest(TcpMessage& request, TcpMessage& respons
             uint64_t size = 0;
             uint32_t usage = 0, flags = 0;
             uint8_t enableRdma = 0;
-            if (!detail::getU64(p, end, size) ||
-                !detail::getU32(p, end, usage) ||
-                !detail::getU32(p, end, flags) ||
-                !detail::getU8(p, end, enableRdma)) {
+            if (!vvm::detail::getU64(p, end, size) ||
+                !vvm::detail::getU32(p, end, usage) ||
+                !vvm::detail::getU32(p, end, flags) ||
+                !vvm::detail::getU8(p, end, enableRdma)) {
                 response = makeResponse(request.type, TcpFlagsError);
                 return;
             }
@@ -1290,56 +1296,56 @@ void MultiNodePoolManager::onTcpRequest(TcpMessage& request, TcpMessage& respons
             auto desc = handleAllocateRequest(requester, size, usage, flags, enableRdma != 0);
             response = makeResponse(request.type, TcpFlagsResponse);
             if (desc) {
-                detail::putU8(response.body, 1);
+                vvm::detail::putU8(response.body, 1);
                 auto bytes = serializeAllocationDesc(*desc);
                 response.body.insert(response.body.end(), bytes.begin(), bytes.end());
             } else {
-                detail::putU8(response.body, 0);
+                vvm::detail::putU8(response.body, 0);
             }
             break;
         }
         case MsgExport: {
             uint64_t localAllocId = 0;
             uint8_t enableRdma = 0, forceHostShadow = 0;
-            if (!detail::getU64(p, end, localAllocId) ||
-                !detail::getU8(p, end, enableRdma) ||
-                !detail::getU8(p, end, forceHostShadow)) {
+            if (!vvm::detail::getU64(p, end, localAllocId) ||
+                !vvm::detail::getU8(p, end, enableRdma) ||
+                !vvm::detail::getU8(p, end, forceHostShadow)) {
                 response = makeResponse(request.type, TcpFlagsError);
                 return;
             }
             auto desc = handleExportRequest(localNodeId_, localAllocId, enableRdma != 0, forceHostShadow != 0);
             response = makeResponse(request.type, TcpFlagsResponse);
             if (desc) {
-                detail::putU8(response.body, 1);
+                vvm::detail::putU8(response.body, 1);
                 auto bytes = serializeAllocationDesc(*desc);
                 response.body.insert(response.body.end(), bytes.begin(), bytes.end());
             } else {
-                detail::putU8(response.body, 0);
+                vvm::detail::putU8(response.body, 0);
             }
             break;
         }
         case MsgImport: {
             RemoteAllocationDesc desc;
             uint32_t usage = 0;
-            if (!deserializeAllocationDesc(p, end, desc) || !detail::getU32(p, end, usage)) {
+            if (!deserializeAllocationDesc(p, end, desc) || !vvm::detail::getU32(p, end, usage)) {
                 response = makeResponse(request.type, TcpFlagsError);
                 return;
             }
             auto alloc = handleImportRequest(localNodeId_, desc, usage);
             response = makeResponse(request.type, TcpFlagsResponse);
             if (alloc) {
-                detail::putU8(response.body, 1);
-                detail::putU64(response.body, registerAllocation(std::move(*alloc)));
+                vvm::detail::putU8(response.body, 1);
+                vvm::detail::putU64(response.body, registerAllocation(std::move(*alloc)));
             } else {
-                detail::putU8(response.body, 0);
+                vvm::detail::putU8(response.body, 0);
             }
             break;
         }
         case MsgMigratePull: {
             uint64_t localAllocId = 0, srcOffset = 0, size = 0;
-            if (!detail::getU64(p, end, localAllocId) ||
-                !detail::getU64(p, end, srcOffset) ||
-                !detail::getU64(p, end, size)) {
+            if (!vvm::detail::getU64(p, end, localAllocId) ||
+                !vvm::detail::getU64(p, end, srcOffset) ||
+                !vvm::detail::getU64(p, end, size)) {
                 response = makeResponse(request.type, TcpFlagsError);
                 return;
             }
@@ -1372,7 +1378,7 @@ void MultiNodePoolManager::onTcpRequest(TcpMessage& request, TcpMessage& respons
         }
         case MsgMigratePush: {
             uint64_t localAllocId = 0, size = 0;
-            if (!detail::getU64(p, end, localAllocId) || !detail::getU64(p, end, size)) {
+            if (!vvm::detail::getU64(p, end, localAllocId) || !vvm::detail::getU64(p, end, size)) {
                 response = makeResponse(request.type, TcpFlagsError);
                 return;
             }
@@ -1418,7 +1424,7 @@ void MultiNodePoolManager::onTcpRequest(TcpMessage& request, TcpMessage& respons
             }
 
             response = makeResponse(request.type, TcpFlagsResponse);
-            detail::putU8(response.body, 1);
+            vvm::detail::putU8(response.body, 1);
             VVM_LOG_INFO("MigratePush: received {} bytes for allocation {}", size, localAllocId);
             break;
         }
@@ -1451,7 +1457,7 @@ void MultiNodePoolManager::onTcpRequest(TcpMessage& request, TcpMessage& respons
         }
         case MsgDeallocate: {
             uint64_t localAllocId = 0;
-            if (!detail::getU64(p, end, localAllocId)) {
+            if (!vvm::detail::getU64(p, end, localAllocId)) {
                 response = makeResponse(request.type, TcpFlagsError);
                 return;
             }
@@ -1463,7 +1469,7 @@ void MultiNodePoolManager::onTcpRequest(TcpMessage& request, TcpMessage& respons
                 VVM_LOG_WARN("Deallocate: unknown allocation {}", localAllocId);
             }
             response = makeResponse(request.type, TcpFlagsResponse);
-            detail::putU8(response.body, 1);
+            vvm::detail::putU8(response.body, 1);
             break;
         }
         default:
@@ -1648,5 +1654,82 @@ std::optional<std::vector<NodeInfo>> MultiNodePoolManager::handleRegisterRequest
     return clusterView_;
 }
 
+// ============================================================================
+// RDMA availability check
+// ============================================================================
+
+bool MultiNodePoolManager::rdmaAvailable() const {
+    return rdmaTransport_ != nullptr;
+}
+
+// ============================================================================
+// UCX Transport Integration (stubs for when UCX is not built)
+// ============================================================================
+
+#if defined(VVM_HAS_UCX)
+void MultiNodePoolManager::setUcxTransport(UcxTransport* ucxTransport) {
+    (void)ucxTransport;
+    VVM_LOG_WARN("setUcxTransport: UCX not built, ignoring");
+}
+
+std::optional<bool> MultiNodePoolManager::exportForRemoteUcx(
+    const RemoteAllocationDesc& desc,
+    const Allocation& alloc,
+    uint32_t deviceIndex) {
+    (void)desc;
+    (void)alloc;
+    (void)deviceIndex;
+    VVM_LOG_WARN("exportForRemoteUcx: UCX not built");
+    return std::nullopt;
+}
+
+std::optional<NetworkMigrationOperation> MultiNodePoolManager::migrateFromRemoteUcx(
+    const RemoteAllocationDesc& source,
+    Allocation& destination,
+    bool useRdma,
+    uint64_t timeoutNs) {
+    (void)source;
+    (void)destination;
+    (void)useRdma;
+    (void)timeoutNs;
+    VVM_LOG_WARN("migrateFromRemoteUcx: UCX not built");
+    return std::nullopt;
+}
+
+void MultiNodePoolManager::waitUcxMigration(NetworkMigrationOperation& op) {
+    (void)op;
+    VVM_LOG_WARN("waitUcxMigration: UCX not built");
+}
+#endif
+
+// ============================================================================
+// Cluster name-based operations (used by TensorTransport)
+// ============================================================================
+
+bool MultiNodePoolManager::announceRemoteTensor(
+    const NodeId& targetNode,
+    const std::string& tensorName,
+    const RemoteAllocationDesc& desc) {
+    
+    (void)targetNode;
+    (void)tensorName;
+    (void)desc;
+    VVM_LOG_WARN("announceRemoteTensor: not implemented");
+    return false;
+}
+
+std::optional<RemoteAllocationDesc> MultiNodePoolManager::waitRemoteTensor(
+    const NodeId& sourceNode,
+    const std::string& tensorName,
+    uint64_t timeoutNs) {
+    
+    (void)sourceNode;
+    (void)tensorName;
+    (void)timeoutNs;
+    VVM_LOG_WARN("waitRemoteTensor: not implemented");
+    return std::nullopt;
+}
+
 }  // namespace network
 }  // namespace vvm
+

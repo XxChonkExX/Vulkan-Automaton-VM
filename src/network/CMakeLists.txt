@@ -128,6 +128,7 @@ add_library(vulkan_vm_network ${NETWORK_CORE_SRCS})
 
 target_include_directories(vulkan_vm_network PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/cross_gpu
     ${Vulkan_INCLUDE_DIRS}
     ${VVM_NETWORK_VERBS_INCS}
     ${VVM_NETWORK_L0_INCS}
