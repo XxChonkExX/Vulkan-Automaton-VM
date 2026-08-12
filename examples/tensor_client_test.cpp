@@ -384,20 +384,21 @@ int main(int argc, char** argv) {
                 recvDone = true;
             });
         
+        // Wait for receive to complete (up to 30 seconds)
         int waitCount = 0;
-        while (!recvDone && waitCount < 600) {
+        while (!recvDone && waitCount < 300) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             ++waitCount;
         }
         
         if (!recvDone) {
-            std::cerr << "FAIL: recvTensor timeout\n";
+            std::cerr << "  FAIL: recvTensor timeout\n";
             ++failures;
         } else if (!recvErr.empty()) {
-            std::cerr << "FAIL: recvTensor: " << recvErr << "\n";
+            std::cerr << "  FAIL: recvTensor: " << recvErr << "\n";
             ++failures;
         } else {
-            std::cout << "  recvTensor: PASS\n";
+            std::cout << "  recvTensor: PASS (received " << kBytes << " bytes)\n";
             
             // Verify received data (copy back to host)
             auto& pool = transport->getPoolManager()->getPool(0);
