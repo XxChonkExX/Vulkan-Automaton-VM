@@ -19,6 +19,13 @@
 #include <unistd.h>
 #endif
 
+#if defined(VVM_PLATFORM_WINDOWS)
+#include <winsock2.h>
+#include <iphlpapi.h>
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "ws2_32.lib")
+#endif
+
 // Helper to auto-detect primary LAN IP (Linux)
 #if defined(VVM_PLATFORM_LINUX)
 static std::string getPrimaryLanIp() {
@@ -51,8 +58,33 @@ static std::string getPrimaryLanIp() {
 }
 #elif defined(VVM_PLATFORM_WINDOWS)
 static std::string getPrimaryLanIp() {
-    // Windows: use GetAdaptersAddresses or fallback
-    return "127.0.0.1";  // TODO: implement Windows IP detection
+    // Windows: use GetAdaptersAddresses to find first non-loopback IPv4
+    ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    ULONG size = 0;
+    GetAdaptersAddresses(AF_INET, flags, nullptr, nullptr, &size);
+    if (size == 0) return "127.0.0.1";
+    
+    std::vector<BYTE> buffer(size);
+    IP_ADAPTER_ADDRESSES* adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+    if (GetAdaptersAddresses(AF_INET, flags, nullptr, adapters, &size) != ERROR_SUCCESS) {
+        return "127.0.0.1";
+    }
+    
+    for (IP_ADAPTER_ADDRESSES* adapter = adapters; adapter != nullptr; adapter = adapter->Next) {
+        if (adapter->OperStatus != IfOperStatusUp) continue;
+        for (IP_ADAPTER_UNICAST_ADDRESS* ua = adapter->FirstUnicastAddress; ua != nullptr; ua = ua->Next) {
+            if (ua->Address.lpSockaddr->sa_family != AF_INET) continue;
+            sockaddr_in* addr = reinterpret_cast<sockaddr_in*>(ua->Address.lpSockaddr);
+            char ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &addr->sin_addr, ip, sizeof(ip));
+            
+            // Skip loopback
+            if (std::string(ip).rfind("127.", 0) == 0) continue;
+            
+            return ip;  // Return first valid LAN IP
+        }
+    }
+    return "127.0.0.1";
 }
 #else
 static std::string getPrimaryLanIp() {
