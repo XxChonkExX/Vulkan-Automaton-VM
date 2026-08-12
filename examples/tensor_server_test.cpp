@@ -255,6 +255,7 @@ static bool deviceCopy(VkDevice device, VkQueue queue, VkBuffer src, VkBuffer ds
 int main(int argc, char** argv) {
     uint16_t port = 51000;
     uint64_t tensorSizeMB = 16;
+    std::string rdmaNic;
     
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -264,14 +265,17 @@ int main(int argc, char** argv) {
             g_verbose = true;
         } else if (arg == "--size-mb" && i + 1 < argc) {
             tensorSizeMB = std::stoull(argv[++i]);
+        } else if (arg == "--rdma-nic" && i + 1 < argc) {
+            rdmaNic = argv[++i];
         } else if (arg == "--help" || arg == "-h") {
-            std::cout << "Usage: " << argv[0] << " [--port <port>] [--size-mb <size>] [--verbose]\n";
+            std::cout << "Usage: " << argv[0] << " [--port <port>] [--size-mb <size>] [--rdma-nic <device>] [--verbose]\n";
             return 0;
         }
     }
 
     LOG_INFO("=== VulkanVM Tensor Server (Evo-X2 Linux) ===");
-    LOG_INFO("Port: " << port << ", Tensor size: " << tensorSizeMB << " MB");
+    LOG_INFO("Port: " << port << ", Tensor size: " << tensorSizeMB << " MB"
+             << (rdmaNic.empty() ? "" : ", RDMA NIC: " + rdmaNic));
 
     if (!initTestDevice()) {
         LOG_ERROR("Failed to initialize Vulkan device");
@@ -284,6 +288,7 @@ int main(int argc, char** argv) {
     TransportConfig cfg;
     cfg.preference = TransportConfig::Preference::NetworkOnly;
     cfg.networkPort = port;
+    cfg.rdmaNicName = rdmaNic;
     cfg.enableAsyncPipeline = true;
     cfg.maxInFlightTransfers = 4;
 

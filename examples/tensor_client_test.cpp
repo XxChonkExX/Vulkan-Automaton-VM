@@ -228,6 +228,7 @@ int main(int argc, char** argv) {
     std::string serverIp = "192.168.0.117";
     uint16_t serverPort = 51000;
     uint16_t localPort = 51005;
+    std::string rdmaNic;
     
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -237,18 +238,22 @@ int main(int argc, char** argv) {
             serverPort = static_cast<uint16_t>(std::stoi(argv[++i]));
         } else if (arg == "--local-port" && i + 1 < argc) {
             localPort = static_cast<uint16_t>(std::stoi(argv[++i]));
+        } else if (arg == "--rdma-nic" && i + 1 < argc) {
+            rdmaNic = argv[++i];
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: " << argv[0] << " [options]\n";
             std::cout << "  --server <ip>        Evo-X2 server IP (default: 192.168.0.117)\n";
             std::cout << "  --port <port>        Evo-X2 server port (default: 51000)\n";
             std::cout << "  --local-port <port>  Local client listen port (default: 51005)\n";
+            std::cout << "  --rdma-nic <device>  RDMA device to use, e.g. rxe0 (default: auto)\n";
             return 0;
         }
     }
 
-    std::cout << "=== VulkanVM Tensor Client (Windows) ===\n";
+    std::cout << "=== VulkanVM Tensor Client (Ubuntu Linux) ===\n";
     std::cout << "Connecting to Evo-X2 at " << serverIp << ":" << serverPort << "\n";
-    std::cout << "Local listen port: " << localPort << "\n\n";
+    std::cout << "Local listen port: " << localPort
+              << (rdmaNic.empty() ? "" : ", RDMA NIC: " + rdmaNic) << "\n\n";
 
     if (!initTestDevice()) {
         std::cerr << "FAILED to initialize Vulkan device\n";
@@ -261,6 +266,7 @@ int main(int argc, char** argv) {
     TransportConfig cfg;
     cfg.preference = TransportConfig::Preference::NetworkOnly;
     cfg.networkPort = localPort;
+    cfg.rdmaNicName = rdmaNic;
     cfg.enableAsyncPipeline = true;
     cfg.maxInFlightTransfers = 4;
 
