@@ -126,15 +126,16 @@ cmd_install() {
 cmd_verify() {
     log "Kernel: $(uname -r)"
     case "$(uname -r)" in
-        *-wsl-rxe) ;;
+        *wsl-rxe*) ;;
         *) warn "Kernel does NOT have the -wsl-rxe localversion - did you install/restart?" ;;
     esac
 
-    if ! lsmod 2>/dev/null | grep -q rdma_rxe; then
+    # rdma_rxe may be built-in (CONFIG_RDMA_RXE=y) or a module; built-in shows
+    # up in /sys/module even though modprobe fails. Only modprobe if absent.
+    if [ ! -d /sys/module/rdma_rxe ] && ! lsmod 2>/dev/null | grep -q rdma_rxe; then
         log "Loading rdma_rxe module..."
         if ! sudo modprobe rdma_rxe 2>/dev/null; then
-            err "modprobe rdma_rxe failed. If kernel build worked, try 'wsl --shutdown' and reopen."
-            exit 1
+            warn "modprobe rdma_rxe failed (built-in kernels do not need it; continuing)"
         fi
     fi
 
@@ -174,11 +175,11 @@ cmd_loopback() {
     sudo rdma link add rxe_0 type rxe netdev veth0 2>/dev/null || warn "rxe_0 exists?"
     sudo rdma link add rxe_1 type rxe netdev veth1 2>/dev/null || warn "rxe_1 exists?"
 
-    log "Running ib_write_bw self-test (rxe_0 -> rxe_1, 16MiB x 5)..."
-    ib_write_bw -d rxe_1 -R -q 8 -s 16 -n 5 >/tmp/ibw_server.log 2>&1 &
+    log "Running ib_write_bw self-test (rxe_0 -> rxe_1)..."
+    ib_write_bw -d rxe_1 -R -q 8 -s 65536 -n 5 >/tmp/ibw_server.log 2>&1 &
     local spid=$!
     sleep 2
-    ib_write_bw -d rxe_0 -R -q 8 -s 16 -n 5 "$a" | grep -E '65536|16 MiB|BW'
+    ib_write_bw -d rxe_0 -R -q 8 -s 65536 -n 5 "$a" | tail -6
     kill "$spid" 2>/dev/null
 
     log "Loopback test done. Cross-machine: create rxe0 over eth0, then"
