@@ -327,6 +327,26 @@ int main(int argc, char** argv) {
 
     // Keep running - wait for Ctrl+C
     std::signal(SIGINT, [](int) { g_running = false; });
+    
+    // Announce tensor to connected clients periodically
+    std::thread([&]() {
+        while (g_running) {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            
+            // Get cluster view and announce to peers
+            auto view = transport->getClusterView();
+            for (const auto& node : view) {
+                if (node.id.toString() != nodeId) {
+                    std::cout << "  Announcing tensor to " << node.id.toString() << "\n";
+                    transport->sendTensor(*serverTensor, node.id.toString(), 
+                        [](bool ok, const std::string& err) {
+                            if (!ok) std::cerr << "  announce failed: " << err << "\n";
+                        });
+                }
+            }
+        }
+    }).detach();
+    
     std::thread([&]() {
         while (g_running) {
             std::this_thread::sleep_for(std::chrono::seconds(10));
