@@ -76,7 +76,7 @@ static bool initTestDevice() {
     appInfo.apiVersion = VK_API_VERSION_1_3;
 
     std::vector<const char*> instanceExts = {
-        VK_KHR_GET_PHYSICAL_PROPERTIES_2_EXTENSION_NAME,
+        VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
         VK_EXT_DEBUG_UTILS_EXTENSION_NAME
     };
     VkInstanceCreateInfo instanceInfo{};
