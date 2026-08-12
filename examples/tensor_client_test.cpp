@@ -100,7 +100,10 @@ static bool initTestDevice() {
         VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
         VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
         VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
+#if !defined(__linux__)
         VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,  // Windows
+#endif
+        VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,     // Linux (DMA-BUF)
         VK_EXT_MEMORY_BUDGET_EXTENSION_NAME
     };
     std::vector<const char*> devExts;

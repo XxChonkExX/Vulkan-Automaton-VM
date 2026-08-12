@@ -126,7 +126,7 @@ std::optional<uint32_t> findImportMemoryTypeIndex(VkPhysicalDevice dstPhysicalDe
         }
     }
     
-    VVM_LOG_WARN("findImportMemoryTypeIndex: no memory type with required flags {:#x}",
+    VVM_LOG_WARN("findImportMemoryTypeIndex: no memory type with required flags {}",
                  requiredFlags);
     return std::nullopt;
 }

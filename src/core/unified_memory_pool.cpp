@@ -614,7 +614,7 @@ static VkExternalMemoryHandleTypeFlags getExportHandleTypes(VkPhysicalDevice phy
         std::optional<Allocation> UnifiedMemoryPool::allocateDedicatedExportable(
         VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags flags) {
         
-        VVM_LOG_INFO("allocateDedicatedExportable: size={}, usage={:#x}, flags={:#x}", size, usage, flags);
+        VVM_LOG_INFO("allocateDedicatedExportable: size={}, usage={}, flags={}", size, usage, flags);
         
         std::lock_guard<std::mutex> lock(mutex_);
         VVM_LOG_INFO("allocateDedicatedExportable: lock acquired");
@@ -646,7 +646,7 @@ static VkExternalMemoryHandleTypeFlags getExportHandleTypes(VkPhysicalDevice phy
         // Step 2: Get memory requirements
         VkMemoryRequirements memReq;
         vkGetBufferMemoryRequirements(device_, buffer, &memReq);
-        VVM_LOG_INFO("allocateDedicatedExportable: memReq.size={}, memReq.memoryTypeBits={:#x}", memReq.size, memReq.memoryTypeBits);
+        VVM_LOG_INFO("allocateDedicatedExportable: memReq.size={}, memReq.memoryTypeBits={}", memReq.size, memReq.memoryTypeBits);
         
         // Budget check: fail soft instead of stealing VRAM past the configured cap.
         if (wouldExceedBudget(memReq.size)) {
@@ -676,7 +676,7 @@ VVM_LOG_INFO("allocateDedicatedExportable: budget check passed");
                 }
             }
         }
-        VVM_LOG_INFO("allocateDedicatedExportable: memType={} (memoryTypeBits={:#x})", 
+        VVM_LOG_INFO("allocateDedicatedExportable: memType={} (memoryTypeBits={})", 
                      memType, memReq.memoryTypeBits);
 
 VkMemoryDedicatedAllocateInfo dedicatedInfo{};
@@ -734,7 +734,7 @@ VVM_LOG_INFO("allocateDedicatedExportable: bind succeeded");
     void* hostPtr = nullptr;
     VkMemoryPropertyFlags memFlags;
     getMemoryTypeProperties(memType, memFlags, getDeviceMemoryInfo().memProps);
-    VVM_LOG_INFO("allocateDedicatedExportable: getMemoryTypeProperties returned, memFlags={:#x}", memFlags);
+    VVM_LOG_INFO("allocateDedicatedExportable: getMemoryTypeProperties returned, memFlags={}", memFlags);
     
     bool isHostVisible = (memFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
     bool isCoherent = (memFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;

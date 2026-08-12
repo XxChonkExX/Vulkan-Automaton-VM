@@ -13,7 +13,7 @@ sudo ./scripts/test_amd_rdma.sh build     # configure + build tests
 sudo ./scripts/test_amd_rdma.sh env       # verify RDMA devices + GPU
 
 # On Evo-X2 (server):
-./scripts/test_amd_rdma.sh server --port 51000
+./scripts/test_amd_rdma.sh server --port 51000 --announce-count 6
 
 # On Ubuntu client:
 ./scripts/test_amd_rdma.sh client --server 192.168.0.117 --port 51000 --local-port 51005
@@ -21,7 +21,11 @@ sudo ./scripts/test_amd_rdma.sh env       # verify RDMA devices + GPU
 
 The script verifies the log for `VerbsRdmaTransport initialized`, `AMD GPUDirect via ibv_reg_dmabuf_mr` (or the mmap fallback), and `migrateFromRemote: pulled`.
 
+`--announce-count N` makes the server exit after announcing N tensors (bounded run for scripts/CI). Without it the server runs until Ctrl-C and the client exits after its tests.
+
 **Kernel note**: `rdma_rxe` dma-buf support landed in kernel 6.19. On older kernels the AMD path uses the `DMA-BUF mmap fallback` (works fine on Strix Halo's unified memory). Soft-RoCE requires native Linux — WSL2 kernels do not include `rdma_rxe`.
+
+**WSL2 note**: The data-plane export step (`allocateDedicatedExportable` → `vkAllocateMemory`) fails with `VK_ERROR_OUT_OF_DEVICE_MEMORY` on WSL2's virtual GPU (`wslgd`) even at 1 MiB — the wslgd driver rejects exportable dedicated allocations. Cluster join, announce, and recv flows work in WSL; the full transfer must be verified on native Linux.
 
 ## Architecture
 
@@ -45,16 +49,24 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DVVM_BUILD_NETWORK=ON
 cmake --build build --target tensor_server_test tensor_client_test
 ```
 
+Both test binaries build on Linux (server is Linux-only; the client builds on Linux **and** Windows).
+
 ### Run Server (Evo-X2 / Linux)
 
 ```bash
 ./build/examples/tensor_server_test --port 51000 --verbose
 ```
 
-### Run Client (Windows / WSL)
+### Run Client (Windows / Linux)
 
 ```powershell
+# Windows
 .\build\examples\tensor_client_test.exe --server 192.168.0.117 --port 51000 --local-port 51005
+```
+
+```bash
+# Linux
+./build/examples/tensor_client_test --server 192.168.0.117 --port 51000 --local-port 51005
 ```
 
 ## Command Line Options
@@ -66,6 +78,7 @@ cmake --build build --target tensor_server_test tensor_client_test
 | `--port` | 51000 | TCP port to listen on |
 | `--size-mb` | 16 | Size of test tensor in MB |
 | `--rdma-nic` | auto | RDMA device to use (e.g. `rxe0`) |
+| `--announce-count` | 0 (unlimited) | Exit after announcing N tensors (bounded runs) |
 | `--verbose` | off | Enable detailed operation logging |
 | `--help` | | Show help |
 

@@ -31,13 +31,14 @@ target_include_directories(network_remote_test PRIVATE ${EXAMPLE_EXTRA_INCLUDES}
 # target_link_libraries(tensor_network_test PRIVATE vulkan_vm vulkan_vm_network)
 # target_include_directories(tensor_network_test PRIVATE ${EXAMPLE_EXTRA_INCLUDES})
 
-# Cross-machine tensor network tests (Windows client <-> Evo-X2 Linux server)
-if(WIN32)
-    add_executable(tensor_client_test tensor_client_test.cpp)
-    target_link_libraries(tensor_client_test PRIVATE vulkan_vm vulkan_vm_network)
-    target_include_directories(tensor_client_test PRIVATE ${EXAMPLE_EXTRA_INCLUDES})
-else()
-    # Linux server test
+# Cross-machine tensor network tests (client <-> server over TCP/RDMA).
+# Client runs on Windows or Linux; server is Linux-only (verbs transport).
+add_executable(tensor_client_test tensor_client_test.cpp)
+target_link_libraries(tensor_client_test PRIVATE vulkan_vm vulkan_vm_network)
+target_include_directories(tensor_client_test PRIVATE ${EXAMPLE_EXTRA_INCLUDES})
+
+if(NOT WIN32)
+    # Linux server test (requires verbs/RDMA for the GPU-direct path)
     add_executable(tensor_server_test tensor_server_test.cpp)
     target_link_libraries(tensor_server_test PRIVATE vulkan_vm vulkan_vm_network)
     target_include_directories(tensor_server_test PRIVATE ${EXAMPLE_EXTRA_INCLUDES})

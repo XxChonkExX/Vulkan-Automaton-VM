@@ -182,7 +182,7 @@ do_env() {
 # ---------------------------------------------------------------------------
 do_build() {
     require_root
-    if [[ ! -d "$REPO/CMakeLists.txt" ]]; then
+    if [[ ! -f "$REPO/CMakeLists.txt" ]]; then
         err "Repo not found at $REPO (pass --repo <dir> or REPO=...)"
         exit 1
     fi
