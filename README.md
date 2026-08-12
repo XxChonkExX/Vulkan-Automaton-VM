@@ -108,7 +108,7 @@ transport->allReduce({t0, t1, t2}, ReduceOp::Sum, {0, 1, 2});
 
 ## GPU Networking & RDMA (Primary Feature)
 
-VulkanVM's networking stack is a **production-grade multi-node GPU fabric** that moves tensor VRAM across machines with zero-copy where hardware allows, automatic fallback where it doesn't.
+VulkanVM's networking stack aspires to be a **production-grade multi-node GPU fabric** that moves tensor VRAM across machines with zero-copy where hardware allows, automatic fallback where it doesn't.
 
 ### Multi-Node Cluster over TCP/RDMA
 
