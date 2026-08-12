@@ -67,6 +67,7 @@ endif()
 
 # Network module dependencies (core builds standalone; gRPC/verbs/TLS optional)
 if(VVM_BUILD_NETWORK)
+    list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
     find_package(Protobuf QUIET)
     find_package(gRPC QUIET)
     find_package(ibverbs QUIET)

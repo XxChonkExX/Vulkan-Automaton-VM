@@ -4,6 +4,11 @@
 #include <mutex>
 #include <vector>
 
+#if defined(__linux__)
+#include <dlfcn.h>
+#include <unistd.h>
+#endif
+
 #if defined(_WIN32)
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
@@ -19,6 +24,7 @@ namespace detail {
 // ============================================================================
 // Intel Level Zero path (Windows) - OPAQUE_WIN32 export
 // ============================================================================
+#if defined(VVM_LEVEL_ZERO_AVAILABLE)
 
 #if defined(_WIN32) && defined(VVM_HAS_LEVEL_ZERO)
 
@@ -120,6 +126,7 @@ void unregisterIntelLevelZero(const GpuDirectRegistration& reg) {
     }
     VVM_LOG_INFO("Intel Level Zero GPU-direct unregistered");
 }
+#endif // VVM_LEVEL_ZERO_AVAILABLE
 
 #else
 std::optional<GpuDirectRegistration> registerIntelLevelZero(const GpuDirectConfig&) {
@@ -154,12 +161,11 @@ typedef enum hipExternalMemoryHandleType_enum {
     hipExternalMemoryHandleTypeOpaqueFd = 1,
     hipExternalMemoryHandleTypeOpaqueWin32 = 2,
     hipExternalMemoryHandleTypeOpaqueWin32Kmt = 3,
-    hipExternalMemoryHandleTypeDmaBuf = 4,
-    hipExternalMemoryHandleTypeD3D12Heap = 5,
-    hipExternalMemoryHandleTypeD3D12Resource = 6,
-    hipExternalMemoryHandleTypeD3D11Resource = 7,
-    hipExternalMemoryHandleTypeD3D11ResourceKmt = 8,
-    hipExternalMemoryHandleTypeNvSciBuf = 9
+    hipExternalMemoryHandleTypeD3D12Heap = 4,
+    hipExternalMemoryHandleTypeD3D12Resource = 5,
+    hipExternalMemoryHandleTypeD3D11Resource = 6,
+    hipExternalMemoryHandleTypeD3D11ResourceKmt = 7,
+    hipExternalMemoryHandleTypeNvSciBuf = 8
 } hipExternalMemoryHandleType;
 
 typedef struct hipExternalMemoryHandleDesc_st {
@@ -253,7 +259,7 @@ std::optional<GpuDirectRegistration> registerAmdRocm(const GpuDirectConfig& conf
     reg.dmaBufFd = dmaBufFd;
 
     hipExternalMemoryHandleDesc desc{};
-    desc.type = hipExternalMemoryHandleTypeDmaBuf;
+    desc.type = hipExternalMemoryHandleTypeOpaqueFd;
     desc.handle.fd = dmaBufFd;
     desc.size = config.size;
     desc.flags = 0;
@@ -363,8 +369,10 @@ std::optional<GpuDirectRegistration> registerGpuMemoryForRdmaVendor(
         case 0x10DE: // NVIDIA
             return detail::registerNvidiaVulkan(config);
 
+#if defined(VVM_LEVEL_ZERO_AVAILABLE)
         case 0x8086: // Intel
             return detail::registerIntelLevelZero(config);
+#endif
 
         case 0x1002: // AMD
             return detail::registerAmdRocm(config);
@@ -380,9 +388,11 @@ void unregisterVendorGpuMemory(const GpuDirectRegistration& reg) {
         case 0x10DE:
             detail::unregisterNvidiaVulkan(reg);
             break;
+#if defined(VVM_LEVEL_ZERO_AVAILABLE)
         case 0x8086:
             detail::unregisterIntelLevelZero(reg);
             break;
+#endif
         case 0x1002:
             detail::unregisterAmdRocm(reg);
             break;
