@@ -1006,7 +1006,7 @@ It's a tongue-in-cheek reference to:
 - **Chonk** = internet slang for "thicc" / hefty — because the pool reserves a massive chunk of VRAM upfront (e.g., 512 MB - 80 GB)
 - **Brand alignment** — GitHub org is `XxChonkExX`, repo is `Vulkan-Automaton-VM`
 
-Don't let the name fool you — under the hood it's a production-grade, hardened buddy allocator with zero fragmentation, budget awareness, and full thread safety.
+Don't let the name fool you — under the hood it is aspiring to be a production-grade, hardened buddy allocator with 'zero fragmentation', budget awareness, and full thread safety.
 
 ---
 
