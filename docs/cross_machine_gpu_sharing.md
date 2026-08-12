@@ -38,13 +38,17 @@ Stock WSL2 kernels lack `rdma_rxe`. `scripts/wsl2_rxe_kernel.sh` builds a custom
 # from Windows PowerShell:
 wsl --shutdown
 # reopen the distro, then:
-./scripts/wsl2_rxe_kernel.sh verify     # modprobe rdma_rxe + rxe0 over eth0 + GID check
+./scripts/wsl2_rxe_kernel.sh verify     # rxe0 over eth0 + GID check (rdma_rxe is built-in;
+#                                        a "modprobe failed" warning is expected & harmless)
 ./scripts/wsl2_rxe_kernel.sh loopback   # veth pair + ib_write_bw self-test
 ```
+
+Notes: the built kernel reports `uname -r` as `<ver>-wsl-rxe+` (trailing `+` from the WSL build); `rdma_rxe` is compiled **in** (`CONFIG_RDMA_RXE=y`), so no module is needed.
 
 What this enables in WSL2:
 - Full verbs/rdma_cm data path over **host memory** — test the transport against the X2 without a native Ubuntu install
 - `ib_write_bw`-style validation (`perftest`) before running the VulkanVM tests
+- Verified: `verify` shows `rxe0` ACTIVE with RoCEv2 GIDs; `loopback` reaches ~1.9 GiB/s (64 KiB msgs, 8 QPs) between veth-backed rxe pairs; `tensor_server_test` logs `VerbsRdmaTransport initialized on device 'rxe0', RDMA listener port 51901`
 
 What it does NOT enable in WSL2:
 - GPU dma-buf export (wslgd limitation above) — the AMD GPU-direct path still needs native Linux
