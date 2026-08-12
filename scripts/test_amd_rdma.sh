@@ -106,8 +106,10 @@ do_setup() {
     detect_iface
 
     if is_wsl; then
-        warn "WSL2 detected: rdma_rxe is NOT available in WSL2 kernels."
-        warn "Install native Ubuntu for the RDMA client. Continuing anyway..."
+        warn "WSL2 detected: rdma_rxe is NOT available in stock WSL2 kernels."
+        warn "Option 1 (native): install Ubuntu on this box for the RDMA client."
+        warn "Option 2 (WSL): build a custom kernel - ./scripts/wsl2_rxe_kernel.sh"
+        warn "Continuing anyway..."
     fi
 
     log "Installing build + RDMA + Vulkan packages..."
@@ -147,12 +149,13 @@ do_env() {
     uname -r
     if is_wsl; then warn "WSL2 detected - rdma_rxe will not work here"; fi
 
-    kver="$(uname -r)"
-    if [[ "$(printf '%s\n' "$kver" "6.19" | sort -V | head -1)" == "$kver" ]]; then
-        warn "Kernel < 6.19: rxe dma-buf MR unsupported, AMD path will use mmap fallback"
-    else
-        log "Kernel >= 6.19: rxe dma-buf MR supported"
+    if is_wsl; then
+        warn "WSL2 kernel: no rdma_rxe module (see scripts/wsl2_rxe_kernel.sh)"
     fi
+    # NOTE: rxe dma-buf (ibv_reg_dmabuf_mr) is NOT in any released kernel
+    # (patchset still upstream-review as of 2026); the mmap fallback is the
+    # expected AMD path on stock kernels.
+    warn "rxe dma-buf MR is not in released kernels - AMD path will use mmap fallback"
 
     echo
     log "== RDMA Devices =="

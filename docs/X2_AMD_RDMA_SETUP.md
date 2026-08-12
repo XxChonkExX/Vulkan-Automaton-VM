@@ -62,8 +62,8 @@ Then on the client (Ubuntu box at .213):
 
 ```
 VerbsRdmaTransport initialized on device 'rxe0', RDMA listener port 51001
-AMD GPUDirect via ibv_reg_dmabuf_mr: lkey=..., rkey=...     <- kernel >= 6.19
-AMD GPUDirect via DMA-BUF mmap fallback: lkey=..., rkey=... <- kernel < 6.19
+AMD GPUDirect via DMA-BUF mmap fallback: lkey=..., rkey=...   <- stock kernels (expected)
+AMD GPUDirect via ibv_reg_dmabuf_mr: lkey=..., rkey=...       <- future kernels with rxe dma-buf
 migrateFromRemote: pulled 16777216 bytes from ...
 ```
 
@@ -80,8 +80,13 @@ migrateFromRemote: pulled 16777216 bytes from ...
   `sudo ufw allow 51000/tcp && sudo ufw allow 51001/tcp` (or equivalent).
 - **MTU**: rxe RoCEv2 uses UDP; keep the LAN MTU at 1500 (default). Don't mix
   with jumbo frames on the same L2 until verified.
-- **Kernel < 6.19**: expect the `mmap fallback` line instead of
-  `ibv_reg_dmabuf_mr` — that is expected and fine on the APU (unified memory).
+- **Kernel < 6.19 / any released kernel**: rxe dma-buf MRs are not in any
+  released kernel (upstream review as of 2026), so expect the `mmap fallback`
+  line instead of `ibv_reg_dmabuf_mr` — that is expected and fine on the APU
+  (unified memory). Check with `uname -r`; no upgrade needed.
+- **Sanity-check with perftest first**: `ib_write_bw -d rxe0 -R` (server) /
+  `ib_write_bw -d rxe0 -R 192.168.0.117` (client) proves the rxe data path
+  before running the VulkanVM tests.
 - **Don't run a second server while testing** — the client connects by IP:port
   and will grab whichever is listening.
 - **GPU memory**: the 890M shares system RAM; big `--size-mb` values compete
