@@ -12,6 +12,7 @@ CMakeCache.txt
 cmake_install.cmake
 CTestTestfile.cmake
 *.cmake
+!cmake/Find*.cmake
 
 # IDE
 .vscode/

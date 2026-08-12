@@ -206,10 +206,11 @@ do_build() {
         log "Verbs transport enabled - RDMA path will be compiled in"
     fi
 
-    log "Building tensor_server_test / tensor_client_test..."
-    cmake --build "$BUILD_DIR" -j"$(nproc)" --target tensor_server_test tensor_client_test
+    log "Building tensor_server_test (tensor_client_test is Windows-only)..."
+    cmake --build "$BUILD_DIR" -j"$(nproc)" --target tensor_server_test || \
+        err "Build failed; see output above"
 
-    ls -la "$BUILD_DIR/examples/tensor_server_test" "$BUILD_DIR/examples/tensor_client_test"
+    ls -la "$BUILD_DIR/examples/tensor_server_test" 2>/dev/null || true
     echo
     log "Build complete. Binaries:"
     echo "  server: $BUILD_DIR/examples/tensor_server_test"
