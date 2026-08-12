@@ -1472,6 +1472,12 @@ void MultiNodePoolManager::onTcpRequest(TcpMessage& request, TcpMessage& respons
             vvm::detail::putU8(response.body, 1);
             break;
         }
+        case MsgTensorAnnounce: {
+            handleTensorAnnounce(request.body);
+            response = makeResponse(request.type, TcpFlagsResponse);
+            vvm::detail::putU8(response.body, 1);
+            break;
+        }
         default:
             VVM_LOG_WARN("Unknown TCP message type {}", request.type);
             response = makeResponse(request.type, TcpFlagsError);
@@ -1706,16 +1712,42 @@ void MultiNodePoolManager::waitUcxMigration(NetworkMigrationOperation& op) {
 // Cluster name-based operations (used by TensorTransport)
 // ============================================================================
 
+// Registry of announced tensors from remote nodes
+static std::mutex g_announcedTensorsMutex;
+static std::unordered_map<std::string, RemoteAllocationDesc> g_announcedTensors;
+
 bool MultiNodePoolManager::announceRemoteTensor(
     const NodeId& targetNode,
     const std::string& tensorName,
     const RemoteAllocationDesc& desc) {
     
-    (void)targetNode;
-    (void)tensorName;
-    (void)desc;
-    VVM_LOG_WARN("announceRemoteTensor: not implemented");
-    return false;
+    // Connect to target node
+    auto conn = getPeerConnection(targetNode.host, targetNode.port);
+    if (conn == 0) {
+        VVM_LOG_ERROR("announceRemoteTensor: no connection to {}", targetNode.toString());
+        return false;
+    }
+    
+    // Build announcement message: tensor name + serialized descriptor
+    std::vector<uint8_t> body;
+    vvm::detail::putStr(body, tensorName);
+    auto descBytes = serializeAllocationDesc(desc);
+    vvm::detail::putBytes(body, descBytes);
+    
+    TcpMessage req;
+    req.type = MsgTensorAnnounce;
+    req.flags = TcpFlagsRequest;
+    req.body = std::move(body);
+    
+    auto resp = tcpTransport_->request(conn, req);
+    if (!resp || resp->flags == TcpFlagsError) {
+        VVM_LOG_ERROR("announceRemoteTensor: announcement failed");
+        return false;
+    }
+    
+    VVM_LOG_INFO("TensorAnnounce: stored '{}' ({} bytes) from {}", 
+                 tensorName, desc.size, desc.owner.toString());
+    return true;
 }
 
 std::optional<RemoteAllocationDesc> MultiNodePoolManager::waitRemoteTensor(
@@ -1723,11 +1755,66 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::waitRemoteTensor(
     const std::string& tensorName,
     uint64_t timeoutNs) {
     
-    (void)sourceNode;
-    (void)tensorName;
-    (void)timeoutNs;
-    VVM_LOG_WARN("waitRemoteTensor: not implemented");
+    // Check if already announced
+    {
+        std::lock_guard<std::mutex> lock(allocsMutex_);
+        auto it = announcedTensors_.find(tensorName);
+        if (it != announcedTensors_.end()) {
+            auto desc = it->second;
+            announcedTensors_.erase(it);
+            return desc;
+        }
+    }
+    
+    // Poll for announcement with timeout
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeoutNs);
+    while (std::chrono::steady_clock::now() < deadline) {
+        {
+            std::lock_guard<std::mutex> lock(allocsMutex_);
+            auto it = announcedTensors_.find(tensorName);
+            if (it != announcedTensors_.end()) {
+                auto desc = it->second;
+                announcedTensors_.erase(it);
+                return desc;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    
+    VVM_LOG_ERROR("waitRemoteTensor: timeout waiting for tensor '{}' from {}", 
+                  tensorName, sourceNode.toString());
     return std::nullopt;
+}
+
+void MultiNodePoolManager::handleTensorAnnounce(const std::vector<uint8_t>& body) {
+    const uint8_t* p = body.data();
+    const uint8_t* end = p + body.size();
+    
+    std::string tensorName;
+    if (!vvm::detail::getStr(p, end, tensorName)) {
+        VVM_LOG_ERROR("handleTensorAnnounce: failed to read tensor name");
+        return;
+    }
+    
+    std::vector<uint8_t> descBytes;
+    if (!vvm::detail::getBytes(p, end, descBytes)) {
+        VVM_LOG_ERROR("handleTensorAnnounce: failed to read descriptor");
+        return;
+    }
+    
+    RemoteAllocationDesc desc;
+    const uint8_t* dp = descBytes.data();
+    const uint8_t* dend = dp + descBytes.size();
+    if (!deserializeAllocationDesc(dp, dend, desc)) {
+        VVM_LOG_ERROR("handleTensorAnnounce: failed to deserialize descriptor");
+        return;
+    }
+    
+    VVM_LOG_INFO("TensorAnnounce: stored '{}' ({} bytes) from {}", 
+                 tensorName, desc.size, desc.owner.toString());
+    
+    std::lock_guard<std::mutex> lock(allocsMutex_);
+    announcedTensors_[tensorName] = std::move(desc);
 }
 
 }  // namespace network

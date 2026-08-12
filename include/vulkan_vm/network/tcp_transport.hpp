@@ -41,6 +41,9 @@ enum : uint32_t {
     // Remote tensor announcement: sender advertises a tensor by name to a
     // peer; the peer stores the descriptor and can later pull the VRAM.
     MsgTensorAnnounce = 14,
+    // Remote tensor lookup: request a tensor descriptor by name; response carries
+    // the RemoteAllocationDesc so the requester can pull the VRAM.
+    MsgTensorLookup   = 15,
 };
 
 enum : uint32_t {
