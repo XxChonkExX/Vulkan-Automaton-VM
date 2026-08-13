@@ -18,6 +18,13 @@
 
 #include <vulkan/vulkan.h>
 
+// Export macros for shared library
+#if defined(VVM_BUILD_SHARED) && defined(VVM_EXPORT)
+#define VVM_API __attribute__((visibility("default")))
+#else
+#define VVM_API
+#endif
+
 #include <cstdint>
 #include <vector>
 #include <optional>
@@ -38,7 +45,7 @@ namespace vvm {
 // Configuration
 // ============================================================================
 
-struct PoolConfig {
+struct VVM_API PoolConfig {
     // Block size for the buddy allocator (power of two). Default 512MB.
     // For high-VRAM cards (RTX 4090 24GB, RTX 6000 48GB), consider 1GB or 2GB.
     VkDeviceSize blockSize = 512ull * 1024 * 1024;  // 512MB per block
@@ -88,7 +95,7 @@ struct PoolConfig {
     static PoolConfig forHighVRAM(VkPhysicalDevice physicalDevice);
 };
 
-struct DeviceConfig {
+struct VVM_API DeviceConfig {
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
     uint32_t graphicsQueueFamily = 0;
@@ -109,7 +116,7 @@ enum class MemoryUsage {
 };
 
 // Allocation descriptor - intent-based API
-struct AllocDesc {
+struct VVM_API AllocDesc {
     VkDeviceSize size = 0;
     VkBufferUsageFlags usage = 0;
     MemoryUsage memoryUsage = MemoryUsage::Auto;
@@ -126,13 +133,13 @@ enum class MemoryTopologyType {
 };
 
 // Classify a physical device's memory layout.
-MemoryTopologyType detectMemoryTopology(VkPhysicalDevice physicalDevice);
+VVM_API MemoryTopologyType detectMemoryTopology(VkPhysicalDevice physicalDevice);
 
 // ============================================================================
 // Allocation
 // ============================================================================
 
-struct Allocation {
+struct VVM_API Allocation {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;  // shared block memory
     VkDeviceSize offset = 0;
@@ -159,7 +166,7 @@ struct Allocation {
 };
 
 // Block metadata (internal)
-struct BlockInfo {
+struct VVM_API BlockInfo {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize size = 0;
     VkDeviceSize used = 0;
@@ -175,7 +182,7 @@ struct BlockInfo {
 // Pool Statistics
 // ============================================================================
 
-struct PoolStats {
+struct VVM_API PoolStats {
     VkDeviceSize totalAllocated = 0;
     VkDeviceSize totalUsed = 0;
     VkDeviceSize totalFree = 0;
@@ -187,7 +194,7 @@ struct PoolStats {
     VkDeviceSize totalCapacity = 0;
 };
 
-struct DeviceMemoryInfo {
+struct VVM_API DeviceMemoryInfo {
     VkPhysicalDeviceMemoryProperties memProps;
     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
     std::vector<VkDeviceSize> heapSizes;
@@ -200,7 +207,7 @@ using MigrationId = uint64_t;
 // Migration Operation
 // ============================================================================
 
-struct MigrationOperation {
+struct VVM_API MigrationOperation {
     MigrationId id = 0;
     Allocation* allocation = nullptr;
     bool toHost = true;          // true = device->host, false = host->device
@@ -236,7 +243,7 @@ enum class ErrorCode {
     SyncFailed
 };
 
-struct Result {
+struct VVM_API Result {
     ErrorCode code = ErrorCode::Success;
     VkResult vkResult = VK_SUCCESS;
     std::string message;
@@ -250,7 +257,7 @@ struct Result {
 
 // Templated Result for operations that return a value
 template<typename T>
-struct ResultT {
+struct VVM_API ResultT {
     ErrorCode code = ErrorCode::Success;
     VkResult vkResult = VK_SUCCESS;
     std::string message;
@@ -263,7 +270,7 @@ struct ResultT {
     }
 };
 
-class OffloadManager;  // forward declaration for UnifiedMemoryPool
+class VVM_API OffloadManager;  // forward declaration for UnifiedMemoryPool
 
 // ============================================================================
 // Unified Memory Pool (core definition)
@@ -275,7 +282,7 @@ class OffloadManager;  // forward declaration for UnifiedMemoryPool
 
 class UniqueAllocation;  // forward declaration for deallocate(UniqueAllocation&&)
 
-class UnifiedMemoryPool {
+class VVM_API UnifiedMemoryPool {
 public:
     // Factory
     static std::optional<UnifiedMemoryPool> create(const DeviceConfig& device, 
@@ -439,7 +446,7 @@ private:
 // GPU Instance (for MultiGPUPoolManager)
 // ============================================================================
 
-struct GPUInstance {
+struct VVM_API GPUInstance {
     UnifiedMemoryPool pool;
     DeviceConfig config;
     uint32_t deviceIndex = 0;
@@ -458,7 +465,7 @@ inline void uniqueAllocationDeleter(UnifiedMemoryPool* pool, Allocation&& alloc)
 }
 
 // RAII wrapper for Allocation - only create via UniqueAllocation::make()
-class UniqueAllocation {
+class VVM_API UniqueAllocation {
 public:
     using Deleter = void(*)(UnifiedMemoryPool*, Allocation&&);
     

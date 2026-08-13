@@ -326,9 +326,8 @@ def estimate_model_memory(config, dtype=torch.bfloat16):
     total_params = embed_params + num_layers * per_layer_params + lm_head_params
     model_bytes = total_params * element_size
 
-    # Optimizer states (AdamW: 2 * params for fp32 master weights + momentum + variance)
-    # Using bfloat16 model with fp32 optimizer states = ~4x model size
-    optimizer_bytes = total_params * 4 * 4  # 4 bytes per fp32, 2 states (exp_avg, exp_avg_sq)
+    # Optimizer states (AdamW: exp_avg + exp_avg_sq in fp32 = 2 * 4 bytes per param = 8 bytes per param)
+    optimizer_bytes = total_params * 8  # 2 states * 4 bytes (fp32)
 
     return {
         "model_params": total_params,
