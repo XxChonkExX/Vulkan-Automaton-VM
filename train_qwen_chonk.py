@@ -164,25 +164,28 @@ def train_step(model, chunk_ids, kv_cache, optimizer, chunk_start, chunk_end, se
     """Single training step on a chunk."""
     cp = torch.arange(chunk_start, chunk_end, device="cuda")
 
-    outputs = model(
-        input_ids=chunk_ids,
-        past_key_values=kv_cache,
-        use_cache=True,
-        cache_position=cp,
-    )
-
-    logits = outputs.logits
-    loss = None
-
-    # Next-token prediction loss
-    if logits is not None:
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = chunk_ids[..., 1:].contiguous()
-        loss_fct = nn.CrossEntropyLoss()
-        loss = loss_fct(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
+    # EXP 4: BF16 autocast for forward pass
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        outputs = model(
+            input_ids=chunk_ids,
+            past_key_values=kv_cache,
+            use_cache=True,
+            cache_position=cp,
         )
+
+        logits = outputs.logits
+        loss = None
+
+        # Next-token prediction loss
+        if logits is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = chunk_ids[..., 1:].contiguous()
+            # EXP 7: Label smoothing
+            loss_fct = nn.CrossEntropyLoss(label_smoothing=0.1)
+            loss = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+            )
 
     return loss, outputs
 
@@ -225,6 +228,7 @@ def main():
         low_cpu_mem_usage=True,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
+        attn_implementation="flash_attention_2",  # EXP 3: Flash Attention 2
     )
     model = model.cuda()
     print(f"  Model loaded, CUDA memory: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
@@ -248,6 +252,11 @@ def main():
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
     print(f"  CUDA memory after LoRA: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+
+    # EXP 2: torch.compile for speedup
+    print("\n[Exp 2] Compiling model with torch.compile...")
+    model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
+    print("  Model compiled successfully")
 
     # 5. Load model weights into Chonk Buffer
     print("\n[6/6] Moving model weights to Chonk Buffer...")
