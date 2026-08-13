@@ -73,4 +73,9 @@ Thumbs.db
 # Profiling
 *.trace
 *.perf
-*.vtune
+*.vtune*.pyc
+__pycache__/
+examples/seed_node.cpp
+examples/tensor_seed_node.cpp
+seed_node.cpp
+_build/
