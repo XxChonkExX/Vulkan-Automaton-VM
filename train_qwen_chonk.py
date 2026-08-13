@@ -55,7 +55,8 @@ LEARNING_RATE = 2e-5
 WEIGHT_DECAY = 0.01
 WARMUP_STEPS = 100
 MAX_STEPS = 10000
-GRAD_ACCUM_STEPS = 1
+GRAD_ACCUM_STEPS = 4  # EXP 1: Effective batch = 4
+GRAD_CLIP_NORM = 1.0  # EXP 1: Gradient clipping
 LOG_INTERVAL = 10
 SAVE_INTERVAL = 500
 
@@ -303,25 +304,38 @@ def main():
         # Reset cache for new sequence
         reset_chonk_cache(kv_cache)
 
+        # Gradient accumulation: track chunks per sequence
+        chunks_this_seq = 0
+
         # Process in chunks
         for chunk_start in range(0, SEQ_LEN, CHUNK_SIZE):
             chunk_end = min(chunk_start + CHUNK_SIZE, SEQ_LEN)
             chunk_ids = input_ids[:, chunk_start:chunk_end]
 
-            # Forward + backward
-            optimizer.zero_grad()
+            # Forward
             loss, outputs = train_step(model, chunk_ids, kv_cache, optimizer, chunk_start, chunk_end, SEQ_LEN)
 
             if loss is not None:
+                # Scale loss for gradient accumulation
+                loss = loss / GRAD_ACCUM_STEPS
                 loss.backward()
+
+            chunks_this_seq += 1
+
+            # Step optimizer after GRAD_ACCUM_STEPS chunks (or end of sequence)
+            if chunks_this_seq % GRAD_ACCUM_STEPS == 0 or chunk_end == SEQ_LEN:
+                # Gradient clipping
+                if GRAD_CLIP_NORM > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
                 optimizer.step()
                 scheduler.step()
+                optimizer.zero_grad()
 
-            # Log
+            # Log (count optimizer steps, not chunks)
             if step % LOG_INTERVAL == 0:
                 stats = pool.stats()
-                print(f"Step {step}: loss={loss.item():.4f}, lr={scheduler.get_last_lr()[0]:.2e}, "
-                      f"pool_used={stats['totalUsed'] / 1e9:.2f} GB")
+                print(f"Step {step}: loss={loss.item() * GRAD_ACCUM_STEPS if loss is not None else 0:.4f}, "
+                      f"lr={scheduler.get_last_lr()[0]:.2e}, pool_used={stats['totalUsed'] / 1e9:.2f} GB")
 
             step += 1
 
