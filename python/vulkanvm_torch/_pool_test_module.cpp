@@ -231,6 +231,118 @@ static py::dict allocExport(size_t size, const std::string& name) {
     return out;
 }
 
+static py::dict allocModelWeights(size_t size, const std::string& name) {
+    if (!g_pool) throw std::runtime_error("not initialized");
+    vvm::AllocDesc desc;
+    desc.size = size;
+    desc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    desc.memoryUsage = vvm::MemoryUsage::GpuOnly;
+    desc.mapped = false;
+    desc.exportable = false;
+    desc.name = name;
+    auto allocOpt = g_pool->allocate(desc);
+    if (!allocOpt) throw std::runtime_error("allocation failed");
+    auto a = std::move(*allocOpt);
+    py::dict out;
+    out["size"] = static_cast<uint64_t>(a.size);
+    out["offset"] = static_cast<uint64_t>(a.offset);
+    out["block"] = static_cast<uint64_t>(a.blockIndex);
+    out["deviceAddress"] = static_cast<uint64_t>(a.deviceAddress);
+    out["hostPtr"] = reinterpret_cast<uint64_t>(a.hostPtr);
+    out["buffer"] = reinterpret_cast<uint64_t>(a.buffer);
+    out["memory"] = reinterpret_cast<uint64_t>(a.memory);
+    out["hostPtrValid"] = (a.hostPtr != nullptr);
+    g_kept.push_back(std::move(a));
+    return out;
+}
+
+static py::dict allocOptimizerStates(size_t size, const std::string& name) {
+    if (!g_pool) throw std::runtime_error("not initialized");
+    vvm::AllocDesc desc;
+    desc.size = size;
+    desc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    desc.memoryUsage = vvm::MemoryUsage::GpuOnly;
+    desc.mapped = false;
+    desc.exportable = false;
+    desc.name = name;
+    auto allocOpt = g_pool->allocate(desc);
+    if (!allocOpt) throw std::runtime_error("allocation failed");
+    auto a = std::move(*allocOpt);
+    py::dict out;
+    out["size"] = static_cast<uint64_t>(a.size);
+    out["offset"] = static_cast<uint64_t>(a.offset);
+    out["block"] = static_cast<uint64_t>(a.blockIndex);
+    out["deviceAddress"] = static_cast<uint64_t>(a.deviceAddress);
+    out["hostPtr"] = reinterpret_cast<uint64_t>(a.hostPtr);
+    out["buffer"] = reinterpret_cast<uint64_t>(a.buffer);
+    out["memory"] = reinterpret_cast<uint64_t>(a.memory);
+    out["hostPtrValid"] = (a.hostPtr != nullptr);
+    g_kept.push_back(std::move(a));
+    return out;
+}
+
+static py::dict allocActivations(size_t size, const std::string& name) {
+    if (!g_pool) throw std::runtime_error("not initialized");
+    vvm::AllocDesc desc;
+    desc.size = size;
+    desc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    desc.memoryUsage = vvm::MemoryUsage::GpuOnly;
+    desc.mapped = false;
+    desc.exportable = false;
+    desc.name = name;
+    auto allocOpt = g_pool->allocate(desc);
+    if (!allocOpt) throw std::runtime_error("allocation failed");
+    auto a = std::move(*allocOpt);
+    py::dict out;
+    out["size"] = static_cast<uint64_t>(a.size);
+    out["offset"] = static_cast<uint64_t>(a.offset);
+    out["block"] = static_cast<uint64_t>(a.blockIndex);
+    out["deviceAddress"] = static_cast<uint64_t>(a.deviceAddress);
+    out["hostPtr"] = reinterpret_cast<uint64_t>(a.hostPtr);
+    out["buffer"] = reinterpret_cast<uint64_t>(a.buffer);
+    out["memory"] = reinterpret_cast<uint64_t>(a.memory);
+    out["hostPtrValid"] = (a.hostPtr != nullptr);
+    g_kept.push_back(std::move(a));
+    return out;
+}
+
+static py::dict allocHostVisible(size_t size, const std::string& name) {
+    if (!g_pool) throw std::runtime_error("not initialized");
+    vvm::AllocDesc desc;
+    desc.size = size;
+    desc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    desc.memoryUsage = vvm::MemoryUsage::CpuToGpu;
+    desc.mapped = true;
+    desc.exportable = false;
+    desc.name = name;
+    auto allocOpt = g_pool->allocate(desc);
+    if (!allocOpt) throw std::runtime_error("allocation failed");
+    auto a = std::move(*allocOpt);
+    py::dict out;
+    out["size"] = static_cast<uint64_t>(a.size);
+    out["offset"] = static_cast<uint64_t>(a.offset);
+    out["block"] = static_cast<uint64_t>(a.blockIndex);
+    out["deviceAddress"] = static_cast<uint64_t>(a.deviceAddress);
+    out["hostPtr"] = reinterpret_cast<uint64_t>(a.hostPtr);
+    out["buffer"] = reinterpret_cast<uint64_t>(a.buffer);
+    out["memory"] = reinterpret_cast<uint64_t>(a.memory);
+    out["hostPtrValid"] = (a.hostPtr != nullptr);
+    g_kept.push_back(std::move(a));
+    return out;
+}
+
 static py::dict stats() {
     if (!g_pool) throw std::runtime_error("not initialized");
     auto s = g_pool->getStats();
@@ -263,6 +375,10 @@ PYBIND11_MODULE(vulkanvm_pool_test, m) {
     m.def("alloc", &alloc, py::arg("size"), py::arg("name") = "");
     m.def("alloc_keep", &allocKeep, py::arg("size"), py::arg("name") = "");
     m.def("alloc_export", &allocExport, py::arg("size"), py::arg("name") = "");
+    m.def("alloc_model_weights", &allocModelWeights, py::arg("size"), py::arg("name") = "");
+    m.def("alloc_optimizer_states", &allocOptimizerStates, py::arg("size"), py::arg("name") = "");
+    m.def("alloc_activations", &allocActivations, py::arg("size"), py::arg("name") = "");
+    m.def("alloc_host_visible", &allocHostVisible, py::arg("size"), py::arg("name") = "");
     m.def("stats", &stats);
     m.def("shutdown", &shutdown);
 }

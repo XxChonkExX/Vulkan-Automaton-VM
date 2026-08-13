@@ -53,8 +53,16 @@ set(TORCH_SRCS
     vulkanvm_autograd_bind.cpp
 )
 
+# Pool test module sources
+set(POOL_TEST_SRCS
+    _pool_test_module.cpp
+)
+
 # Create the extension module
 pybind11_add_module(vulkanvm_torch ${TORCH_SRCS})
+
+# Create pool test module
+pybind11_add_module(vulkanvm_pool_test ${POOL_TEST_SRCS})
 
 # Link libraries
 target_link_libraries(vulkanvm_torch PRIVATE
@@ -63,6 +71,15 @@ target_link_libraries(vulkanvm_torch PRIVATE
     "C:/Users/mikeh/miniconda3/Lib/site-packages/torch/lib/torch_python.lib"
     pybind11::module
 )
+
+target_link_libraries(vulkanvm_pool_test PRIVATE
+    vulkan_vm
+    ${TORCH_LIBRARIES}
+    pybind11::module
+)
+
+target_include_directories(vulkanvm_pool_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(vulkanvm_pool_test PRIVATE -DVVM_PLATFORM_LINUX=1)
 
 # Include this directory so the headers resolve
 target_include_directories(vulkanvm_torch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

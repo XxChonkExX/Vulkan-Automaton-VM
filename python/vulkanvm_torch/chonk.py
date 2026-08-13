@@ -91,6 +91,7 @@ class ChonkPool:
         self.device_name = info["device"]
         self._ext_mem = ctypes.c_void_p()
         self._fds = []
+        self._allocations = []
 
     def alloc_base(self, nbytes: int, name: str = "chonk"):
         """Allocate nbytes in the pool, import to HIP, return a 1-D uint8
@@ -128,7 +129,52 @@ class ChonkPool:
         wrap = type("PoolWrap", (), {"__cuda_array_interface__": iface})()
         base = torch.as_tensor(wrap, device="cuda")
         base = base.view(torch.uint8)
+        self._allocations.append(a)
         return base, host_ptr
+
+    def alloc_model_weights(self, nbytes: int, name: str = "model_weights"):
+        """Allocate model weights in Chonk Buffer (no export needed)."""
+        nbytes = int(nbytes)
+        a = pool_mod.alloc_model_weights(nbytes, name)
+        self._allocations.append(a)
+        return self._make_tensor_from_alloc(a)
+
+    def alloc_optimizer_states(self, nbytes: int, name: str = "optimizer_states"):
+        """Allocate optimizer states in Chonk Buffer."""
+        nbytes = int(nbytes)
+        a = pool_mod.alloc_optimizer_states(nbytes, name)
+        self._allocations.append(a)
+        return self._make_tensor_from_alloc(a)
+
+    def alloc_activations(self, nbytes: int, name: str = "activations"):
+        """Allocate activations buffer in Chonk Buffer."""
+        nbytes = int(nbytes)
+        a = pool_mod.alloc_activations(nbytes, name)
+        self._allocations.append(a)
+        return self._make_tensor_from_alloc(a)
+
+    def alloc_host_visible(self, nbytes: int, name: str = "host_visible"):
+        """Allocate host-visible buffer in Chonk Buffer (for staging)."""
+        nbytes = int(nbytes)
+        a = pool_mod.alloc_host_visible(nbytes, name)
+        self._allocations.append(a)
+        return self._make_tensor_from_alloc(a), a["hostPtr"]
+
+    def _make_tensor_from_alloc(self, a):
+        """Create a CUDA tensor from pool allocation."""
+        dev_ptr = a["deviceAddress"]
+        nbytes = a["size"]
+        iface = {
+            "shape": (nbytes,),
+            "strides": None,
+            "data": (dev_ptr, False),
+            "typestr": "<u1",
+            "version": 2,
+        }
+        wrap = type("PoolWrap", (), {"__cuda_array_interface__": iface})()
+        base = torch.as_tensor(wrap, device="cuda")
+        base = base.view(torch.uint8)
+        return base
 
     def stats(self):
         return pool_mod.stats()
@@ -245,3 +291,146 @@ def build_chonk_cache(config, batch_size, max_cache_len, pool=None):
     cache.full_layer_bytes = per_layer_bytes
     cache._batch_size = batch_size
     return cache
+
+
+def estimate_model_memory(config, dtype=torch.bfloat16):
+    """Estimate memory requirements for model weights and optimizer states."""
+    text_cfg = config.get_text_config(decoder=True)
+    hidden_size = text_cfg.hidden_size
+    num_layers = text_cfg.num_hidden_layers
+    num_attention_heads = text_cfg.num_attention_heads
+    num_kv_heads = getattr(text_cfg, "num_key_value_heads", num_attention_heads)
+    head_dim = getattr(text_cfg, "head_dim", hidden_size // num_attention_heads)
+    intermediate_size = getattr(text_cfg, "intermediate_size", hidden_size * 4)
+    vocab_size = text_cfg.vocab_size
+
+    element_size = dtype.itemsize
+
+    # Embedding: vocab_size * hidden_size
+    embed_params = vocab_size * hidden_size
+
+    # Per layer params (attention + FFN)
+    # QKV: 3 * hidden_size * hidden_size
+    # O: hidden_size * hidden_size
+    # FFN: gate + up + down = 3 * hidden_size * intermediate_size
+    # Norms: ~4 * hidden_size (rms/layernorm)
+    per_layer_params = (
+        4 * hidden_size * hidden_size +  # QKV + O
+        3 * hidden_size * intermediate_size +  # FFN
+        4 * hidden_size  # norms
+    )
+
+    # LM head: hidden_size * vocab_size (usually tied to embed)
+    lm_head_params = hidden_size * vocab_size
+
+    total_params = embed_params + num_layers * per_layer_params + lm_head_params
+    model_bytes = total_params * element_size
+
+    # Optimizer states (AdamW: 2 * params for fp32 master weights + momentum + variance)
+    # Using bfloat16 model with fp32 optimizer states = ~4x model size
+    optimizer_bytes = total_params * 4 * 4  # 4 bytes per fp32, 2 states (exp_avg, exp_avg_sq)
+
+    return {
+        "model_params": total_params,
+        "model_bytes": model_bytes,
+        "optimizer_bytes": optimizer_bytes,
+        "total_bytes": model_bytes + optimizer_bytes,
+    }
+
+
+def load_model_into_chonk(model, pool: ChonkPool, dtype=torch.bfloat16):
+    """Load model weights into Chonk Buffer, replacing model's parameters
+    with views into the pool memory."""
+    param_info = estimate_model_memory(model.config, dtype)
+    model_buffer = pool.alloc_model_weights(param_info["model_bytes"], "model_weights")
+    model_buffer_typed = model_buffer.view(dtype)
+
+    offset = 0
+    for name, param in model.named_parameters():
+        numel = param.numel()
+        param_view = model_buffer_typed.narrow(0, offset, numel).view_as(param)
+        param_view.copy_(param.data)
+        # Replace parameter data with view into Chonk Buffer
+        param.data = param_view
+        offset += numel
+
+    print(f"Loaded model into Chonk Buffer: {offset * dtype.itemsize / 1e9:.2f} GB")
+    return model_buffer
+
+
+def create_optimizer_states_in_chonk(model, pool: ChonkPool):
+    """Create optimizer states (AdamW) in Chonk Buffer."""
+    param_info = estimate_model_memory(model.config)
+    opt_buffer = pool.alloc_optimizer_states(param_info["optimizer_bytes"], "optimizer_states")
+    opt_buffer_typed = opt_buffer.view(torch.float32)  # fp32 optimizer states
+
+    offset = 0
+    optimizer_states = {}
+    for name, param in model.named_parameters():
+        numel = param.numel()
+        # AdamW has exp_avg and exp_avg_sq for each parameter
+        exp_avg = opt_buffer_typed.narrow(0, offset, numel).view_as(param)
+        offset += numel
+        exp_avg_sq = opt_buffer_typed.narrow(0, offset, numel).view_as(param)
+        offset += numel
+        optimizer_states[name] = {"exp_avg": exp_avg, "exp_avg_sq": exp_avg_sq}
+
+    print(f"Created optimizer states in Chonk Buffer: {offset * 4 / 1e9:.2f} GB")
+    return optimizer_states, opt_buffer
+
+
+def create_activation_buffers(pool: ChonkPool, batch_size, seq_len, hidden_size, num_layers, dtype=torch.bfloat16, chunk_size=4096):
+    """Create activation buffers in Chonk Buffer for chunked forward pass."""
+    # Estimate activation memory per chunk
+    # Per token: hidden_size * num_layers * (some factor for intermediate activations)
+    # Using chunk_size tokens per forward chunk
+    element_size = dtype.itemsize
+    # Rough estimate: 4x hidden_size per layer per token (attention + FFN intermediates)
+    per_token_per_layer = hidden_size * 4
+    chunk_tokens = chunk_size
+    activations_per_chunk = batch_size * chunk_tokens * num_layers * per_token_per_layer * element_size
+    # Need 2-3 buffers for double/triple buffering
+    total_activation_bytes = activations_per_chunk * 3
+
+    act_buffer = pool.alloc_activations(total_activation_bytes, "activations")
+    print(f"Created activation buffers in Chonk Buffer: {total_activation_bytes / 1e9:.2f} GB")
+    return act_buffer
+
+
+def build_full_chonk_training_setup(model, config, batch_size, max_cache_len, seq_len, chunk_size=4096):
+    """Build complete training setup with EVERYTHING in Chonk Buffer."""
+    pool = ChonkPool()
+
+    # 1. Build KV cache
+    kv_cache = build_chonk_cache(config, batch_size, max_cache_len, pool)
+
+    # 2. Load model weights into Chonk Buffer
+    model_buffer = load_model_into_chonk(model, pool)
+
+    # 3. Create optimizer states in Chonk Buffer
+    optimizer_states, opt_buffer = create_optimizer_states_in_chonk(model, pool)
+
+    # 4. Create activation buffers in Chonk Buffer
+    text_cfg = config.get_text_config(decoder=True)
+    hidden_size = text_cfg.hidden_size
+    num_layers = text_cfg.num_hidden_layers
+    act_buffer = create_activation_buffers(pool, batch_size, seq_len, hidden_size, num_layers, chunk_size=chunk_size)
+
+    # 5. Create host-visible staging buffer
+    staging_buffer, staging_host_ptr = pool.alloc_host_visible(2 * 1024 * 1024 * 1024, "staging")  # 2GB
+
+    print(f"\n=== Chonk Buffer Training Setup Complete ===")
+    stats = pool.stats()
+    print(f"Pool stats: {stats}")
+    print(f"Total used: {stats['totalUsed'] / 1e9:.2f} GB")
+
+    return {
+        "pool": pool,
+        "kv_cache": kv_cache,
+        "model_buffer": model_buffer,
+        "optimizer_states": optimizer_states,
+        "opt_buffer": opt_buffer,
+        "act_buffer": act_buffer,
+        "staging_buffer": staging_buffer,
+        "staging_host_ptr": staging_host_ptr,
+    }
