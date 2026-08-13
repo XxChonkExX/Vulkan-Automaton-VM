@@ -146,6 +146,39 @@ class ChonkAdamW(torch.optim.Optimizer):
         return loss
 
 
+class EMAModel:
+    """Exponential Moving Average of model weights for better final quality."""
+    
+    def __init__(self, model, decay=0.9999):
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        self.model = model
+        self.register()
+    
+    def register(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+    
+    def update(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name].mul_(self.decay).add_(param.data, alpha=1 - self.decay)
+    
+    def apply_shadow(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data
+                param.data = self.shadow[name]
+    
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                param.data = self.backup[name]
+        self.backup = {}
+
+
 def patch_sdpa_for_chonk():
     """Patch scaled dot product attention to work with Chonk Cache."""
     from torch.nn.functional import scaled_dot_product_attention as orig_sdpa
@@ -277,6 +310,10 @@ def main():
         weight_decay=WEIGHT_DECAY,
     )
 
+    # EXP 7: EMA for better final quality
+    ema = EMAModel(model, decay=0.9999)
+    print("  EMA model initialized (decay=0.9999)")
+
     # 8. Create activation buffers
     print("\n[8/6] Creating activation buffers...")
     hidden_size = config.hidden_size
@@ -339,6 +376,8 @@ def main():
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
+                # EXP 7: Update EMA
+                ema.update()
 
             # Log (count optimizer steps, not chunks)
             if step % LOG_INTERVAL == 0:
@@ -359,10 +398,12 @@ def main():
             print(f"Checkpoint saved to {save_path}")
 
     # Final save
+    # Apply EMA weights for final model
+    ema.apply_shadow()
     save_path = f"/home/chonke/local_training/qwen_fine_tuned/chonk_final"
     os.makedirs(save_path, exist_ok=True)
     model.save_pretrained(save_path)
-    print(f"\nFinal model saved to {save_path}")
+    print(f"\nFinal model saved to {save_path} (EMA weights applied)")
 
     # Cleanup
     pool.shutdown()
