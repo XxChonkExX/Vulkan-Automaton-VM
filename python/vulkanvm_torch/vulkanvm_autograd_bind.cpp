@@ -119,8 +119,9 @@ VulkanLoraLinearFn_apply(torch::Tensor input,
 
 static torch::Tensor
 VulkanCrossEntropyFn_apply(torch::Tensor logits,
-                           torch::Tensor target) {
-  return autograd::VulkanCrossEntropyFn::apply(logits, target);
+                           torch::Tensor target,
+                           int64_t ignore_index) {
+  return autograd::VulkanCrossEntropyFn::apply(logits, target, ignore_index);
 }
 
 static torch::Tensor
@@ -246,8 +247,8 @@ void register_vulkanvm_autograd_bindings(py::module_& m) {
         py::arg("lora_a"), py::arg("lora_b"), py::arg("scale"),
         "VulkanVM custom-autograd LoRA-augmented Linear");
   m.def("vulkan_cross_entropy", &VulkanCrossEntropyFn_apply,
-        py::arg("logits"), py::arg("target"),
-        "VulkanVM custom-autograd cross-entropy loss");
+        py::arg("logits"), py::arg("target"), py::arg("ignore_index") = -100,
+        "VulkanVM custom-autograd cross-entropy loss (supports ignore_index)");
   m.def("vulkan_conv2d",      [](torch::Tensor input, torch::Tensor weight,
                                  torch::Tensor bias,
                                  std::vector<int64_t> stride,

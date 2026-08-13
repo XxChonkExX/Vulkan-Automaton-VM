@@ -110,8 +110,12 @@ class LoRARegistry {
 
   void init_weights(LoRAAdapter& a) {
     // A ~ N(0, 1/r)  ; B = 0  (standard LoRA init)
-    auto opts = torch::kFloat32;
-    if (torch::cuda::is_available()) opts = torch::kFloat32;
+    // Place adapters on the same device as the rest of training: CUDA/HIP if
+    // available, CPU otherwise. (The old code assigned kFloat32 in both
+    // branches, so adapters were silently stuck on CPU and matmul'ing against
+    // GPU inputs would throw.)
+    torch::TensorOptions opts = torch::kFloat32;
+    if (torch::cuda::is_available()) opts = opts.device(torch::kCUDA);
     a.a = torch::randn({a.rank, a.in_features}, opts) /
           std::sqrt(static_cast<double>(a.rank > 0 ? a.rank : 1));
     a.b = torch::zeros({a.out_features, a.rank}, opts);
@@ -122,6 +126,10 @@ class LoRARegistry {
     a.step = 0;
     a.merged = false;
     a.initialized = true;
+    // A and B are the trainable parameters; the caller may still .to() them
+    // elsewhere, but requires_grad must be set for .grad() to be populated.
+    a.a.requires_grad_(true);
+    a.b.requires_grad_(true);
   }
 
   mutable std::mutex mu_;
@@ -137,6 +145,7 @@ inline void merge_into_base(LoRAAdapter& a, torch::Tensor base_weight) {
   TORCH_CHECK(base_weight.sizes() ==
                   torch::IntArrayRef({a.out_features, a.in_features}),
               "base weight shape mismatch for LoRA merge");
+  torch::NoGradGuard no_grad;
   auto delta = a.b.mm(a.a) * a.scale;
   base_weight.add_(delta);
   a.base_weight = base_weight.clone();
@@ -145,6 +154,7 @@ inline void merge_into_base(LoRAAdapter& a, torch::Tensor base_weight) {
 
 inline void unmerge_from_base(LoRAAdapter& a) {
   if (!a.merged || !a.base_weight.defined()) return;
+  torch::NoGradGuard no_grad;
   auto delta = a.b.mm(a.a) * a.scale;
   a.base_weight.sub_(delta);    // restore
   a.merged = false;
@@ -152,21 +162,25 @@ inline void unmerge_from_base(LoRAAdapter& a) {
 
 // ---------------------------------------------------------------------------
 // Apply one AdamW step to A, B using their stored grads (.grad tensors)
+// Uses TRUE decoupled AdamW: weight decay is applied to the parameter
+// directly, not folded into the gradient (L2-style). All updates happen on
+// .data() under NoGradGuard so in-place ops on the leaf are legal.
 // ---------------------------------------------------------------------------
 
 inline void adamw_step(LoRAAdapter& a,
                        double lr,
                        double betas0, double betas1,
                        double eps, double weight_decay) {
+  torch::NoGradGuard no_grad;
   auto step_update = [&](torch::Tensor p, torch::Tensor m, torch::Tensor v) {
-    if (!p.grad().defined()) return;
+    if (!p.requires_grad() || !p.grad().defined()) return;
     auto g = p.grad();
-    if (weight_decay != 0.0) g = g + p * weight_decay;
     m.mul_(betas0).add_(g, 1.0 - betas0);
     v.mul_(betas1).addcmul_(g, g, 1.0 - betas1);
     auto m_hat = m / (1.0 - std::pow(betas0, a.step + 1));
     auto v_hat = v / (1.0 - std::pow(betas1, a.step + 1));
-    p.addcmul_(m_hat, v_hat.sqrt().add_(eps), -lr);
+    p.data().addcmul_(m_hat, v_hat.sqrt().add_(eps), -lr);
+    if (weight_decay != 0.0) p.data().mul_(1.0 - lr * weight_decay);
   };
   step_update(a.a, a.a_m, a.a_v);
   step_update(a.b, a.b_m, a.b_v);
@@ -174,8 +188,9 @@ inline void adamw_step(LoRAAdapter& a,
 }
 
 inline void zero_grad(LoRAAdapter& a) {
-  if (a.a.grad().defined()) a.a.grad().zero_();
-  if (a.b.grad().defined()) a.b.grad().zero_();
+  torch::NoGradGuard no_grad;
+  if (a.a.requires_grad() && a.a.grad().defined()) a.a.grad().zero_();
+  if (a.b.requires_grad() && a.b.grad().defined()) a.b.grad().zero_();
 }
 
 inline std::unordered_map<std::string, torch::Tensor>

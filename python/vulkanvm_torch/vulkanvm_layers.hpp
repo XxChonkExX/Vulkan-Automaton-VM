@@ -116,32 +116,33 @@ class AdamWRegistry {
 
   void step(const std::vector<std::string>& keys, double lr,
             double beta0, double beta1, double eps, double weight_decay) {
+    torch::NoGradGuard no_grad;
     std::lock_guard<std::mutex> lock(mu_);
     for (const auto& k : keys) {
       auto it = state_.find(k);
       if (it == state_.end()) continue;
       auto& [p, s] = it->second;
-      if (!p.grad().defined()) continue;
+      if (!p.requires_grad() || !p.grad().defined()) continue;
       auto g = p.grad();
-      if (weight_decay != 0.0) g = g + p * weight_decay;
       s.m.mul_(beta0).add_(g, 1.0 - beta0);
       s.v.mul_(beta1).addcmul_(g, g, 1.0 - beta1);
       auto m_hat = s.m / (1.0 - std::pow(beta0, s.step + 1));
       auto v_hat = s.v / (1.0 - std::pow(beta1, s.step + 1));
-      // Use NoGradGuard and .data to avoid in-place on leaf tensor
-      torch::NoGradGuard no_grad;
+      // Decoupled AdamW on .data() under NoGradGuard (see lora.hpp).
       p.data().addcmul_(m_hat, v_hat.sqrt().add_(eps), -lr);
+      if (weight_decay != 0.0) p.data().mul_(1.0 - lr * weight_decay);
       ++s.step;
     }
   }
 
   void zero_grad(const std::vector<std::string>& keys) {
+    torch::NoGradGuard no_grad;
     std::lock_guard<std::mutex> lock(mu_);
     for (const auto& k : keys) {
       auto it = state_.find(k);
       if (it == state_.end()) continue;
       auto& [p, s] = it->second;
-      if (p.grad().defined()) p.grad().zero_();
+      if (p.requires_grad() && p.grad().defined()) p.grad().zero_();
     }
   }
 

@@ -162,7 +162,8 @@ class VulkanLayerNormFn : public Function<VulkanLayerNormFn> {
     constexpr double kEps = 1e-5;
     auto rstd = torch::rsqrt(var + kEps);
     auto normed = centered * rstd;
-    auto out = normed * weight + (bias.defined() ? bias : torch::Tensor());
+    auto out = normed * weight;
+    if (bias.defined()) out = out + bias;
     ctx->saved_data["rstd"] = rstd;
     ctx->saved_data["mean"] = mean;
     ctx->saved_data["has_bias"] = bias.defined();
@@ -338,14 +339,20 @@ class VulkanCrossEntropyFn : public Function<VulkanCrossEntropyFn> {
  public:
   static torch::Tensor forward(AutogradContext* ctx,
                                torch::Tensor logits,
-                               torch::Tensor target) {
+                               torch::Tensor target,
+                               int64_t ignore_index) {
     ctx->save_for_backward({logits, target});
+    ctx->saved_data["ignore_index"] = ignore_index;
     auto m = std::get<0>(logits.max(-1, /*keepdim=*/true));
     auto shifted = logits - m;
     auto logsumexp = torch::logsumexp(shifted, -1);
     auto picked = shifted.gather(-1, target.unsqueeze(-1)).squeeze(-1);
-    auto loss = (logsumexp - picked).mean();
-    ctx->saved_data["loss"] = loss;
+    // Mask ignored tokens (e.g. padding, ignore_index=-100) out of the mean.
+    auto valid = (target != ignore_index).to(logits.scalar_type());
+    auto per_token = (logsumexp - picked) * valid;
+    auto denom = valid.sum().clamp_min(1.0);
+    auto loss = per_token.sum() / denom;
+    ctx->saved_data["valid"] = valid;
     return loss;
   }
 
@@ -354,16 +361,22 @@ class VulkanCrossEntropyFn : public Function<VulkanCrossEntropyFn> {
     auto logits = saved[0];
     auto target = saved[1];
     auto dy = grad_outputs[0];
+    auto valid = ctx->saved_data["valid"].toTensor();
+    auto denom = valid.sum().clamp_min(1.0);
     auto m = std::get<0>(logits.max(-1, /*keepdim=*/true));
     auto shifted = logits - m;
     auto e = torch::exp(shifted);
     auto p = e / e.sum(-1, /*keepdim=*/true);
+    // grad = (p - onehot(target)) * valid / denom, avoiding a full
+    // ones_like(p) intermediate (V=152k for Qwen -> 2.5 GB temp otherwise).
+    // Clamp ignored indices (e.g. -100) to a valid slot; the valid mask zeroes
+    // those rows out afterwards so the value there is irrelevant.
+    auto idx = target.clamp(0, logits.size(-1) - 1).unsqueeze(-1);
     auto grad_logits = p;
-    grad_logits.scatter_add_(-1, target.unsqueeze(-1),
-                             torch::ones_like(p) * -1.0);
-    auto N = logits.size(0);
-    grad_logits = grad_logits * (dy / static_cast<double>(N));
-    return {grad_logits, torch::Tensor()};
+    grad_logits.scatter_add_(-1, idx, torch::ones_like(p, torch::kFloat32) * -1.0);
+    grad_logits = grad_logits * valid.unsqueeze(-1);
+    grad_logits = grad_logits * (dy / denom);
+    return {grad_logits, torch::Tensor(), torch::Tensor()};
   }
 };
 
