@@ -27,6 +27,7 @@
 #include <mutex>
 #include <functional>
 #include <cassert>
+#include <unordered_set>
 
 #include "vulkan_vm/buddy_allocator.hpp"
 #include "vulkan_vm/utils.hpp"
@@ -303,6 +304,14 @@ public:
         VkDeviceSize size, VkBufferUsageFlags usage,
         VkMemoryPropertyFlags flags = 0);
     
+    // Allocate a dedicated VkDeviceMemory for a single NON-exportable buffer.
+    // Used as the oversized-allocation fallback in allocate(): requests larger
+    // than config_.blockSize cannot be served by the buddy blocks, so they get
+    // their own VkDeviceMemory instead of failing.
+    std::optional<Allocation> allocateDedicated(
+        VkDeviceSize size, VkBufferUsageFlags usage,
+        VkMemoryPropertyFlags flags = 0);
+    
     std::optional<Allocation> allocateTensor(VkDeviceSize size,
                                              VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     
@@ -361,10 +370,24 @@ private:
     // Verify required Vulkan features/extensions were enabled at device creation.
     bool validateDeviceCapabilities() const;
     
-    // Generation tracking for handle validation
-    uint64_t nextGeneration() { return ++generationCounter_; }
+    // Generation tracking for handle validation.
+    //
+    // Generations are monotonic, but validity is tracked via a LIVE SET, not
+    // by comparing against the current counter. Comparing against the counter
+    // only ever matches the most-recently-created allocation, so freeing an
+    // older allocation (out of order) was wrongly rejected and leaked memory.
+    uint64_t nextGeneration() {
+        uint64_t g = ++generationCounter_;
+        liveGenerations_.insert(g);
+        return g;
+    }
     uint64_t getCurrentGeneration() const { return generationCounter_; }
-    bool isValidGeneration(uint64_t generation) const { return generation == generationCounter_; }
+    bool isValidGeneration(uint64_t generation) const {
+        return liveGenerations_.count(generation) != 0;
+    }
+    void retireGeneration(uint64_t generation) {
+        liveGenerations_.erase(generation);
+    }
     
     std::optional<uint32_t> findMemoryType(VkMemoryPropertyFlags required,
                                            VkMemoryPropertyFlags preferred);
@@ -407,6 +430,9 @@ private:
     
     // Generation counter for handle validation (prevents stale handle use)
     uint64_t generationCounter_ = 0;
+    // Live (not-yet-freed) generations. An allocation's generation is valid
+    // iff it is present here; deallocate() retires it.
+    std::unordered_set<uint64_t> liveGenerations_;
 };
 
 // ============================================================================

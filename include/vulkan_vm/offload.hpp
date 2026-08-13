@@ -17,7 +17,9 @@ namespace vvm {
 // ============================================================================
 
 struct OffloadConfig {
-    VkDeviceSize hostShadowSize = 4 * 1024 * 1024 * 1024;  // 4GB host shadow
+    // 4 GiB host shadow. NOTE: `4 * 1024 * 1024 * 1024` is int arithmetic
+    // (32-bit) and overflows to 0; the literal must be size_t / 1ULL.
+    VkDeviceSize hostShadowSize = 4ull * 1024 * 1024 * 1024;  // 4GB host shadow
     [[deprecated("unsafe on vkMapMemory memory; use only on user-allocated mmap regions")]]
     bool useMadvise = false;
     [[deprecated("unsafe on vkMapMemory memory; use only on user-allocated mmap regions")]]
