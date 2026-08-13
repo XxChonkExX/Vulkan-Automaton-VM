@@ -637,7 +637,6 @@ static VkExternalMemoryHandleTypeFlags getExportHandleTypes(VkPhysicalDevice phy
         
         VkBuffer buffer;
         VkResult result = vkCreateBuffer(device_, &bufferInfo, nullptr, &buffer);
-        VVM_LOG_INFO("allocateDedicatedExportable: vkCreateBuffer result={}", result);
         if (result != VK_SUCCESS) {
             VVM_LOG_ERROR("vkCreateBuffer failed for dedicated exportable: {}", vkResultToString(result).c_str());
             return std::nullopt;
@@ -789,6 +788,149 @@ VVM_LOG_INFO("allocateDedicatedExportable: bind succeeded");
     return alloc;
 }
 
+std::optional<Allocation> UnifiedMemoryPool::allocateDedicated(
+    VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags flags) {
+    // NOTE: caller (allocate) holds mutex_ -- do NOT lock here or we deadlock.
+
+    size = alignUp(size, config_.minAlignment);
+
+    // Step 1: Create the buffer (no external handle types -- plain dedicated).
+    VkBufferCreateInfo bufferInfo{};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = size;
+    bufferInfo.usage = usage;
+    if (config_.enableDeviceAddress) {
+        bufferInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    }
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VkBuffer buffer;
+    VkResult result = vkCreateBuffer(device_, &bufferInfo, nullptr, &buffer);
+    if (result != VK_SUCCESS) {
+        VVM_LOG_ERROR("allocateDedicated: vkCreateBuffer failed: {}", vkResultToString(result).c_str());
+        return std::nullopt;
+    }
+
+    // Step 2: Get memory requirements
+    VkMemoryRequirements memReq;
+    vkGetBufferMemoryRequirements(device_, buffer, &memReq);
+
+    // Budget check: fail soft instead of stealing VRAM past the configured cap.
+    if (wouldExceedBudget(memReq.size)) {
+        VVM_LOG_ERROR("allocateDedicated: would exceed budget");
+        vkDestroyBuffer(device_, buffer, nullptr);
+        return std::nullopt;
+    }
+
+    // Step 3: Pick memory type honoring the caller's host-visible preference.
+    uint32_t memType = deviceLocalMemoryType_;
+    if (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+        memType = (hostVisibleMemoryType_ != UINT32_MAX) ? hostVisibleMemoryType_ : deviceLocalMemoryType_;
+    }
+    if ((memType >= 32) || ((memReq.memoryTypeBits & (1u << memType)) == 0)) {
+        VkMemoryPropertyFlags requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        if (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+            requiredFlags |= VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        }
+        const auto& mp = getDeviceMemoryInfo().memProps;
+        for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+            if ((memReq.memoryTypeBits & (1u << i)) &&
+                (mp.memoryTypes[i].propertyFlags & requiredFlags) == requiredFlags) {
+                memType = i;
+                break;
+            }
+        }
+    }
+
+    VkMemoryDedicatedAllocateInfo dedicatedInfo{};
+    dedicatedInfo.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+    dedicatedInfo.buffer = buffer;
+    dedicatedInfo.image = VK_NULL_HANDLE;
+
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memReq.size;
+    allocInfo.memoryTypeIndex = memType;
+    // Both pNext structs MUST outlive the vkAllocateMemory call below. Declaring
+    // VkMemoryAllocateFlagsInfo inside a nested block made allocInfo.pNext dangle
+    // once the block ended, which crashed RADV on gfx1151. Chain order: dedicated
+    // info first, then the device-address flags (spec VUID-VkMemoryAllocateInfo-pNext-00638).
+    VkMemoryAllocateFlagsInfo flagsInfo{};
+    flagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+    flagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    if (config_.enableDeviceAddress) {
+        dedicatedInfo.pNext = &flagsInfo;
+        allocInfo.pNext = &dedicatedInfo;
+    } else {
+        allocInfo.pNext = &dedicatedInfo;
+    }
+
+    VkDeviceMemory memory;
+    result = vkAllocateMemory(device_, &allocInfo, nullptr, &memory);
+    if (result != VK_SUCCESS) {
+        VVM_LOG_ERROR("allocateDedicated: vkAllocateMemory failed: {}", vkResultToString(result).c_str());
+        vkDestroyBuffer(device_, buffer, nullptr);
+        return std::nullopt;
+    }
+
+    // Step 4: Bind buffer to memory
+    VkBindBufferMemoryInfo bindInfo{};
+    bindInfo.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO;
+    bindInfo.buffer = buffer;
+    bindInfo.memory = memory;
+    bindInfo.memoryOffset = 0;
+
+    result = vkBindBufferMemory2(device_, 1, &bindInfo);
+    if (result != VK_SUCCESS) {
+        VVM_LOG_ERROR("allocateDedicated: vkBindBufferMemory2 failed: {}", vkResultToString(result).c_str());
+        vkFreeMemory(device_, memory, nullptr);
+        vkDestroyBuffer(device_, buffer, nullptr);
+        return std::nullopt;
+    }
+
+    // Step 5: Map if host-visible
+    VkMemoryPropertyFlags memFlags;
+    getMemoryTypeProperties(memType, memFlags, getDeviceMemoryInfo().memProps);
+    bool isHostVisible = (memFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+    bool isCoherent = (memFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+    void* hostPtr = nullptr;
+    if (isHostVisible) {
+        result = vkMapMemory(device_, memory, 0, VK_WHOLE_SIZE, 0, &hostPtr);
+        if (result != VK_SUCCESS) {
+            VVM_LOG_ERROR("allocateDedicated: vkMapMemory failed: {}", vkResultToString(result).c_str());
+            hostPtr = nullptr;
+        }
+    }
+
+    // Step 6: Get device address
+    VkDeviceAddress deviceAddress = 0;
+    if (config_.enableDeviceAddress) {
+        VkBufferDeviceAddressInfo addrInfo{};
+        addrInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+        addrInfo.buffer = buffer;
+        deviceAddress = vkGetBufferDeviceAddress(device_, &addrInfo);
+    }
+
+    // Step 7: Create Allocation (blockIndex = UINT32_MAX indicates dedicated)
+    Allocation alloc;
+    alloc.buffer = buffer;
+    alloc.memory = memory;
+    alloc.offset = 0;
+    alloc.size = size;
+    alloc.blockIndex = UINT32_MAX;  // Special marker for dedicated allocation
+    alloc.isHostVisible = isHostVisible;
+    alloc.isMapped = isHostVisible;
+    alloc.isCoherent = isCoherent;
+    alloc.isExternal = false;
+    alloc.memoryFlags = memFlags;
+    alloc.hostPtr = hostPtr;
+    alloc.deviceAddress = deviceAddress;
+    alloc.generation = nextGeneration();
+
+    dedicatedAllocations_.push_back(alloc);
+    return alloc;
+}
+
 std::optional<Allocation> UnifiedMemoryPool::allocate(VkDeviceSize size,
                                                         VkBufferUsageFlags usage,
                                                         VkMemoryPropertyFlags flags) {
@@ -813,12 +955,23 @@ std::optional<Allocation> UnifiedMemoryPool::allocate(VkDeviceSize size,
     
     // Need new block
     if (blocks_.size() >= config_.maxBlocks) {
+        // Oversized allocation: can't create another pool block. Fall back to
+        // a dedicated VkDeviceMemory if the request still fits the budget.
+        if (size > config_.blockSize) {
+            return allocateDedicated(size, usage, flags);
+        }
         return std::nullopt;
     }
-    
+
     // Budget check: fail soft instead of stealing VRAM past the configured cap.
     if (wouldExceedBudget(config_.blockSize)) {
         return std::nullopt;
+    }
+    
+    // Request larger than any single block: allocate dedicated memory instead
+    // of growing the pool by a block that still couldn't hold the request.
+    if (size > config_.blockSize) {
+        return allocateDedicated(size, usage, flags);
     }
     
     uint32_t memType = (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) 
@@ -863,7 +1016,9 @@ void UnifiedMemoryPool::deallocate(Allocation&& alloc) {
         return;
     }
     
-    // Invalidate the generation to prevent double-free
+    // Retire the generation BEFORE freeing. subDeallocate must not re-validate:
+    // the generation has already been checked here exactly once.
+    retireGeneration(alloc.generation);
     alloc.generation = 0;
     
     if (alloc.blockIndex == UINT32_MAX) {
@@ -1274,6 +1429,14 @@ PoolStats UnifiedMemoryPool::getStats() const {
             stats.allocationCount += static_cast<uint32_t>(block.buddy->getAllocationCount());
         }
     }
+    // Dedicated allocations each own their full VkDeviceMemory. Count them so
+    // getStats() reflects all live memory, not just sub-allocated blocks.
+    // (No free space inside a dedicated allocation -- it is fully committed.)
+    for (const auto& alloc : dedicatedAllocations_) {
+        stats.totalAllocated += alloc.size;
+        stats.totalUsed += alloc.size;
+        stats.allocationCount++;
+    }
     
     if (stats.totalAllocated > 0) {
         stats.fragmentationRatio = 1.0f - 
@@ -1445,14 +1608,6 @@ void UnifiedMemoryPool::subDeallocate(Allocation&& alloc) {
     // Dedicated allocations (blockIndex == UINT32_MAX) have their own VkDeviceMemory
     // and VkBuffer - destroy both directly and remove from tracking
     if (alloc.blockIndex == UINT32_MAX) {
-        // Validate generation counter
-        if (!isValidGeneration(alloc.generation)) {
-            VVM_LOG_WARN("subDeallocate: stale dedicated allocation handle (generation {}) rejected", alloc.generation);
-            return;
-        }
-        // Invalidate generation
-        alloc.generation = 0;
-        
         if (alloc.buffer) vkDestroyBuffer(device_, alloc.buffer, nullptr);
         if (alloc.memory) {
             if (alloc.hostPtr) vkUnmapMemory(device_, alloc.memory);
@@ -1469,14 +1624,6 @@ void UnifiedMemoryPool::subDeallocate(Allocation&& alloc) {
     }
 
     if (alloc.blockIndex >= blocks_.size()) return;
-
-    // Validate generation counter
-    if (!isValidGeneration(alloc.generation)) {
-        VVM_LOG_WARN("subDeallocate: stale block allocation handle (generation {}) rejected", alloc.generation);
-        return;
-    }
-    // Invalidate generation
-    alloc.generation = 0;
 
     vkDestroyBuffer(device_, alloc.buffer, nullptr);
 

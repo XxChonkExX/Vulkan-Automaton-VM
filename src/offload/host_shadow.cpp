@@ -49,6 +49,14 @@ HostShadowManager::~HostShadowManager() {
 
 bool HostShadowManager::createShadowBuffer() {
     VVM_LOG_INFO("createShadowBuffer: allocating buffer of size {}", config_.hostShadowSize);
+    // A zero-sized shadow is a valid "disabled" state (APU/forAPU sets
+    // hostShadowMultiplier=0). Creating and binding a 0-size buffer hangs
+    // the Vulkan driver (observed on gfx1151 / RADV) and serves no purpose.
+    if (config_.hostShadowSize == 0) {
+        VVM_LOG_INFO("hostShadowSize=0, shadow buffer disabled");
+        shadowBuffer_.size = 0;
+        return true;
+    }
     VkBufferCreateInfo bufferInfo{};
     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bufferInfo.size = config_.hostShadowSize;
