@@ -6,6 +6,13 @@
 #include <unistd.h>
 #endif
 
+// Export macros for shared library (also defined in core.hpp)
+#if defined(VVM_BUILD_SHARED) && defined(VVM_EXPORT)
+#define VVM_API __attribute__((visibility("default")))
+#else
+#define VVM_API
+#endif
+
 #include <vector>
 #include <string>
 #include <optional>
@@ -34,10 +41,10 @@ struct QueueFamilies {
     std::optional<uint32_t> present;
 };
 
-QueueFamilies findQueueFamilies(VkPhysicalDevice physicalDevice, VkSurfaceKHR surface = VK_NULL_HANDLE);
+VVM_API QueueFamilies findQueueFamilies(VkPhysicalDevice physicalDevice, VkSurfaceKHR surface = VK_NULL_HANDLE);
 
 // Memory type finding
-std::optional<uint32_t> findMemoryTypeIndex(const VkPhysicalDeviceMemoryProperties& memProps,
+VVM_API std::optional<uint32_t> findMemoryTypeIndex(const VkPhysicalDeviceMemoryProperties& memProps,
                                              VkMemoryPropertyFlags required,
                                              VkMemoryPropertyFlags preferred = 0);
 
@@ -45,12 +52,12 @@ std::optional<uint32_t> findMemoryTypeIndex(const VkPhysicalDeviceMemoryProperti
 // Given the source device's memory type index and required flags, this queries
 // the destination device's memory properties to find a compatible type.
 // This is required because memoryTypeIndex is NOT portable across devices.
-std::optional<uint32_t> findImportMemoryTypeIndex(VkPhysicalDevice dstPhysicalDevice,
+VVM_API std::optional<uint32_t> findImportMemoryTypeIndex(VkPhysicalDevice dstPhysicalDevice,
                                                    uint32_t srcMemoryTypeIndex,
                                                    VkMemoryPropertyFlags requiredFlags,
                                                    VkExternalMemoryHandleTypeFlagBits handleType);
 
-void getMemoryTypeProperties(uint32_t memoryTypeIndex, 
+VVM_API void getMemoryTypeProperties(uint32_t memoryTypeIndex, 
                              VkMemoryPropertyFlags& flags,
                              const VkPhysicalDeviceMemoryProperties& memProps);
 
@@ -66,21 +73,21 @@ struct DeviceScore {
     uint32_t deviceID = 0;
 };
 
-std::vector<DeviceScore> enumerateDevices(VkInstance instance);
-std::optional<DeviceScore> selectBestDevice(const std::vector<DeviceScore>& devices,
+VVM_API std::vector<DeviceScore> enumerateDevices(VkInstance instance);
+VVM_API std::optional<DeviceScore> selectBestDevice(const std::vector<DeviceScore>& devices,
                                              bool preferDiscrete = true,
                                              uint32_t minHeapSizeMB = 0);
 
 // Format helpers
-VkFormat findSupportedFormat(VkPhysicalDevice physicalDevice,
+VVM_API VkFormat findSupportedFormat(VkPhysicalDevice physicalDevice,
                               const std::vector<VkFormat>& candidates,
                               VkImageTiling tiling,
                               VkFormatFeatureFlags features);
 
 // Extension checking
-bool checkDeviceExtensionSupport(VkPhysicalDevice device, 
+VVM_API bool checkDeviceExtensionSupport(VkPhysicalDevice device, 
                                   const std::vector<const char*>& required);
-bool checkInstanceExtensionSupport(const std::vector<const char*>& required);
+VVM_API bool checkInstanceExtensionSupport(const std::vector<const char*>& required);
 
 // Memory type selection with budget awareness
 struct MemoryTypeSelector;
@@ -122,15 +129,15 @@ inline VkDeviceSize getHeapUsage(const VkPhysicalDeviceMemoryBudgetPropertiesEXT
 }
 
 // Debug helpers
-void printMemoryTypes(const VkPhysicalDeviceMemoryProperties& props);
-void printQueueFamilies(VkPhysicalDevice physicalDevice);
-void printDeviceProperties(VkPhysicalDevice physicalDevice);
+VVM_API void printMemoryTypes(const VkPhysicalDeviceMemoryProperties& props);
+VVM_API void printQueueFamilies(VkPhysicalDevice physicalDevice);
+VVM_API void printDeviceProperties(VkPhysicalDevice physicalDevice);
 
 // Debug utils
-std::string vkResultToString(VkResult result);
-std::string vkErrorToString(VkResult result);
+inline std::string vkResultToString(VkResult result);
+inline std::string vkErrorToString(VkResult result);
 
-void setDebugName(VkDevice device, VkObjectType type, uint64_t handle, const char* name);
+VVM_API void setDebugName(VkDevice device, VkObjectType type, uint64_t handle, const char* name);
 
 // ============================================================================
 // Synchronization Helpers
@@ -192,8 +199,8 @@ private:
     std::mutex mutex_;
 };
 
-VkCommandBuffer beginSingleTimeCommands(VkDevice device, VkCommandPool pool);
-void endSingleTimeCommands(VkDevice device, VkCommandPool pool, VkCommandBuffer cmdBuffer, VkQueue queue);
+VVM_API VkCommandBuffer beginSingleTimeCommands(VkDevice device, VkCommandPool pool);
+VVM_API void endSingleTimeCommands(VkDevice device, VkCommandPool pool, VkCommandBuffer cmdBuffer, VkQueue queue);
 
 // ============================================================================
 // Profiling / Timing
@@ -652,7 +659,7 @@ inline bool getBytes(const uint8_t*& p, const uint8_t* end, std::vector<uint8_t>
 
 }  // namespace detail
 
-class Logger {
+class VVM_API Logger {
 public:
     static Logger& instance();
     
@@ -693,7 +700,35 @@ private:
 // ============================================================================
 
 // Convert VkResult to human-readable string
-inline std::string vkResultToString(VkResult result);
+inline std::string vkResultToString(VkResult result) {
+    switch (result) {
+        case VK_SUCCESS: return "VK_SUCCESS";
+        case VK_NOT_READY: return "VK_NOT_READY";
+        case VK_TIMEOUT: return "VK_TIMEOUT";
+        case VK_EVENT_SET: return "VK_EVENT_SET";
+        case VK_EVENT_RESET: return "VK_EVENT_RESET";
+        case VK_INCOMPLETE: return "VK_INCOMPLETE";
+        case VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY";
+        case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+        case VK_ERROR_INITIALIZATION_FAILED: return "VK_ERROR_INITIALIZATION_FAILED";
+        case VK_ERROR_DEVICE_LOST: return "VK_ERROR_DEVICE_LOST";
+        case VK_ERROR_MEMORY_MAP_FAILED: return "VK_ERROR_MEMORY_MAP_FAILED";
+        case VK_ERROR_LAYER_NOT_PRESENT: return "VK_ERROR_LAYER_NOT_PRESENT";
+        case VK_ERROR_EXTENSION_NOT_PRESENT: return "VK_ERROR_EXTENSION_NOT_PRESENT";
+        case VK_ERROR_FEATURE_NOT_PRESENT: return "VK_ERROR_FEATURE_NOT_PRESENT";
+        case VK_ERROR_INCOMPATIBLE_DRIVER: return "VK_ERROR_INCOMPATIBLE_DRIVER";
+        case VK_ERROR_TOO_MANY_OBJECTS: return "VK_ERROR_TOO_MANY_OBJECTS";
+        case VK_ERROR_FORMAT_NOT_SUPPORTED: return "VK_ERROR_FORMAT_NOT_SUPPORTED";
+        case VK_ERROR_FRAGMENTED_POOL: return "VK_ERROR_FRAGMENTED_POOL";
+        case VK_ERROR_UNKNOWN: return "VK_ERROR_UNKNOWN";
+        case VK_ERROR_OUT_OF_POOL_MEMORY: return "VK_ERROR_OUT_OF_POOL_MEMORY";
+        case VK_ERROR_INVALID_EXTERNAL_HANDLE: return "VK_ERROR_INVALID_EXTERNAL_HANDLE";
+        case VK_ERROR_FRAGMENTATION: return "VK_ERROR_FRAGMENTATION";
+        case VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS: return "VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS";
+        case VK_PIPELINE_COMPILE_REQUIRED: return "VK_PIPELINE_COMPILE_REQUIRED";
+        default: return "UNKNOWN_VK_RESULT";
+    }
+}
 
 // Macro for checking Vulkan results in functions that can return std::optional<T>
 // Usage: VVM_VK_CHECK(vkCreateBuffer(...)); - returns std::nullopt on failure
@@ -717,6 +752,7 @@ inline std::string vkResultToString(VkResult result);
     } while (false)
 
 // Macro for checking Vulkan results in functions returning bool
+// Macro for checking Vulkan results in functions returning bool
 #define VVM_VK_CHECK_BOOL(expr) \
     do { \
         VkResult _vk_result = (expr); \
@@ -725,6 +761,37 @@ inline std::string vkResultToString(VkResult result);
             return false; \
         } \
     } while (false)
+
+// Convert VkResult to short error string
+inline std::string vkErrorToString(VkResult result) {
+    switch (result) {
+        case VK_SUCCESS: return "Success";
+        case VK_NOT_READY: return "Not Ready";
+        case VK_TIMEOUT: return "Timeout";
+        case VK_EVENT_SET: return "Event Set";
+        case VK_EVENT_RESET: return "Event Reset";
+        case VK_INCOMPLETE: return "Incomplete";
+        case VK_ERROR_OUT_OF_HOST_MEMORY: return "Out of Host Memory";
+        case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "Out of Device Memory";
+        case VK_ERROR_INITIALIZATION_FAILED: return "Initialization Failed";
+        case VK_ERROR_DEVICE_LOST: return "Device Lost";
+        case VK_ERROR_MEMORY_MAP_FAILED: return "Memory Map Failed";
+        case VK_ERROR_LAYER_NOT_PRESENT: return "Layer Not Present";
+        case VK_ERROR_EXTENSION_NOT_PRESENT: return "Extension Not Present";
+        case VK_ERROR_FEATURE_NOT_PRESENT: return "Feature Not Present";
+        case VK_ERROR_INCOMPATIBLE_DRIVER: return "Incompatible Driver";
+        case VK_ERROR_TOO_MANY_OBJECTS: return "Too Many Objects";
+        case VK_ERROR_FORMAT_NOT_SUPPORTED: return "Format Not Supported";
+        case VK_ERROR_FRAGMENTED_POOL: return "Fragmented Pool";
+        case VK_ERROR_UNKNOWN: return "Unknown Error";
+        case VK_ERROR_OUT_OF_POOL_MEMORY: return "Out of Pool Memory";
+        case VK_ERROR_INVALID_EXTERNAL_HANDLE: return "Invalid External Handle";
+        case VK_ERROR_FRAGMENTATION: return "Fragmentation";
+        case VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS: return "Invalid Opaque Capture Address";
+        case VK_PIPELINE_COMPILE_REQUIRED: return "Pipeline Compile Required";
+        default: return "Unknown";
+    }
+}
 
 #define VVM_LOG_TRACE(...)  vvm::Logger::instance().log(vvm::LogLevel::Trace, __VA_ARGS__)
 #define VVM_LOG_DEBUG(...)  vvm::Logger::instance().log(vvm::LogLevel::Debug, __VA_ARGS__)

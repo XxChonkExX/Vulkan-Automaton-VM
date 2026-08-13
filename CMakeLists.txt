@@ -156,7 +156,7 @@ if(VVM_BUILD_SHARED)
         CXX_VISIBILITY_PRESET hidden
         VISIBILITY_INLINES_HIDDEN ON
     )
-    target_compile_definitions(vulkan_vm PRIVATE VVM_EXPORT=1)
+    target_compile_definitions(vulkan_vm PUBLIC VVM_EXPORT=1 VVM_BUILD_SHARED=1)
 else()
     target_compile_definitions(vulkan_vm PRIVATE VVM_STATIC=1)
 endif()

@@ -124,7 +124,11 @@ else()
     message(STATUS "VulkanVM network: TLS support disabled (OpenSSL not found)")
 endif()
 
-add_library(vulkan_vm_network ${NETWORK_CORE_SRCS})
+if(VVM_BUILD_SHARED)
+    add_library(vulkan_vm_network SHARED ${NETWORK_CORE_SRCS})
+else()
+    add_library(vulkan_vm_network STATIC ${NETWORK_CORE_SRCS})
+endif()
 
 target_include_directories(vulkan_vm_network PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
