@@ -101,18 +101,33 @@ endif()
 
 # Include directories (target-based)
 # Library
-add_library(vulkan_vm
-    src/core/unified_memory_pool.cpp
-    src/core/sparse_memory.cpp
-    src/allocator/buddy_allocator.cpp
-    src/cross_gpu/external_memory.cpp
-    src/cross_gpu/multi_gpu_manager.cpp
-    src/offload/host_shadow.cpp
-    src/utils/vulkan_utils.cpp
-    src/utils/error_handling.cpp
-    src/placement/shard_placer.cpp
-    src/placement/placement_executor.cpp
-)
+if(VVM_BUILD_SHARED)
+    add_library(vulkan_vm SHARED
+        src/core/unified_memory_pool.cpp
+        src/core/sparse_memory.cpp
+        src/allocator/buddy_allocator.cpp
+        src/cross_gpu/external_memory.cpp
+        src/cross_gpu/multi_gpu_manager.cpp
+        src/offload/host_shadow.cpp
+        src/utils/vulkan_utils.cpp
+        src/utils/error_handling.cpp
+        src/placement/shard_placer.cpp
+        src/placement/placement_executor.cpp
+    )
+else()
+    add_library(vulkan_vm STATIC
+        src/core/unified_memory_pool.cpp
+        src/core/sparse_memory.cpp
+        src/allocator/buddy_allocator.cpp
+        src/cross_gpu/external_memory.cpp
+        src/cross_gpu/multi_gpu_manager.cpp
+        src/offload/host_shadow.cpp
+        src/utils/vulkan_utils.cpp
+        src/utils/error_handling.cpp
+        src/placement/shard_placer.cpp
+        src/placement/placement_executor.cpp
+    )
+endif()
 
 target_include_directories(vulkan_vm
     PUBLIC
