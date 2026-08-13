@@ -185,7 +185,7 @@ class ChonkFullLayer(StaticLayer):
         return self.keys[:b, :, : start + kv_length], self.values[:b, :, : start + kv_length]
 
     def get_mask_sizes(self, query_length: int) -> tuple[int, int]:
-        return int(self.cumulative_length.item()), 0
+        return int(self.cumulative_length.item()) + query_length, 0
 
     def reset(self) -> None:
         self.cumulative_length.zero_()

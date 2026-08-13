@@ -124,7 +124,7 @@ static py::dict init() {
 
     PoolConfig cfg = PoolConfig::forAPU(128ull * 1024 * 1024 * 1024);
     cfg.blockSize = 1024ull * 1024 * 1024;
-    cfg.maxBlocks = 16;
+    cfg.maxBlocks = 64;
     cfg.enableHostVisible = true;
     cfg.enableExternal = true;
     cfg.enableDeviceAddress = true;
