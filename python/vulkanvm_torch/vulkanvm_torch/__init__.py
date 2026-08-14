@@ -21,12 +21,17 @@ Example:
 import os
 import sys
 import torch
+import glob
 
 # Try to load the C++ extension
+_C = None
+_C_available = False
 try:
-    import vulkanvm_torch as _C
+    # First try direct import (if already installed)
+    import vulkanvm_torch._C as _C
+    _C_available = True
 except ImportError:
-    # Try to find the built extension
+    # Try to find the built extension - look for vulkanvm_torch*.so specifically
     build_paths = [
         os.path.join(os.path.dirname(__file__), 'build', 'lib.*'),
         os.path.join(os.path.dirname(__file__), '..', '..', '..', 'build', 'python', 'vulkanvm_torch'),
@@ -34,25 +39,52 @@ except ImportError:
     for path in build_paths:
         for p in glob.glob(path):
             if os.path.isdir(p):
-                sys.path.insert(0, p)
-                try:
-                    import vulkanvm_torch as _C
-                    break
-                except ImportError:
-                    pass
+                # Check if the specific module exists
+                so_files = glob.glob(os.path.join(p, 'vulkanvm_torch*.so'))
+                if so_files:
+                    sys.path.insert(0, p)
+                    try:
+                        import vulkanvm_torch._C as _C
+                        _C_available = True
+                        break
+                    except ImportError:
+                        pass
 
-from ._C import (
-    create_pool,
-    destroy_pool,
-    is_pool_created,
-    allocate,
-    deallocate,
-    get_device_address,
-    export_memory,
-    get_pool_stats,
-    MemoryUsage,
-    ExternalHandleType,
-)
+if _C_available:
+    from ._C import (
+        create_pool,
+        destroy_pool,
+        is_pool_created,
+        allocate,
+        deallocate,
+        get_device_address,
+        export_memory,
+        get_pool_stats,
+        MemoryUsage,
+        ExternalHandleType,
+    )
+else:
+    # Provide dummy classes/constants for type checking when C++ ext not available
+    class MemoryUsage:
+        GpuOnly = 0
+        CpuToGpu = 1
+        GpuToCpu = 2
+        CpuCopy = 3
+        Auto = 4
+    
+    class ExternalHandleType:
+        OpaqueFd = 0
+        OpaqueWin32 = 1
+        D3D12Heap = 2
+        DmaBuf = 3
+        AndroidHardwareBuffer = 4
+    
+    def _not_available(*args, **kwargs):
+        raise RuntimeError("vulkanvm_torch C++ extension not available. Build with VVM_BUILD_PYTORCH=ON")
+    
+    create_pool = destroy_pool = is_pool_created = allocate = deallocate = _not_available
+    get_device_address = export_memory = get_pool_stats = _not_available
+    get_device_address = export_memory = get_pool_stats = _not_available
 
 import torch
 from typing import Optional, List, Tuple, Union
