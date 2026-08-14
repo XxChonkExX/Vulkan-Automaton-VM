@@ -244,6 +244,31 @@
 
 ---
 
+## Test 10: Full-sequence memory wall & AOTriton SDPA attempt (2026-08-14)
+**Context**: full 131072-seq run (128 chunks @1024, allocator on) dies during the FIRST forward with
+`VK_ERROR_OUT_OF_DEVICE_MEMORY` (radv: "Failed to allocate a buffer size 2147483648 domains 4") on a 2GB block
+(MLP/LoRA `F.linear`). Pool after setup+empty_cache: 71.37GB used, 6 allocations.
+
+**Budget analysis (eager attention)**:
+- Fixed ~70GB: weights 53.8 + KV@131K 8.6 + LoRA 0.64 + optimizer 2.55 + activations 2.15 + staging 2
+- Eager autograd graph @ chunk 1024 ≈ +30GB (fp32 attn_weights 537MB × 24 layers + softmax outs + mask) → ~103-105GB total
+- Eager graph @ chunk 512 ≈ +15GB → ~88GB total (inside envelope)
+- Effective wall ≈ 105-110GB committed + display (radv reports heap_mb=41642 ≈ (gttsize 122880+2048)/3 but ignores it; 105GB allocates fine)
+
+**TTM phantom memory**: `ttm.page_pool_size` = 15,887,313 pages ≈ **60.6 GiB** freed GPU pages held in the TTM
+page pool (reclaimable, not lost). Explains the recurring "~63GB used / device memory nearly full" readings after
+crashed runs. Reboot clears it.
+
+**Attempt: AOTriton fused SDPA (`TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` + `CHONK_ATTN=sdpa`)**:
+- Rationale: fused kernels drop the fp32 attn_weights autograd graph (~12GB+); guide for this exact stack
+  (Qwen3.5-27B LoRA @ gfx1151, ROCm 7.13, PT 2.11) requires the env var for fused SDPA
+- **Result: display driver reset → Linux login screen during edge 512/8192**, same failure mode as the old
+  Test-1-era note. Confirmed again: fused AMD SDPA kernels crash when writing through dma-buf-imported Chonk memory.
+- **Verdict: abandon sdpa/AOTriton on this stack.** Eager attention only. Memory headroom must come from
+  CHUNK_SIZE instead: **full 131K run uses eager + CHUNK=512 (256 chunks, ~88GB budget)**.
+
+---
+
 ## Final Recommendations
 - **Use eager attention** — experimental AMD SDPA kernels crash the display driver (login screen) when writing through dma-buf-imported Chonk memory
 - **CHUNK_SIZE = 1024 default** — 2048 froze the machine, 4096-chunk backward caused kernel panic (hard boot); 512/1024 validated stable
