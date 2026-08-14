@@ -392,15 +392,14 @@ def main():
 
             chunks_this_seq += 1
 
-            # Heartbeat + HIP heap defrag (keeps the driver heap from
-            # fragmenting as the cache grows; system memory is shared)
+            # Heartbeat. NOTE: no torch.cuda.empty_cache() here — with the
+            # pool-backed pluggable allocator every segment block is a
+            # dedicated exportable VkDeviceMemory; releasing/re-creating
+            # blocks every few chunks churns the GTT and triggers driver
+            # memory pressure (see Test 10 in OPTIMIZATION_LOG.md).
             if chunks_this_seq % 8 == 0:
-                torch.cuda.empty_cache()
-                peak_gb = torch.cuda.max_memory_allocated() / 1e9
                 print(f"  [seq] chunk {chunks_this_seq}/{SEQ_LEN // CHUNK_SIZE} "
-                      f"({time.time() - t_seq_start:.0f}s, loss={last_loss:.4f}, "
-                      f"hip_peak={peak_gb:.1f}GB)", flush=True)
-                torch.cuda.reset_peak_memory_stats()
+                      f"({time.time() - t_seq_start:.0f}s, loss={last_loss:.4f})", flush=True)
 
             # Step optimizer after GRAD_ACCUM_STEPS chunks (or end of sequence)
             if chunks_this_seq % GRAD_ACCUM_STEPS == 0 or chunk_end == SEQ_LEN:

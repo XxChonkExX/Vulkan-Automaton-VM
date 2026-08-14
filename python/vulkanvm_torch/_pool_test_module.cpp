@@ -416,10 +416,13 @@ struct ChonkAllocator {
     std::mutex mtx;
     std::vector<std::unique_ptr<AllocBlock>> blocks;
     std::unordered_map<void*, size_t> liveSizes;
-    // Keep a few freed blocks warm; release the rest on empty_cache so
-    // torch's setup-phase cache returns to the pool (cuts GTT pressure
-    // before the first forward — the display shares the unified heap).
-    size_t warmBlocks = 8;
+    // Never release blocks back to the pool: every block is a dedicated
+    // exportable VkDeviceMemory, so releasing only sends pages to the TTM
+    // page pool and the next chunk re-creates fresh blocks (GTT churn ->
+    // driver memory pressure). Keeping every block warm means torch's
+    // empty_cache just returns chunks to the slab and the footprint stays
+    // at the first-step peak (stable at ~88GB for the 131K run).
+    size_t warmBlocks = 512;
 
     static constexpr size_t kAlign = 512;
     static constexpr size_t kMinBlock = 2ull * 1024 * 1024 * 1024;  // 2 GB
