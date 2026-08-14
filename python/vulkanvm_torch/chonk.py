@@ -82,12 +82,58 @@ class _BufferDesc(ctypes.Structure):
     ]
 
 
+def install_chonk_allocator():
+    """Replace torch's HIP caching allocator with the pool-backed allocator.
+
+    Every segment torch allocates is carved from a Chonk Buffer block
+    (Vulkan dma-buf -> hipImportExternalMemory) and freed back into the
+    pool, keeping one allocator family over the unified heap. Must be
+    called before any CUDA tensor exists.
+
+    Order matters: the pool must exist and the HIP context must be
+    initialized BEFORE torch's allocator is swapped in, otherwise the
+    first allocation re-enters HIP context init from inside the
+    allocator (deadlock/hang).
+    """
+    try:
+        pool_mod.init()
+    except RuntimeError as e:
+        if "already initialized" not in str(e):
+            raise
+    _hip_malloc = _HIP.hipMalloc
+    _hip_malloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
+    _hip_malloc.restype = ctypes.c_int
+    _hip_free = _HIP.hipFree
+    _hip_free.argtypes = [ctypes.c_void_p]
+    _hip_free.restype = ctypes.c_int
+    probe = ctypes.c_void_p()
+    if _hip_malloc(ctypes.byref(probe), 4096) != 0:
+        raise RuntimeError("hipMalloc probe failed (HIP context init)")
+    _hip_free(probe)
+
+    from torch.cuda.memory import CUDAPluggableAllocator, change_current_allocator
+
+    allocator = CUDAPluggableAllocator(
+        pool_mod.__file__,
+        "chonk_allocator_alloc",
+        "chonk_allocator_free",
+    )
+    change_current_allocator(allocator)
+
+
 class ChonkPool:
     """Wraps the pool binding + HIP dma-buf import, exposing a base tensor
     that aliases the pool's unified memory for both GPU and host."""
 
     def __init__(self):
-        info = pool_mod.init()
+        try:
+            info = pool_mod.init()
+        except RuntimeError as e:
+            if "already initialized" not in str(e):
+                raise
+            # The pluggable allocator already created the pool on first
+            # allocation; adopt the existing one.
+            info = pool_mod.info()
         self.device_name = info["device"]
         self._ext_mems = []
         self._fds = []

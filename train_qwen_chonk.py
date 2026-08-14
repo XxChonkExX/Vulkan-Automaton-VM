@@ -41,6 +41,7 @@ from chonk import (
     create_activation_buffers,
     estimate_model_memory,
     patch_linear_cache_for_chunked_training,
+    install_chonk_allocator,
 )
 
 # ROCm/Strix Halo memory config
@@ -54,6 +55,7 @@ CHONK_AUTOCAST = os.environ.get("CHONK_AUTOCAST", "0") == "1"  # bf16 autocast i
 CHONK_PAUSE = float(os.environ.get("CHONK_PAUSE", "0.02"))     # sec pause per chunk (display breathing room)
 CHONK_SMOKE = os.environ.get("CHONK_SMOKE", "0") == "1"        # smoke test: tiny seq, 2 steps
 CHONK_ATTN = os.environ.get("CHONK_ATTN", "eager")             # eager (stable) | sdpa | flash_attention_2
+CHONK_ALLOCATOR = os.environ.get("CHONK_ALLOCATOR", "1") == "1"  # pool-backed pluggable allocator for torch/HIP
 
 # Training config
 MODEL_PATH = "/home/chonke/local_training/models/qwen36_27ablit"
@@ -289,6 +291,10 @@ def main():
     # 2/3. Everything happens inside build_lora_chonk_setup (single pool):
     #      KV cache, base weights, LoRA, optimizer states, staging
     print("\n[2/6] Building LoRA training setup in Chonk Buffer...")
+    if CHONK_ALLOCATOR:
+        print("  [+] Installing pool-backed pluggable allocator "
+              "(torch segments draw from the Chonk Buffer)")
+        install_chonk_allocator()
     setup = build_lora_chonk_setup(
         MODEL_PATH, config, BATCH_SIZE, MAX_CACHE_LEN,
         lora_r=64, lora_alpha=128, lora_dropout=0.05,
