@@ -72,9 +72,9 @@ LOG_INTERVAL = 10
 SAVE_INTERVAL = 500
 
 if CHONK_SMOKE:
-    SEQ_LEN = 2048
-    MAX_STEPS = 2
-    CHUNK_SIZE = 512
+    SEQ_LEN = int(os.environ.get("CHONK_SMOKE_SEQ", "2048"))
+    MAX_STEPS = int(os.environ.get("CHONK_SMOKE_STEPS", "2"))
+    CHUNK_SIZE = int(os.environ.get("CHONK_SMOKE_CHUNK", "512"))
 
 # Chonk Buffer config
 # Total pool size: ~80-90GB (model ~22GB + optimizer ~44GB + KV ~10GB + activations ~8GB + staging ~2GB)
