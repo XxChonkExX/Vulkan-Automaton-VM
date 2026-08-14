@@ -1,5 +1,4 @@
 import sys, time, faulthandler, json, os
-os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
 sys.path.insert(0, '/home/chonke/Vulkan-Automaton-VM/python/vulkanvm_torch')
 sys.path.insert(0, '/home/chonke/Vulkan-Automaton-VM/_build')
 faulthandler.enable()

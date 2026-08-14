@@ -17,12 +17,6 @@ import os
 import sys
 import time
 import contextlib
-
-# MUST be set before torch import: enables fused SDPA (AOTriton) on gfx1151.
-# Without it attention falls back to eager/math and the autograd graph keeps
-# fp32 attn_weights for all 24 layers (~12GB+ at 131K context).
-os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
-
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, IterableDataset
