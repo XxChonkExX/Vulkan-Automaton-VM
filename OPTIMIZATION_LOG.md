@@ -125,6 +125,7 @@
 | 3 (Flash Attn) | TBD | |
 | 4 (Autocast) | TBD | |
 | 7 (EMA) | TBD | |
+| **Pool Budget** | **Fixed** | maxHeapFraction=0.0f disables budget check for Chonk Buffer training |
 
 ---
 
@@ -143,6 +144,39 @@
 | Label Smoothing | 0.1 |
 | EMA Decay | 0.9999 |
 | Grad Clip | 1.0 |
+
+---
+
+## Phase 2: Testing & Metrics Collection (IN PROGRESS)
+
+### Test 1: ChonkPool + KV Cache Integration
+**Date**: 2026-08-13
+**Status**: �� PASSED
+**Config**: SEQ_LEN=8192, BATCH_SIZE=1, max_cache_len=8192
+**Results**:
+- ChonkPool initializes on Radeon 8060S (Strix Halo)
+- KV cache builds: 64 layers (full attention)
+- Pool used: 0.54 GB
+- Pool budget disabled (maxHeapFraction=0.0f)
+
+### Test 2: Model Load + Move to Chonk Buffer
+**Date**: 2026-08-13
+**Status**: ��� IN PROGRESS (timeout on full model)
+**Config**: Qwen 27B, bfloat16, trust_remote_code=True
+**Partial Results**:
+- Config loads: qwen3_5
+- Model loads: 53.79 GB CUDA memory
+- load_model_into_chonk() started but timed out (120s)
+- Need: longer timeout or staged move
+
+### Next Tests Planned
+1. **Test 2b**: Staged model move (layer-by-layer or shard-by-shard)
+2. **Test 3**: Full training step (forward + backward on 4K chunk)
+3. **Test 4**: Optimizer step with ChonkAdamW
+4. **Test 5**: Multi-chunk sequence processing
+5. **Test 6**: Full sequence (128K) with chunked forward
+6. **Test 7**: EMA weight application
+7. **Test 8**: Memory usage over time (leak detection)
 
 ---
 
