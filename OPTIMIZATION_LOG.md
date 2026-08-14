@@ -218,18 +218,37 @@
 - Step 0 loss 4.22 (label smoothing 0.1), EMA applied, final save OK
 - Dataset format: memmap tokens.bin+index.bin (variable-length seqs, packed into fixed blocks; fallback kept for .npy)
 
+### Test 9: Pool-backed pluggable allocator (torch/HIP draws from Chonk Buffer)
+**Date**: 2026-08-14
+**Status**: PASSED (commit b70ae90)
+**Goal**: Eliminate interleaved HIP segments + dedicated Vulkan BOs fragmenting the driver GTT manager (root cause of "free but can't allocate 48MB" OOMs and vkAllocateMemory hangs)
+**Design**:
+- `_pool_test_module.cpp` exports C-ABI `chonk_allocator_alloc/free` (old-style 2-fn `CUDAPluggableAllocator` ABI: `void* alloc(ssize_t, int, void*)`)
+- Every torch segment is carved from a pool block: `g_pool->allocate(exportable)` → dma-buf fd → `hipImportExternalMemory` (in C++, `-D__HIP_PLATFORM_AMD__` + `-lamdhip64`)
+- Slab sub-allocator: 2GB+ blocks, first-fit carve (512-align), coalescing freelist, keep `warmBlocks=2` fully-free blocks, release the rest back to the pool for KV cache reuse
+- `chonk.py: install_chonk_allocator()` — **order matters**: pool init + HIP context probe (ctypes hipMalloc) BEFORE `change_current_allocator`; lazy pool-init inside alloc() deadlocked torch's context init (re-entrant hipImport)
+- `ChonkPool()` adopts the already-created pool via `pool_mod.info()` (init throws "already initialized")
+**Bugs found & fixed**:
+1. torch calls `alloc(0)` (hipMalloc semantics) — returned an un-carved pointer colliding with the next alloc → duplicate addresses → torch double-free → "Trying to free a pointer not allocated here" abort. Fixed: min carve 512B.
+2. Exit segfault: static `py::dict g_lastInitInfo` destructor ran after interpreter teardown (pybind needs live interpreter). Fixed: heap-allocate, never free.
+3. Teardown crash: `hipDestroyExternalMemory` on blocks released after `pool.shutdown()` (HIP context gone). Fixed: skip HIP destroy when `g_pool == nullptr`.
+**Results (smoke 1024-seq/256-chunk/3 chunks)**:
+- Step 0 loss 4.4375, EMA applied, final save OK, **clean exit 0** (previous runs segfaulted at teardown)
+- Pool stats now include torch segments: totalUsed 79.96GB at step 0 (was 69.23GB pool-only + invisible HIP)
+- torch.cuda.memory / HIP peak metrics no longer meaningful — everything is pool memory now
+
 ### Next Tests Planned
-1. **Full-scale step**: MAX_CACHE_LEN=131072, SEQ_LEN=131072, CHUNK_SIZE=2048 (4096 CRASHES), 1-2 full steps — run in short bursts with pacing
-2. **Loss trend**: 10+ steps at real scale
-3. **Leak detection**: pool stats over many steps
-4. **Chunk-size retest** at 4096 only if the driver stack is updated
+1. **Edge sweep with allocator** (chunk 512→4096 × seq, one process at a time): re-map the crash envelope — the allocator changes the memory layout completely
+2. **Full-scale step**: MAX_CACHE_LEN=131072, SEQ_LEN=131072, CHUNK_SIZE=1024, 1 step — run with pacing
+3. **Leak detection**: pool stats + block count over many steps (blocks should stabilize; warmBlocks cap 2)
 
 ---
 
 ## Final Recommendations
 - **Use eager attention** — experimental AMD SDPA kernels crash the display driver (login screen) when writing through dma-buf-imported Chonk memory
-- **CHUNK_SIZE = 2048 MAX** — 4096-token backward caused userspace page faults → kernel panic (hard boot)
+- **CHUNK_SIZE = 1024 default** — 2048 froze the machine, 4096-chunk backward caused kernel panic (hard boot); 512/1024 validated stable
+- **Pool-backed pluggable allocator is now the default** (CHONK_ALLOCATOR=1): one allocator family over the unified heap; torch segments come from and return to the Chonk pool
 - **Run with pacing** (CHONK_PAUSE >= 0.02s/chunk) and keep sustained runs bounded; iGPU also drives the display
 - **LoRA r=64 in Chonk** is the validated training strategy (full-param AdamW fp32 = 215GB does not fit at 131K)
 - **Keep torch.compile + autocast OFF** until validated (env flags CHONK_COMPILE / CHONK_AUTOCAST)
-- Full-scale 131K steps: expect ~5min/step (64 chunks @2048), run step-by-step with pauses
+- Full-scale 131K steps: expect ~30-40min/step (128 chunks @1024), run step-by-step with pauses

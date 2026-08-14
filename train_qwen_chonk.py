@@ -17,6 +17,12 @@ import os
 import sys
 import time
 import contextlib
+
+# MUST be set before torch import: enables fused SDPA (AOTriton) on gfx1151.
+# Without it attention falls back to eager/math and the autograd graph keeps
+# fp32 attn_weights for all 24 layers (~12GB+ at 131K context).
+os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, IterableDataset
@@ -305,6 +311,12 @@ def main():
     model = setup["model"]
     optimizer_states = setup["optimizer_states"]
     print(f"  Device: {pool.device_name}")
+    # Release torch's setup-phase cached segments back to the pool so the
+    # first forward doesn't spike on top of them (display shares the heap).
+    torch.cuda.empty_cache()
+    s = pool.stats()
+    print(f"  Pool after setup+empty_cache: {s['totalUsed'] / 1e9:.2f} GB used, "
+          f"{s['allocationCount']} allocations")
     print(f"  KV cache built for {len([l for l in kv_cache.layers if hasattr(l, 'keys')])} full-attention layers")
     model.print_trainable_parameters()
 
