@@ -121,29 +121,35 @@
 | Experiment | Breaking Point | Root Cause |
 |------------|----------------|------------|
 | 1 (Grad Accum) | TBD | |
-| 2 (torch.compile) | TBD | |
-| 3 (Flash Attn) | TBD | |
-| 4 (Autocast) | TBD | |
-| 7 (EMA) | TBD | |
+| 2 (torch.compile) | **Not validated** | fla kernels + dynamo = risky; compile OFF by default (CHONK_COMPILE=1 to try) |
+| 3 (Flash Attn) | **CRASHED (login screen)** | Experimental AMD SDPA kernels writing through dma-buf-imported Chonk memory reset the display driver; use eager |
+| 4 (Autocast) | **Not validated** | Untested on Chonk path; OFF by default (CHONK_AUTOCAST=1 to try) |
+| 7 (EMA) | **PASSED** | EMA shadow clone + apply works (fp32 clone of bf16 LoRA params) |
 | **Pool Budget** | **Fixed** | maxHeapFraction=0.0f disables budget check for Chonk Buffer training |
+| **"-2 is not a valid device"** | **FIXED (root cause)** | Non-exportable Vulkan allocations' deviceAddress is NOT a valid HIP pointer. All GPU allocs now route through alloc_export: dma-buf export → hipImportExternalMemory → hipExternalMemoryGetMappedBuffer |
+| **Sustained compute** | **CRASHED (login screen)** | 4x8192-token fwd+bwd benchmark (even eager) starved the iGPU display pipeline → driver reset. Mitigation: CHONK_PAUSE=0.02-0.05s per chunk, keep runs short |
+| **Linear-attention cache copy_** | **FIXED** | in-place copy_ into cached states broke autograd (version mismatch / freed saved tensors); patch_linear_cache_for_chunked_training() reassigns .detach().clone() instead (truncated BPTT) |
 
 ---
 
-## Optimal Configuration (to be determined)
+## Optimal Configuration (validated 2026-08-13)
 **Target**: Best quality/speed tradeoff
 
-| Setting | Value |
-|---------|-------|
-| GRAD_ACCUM_STEPS | 4 |
-| CHUNK_SIZE | 4096 |
-| LR / Scheduler | 2e-5 / Cosine + 100 warmup |
-| Optimizer | ChonkAdamW (fp32 states in Chonk Buffer) |
-| Compile mode | reduce-overhead |
-| Flash Attention | Enabled (flash_attention_2) |
-| Autocast | BF16 |
-| Label Smoothing | 0.1 |
-| EMA Decay | 0.9999 |
-| Grad Clip | 1.0 |
+| Setting | Value | Status |
+|---------|-------|--------|
+| GRAD_ACCUM_STEPS | 4 | implemented |
+| CHUNK_SIZE | 2048-4096 | validated up to 2048 (eager); 4096 planned |
+| LR / Scheduler | 2e-5 / Cosine + 100 warmup | |
+| Optimizer | ChonkAdamW (fp32 states in Chonk Buffer, 2.55GB) | PASSED |
+| LoRA | r=64, alpha=128, dropout 0.05 (7 proj modules) | PASSED (full-param AdamW fp32=215GB does NOT fit at 131K) |
+| Compile mode | OFF by default (CHONK_COMPILE=1 to try) | untested |
+| Attention | **eager** (stable) | PASSED — sdpa/flash crash the driver |
+| Autocast | OFF by default (CHONK_AUTOCAST=1 to try) | untested |
+| Label Smoothing | 0.1 | PASSED |
+| EMA Decay | 0.9999 | PASSED |
+| Grad Clip | 1.0 | |
+| Pacing | CHONK_PAUSE=0.02-0.05s per chunk | mitigates iGPU display-starve crashes |
+| Pool total | 69.23 GB (model 53.79 + KV 8.6@131K + LoRA 0.64 + opt 2.55 + acts 2.15 + staging) | fits 121GB |
 
 ---
 
@@ -161,24 +167,67 @@
 
 ### Test 2: Model Load + Move to Chonk Buffer
 **Date**: 2026-08-13
-**Status**: ��� IN PROGRESS (timeout on full model)
+**Status**: PASSED
 **Config**: Qwen 27B, bfloat16, trust_remote_code=True
-**Partial Results**:
-- Config loads: qwen3_5
-- Model loads: 53.79 GB CUDA memory
-- load_model_into_chonk() started but timed out (120s)
-- Need: longer timeout or staged move
+**Results**:
+- Root cause of load failure fixed: "-2 is not a valid device" = non-exportable Vulkan allocation's deviceAddress used as HIP pointer
+- All allocations (weights/opt-states/acts) now route through alloc_export (dma-buf → hipImportExternalMemory)
+- **load_model_directly_to_chonk**: 53.79 GB / 851 params in ~22s (keys remapped: model.X → model.language_model.X, lm_head.weight passthrough; vision + mtp keys skipped; precomputed slot offsets fix double-counting)
+- **build_model_from_chonk_buffer**: zero-copy model from pool (nn.Parameter views in named_parameters order); rotary inv_freq materialized on CUDA
+
+### Test 3: Full training step (forward + backward on chunk)
+**Date**: 2026-08-13
+**Status**: PASSED
+**Results**:
+- 512-token fwd+bwd on Chonk weights: loss 13.56, grads on 851/851 params
+- Chunked KV-cache fwd+bwd (2x1024, eager): both chunks backward OK (truncated BPTT)
+- Chunked semantics: cached K/V + linear-attention states are constants across chunks (detached); current chunk's K/V differentiable via cat
+- patch_linear_cache_for_chunked_training() required (in-place copy_ broke autograd)
+- Perf: ~5s per 1024-token chunk fwd (eager), ~9s per 2048
+
+### Test 4: Optimizer step with ChonkAdamW
+**Date**: 2026-08-13
+**Status**: PASSED
+**Results**:
+- 512/512 trainable LoRA params got grads (lora_B first-step grads non-zero; lora_A zero until B non-zero — expected)
+- fp32 AdamW states in Chonk (2.55GB), keyed by param object
+- Step ran in-place on Chonk tensors; 256/512 states non-zero after 1 step (zero-grad lora_A — correct)
+
+### Test 5: Multi-chunk sequence processing (LoRA KV pipeline)
+**Date**: 2026-08-13
+**Status**: PASSED (eager)
+**Results**:
+- 2x1024 chunks fwd+bwd through Chonk KV cache; pool 61.17GB totalUsed, allocationCount 5; HIP mem only 3.28GB (weights/opt/KV all in pool)
+- 2048-token forward crashed with default sdpa (login screen); eager is the stable path
+
+### Test 6: Full sequence (128K) with chunked forward
+**Status**: PLANNED (needs long stable run; KV @131K = 8.6GB, total pool 69.23GB validated at setup)
+- Setup validated at max_cache_len=131072: pool totalUsed 69.23GB, all 5 allocations, fits
+
+### Test 7: EMA weight application
+**Status**: PASSED
+**Results**: EMA shadow = fp32 clone (0.64GB); apply_shadow + save_pretrained to chonk_final OK (adapter 1.27GB saved)
+
+### Test 8: End-to-end smoke run (train_qwen_chonk.py)
+**Date**: 2026-08-13
+**Status**: PASSED
+**Config**: CHONK_SMOKE=1 (SEQ_LEN=2048, CHUNK_SIZE=512, MAX_STEPS=2), eager, CHONK_PAUSE=0.05
+**Results**:
+- Setup: pool 69.23GB; LoRA 318.8M trainable (1.17%); optimizer states 2.55GB; dataset packing OK (598.8M tokens, 936K seqs → 292K blocks @2048)
+- Step 0 loss 4.22 (label smoothing 0.1), EMA applied, final save OK
+- Dataset format: memmap tokens.bin+index.bin (variable-length seqs, packed into fixed blocks; fallback kept for .npy)
 
 ### Next Tests Planned
-1. **Test 2b**: Staged model move (layer-by-layer or shard-by-shard)
-2. **Test 3**: Full training step (forward + backward on 4K chunk)
-3. **Test 4**: Optimizer step with ChonkAdamW
-4. **Test 5**: Multi-chunk sequence processing
-5. **Test 6**: Full sequence (128K) with chunked forward
-6. **Test 7**: EMA weight application
-7. **Test 8**: Memory usage over time (leak detection)
+1. **Full-scale step**: MAX_CACHE_LEN=131072, SEQ_LEN=131072, CHUNK_SIZE=4096, 1-2 full steps
+2. **Chunk-size benchmark** (2048/4096) with pacing to avoid display-starve crash
+3. **Leak detection**: pool stats over many steps
+4. **Loss trend**: 10+ steps at real scale
 
 ---
 
 ## Final Recommendations
-*To be filled after all experiments complete*
+- **Use eager attention** — experimental AMD SDPA kernels crash the display driver (login screen) when writing through dma-buf-imported Chonk memory
+- **Run with pacing** (CHONK_PAUSE >= 0.02s/chunk) and keep sustained runs bounded; iGPU also drives the display
+- **LoRA r=64 in Chonk** is the validated training strategy (full-param AdamW fp32 = 215GB does not fit at 131K)
+- **Keep torch.compile + autocast OFF** until validated (env flags CHONK_COMPILE / CHONK_AUTOCAST)
+- **Chunk size 2048-4096**; benchmark at scale before committing to a default

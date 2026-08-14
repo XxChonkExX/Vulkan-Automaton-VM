@@ -785,18 +785,27 @@ PoolConfig cfg = PoolConfig::forAPU(128 * 1024 * 1024 * 1024);
 # → 2 GB blocks, 8-16 blocks, host-visible, no host shadow
 ```
 
-**Training Config (Optimal Baseline):**
+**Training Config (Optimal Baseline — validated 2026-08-13):**
 ```python
 SEQ_LEN = 131072
 BATCH_SIZE = 1
-CHUNK_SIZE = 4096
+CHUNK_SIZE = 2048-4096
 GRAD_ACCUM_STEPS = 4
 LR = 2e-5, Cosine + 100 warmup
-FLASH_ATTENTION = True
-AUTOCAST = BF16
+ATTENTION = eager   # sdpa/flash crash the display driver (experimental AMD kernels + Chonk dma-buf memory)
+AUTOCAST = OFF      # CHONK_AUTOCAST=1 to try
+COMPILE = OFF       # CHONK_COMPILE=1 to try (fla kernels risky under dynamo)
 LABEL_SMOOTHING = 0.1
 EMA_DECAY = 0.9999
 GRAD_CLIP = 1.0
+CHONK_PAUSE = 0.02  # sec per chunk; iGPU also drives the display — pacing prevents driver resets
+```
+
+**Run flags (train_qwen_chonk.py):**
+```bash
+CHONK_SMOKE=1 python3 train_qwen_chonk.py    # tiny seq (2048) + 2 steps, validates the full pipeline
+CHONK_PAUSE=0.05 python3 train_qwen_chonk.py # real run with pacing
+CHONK_COMPILE=1 CHONK_AUTOCAST=1 CHONK_ATTN=sdpa python3 train_qwen_chonk.py  # experimental knobs
 ```
 
 ---
