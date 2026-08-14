@@ -44,8 +44,8 @@ from chonk import (
 )
 
 # ROCm/Strix Halo memory config
-os.environ["PYTORCH_HIP_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.6"
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.6"
+os.environ["PYTORCH_HIP_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.4"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.4"
 
 # Stability knobs (iGPU also drives the display; sustained compute can
 # starve it and reset the driver -> login screen)
@@ -60,7 +60,7 @@ MODEL_PATH = "/home/chonke/local_training/models/qwen36_27ablit"
 DATA_PATH = "/home/chonke/local_training/qwen_tokenized_128k"
 SEQ_LEN = 131072
 BATCH_SIZE = 1
-CHUNK_SIZE = 4096  # 2K-4K recommended for ROCm stability
+CHUNK_SIZE = 1024  # 1024 validated stable; 2048 froze the machine, 4096 panicked
 MAX_CACHE_LEN = 131072
 LEARNING_RATE = 2e-5
 WEIGHT_DECAY = 0.01
@@ -74,7 +74,7 @@ SAVE_INTERVAL = 500
 if CHONK_SMOKE:
     SEQ_LEN = int(os.environ.get("CHONK_SMOKE_SEQ", "2048"))
     MAX_STEPS = int(os.environ.get("CHONK_SMOKE_STEPS", "2"))
-    CHUNK_SIZE = int(os.environ.get("CHONK_SMOKE_CHUNK", "512"))
+    CHUNK_SIZE = int(os.environ.get("CHONK_SMOKE_CHUNK", "1024"))
 
 # Chonk Buffer config
 # Total pool size: ~80-90GB (model ~22GB + optimizer ~44GB + KV ~10GB + activations ~8GB + staging ~2GB)
@@ -345,6 +345,7 @@ def main():
 
     step = 0
     model.train()
+    t_seq_start = time.time()
 
     for input_ids in dataset_gen:
         if step >= MAX_STEPS:
@@ -369,12 +370,25 @@ def main():
             if CHONK_PAUSE > 0:
                 time.sleep(CHONK_PAUSE)  # give the display pipeline breathing room
 
+            last_loss = float("nan")
             if loss is not None:
                 # Scale loss for gradient accumulation
                 loss = loss / GRAD_ACCUM_STEPS
+                last_loss = loss.item()
                 loss.backward()
+                del loss, outputs  # free the 2GB logits + graph ASAP
 
             chunks_this_seq += 1
+
+            # Heartbeat + HIP heap defrag (keeps the driver heap from
+            # fragmenting as the cache grows; system memory is shared)
+            if chunks_this_seq % 8 == 0:
+                torch.cuda.empty_cache()
+                peak_gb = torch.cuda.max_memory_allocated() / 1e9
+                print(f"  [seq] chunk {chunks_this_seq}/{SEQ_LEN // CHUNK_SIZE} "
+                      f"({time.time() - t_seq_start:.0f}s, loss={last_loss:.4f}, "
+                      f"hip_peak={peak_gb:.1f}GB)", flush=True)
+                torch.cuda.reset_peak_memory_stats()
 
             # Step optimizer after GRAD_ACCUM_STEPS chunks (or end of sequence)
             if chunks_this_seq % GRAD_ACCUM_STEPS == 0 or chunk_end == SEQ_LEN:
@@ -390,7 +404,7 @@ def main():
             # Log (count optimizer steps, not chunks)
             if step % LOG_INTERVAL == 0:
                 stats = pool.stats()
-                print(f"Step {step}: loss={loss.item() * GRAD_ACCUM_STEPS if loss is not None else 0:.4f}, "
+                print(f"Step {step}: loss={last_loss * GRAD_ACCUM_STEPS:.4f}, "
                       f"lr={scheduler.get_last_lr()[0]:.2e}, pool_used={stats['totalUsed'] / 1e9:.2f} GB")
 
             step += 1
