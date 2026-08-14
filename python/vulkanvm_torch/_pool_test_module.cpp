@@ -416,7 +416,10 @@ struct ChonkAllocator {
     std::mutex mtx;
     std::vector<std::unique_ptr<AllocBlock>> blocks;
     std::unordered_map<void*, size_t> liveSizes;
-    size_t warmBlocks = 2;  // fully-free blocks kept for reuse before release
+    // Keep a few freed blocks warm; release the rest on empty_cache so
+    // torch's setup-phase cache returns to the pool (cuts GTT pressure
+    // before the first forward — the display shares the unified heap).
+    size_t warmBlocks = 8;
 
     static constexpr size_t kAlign = 512;
     static constexpr size_t kMinBlock = 2ull * 1024 * 1024 * 1024;  // 2 GB
