@@ -125,6 +125,7 @@ static py::dict init() {
     PoolConfig cfg = PoolConfig::forAPU(128ull * 1024 * 1024 * 1024);
     cfg.blockSize = 1024ull * 1024 * 1024;
     cfg.maxBlocks = 64;
+    cfg.maxHeapFraction = 0.0f;  // Disable budget check for Chonk Buffer training
     cfg.enableHostVisible = true;
     cfg.enableExternal = true;
     cfg.enableDeviceAddress = true;
