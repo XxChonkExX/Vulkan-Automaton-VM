@@ -128,6 +128,7 @@
 | **Pool Budget** | **Fixed** | maxHeapFraction=0.0f disables budget check for Chonk Buffer training |
 | **"-2 is not a valid device"** | **FIXED (root cause)** | Non-exportable Vulkan allocations' deviceAddress is NOT a valid HIP pointer. All GPU allocs now route through alloc_export: dma-buf export → hipImportExternalMemory → hipExternalMemoryGetMappedBuffer |
 | **Sustained compute** | **CRASHED (login screen)** | 4x8192-token fwd+bwd benchmark (even eager) starved the iGPU display pipeline → driver reset. Mitigation: CHONK_PAUSE=0.02-0.05s per chunk, keep runs short |
+| **4096-token chunks** | **CRASHED (kernel panic, hard boot)** | 4096-chunk fwd+bwd at 8192 context → userspace page faults (AOTriton path) → GPU faults → panic. **Use CHUNK_SIZE <= 2048** |
 | **Linear-attention cache copy_** | **FIXED** | in-place copy_ into cached states broke autograd (version mismatch / freed saved tensors); patch_linear_cache_for_chunked_training() reassigns .detach().clone() instead (truncated BPTT) |
 
 ---
@@ -201,8 +202,8 @@
 - 2048-token forward crashed with default sdpa (login screen); eager is the stable path
 
 ### Test 6: Full sequence (128K) with chunked forward
-**Status**: PLANNED (needs long stable run; KV @131K = 8.6GB, total pool 69.23GB validated at setup)
-- Setup validated at max_cache_len=131072: pool totalUsed 69.23GB, all 5 allocations, fits
+**Status**: PARTIAL — setup validated at max_cache_len=131072 (pool 69.23GB, fits); full-scale step NOT yet run (long sustained compute crashes; see breaking points)
+- **4096-chunk backward CRASHED the machine (kernel panic)** — chunk size is capped at 2048
 
 ### Test 7: EMA weight application
 **Status**: PASSED
@@ -218,16 +219,17 @@
 - Dataset format: memmap tokens.bin+index.bin (variable-length seqs, packed into fixed blocks; fallback kept for .npy)
 
 ### Next Tests Planned
-1. **Full-scale step**: MAX_CACHE_LEN=131072, SEQ_LEN=131072, CHUNK_SIZE=4096, 1-2 full steps
-2. **Chunk-size benchmark** (2048/4096) with pacing to avoid display-starve crash
+1. **Full-scale step**: MAX_CACHE_LEN=131072, SEQ_LEN=131072, CHUNK_SIZE=2048 (4096 CRASHES), 1-2 full steps — run in short bursts with pacing
+2. **Loss trend**: 10+ steps at real scale
 3. **Leak detection**: pool stats over many steps
-4. **Loss trend**: 10+ steps at real scale
+4. **Chunk-size retest** at 4096 only if the driver stack is updated
 
 ---
 
 ## Final Recommendations
 - **Use eager attention** — experimental AMD SDPA kernels crash the display driver (login screen) when writing through dma-buf-imported Chonk memory
+- **CHUNK_SIZE = 2048 MAX** — 4096-token backward caused userspace page faults → kernel panic (hard boot)
 - **Run with pacing** (CHONK_PAUSE >= 0.02s/chunk) and keep sustained runs bounded; iGPU also drives the display
 - **LoRA r=64 in Chonk** is the validated training strategy (full-param AdamW fp32 = 215GB does not fit at 131K)
 - **Keep torch.compile + autocast OFF** until validated (env flags CHONK_COMPILE / CHONK_AUTOCAST)
-- **Chunk size 2048-4096**; benchmark at scale before committing to a default
+- Full-scale 131K steps: expect ~5min/step (64 chunks @2048), run step-by-step with pauses
