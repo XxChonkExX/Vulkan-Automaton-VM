@@ -1,10 +1,12 @@
 # VulkanVM — High-Performance GPU Networking & RDMA + Unified Memory Pool (Chonk Buffer)
 
-**VulkanVM** is a **cross-vendor GPU networking and RDMA library** that enables zero-copy GPU↔GPU transfers over TCP, RDMA, and GPU-direct NIC DMA across AMD, NVIDIA, and Intel GPUs. Built on a hardened, zero-fragmentation Vulkan memory pool (the "Chonk Buffer"), it provides Hugging Face–style model distribution, capacity-first shard placement, and a unified tensor transport for AI inference clusters. One header, one library, zero system changes — link it into your application.
+**VulkanVM** is a **cross-vendor GPU networking and RDMA library** that enables zero-copy GPU���GPU transfers over TCP, RDMA, and GPU-direct NIC DMA across AMD, NVIDIA, and Intel GPUs. Built on a hardened, zero-fragmentation Vulkan memory pool (the "Chonk Buffer"), it provides Hugging Face–style model distribution, capacity-first shard placement, and a unified tensor transport for AI inference clusters. One header, one library, zero system changes — link it into your application.
 
 **Version**: 0.2.0-pre (pre-release)
 
-> **Cross-Machine GPU Sharing (NEW)**: Verified working between Windows (Intel Arc B70) and Linux (AMD Strix Halo) over TCP. See [docs/cross_machine_gpu_sharing.md](docs/cross_machine_gpu_sharing.md) for setup guide.
+> **Cross-Machine GPU Sharing**: Verified working between Windows (Intel Arc B70) and Linux (AMD Strix Halo) over TCP. See [docs/cross_machine_gpu_sharing.md](docs/cross_machine_gpu_sharing.md) for setup guide.
+>
+> **NEW: Chonk Buffer Training (v0.2.1-dev)**: Full LLM training with *everything* in Chonk Buffer — model weights, optimizer states, KV cache, activations, staging. See [train_qwen_chonk.py](train_qwen_chonk.py) for Qwen 27B @ 128K context on Strix Halo (128GB unified RAM). Active optimization experiments documented in [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
 
 ---
 Notice! Help wanted desperately-
@@ -713,6 +715,92 @@ peer_alloc = peer_pool.import_memory(exported, usage)
 
 **Note**: `allocate_tensor()` returns an int64 tensor containing the Vulkan allocation metadata (buffer handle, memory handle, offset, size, device address, host pointer, block index). This metadata tensor can be passed to `deallocate_tensor()` to release the allocation.
 
+### Chonk Buffer Training — Full LLM Training in Unified Memory (v0.2.1-dev)
+
+> **������ EXPERIMENTAL** — Full LLM training with **everything** in the Chonk Buffer: model weights, optimizer states, KV cache, activations, staging. Currently tested on Qwen 27B @ 128K context on AMD Strix Halo (128GB unified RAM).
+
+```python
+# train_qwen_chonk.py — Full training script
+from vulkanvm_torch.chonk import (
+    ChonkPool, build_chonk_cache, reset_chonk_cache,
+    load_model_into_chonk, create_optimizer_states_in_chonk,
+    create_activation_buffers, build_full_chonk_training_setup
+)
+
+# 1. Build Chonk Buffer FIRST (prevents fragmentation)
+pool = ChonkPool()
+
+# 2. Build KV cache in Chonk Buffer
+kv_cache = build_chonk_cache(config, batch_size=1, max_cache_len=131072, pool=pool)
+
+# 3. Load model → move weights to Chonk Buffer
+model = AutoModelForCausalLM.from_pretrained(..., torch_dtype=torch.bfloat16)
+model = model.cuda()
+model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
+model = get_peft_model(model, lora_config)
+load_model_into_chonk(model, pool)
+
+# 4. Create optimizer states in Chonk Buffer (fp32 AdamW)
+optimizer_states, _ = create_optimizer_states_in_chonk(model, pool)
+optimizer = ChonkAdamW(model.parameters(), optimizer_states, lr=2e-5)
+
+# 5. Create activation buffers in Chonk Buffer (chunked)
+act_buffer = create_activation_buffers(pool, 1, 131072, 5120, 48, chunk_size=4096)
+
+# 6. Training loop with chunked forward (4K chunks for ROCm stability)
+for input_ids in dataset:
+    reset_chonk_cache(kv_cache)
+    for chunk_start in range(0, 131072, 4096):
+        chunk_end = min(chunk_start + 4096, 131072)
+        loss = train_step(model, input_ids[:, chunk_start:chunk_end], kv_cache, ...)
+```
+
+**Key Features:**
+- **Zero fragmentation** — Single contiguous allocation for all training state
+- **No host���device copies** — Everything stays in unified memory
+- **Chunked forward** — 4K chunks for ROCm GEMM stability
+- **Custom optimizer** — `ChonkAdamW` uses pre-allocated fp32 states
+- **EMA weights** — Exponential moving average (decay=0.9999) for final quality
+
+**Optimization Experiments** (see [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md)):
+| Exp | Optimization | Status |
+|-----|--------------|--------|
+| 1 | Gradient Accumulation (4x) + Clipping (1.0) | �� |
+| 2 | torch.compile (reduce-overhead) | �� |
+| 3 | Flash Attention 2 | �� |
+| 4 | BF16 Autocast + Label Smoothing (0.1) | �� |
+| 5 | Double-Buffer Chunks | Framework ready |
+| 6 | Curriculum Learning (8K→128K) | Framework ready |
+| 7 | EMA Weights (0.9999) + Label Smoothing | �� |
+
+**Hardware Requirements:**
+- AMD Strix Halo (128GB unified RAM) or 80GB+ unified memory system
+- ROCm 6.0+ with flash-attn support
+- PyTorch 2.1+ with ROCm backend
+
+**Chonk Buffer Config:**
+```python
+# Auto-tuned for Strix Halo APU
+PoolConfig cfg = PoolConfig::forAPU(128 * 1024 * 1024 * 1024);
+# → 2 GB blocks, 8-16 blocks, host-visible, no host shadow
+```
+
+**Training Config (Optimal Baseline):**
+```python
+SEQ_LEN = 131072
+BATCH_SIZE = 1
+CHUNK_SIZE = 4096
+GRAD_ACCUM_STEPS = 4
+LR = 2e-5, Cosine + 100 warmup
+FLASH_ATTENTION = True
+AUTOCAST = BF16
+LABEL_SMOOTHING = 0.1
+EMA_DECAY = 0.9999
+GRAD_CLIP = 1.0
+```
+
+---
+
 ### Experimental: Custom Autograd Functions & LoRA (v0.3.0-dev)
 
 > **⚠️ EXPERIMENTAL** — The following APIs are available in `v0.3.0-dev` builds but are **not yet stabilized**. They may change without notice. Use in production at your own risk.
@@ -1038,6 +1126,15 @@ Don't let the name fool you — under the hood it is aspiring to be a production
 
 ### Build & Cleanup
 - Removed orphaned `src/core/unified_memory_pool.cpp.tmp` (was not referenced by CMake).
+
+### Chonk Buffer Training — New Experimental Feature (v0.2.1-dev)
+- **Full LLM training in Chonk Buffer**: Model weights, optimizer states, KV cache, activations, staging all in unified memory
+- **New Python module** `vulkanvm_torch.chonk`: `ChonkPool`, `build_chonk_cache`, `load_model_into_chonk`, `create_optimizer_states_in_chonk`, `create_activation_buffers`
+- **New training script** `train_qwen_chonk.py`: Qwen 27B @ 128K context on Strix Halo
+- **Optimization experiments** documented in `OPTIMIZATION_LOG.md`: gradient accumulation, torch.compile, Flash Attention 2, BF16 autocast, EMA weights, label smoothing
+- **Custom optimizer**: `ChonkAdamW` using pre-allocated fp32 states in Chonk Buffer
+- **EMA weights**: Exponential moving average (decay=0.9999) applied at final save
+- **Chunked forward**: 4K chunks for ROCm GEMM stability
 
 ### Vulkan API Hardening
 - **VVM_VK_CHECK macros**: `VVM_VK_CHECK()`, `VVM_VK_CHECK_VOID()`, `VVM_VK_CHECK_BOOL()` for consistent Vulkan result checking with automatic error logging and early return.

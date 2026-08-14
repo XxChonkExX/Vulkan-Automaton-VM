@@ -450,6 +450,91 @@ output_np = provider.download_tensor(alloc, output_np, output_np.nbytes)
 
 ---
 
+## NEW: Chonk Buffer Training — Full LLM Training in Unified Memory (v0.2.1-dev)
+
+> **������ EXPERIMENTAL** — Full LLM training with **everything** in the Chonk Buffer: model weights, optimizer states, KV cache, activations, staging. Currently tested on Qwen 27B @ 128K context on AMD Strix Halo (128GB unified RAM).
+
+```python
+# train_qwen_chonk.py — Full training script
+from vulkanvm_torch.chonk import (
+    ChonkPool, build_chonk_cache, reset_chonk_cache,
+    load_model_into_chonk, create_optimizer_states_in_chonk,
+    create_activation_buffers, build_full_chonk_training_setup
+)
+
+# 1. Build Chonk Buffer FIRST (prevents fragmentation)
+pool = ChonkPool()
+
+# 2. Build KV cache in Chonk Buffer
+kv_cache = build_chonk_cache(config, batch_size=1, max_cache_len=131072, pool=pool)
+
+# 3. Load model → move weights to Chonk Buffer
+model = AutoModelForCausalLM.from_pretrained(..., torch_dtype=torch.bfloat16)
+model = model.cuda()
+model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
+model = get_peft_model(model, lora_config)
+load_model_into_chonk(model, pool)
+
+# 4. Create optimizer states in Chonk Buffer (fp32 AdamW)
+optimizer_states, _ = create_optimizer_states_in_chonk(model, pool)
+optimizer = ChonkAdamW(model.parameters(), optimizer_states, lr=2e-5)
+
+# 5. Create activation buffers in Chonk Buffer (chunked)
+act_buffer = create_activation_buffers(pool, 1, 131072, 5120, 48, chunk_size=4096)
+
+# 6. Training loop with chunked forward (4K chunks for ROCm stability)
+for input_ids in dataset:
+    reset_chonk_cache(kv_cache)
+    for chunk_start in range(0, 131072, 4096):
+        chunk_end = min(chunk_start + 4096, 131072)
+        loss = train_step(model, input_ids[:, chunk_start:chunk_end], kv_cache, ...)
+```
+
+**Key Features:**
+- **Zero fragmentation** — Single contiguous allocation for all training state
+- **No host���device copies** — Everything stays in unified memory
+- **Chunked forward** — 4K chunks for ROCm GEMM stability
+- **Custom optimizer** — `ChonkAdamW` uses pre-allocated fp32 states
+- **EMA weights** — Exponential moving average (decay=0.9999) for final quality
+
+**Active Optimization Experiments** (see [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md)):
+| Exp | Optimization | Status |
+|-----|--------------|--------|
+| 1 | Gradient Accumulation (4x) + Clipping (1.0) | ���� |
+| 2 | torch.compile (reduce-overhead) | ���� |
+| 3 | Flash Attention 2 | ���� |
+| 4 | BF16 Autocast + Label Smoothing (0.1) | ���� |
+| 5 | Double-Buffer Chunks | Framework ready |
+| 6 | Curriculum Learning (8K→128K) | Framework ready |
+| 7 | EMA Weights (0.9999) + Label Smoothing | ���� |
+
+**Hardware Requirements:**
+- AMD Strix Halo (128GB unified RAM) or 80GB+ unified memory system
+- ROCm 6.0+ with flash-attn support
+- PyTorch 2.1+ with ROCm backend
+
+**Chonk Buffer Config (Auto-tuned for Strix Halo APU):**
+```cpp
+PoolConfig cfg = PoolConfig::forAPU(128 * 1024 * 1024 * 1024);
+// → 2 GB blocks, 8-16 blocks, host-visible, no host shadow
+```
+
+**Training Config (Optimal Baseline):**
+```python
+SEQ_LEN = 131072
+BATCH_SIZE = 1
+CHUNK_SIZE = 4096
+GRAD_ACCUM_STEPS = 4
+LR = 2e-5, Cosine + 100 warmup
+FLASH_ATTENTION = True
+AUTOCAST = BF16
+LABEL_SMOOTHING = 0.1
+EMA_DECAY = 0.9999
+GRAD_CLIP = 1.0
+```
+
+---
+
 ## Building
 
 ### Windows
