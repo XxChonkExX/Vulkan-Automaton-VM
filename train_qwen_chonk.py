@@ -392,16 +392,22 @@ def main():
 
             chunks_this_seq += 1
 
-            # Heartbeat + return cached segments to the slab. empty_cache is SAFE here:
-            # blocks are never released (warmBlocks=512), so freed segments
-            # just re-merge into the slab's freelist (coalescing) and the next
-            # chunk reuses the same address space. Without it, torch's cached
-            # segments stay carved in place, fragmenting the slab and forcing
-            # new 2GB blocks every step until the driver OOMs (Test 10).
+            # Return ALL cached segments to the slab EVERY chunk. The saved
+            # fp32 attn_weights grow with position (512 x pos x 16 layers), so
+            # every chunk's request is bigger than the last; torch's cached
+            # smaller segments never fit, forcing fresh 2GB blocks. Emptying
+            # the cache each chunk coalesces the whole slab so each chunk
+            # re-carves the same blocks (growth ~= intrinsic delta, ~4GB at
+            # 131K, not ~1GB/chunk -> OOM at 112GB). Blocks are never
+            # released (warmBlocks=512), so this is pure slab recycling.
+            torch.cuda.empty_cache()
+
+            # Heartbeat
             if chunks_this_seq % 8 == 0:
-                torch.cuda.empty_cache()
+                ps = pool.stats()
                 print(f"  [seq] chunk {chunks_this_seq}/{SEQ_LEN // CHUNK_SIZE} "
-                      f"({time.time() - t_seq_start:.0f}s, loss={last_loss:.4f})", flush=True)
+                      f"({time.time() - t_seq_start:.0f}s, loss={last_loss:.4f}, "
+                      f"pool={ps['totalUsed'] / 1e9:.2f}GB)", flush=True)
 
             # Step optimizer after GRAD_ACCUM_STEPS chunks (or end of sequence)
             if chunks_this_seq % GRAD_ACCUM_STEPS == 0 or chunk_end == SEQ_LEN:

@@ -498,6 +498,7 @@ static bool allocatorCreateBlock(size_t need) {
     block->size = blockSize;
     block->freeChunks.push_back({0, blockSize});
     g_allocator.blocks.push_back(std::move(block));
+    allocLog("B", base, blockSize);
     return true;
 }
 
