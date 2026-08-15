@@ -262,16 +262,22 @@ class ChonkFullLayer(StaticLayer):
         # Store into the pool with DETACHED sources: cached tokens are
         # constants (truncated BPTT), so later chunks never reference a
         # previous chunk's freed autograd graph.
-        self.keys[:b, :, start : start + kv_length].copy_(key_states.detach())
-        self.values[:b, :, start : start + kv_length].copy_(value_states.detach())
+        # The cells are bf16; the model runs fp32, so cast the inputs to the
+        # cells' dtype BEFORE the cat: an fp32 cat would promote the whole
+        # cached span to fp32 and double the dominant position-proportional
+        # memory term (the cats grow 128KB/pos in fp32 vs 64KB/pos bf16).
+        ks = key_states.to(self.keys.dtype)
+        vs = value_states.to(self.values.dtype)
+        self.keys[:b, :, start : start + kv_length].copy_(ks.detach())
+        self.values[:b, :, start : start + kv_length].copy_(vs.detach())
         self.cumulative_length.add_(kv_length)
         if start == 0:
             # First chunk: nothing cached yet, keep the graph fully alive
-            return key_states, value_states
+            return ks, vs
         # Previous tokens are constants; the current chunk's K/V stay
         # differentiable so grads flow to its own projections.
-        k = torch.cat([self.keys[:b, :, :start].detach(), key_states], dim=-2)
-        v = torch.cat([self.values[:b, :, :start].detach(), value_states], dim=-2)
+        k = torch.cat([self.keys[:b, :, :start].detach(), ks], dim=-2)
+        v = torch.cat([self.values[:b, :, :start].detach(), vs], dim=-2)
         return k, v
 
     def get_mask_sizes(self, query_length: int) -> tuple[int, int]:

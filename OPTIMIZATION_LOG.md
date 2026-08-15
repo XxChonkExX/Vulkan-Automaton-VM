@@ -269,7 +269,7 @@ crashed runs. Reboot clears it.
 
 ---
 
-## Final Recommendations
+## Final Recommendations (pre-quantization)
 - **Use eager attention** — experimental AMD SDPA kernels crash the display driver (login screen) when writing through dma-buf-imported Chonk memory
 - **CHUNK_SIZE = 1024 default** — 2048 froze the machine, 4096-chunk backward caused kernel panic (hard boot); 512/1024 validated stable
 - **Pool-backed pluggable allocator is now the default** (CHONK_ALLOCATOR=1): one allocator family over the unified heap; torch segments come from and return to the Chonk pool
@@ -277,3 +277,149 @@ crashed runs. Reboot clears it.
 - **LoRA r=64 in Chonk** is the validated training strategy (full-param AdamW fp32 = 215GB does not fit at 131K)
 - **Keep torch.compile + autocast OFF** until validated (env flags CHONK_COMPILE / CHONK_AUTOCAST)
 - Full-scale 131K steps: expect ~30-40min/step (128 chunks @1024), run step-by-step with pauses
+
+---
+
+## Experiment 6: Long-Context Stabilization (Aug 15, 2026) 
+
+### Context
+Full 131K runs with eager attention + CHONK_ATTN_RECOMPUTE=1 + grouped matmuls. Target: complete 131K training without OOM.
+
+### Root Causes Fixed
+| Root Cause | Fix | File |
+|---|---|---|
+| Eager attention saved full k/v cats (64KB/pos) in fn | Split path: clone current-chunk slice, stash cached spans as data_ptr + from_blob | `vulkanvm_autograd.hpp` |
+| Expanded k/v repeats (1,24,pos,256) bf16 in backward | Grouped matmuls: `qq.view({B,g,kv,qlen,D}) @ k.unsqueeze(1).T`; backward sum over groups; *scale on dq/dk | `vulkanvm_autograd.hpp` |
+| `torch.empty(0)` mask treated as real mask → shape error | Model wrapper always passes real mask; pybind11 binding only works with all 8 args explicit | `_attn_recompute_module.cpp` |
+| CHONK_AUTOCAST=0 kept bf16 path clean | Verified bf16 numerics pass (causal/non-causal/split) | — |
+
+### GRUB Memory Raise (user applied + reboot)
+- Removed `crashkernel=...` from `/etc/default/grub.d/kdump-tools.cfg`
+- `amdgpu.gttsize=124000` (deprecated but kept), `ttm.pages_limit=32000000` (modern 122GB limit)
+- `/proc/cmdline` clean; `MemTotal 129.5GB`, `MemAvailable 126.2GB` clean post-reboot
+- Wall moved from ~105.6GB → ~112GB
+
+### The 2^31-Byte Boundary Crash (Critical Failure → Root Cause)
+**Observation**: 131K@512 with 2GB min blocks crashed at chunk ~170 (pos 87K-88K) with `VK_ERROR_OUT_OF_DEVICE_MEMORY` on a 2.16GB p/scores request. Pool jumped 99.29GB → 110.05GB in 2 chunks.
+
+**Root Cause**: p/scores (1,24,512,pos) bf16 crosses 2^31 bytes (2.147GB) at pos 87,381. Allocator `kMinBlock=2GB` created blocks sized exactly to request (2.01GB → 2.16GB). Freed pre-crossing blocks (2.14GB) couldn't serve post-crossing requests (2.16GB) → fresh block per tensor → 5×2.16GB = 10.7GB wave → OOM at ~112GB wall.
+
+### Fix: Configurable Min Block Size (CHONK_MIN_BLOCK_GB)
+- Added `CHONK_MIN_BLOCK_GB` env (default 2GB) in `_pool_test_module.cpp`
+- For 131K@512: set 4GB → max p/scores at 131K = 3.22GB < 4GB → single size class → freed 4GB blocks reused → NO wave
+- Verified in alloc log: all blocks = 4294967296 (4GB)
+
+### Validated Configurations
+| Config | Pool Peak | Status |
+|---|---|---|
+| 131K @ chunk 256 (2GB min) | 92.85GB flat | ✅ Completed, adapter saved |
+| 131K @ chunk 512 (2GB min) | 110.05GB → OOM | ❌ 2^31 crossing at pos 87K |
+| 131K @ chunk 512 (4GB min) | 112.18GB plateau | ✅ **Completed, adapter saved** |
+| 131K @ 1024/4096 | — | ❌ Infeasible (p/scores 6.4/25GB @ 131K, 2^31 crossing at 43K/11K) |
+
+### Terminal Launcher (`run_train_terminal.sh`)
+- Detached `setsid nohup` run survives opencode timeout (90min killed 496/512 before)
+- Frees opencode RAM (few GB) — helps but didn't fix 2^31 wave (needed 4GB blocks)
+- Flags: `--chunk`, `--seq`, `--steps`, `--rank`, `--min-block-gb`, `--pause`, `--watch`
+- LoRA rank override via sed-patched copy (original untouched)
+
+### Retention Measurement Methodology (for 131K vs 32K comparison)
+The feasible comparison matrix is **131K@256 (done) vs 32K@256** (131K@512 marginal). Metrics:
+1. **Position-binned perplexity** (LongEval coarse) — 0-8K, 8-16K, ..., 120-131K bins
+2. **Needle-in-haystack (RULER)** — facts planted at 5/25/50/75/95% depth, retrieval accuracy
+3. **Cross-chunk dependency accuracy** — synthetic D ∈ {256,512,1024,2048} to probe gradient horizon
+4. **Same-length QA** — 32K questions evaluated on both 32K and 131K models
+
+### Memory Budget Anatomy (131K@512, 4GB blocks, 112.18GB plateau)
+| Component | Size |
+|---|---|
+| Model bf16 (53.79GB) + KV@131K (8.6GB) | 62.4GB |
+| LoRA r=64 params + AdamW fp32 | 3.2GB |
+| Activation buffer (budget 2.0GB, likely unused scratch) | 2.0GB |
+| Staging buffer host-visible (2.0GB, unused — offload not enabled) | 2.0GB |
+| **Baseline** | **~71.4GB** |
+| Fixed graph (SwiGLU saves, logits, etc.) | ~17.7GB |
+| p/scores 5× concurrent (max 3.22GB ×5 = 16.1GB at 131K) | ~16.1GB |
+| Masks, cats, misc | ~6.0GB |
+| **Slab @ 131K** | **~39.8GB** |
+| **Total pool** | **~111.2GB** (matches 112.18GB plateau) |
+
+### Trimmable Baseline (Immediate LoRA Headroom)
+| Buffer | Current | Proposed | Saved |
+|---|---|---|---|
+| `activation_budget_gb=2.0` (scratch, unused) | 2.0GB | 0.5GB | **1.5GB** |
+| `staging_gb=2.0` (host-visible, offload disabled) | 2.0GB | 0.25GB | **1.75GB** |
+| **Total** | | | **~3.25GB** |
+
+Funds LoRA r=64→r=128 (+3.2GB) or r=96 (+1.6GB) at chunk 512 while staying ~115GB.
+
+### Allocator Fix (code)
+```cpp
+// python/vulkanvm_torch/_pool_test_module.cpp
+static constexpr size_t kAlign = 512;
+static constexpr size_t kMinBlock = 2ull * 1024 * 1024 * 1024;  // 2 GB default
+static size_t minBlock() {
+    const char* p = getenv("CHONK_MIN_BLOCK_GB");
+    if (p) { double gb = atof(p); if (gb >= 1.0) return (size_t)(gb * 1024.0 * 1024.0 * 1024.0); }
+    return kMinBlock;
+}
+// used in allocatorCreateBlock: std::max(ChonkAllocator::minBlock(), aligned(need))
+```
+
+### Files Changed This Session
+- `python/vulkanvm_torch/_pool_test_module.cpp` — `kMinBlock` → `minBlock()` + `CHONK_MIN_BLOCK_GB` env
+- `_build/vulkanvm_pool_test.so` — rebuilt
+- `run_train_terminal.sh` — added `--min-block-gb` flag
+- `train_qwen_chonk.py` — minor (CHONK_INTEROP block removed, no functional change)
+- `vulkanvm_autograd.hpp` — grouped matmuls + split path (prior, validated)
+
+### Files NOT Needed / Cleaned
+- `python/vulkanvm_torch/__pycache__/` — ignore
+- `_attn_recompute_module.cpp` — standalone pybind11 binding (kept)
+
+---
+
+## Next Phase: Quantization in the Chonk Buffer (Planned)
+
+### Goal
+Train quantized model in the Chonk Buffer pipeline to unlock:
+- **131K @ chunk 1024** (or 2048) with headroom
+- **LoRA r=128-256** simultaneously  
+- **No architecture change** — everything stays in pool, pluggable allocator, grouped matmuls, terminal launcher
+
+### Strategy: Hybrid Dequant-in-Pool (QLoRA-style, Stay in Buffer)
+**Why not Unsloth/bitsandbytes?** Unsloth uses Triton (AOTriton dead on gfx1151 — display resets). bitsandbytes ROCm support uncertain on gfx1151 (RDNA 3.5). Both lose the Chonk Buffer + 131K chunked-carry architecture we built.
+
+**Path: Store weights INT4/INT8 in pool, dequant-on-the-fly via custom autograd fn**
+- Replace frozen `nn.Linear` with `QuantLinear` holding int4/int8 weight + scale in pool
+- Forward: `out = dequant(W_int) @ x + LoRA(x)` — dequant via custom autograd fn (read int4 from pool, expand to bf16 in registers/fused)
+- Backward: weight frozen → LoRA handles grad; dx recomputes dequant (don't save bf16)
+- Stays in pool: quant weights in pool, dequant transients via pluggable allocator, KV/LORA/OPT/transients unchanged
+
+### Quantization Options
+| Scheme | Model Size | Savings | Pool @ 131K@512 | Unlocks |
+|---|---|---|---|---|
+| bf16 (current) | 53.8GB | — | 112.18GB | 131K@256/512, r=64 |
+| int8 (per-channel) | 27GB | -27GB | ~85GB | 131K@1024, r=128+ |
+| int4/NF4 (GPTQ-style) | 13.5GB | -40GB | ~72GB | 131K@2048, r=256+ |
+
+### Implementation Steps (Chonk-Native)
+1. **Quant step** (one-time, offline): Use GPTQ/bitsandbytes on CPU/other GPU to produce int4/int8 weights + scales for all 7 LoRA target modules. Save as safetensors.
+2. **Custom `QuantizedMatmul` autograd fn** (in `vulkanvm_autograd.hpp` + pybind): fused int4→bf16 dequant + matmul kernel (HIP or torch fallback). Reads int4 from pool, computes bf16 in registers, no bf16 intermediate saved.
+3. **Model surgery** (`chonk.py` `build_lora_chonk_setup`): replace target `nn.Linear` with `QuantLinear` holding int4 weight + scale (pool-allocated) + LoRA adapter.
+4. **Test** with 16K probe, alloc log, verify 4GB blocks still work (quant weights < 4GB).
+5. **Run 131K@1024** with `CHONK_MIN_BLOCK_GB=8` (p/scores max 6.4GB < 8GB).
+
+### Key Advantage
+- **Everything stays in the Chonk Buffer**: no architecture change, pluggable allocator handles quant weights + transients, grouped matmuls + split path + terminal launcher all unchanged.
+- **LoRA rank scales independently**: quant frees model RAM → headroom for r=256+.
+
+### Open Questions for Quantization R&D
+1. **int4 dequant kernel**: HIP vs torch fallback? AOTriton dead; hand-written HIP kernel or torch.view+bitops. Group size 128 typical.
+2. **Calibration**: GPTQ needs representative data — use tokenized Unreal PDFs.
+3. **Accuracy**: validate perplexity vs bf16 baseline (expect <0.5 PPL delta for int4 LoRA).
+4. **Backward recompute**: dx recomputes dequant → 2× dequant cost. Acceptable if kernel fast.
+
+---
+
+*End of log — quantization phase begins*

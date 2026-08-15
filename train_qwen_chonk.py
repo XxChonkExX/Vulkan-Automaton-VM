@@ -44,9 +44,14 @@ from chonk import (
     install_chonk_allocator,
 )
 
-# ROCm/Strix Halo memory config
-os.environ["PYTORCH_HIP_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.4"
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.4"
+# ROCm/Strix Halo memory config.
+# NOTE: expandable_segments MUST stay False — (a) the pluggable allocator path
+# bypasses expandable segments anyway (no alloc/free hooks to swap), and
+# (b) expandable_segments:True crashes on ROCm/kernel 7.0
+# (pytorch/pytorch#187343, drm_suballoc_helper splits) — the recurring
+# display-driver resets.
+os.environ["PYTORCH_HIP_ALLOC_CONF"] = "expandable_segments:False,garbage_collection_threshold:0.4"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:False,garbage_collection_threshold:0.4"
 
 # Stability knobs (iGPU also drives the display; sustained compute can
 # starve it and reset the driver -> login screen)
@@ -55,6 +60,7 @@ CHONK_AUTOCAST = os.environ.get("CHONK_AUTOCAST", "0") == "1"  # bf16 autocast i
 CHONK_PAUSE = float(os.environ.get("CHONK_PAUSE", "0.02"))     # sec pause per chunk (display breathing room)
 CHONK_SMOKE = os.environ.get("CHONK_SMOKE", "0") == "1"        # smoke test: tiny seq, 2 steps
 CHONK_ATTN = os.environ.get("CHONK_ATTN", "eager")             # eager (stable) | sdpa | flash_attention_2
+CHONK_ATTN_RECOMPUTE = os.environ.get("CHONK_ATTN_RECOMPUTE", "1") == "1"  # attention checkpointing (THE fix for the ~1.5MB/token eager-graph growth)
 CHONK_ALLOCATOR = os.environ.get("CHONK_ALLOCATOR", "1") == "1"  # pool-backed pluggable allocator for torch/HIP
 
 # Training config
@@ -232,6 +238,58 @@ def patch_sdpa_for_chonk():
     torch.nn.functional.scaled_dot_product_attention = patched_sdpa
 
 
+def patch_eager_attention_recompute(model, kv_cache):
+    """Route eager attention through the recompute-checkpointed autograd fn.
+
+    Plain eager saves the fp32 softmax probabilities per layer
+    ((B,H,q,pos) -> grows with position: ~1.5MB/token across 24 layers),
+    which is the per-chunk slab growth that OOMs at ~112GB (~chunk 25).
+    With recompute, backward re-derives the probs from q/k/v instead of
+    saving them (attention checkpointing; attention math runs in bf16 to
+    halve the position-proportional tensors, grads return in fp32).
+    Requires _build/vulkanvm_attn.so.
+    """
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "_build"))
+        import vulkanvm_attn as vvm_attn
+    except ImportError:
+        print("[warn] vulkanvm_attn.so not built; falling back to plain eager")
+        return
+    vvm_attn.set_attention_recompute(True)
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    first = next(l for l in base.model.layers if hasattr(l, "self_attn"))
+    attn_mod = type(first.self_attn).__module__
+    mod = sys.modules[attn_mod]
+    orig = mod.eager_attention_forward
+
+    def patched(module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs):
+        if dropout > 0:
+            return orig(module, query, key, value, attention_mask, scaling, dropout, **kwargs)
+        # Chunked cache: key/value are the full cat [cached | current]. Pass
+        # zero-copy views of the constant cached span so the autograd fn
+        # saves only the current chunk's rows (~1MB) instead of the whole
+        # cat (2KB/pos x layers -> 8+ GB at 131K).
+        layer = kv_cache.layers[module.layer_idx]
+        cached_k = cached_v = torch.empty(0, device=query.device, dtype=torch.bfloat16)
+        if hasattr(layer, "keys"):
+            cur_len = key.shape[-2] - query.shape[-2]
+            if cur_len > 0:
+                # Views of the POOL CELLS (permanent storage, retention-free);
+                # detached: the cells' shared storage is written by every
+                # layer's update, which would trip autograd's inplace-version
+                # check on the saved views (data is constant at backward).
+                cached_k = layer.keys[: key.shape[0], :, :cur_len].detach()
+                cached_v = layer.values[: key.shape[0], :, :cur_len].detach()
+        out = vvm_attn.vulkan_attention(query, key, value, scaling, attention_mask,
+                                        kv_repeat=module.num_key_value_groups,
+                                        cached_k=cached_k, cached_v=cached_v)
+        out = out.transpose(1, 2).contiguous()
+        return out, None
+
+    mod.eager_attention_forward = patched
+    print("[+] eager attention patched: fp32 attn probs recomputed in backward (not saved)")
+
+
 def train_step(model, chunk_ids, kv_cache, optimizer, chunk_start, chunk_end, seq_len):
     """Single training step on a chunk."""
     cp = torch.arange(chunk_start, chunk_end, device="cuda")
@@ -316,6 +374,9 @@ def main():
 
     # Patch linear-attention cache for chunked forward/backward (truncated BPTT)
     patch_linear_cache_for_chunked_training()
+
+    if CHONK_ATTN == "eager" and CHONK_ATTN_RECOMPUTE:
+        patch_eager_attention_recompute(model, kv_cache)
 
     if CHONK_COMPILE:
         # EXP 2: torch.compile for speedup (off by default: fla kernels are risky under dynamo)
