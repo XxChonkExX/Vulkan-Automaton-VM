@@ -426,6 +426,14 @@ struct ChonkAllocator {
 
     static constexpr size_t kAlign = 512;
     static constexpr size_t kMinBlock = 2ull * 1024 * 1024 * 1024;  // 2 GB
+    static size_t minBlock() {
+        const char* p = getenv("CHONK_MIN_BLOCK_GB");
+        if (p) {
+            double gb = atof(p);
+            if (gb >= 1.0) return (size_t)(gb * 1024.0 * 1024.0 * 1024.0);
+        }
+        return kMinBlock;
+    }
 };
 
 static ChonkAllocator g_allocator;
@@ -463,7 +471,7 @@ static void* hipImportFromFd(int fd, size_t size, hipExternalMemory_t* outExt) {
 
 static bool allocatorCreateBlock(size_t need) {
     if (!g_pool) return false;
-    size_t blockSize = std::max(ChonkAllocator::kMinBlock,
+    size_t blockSize = std::max(ChonkAllocator::minBlock(),
                                 (need + ChonkAllocator::kAlign - 1) & ~(ChonkAllocator::kAlign - 1));
     vvm::AllocDesc desc;
     desc.size = blockSize;
@@ -563,6 +571,7 @@ extern "C" void* chonk_allocator_alloc(ssize_t size, int device, void* stream) {
     }
 
     // No fit: create a new block sized for the request.
+    allocLog("N", nullptr, aligned);
     if (!allocatorCreateBlock(aligned)) return nullptr;
     auto& blk = g_allocator.blocks.back();
     auto it = blk->freeChunks.begin();
@@ -641,6 +650,7 @@ extern "C" void chonk_allocator_free(void* ptr, size_t size, void* stream) {
         return;
     }
     // Unknown pointer: ignore (torch may free pointers from other allocators).
+    allocLog("U", ptr, size);
     fprintf(stderr, "[allocator] WARN: free of UNKNOWN ptr=%p size=%zu\n", ptr, size);
 }
 
