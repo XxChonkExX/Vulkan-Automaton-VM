@@ -416,4 +416,36 @@ Pure-Python per-group INT8/INT4 quantization, no C++/HIP kernel needed:
 
 ---
 
+## Qwen3.8 pivot + 262K validation run (2026-08-16)
+
+### Why Qwen3.8 instead of Qwen3.6
+- **Goal change**: the 131K frontier is solved on Strix Halo (optimum below); the remaining open question is the **262,144-token** context frontier. Qwen3.8-27B natively supports `max_position_embeddings=262144`.
+- **KV cache economics (the decisive factor)**: Qwen3.8 uses a **24Q/4KV head layout, head_dim 256** — the same hybrid full-attn + GDN-linear-attention family as Qwen3.6, but Qwen3.6's KV footprint was 30.1GB at just 131K (would exceed the 122GB wall well before 262K). Qwen3.8's KV is **~4KB/token/full-attn-layer × 16 layers = 64KB/token → 16.8GB at 262K** (8.4GB at 131K), so 262K becomes memory-feasible with ~24GB of headroom.
+- **Base model selection**: `AEON-7/Qwen3.8-27B-AEON-ULTIMATE-UNCENSORED-BF16` over the Coletti Heretic build:
+  - Both probe **0/67 refusals** (weapons, CBRN, bio, drugs, cyber, fraud, doxxing, non-consent, explicit, minor-adjacent, violence, political) + 0/20 on the focused thinking-off probe; both fully comply.
+  - AEON only: **SSM conv1d outlier repair** (FernflowerAI) — targets exactly the long-context coherence-collapse failure mode that matters at 262K; built with abliterix 1.12.2, 50-trial Optuna + judge, "coherent unlock" (deliberately not KL-chasing, per Abliterlitics audit: over-abliterated models degrade; AEON's older 3.6 build was worst-of-5 at KL 0.0238, this methodology avoids that).
+  - AEON's disclaimers/suicide-redirects are **response-style traces, not refusal directions** (probe markers 0/87; crisis-line text appears inside otherwise compliant answers) — decided NOT to run a second-pass ablation: it optimizes an already-zero metric and risks exactly the coherence damage the conv1d repair prevents.
+  - Coletti deleted after decision (freed 60GB).
+
+### Why 262K vs 131K (the Qwen3.6 difference, concretely)
+| | Qwen3.6-27B (old base) | Qwen3.8-27B (AEON) |
+|---|---|---|
+| KV cache @ 131K | 30.1GB | ~8.4GB |
+| KV cache @ 262K | ~60GB (infeasible > wall) | **16.8GB** |
+| 262K feasible on Strix Halo | No | **Yes** (98.03GB/122GB measured) |
+| max_position_embeddings | 131072 | 262144 |
+
+### Pipeline transfer (Qwen3.8-specific fixes)
+- **`config.language_model_only = True`** forced in loader: Qwen3.5/3.6/3.8 ship as multimodal wrappers (`Qwen3_5ForConditionalGeneration`); without the flag the meta model includes vision + MTP and every checkpoint lookup misses → **silent zeros**. Verified: 851 text params copied, 497 linears INT4-quantized, 256 PEFT-swapped, 241 plain.
+- **Lazy-import `get_cosine_schedule_with_warmup`**: transformers 5.14.1 initializes torch CUDA at import time, breaking the Chonk allocator swap ("Can't swap an already initialized allocator"). peft 0.20 (pulled in by heretic-llm) is fine once the swap is done.
+- New envs: `CHONK_SEQ_LEN`, `CHONK_MAX_CACHE_LEN`, `CHONK_CHUNK`; default model path → AEON.
+- **Data transfers as-is**: `qwen_tokenized_128k` vocab 248,044 == Qwen3.8 tokenizer vocab exactly; max token id in data 248,069 < embed 248,320. No re-tokenization needed.
+
+### 262K run status (in progress, auto-restart wrapper)
+- Config: SEQ 262144, cache 262144, chunk 1024, r=128, alpha=128, INT4 quantize-all (497 modules, group 128), eager + recompute, ChonkAdamW, LR 2e-5 cosine / warmup 100, wd 0.01, clip 1.0, grad accum 4, save every 500, EMA final.
+- Step 0: loss=6.25, pool_used=98.03GB (vs 99.31GB at 131K on Qwen3.6 — 262K fits with ~24GB headroom).
+- **Throughput caveat**: ~181s/chunk observed at 262K → ~12.9h/step → full epoch (~2284 blocks) infeasible as-is. This run is the **262K feasibility + loss-behavior validation**; if it converges meaningfully, real training needs a cheaper per-step strategy (e.g., block subsampling or shorter passes) rather than this run continuing to MAX_STEPS.
+
+---
+
 *End of log*
