@@ -572,14 +572,19 @@ def load_model_directly_to_chonk(model_path, config, pool: ChonkPool, dtype=torc
     quant_dict = {}
 
     # Create model on meta device (no memory allocation) using from_config
+    # Qwen3.5/3.6/3.8 ship as multimodal wrappers (Qwen3_5ForConditionalGeneration):
+    # force text-only so the meta model is 'model.layers.*' + lm_head, matching
+    # the to_ckpt_name remap below. Without this, the meta model includes the
+    # vision tower + MTP head and every weight lookup fails (silent zeros).
     print("Creating model on meta device...")
+    config.language_model_only = True
     with torch.device('meta'):
         model = AutoModelForCausalLM.from_config(
             config,
             torch_dtype=dtype,
             trust_remote_code=True,
         )
-    
+
     # Estimate memory and allocate in Chonk Buffer (use actual param count
     # from the meta model so the buffer matches the weights exactly)
     params_list = list(model.named_parameters())

@@ -24,7 +24,6 @@ from transformers import (
     AutoModelForCausalLM,
     AutoConfig,
     AutoTokenizer,
-    get_cosine_schedule_with_warmup,
 )
 from transformers.modeling_utils import PreTrainedModel
 
@@ -69,13 +68,13 @@ CHONK_ACT_GB = float(os.environ.get("CHONK_ACT_GB", "2.0"))      # activation sc
 CHONK_STAGING_GB = float(os.environ.get("CHONK_STAGING_GB", "2.0"))  # host-visible staging (unused w/o offload)
 
 # Training config
-MODEL_PATH = os.environ.get("CHONK_MODEL_PATH", "/home/chonke/local_training/models/qwen36_27ablit")
+MODEL_PATH = os.environ.get("CHONK_MODEL_PATH", "/home/chonke/local_training/models/Qwen3.8-27B-Uncensored")
 DATA_PATH = os.environ.get("CHONK_DATA_PATH", "/home/chonke/local_training/qwen_tokenized_128k")
 OUT_DIR = os.environ.get("CHONK_OUT_DIR", "/home/chonke/local_training/qwen_fine_tuned")
-SEQ_LEN = 131072
+SEQ_LEN = int(os.environ.get("CHONK_SEQ_LEN", "131072"))     # 262144 = the long-context target
 BATCH_SIZE = 1
 CHUNK_SIZE = 1024  # 1024 validated stable; 2048 froze the machine, 4096 panicked
-MAX_CACHE_LEN = 131072
+MAX_CACHE_LEN = int(os.environ.get("CHONK_MAX_CACHE_LEN", str(SEQ_LEN)))
 LEARNING_RATE = 2e-5
 WEIGHT_DECAY = 0.01
 WARMUP_STEPS = 100
@@ -348,6 +347,9 @@ def main():
     # 1. Load config first (to estimate memory)
     print("\n[1/6] Loading model config...")
     config = AutoConfig.from_pretrained(MODEL_PATH, trust_remote_code=True)
+    # Qwen3.5/3.6/3.8 multimodal wrappers: text-only everywhere (loader,
+    # quantize-module listing, buffer rebuild all use from_config).
+    config.language_model_only = True
     text_cfg = config.get_text_config(decoder=True)
     print(f"  Hidden size: {text_cfg.hidden_size}")
     print(f"  Num layers: {text_cfg.num_hidden_layers}")
@@ -414,6 +416,9 @@ def main():
     print("  SDPA patched for Chonk Cache")
 
     # 10. Learning rate scheduler
+    # Lazy import: transformers' schedule module initializes torch CUDA at
+    # import time, which breaks the Chonk allocator swap.
+    from transformers import get_cosine_schedule_with_warmup
     scheduler = get_cosine_schedule_with_warmup(
         optimizer, num_warmup_steps=WARMUP_STEPS, num_training_steps=MAX_STEPS
     )
