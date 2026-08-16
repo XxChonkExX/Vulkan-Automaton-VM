@@ -4,6 +4,8 @@
 
 **Version**: 0.2.0-pre (pre-release)
 
+> **⚠️ Please pull latest `main` before continuing work — see [docs/AUDIT_NOTES_2026-08-15.md](docs/AUDIT_NOTES_2026-08-15.md)** (external audit recommendations + recent changes + field-testing comparison for sync).
+>
 > **Cross-Machine GPU Sharing**: Verified working between Windows (Intel Arc B70) and Linux (AMD Strix Halo) over TCP. See [docs/cross_machine_gpu_sharing.md](docs/cross_machine_gpu_sharing.md) for setup guide.
 >
 > **NEW: Chonk Buffer Training (v0.2.1-dev)**: Full LLM training with *everything* in Chonk Buffer — model weights, optimizer states, KV cache, activations, staging. See [train_qwen_chonk.py](train_qwen_chonk.py) for Qwen 27B @ 128K context on Strix Halo (128GB unified RAM). Active optimization experiments documented in [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
