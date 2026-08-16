@@ -553,7 +553,7 @@ uint32_t MigrationEngine::getPendingCount() const {
 
 OffloadManager::OffloadManager(UnifiedMemoryPool* pool, const OffloadConfig& config)
     : pool_(pool), config_(config),
-      completionThread_([this](std::stop_token st) { processCompletions(); }) {
+      completionThread_([this]() { processCompletions(); }) {
     VVM_LOG_INFO("OffloadManager: pool={}, transferQueue={}, transferQueueFamily={}",
                  pool, config.transferQueue, config.transferQueueFamily);
 
@@ -584,16 +584,16 @@ OffloadManager::OffloadManager(UnifiedMemoryPool* pool, const OffloadConfig& con
 
 OffloadManager::~OffloadManager() {
     shutdown_.store(true, std::memory_order_release);
+    threadShouldStop_.store(true, std::memory_order_release);
     completionCv_.notify_all();
     if (completionThread_.joinable()) {
-        completionThread_.request_stop();
         completionThread_.join();
     }
     waitAll();
 }
 
 void OffloadManager::processCompletions() {
-    while (!shutdown_.load(std::memory_order_acquire)) {
+    while (!shutdown_.load(std::memory_order_acquire) && !threadShouldStop_.load(std::memory_order_acquire)) {
         std::function<void()> task;
         {
             std::unique_lock<std::mutex> lock(completionMutex_);

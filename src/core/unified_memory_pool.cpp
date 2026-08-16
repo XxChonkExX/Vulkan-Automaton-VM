@@ -1060,7 +1060,23 @@ std::optional<ExternalMemoryInfo> UnifiedMemoryPool::exportMemory(
     info.memoryTypeIndex = UINT32_MAX;  // Will be re-selected by importer
     info.dedicatedAllocation = true;
     
-    #ifdef VVM_PLATFORM_LINUX
+    #if defined(VVM_PLATFORM_ANDROID)
+    if (type == ExternalHandleType::AndroidHardwareBuffer) {
+        VkMemoryGetAndroidHardwareBufferInfoANDROID ahbInfo{};
+        ahbInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_ANDROID_HARDWARE_BUFFER_INFO_ANDROID;
+        ahbInfo.memory = alloc.memory;
+        
+        PFN_vkGetMemoryAndroidHardwareBufferANDROID vkGetMemoryAndroidHardwareBufferANDROID = 
+            (PFN_vkGetMemoryAndroidHardwareBufferANDROID)vkGetDeviceProcAddr(device_, "vkGetMemoryAndroidHardwareBufferANDROID");
+        if (!vkGetMemoryAndroidHardwareBufferANDROID) return std::nullopt;
+        
+        AHardwareBuffer* ahb = nullptr;
+        if (vkGetMemoryAndroidHardwareBufferANDROID(device_, &ahbInfo, &ahb) != VK_SUCCESS) return std::nullopt;
+        
+        info.handle = ExternalHandle(ahb);  // RAII wrapper takes ownership
+        return info;
+    }
+    #elif defined(VVM_PLATFORM_LINUX)
     if (type == ExternalHandleType::OpaqueFd || type == ExternalHandleType::DmaBuf) {
         VkMemoryGetFdInfoKHR fdInfo{};
         fdInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
@@ -1124,21 +1140,26 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
     
     // Step 1: Determine the VkExternalMemoryHandleTypeFlagBits for import
     VkExternalMemoryHandleTypeFlagBits importHandleType = static_cast<VkExternalMemoryHandleTypeFlagBits>(0);
+    #ifdef VVM_PLATFORM_ANDROID
+    if (info.type == ExternalHandleType::AndroidHardwareBuffer) {
+        importHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+    } else
+    #endif
     #ifdef VVM_PLATFORM_LINUX
     if (info.type == ExternalHandleType::OpaqueFd) {
         importHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
     } else if (info.type == ExternalHandleType::DmaBuf) {
         importHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-    }
-    #elif defined(VVM_PLATFORM_WINDOWS)
+    } else
+    #endif
+    #ifdef VVM_PLATFORM_WINDOWS
     if (info.type == ExternalHandleType::OpaqueWin32) {
         importHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
     } else if (info.type == ExternalHandleType::D3D12Heap) {
         importHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
-    }
+    } else
     #endif
-    
-    if (importHandleType == 0) {
+    {
         VVM_LOG_ERROR("Unsupported external handle type for import");
         return std::nullopt;
     }
@@ -1189,6 +1210,9 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
 #ifdef VVM_PLATFORM_WINDOWS
     VkImportMemoryWin32HandleInfoKHR importWin32Info{};
 #endif
+#ifdef VVM_PLATFORM_ANDROID
+    VkImportAndroidHardwareBufferInfoANDROID importAhbInfo{};
+#endif
     
     VkMemoryAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -1203,7 +1227,14 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
     
     void* pNext = nullptr;
     
-#ifdef VVM_PLATFORM_LINUX
+#if defined(VVM_PLATFORM_ANDROID)
+    if (info.type == ExternalHandleType::AndroidHardwareBuffer && info.handle) {
+        importAhbInfo.sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID;
+        importAhbInfo.buffer = info.handle.get();
+        importAhbInfo.pNext = pNext;
+        pNext = &importAhbInfo;
+    }
+#elif defined(VVM_PLATFORM_LINUX)
     if (info.type == ExternalHandleType::OpaqueFd && info.handle) {
         importFdInfo.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
         importFdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
@@ -1217,7 +1248,7 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
         importFdInfo.pNext = pNext;
         pNext = &importFdInfo;
     }
-    #elif defined(VVM_PLATFORM_WINDOWS)
+#elif defined(VVM_PLATFORM_WINDOWS)
     if (info.type == ExternalHandleType::OpaqueWin32 && info.handle) {
         importWin32Info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR;
         importWin32Info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
@@ -1231,7 +1262,7 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
         importWin32Info.pNext = pNext;
         pNext = &importWin32Info;
     }
-    #endif
+#endif
     
     // Dedicated allocation for imported memory - NOW with the actual buffer!
     VkMemoryDedicatedAllocateInfo dedicatedInfo{};

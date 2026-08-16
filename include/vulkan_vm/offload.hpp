@@ -236,8 +236,9 @@ private:
     std::vector<std::function<void()>> completionQueue_;
     std::mutex completionMutex_;
     std::condition_variable completionCv_;
-    std::jthread completionThread_;
+    std::thread completionThread_;
     std::atomic<bool> shutdown_{false};
+    std::atomic<bool> threadShouldStop_{false};
 
     std::optional<MigrationOperation> offloadLocked(Allocation& alloc);
     std::optional<MigrationOperation> reloadLocked(Allocation& alloc);
