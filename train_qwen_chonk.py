@@ -68,12 +68,12 @@ CHONK_ACT_GB = float(os.environ.get("CHONK_ACT_GB", "2.0"))      # activation sc
 CHONK_STAGING_GB = float(os.environ.get("CHONK_STAGING_GB", "2.0"))  # host-visible staging (unused w/o offload)
 
 # Training config
-MODEL_PATH = os.environ.get("CHONK_MODEL_PATH", "/home/chonke/local_training/models/Qwen3.8-27B-Uncensored")
+MODEL_PATH = os.environ.get("CHONK_MODEL_PATH", "/home/chonke/local_training/models/Qwen3.8-AEON-Ultimate")
 DATA_PATH = os.environ.get("CHONK_DATA_PATH", "/home/chonke/local_training/qwen_tokenized_128k")
 OUT_DIR = os.environ.get("CHONK_OUT_DIR", "/home/chonke/local_training/qwen_fine_tuned")
 SEQ_LEN = int(os.environ.get("CHONK_SEQ_LEN", "131072"))     # 262144 = the long-context target
 BATCH_SIZE = 1
-CHUNK_SIZE = 1024  # 1024 validated stable; 2048 froze the machine, 4096 panicked
+CHUNK_SIZE = int(os.environ.get("CHONK_CHUNK", "1024"))  # 1024 validated stable; 2048 froze the machine, 4096 panicked
 MAX_CACHE_LEN = int(os.environ.get("CHONK_MAX_CACHE_LEN", str(SEQ_LEN)))
 LEARNING_RATE = 2e-5
 WEIGHT_DECAY = 0.01
