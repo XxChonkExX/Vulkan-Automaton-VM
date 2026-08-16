@@ -18,6 +18,7 @@
 # grows without the cat() copy storm that previously hung the driver.
 
 import ctypes
+import math
 import os
 import sys
 
@@ -426,14 +427,20 @@ def load_model_into_chonk(model, pool: ChonkPool, dtype=torch.bfloat16, chunk_si
     return model_buffer
 
 
-def build_model_from_chonk_buffer(config, model_buffer, dtype=torch.bfloat16, attn_implementation=None):
+def build_model_from_chonk_buffer(config, model_buffer, dtype=torch.bfloat16,
+                                  attn_implementation=None, skip_modules=None):
     """Build a trainable model whose parameters are zero-copy views into a
     Chonk Buffer allocation. Creates the module structure on meta (no memory),
     then replaces every parameter with an nn.Parameter view into the buffer.
     The flat buffer layout must match named_parameters() order (this is how
-    load_model_directly_to_chonk writes it)."""
+    load_model_directly_to_chonk writes it).
+    skip_modules: set of module names whose params are left as meta tensors
+    (they are quantized; the PEFT LoraLayer base will be swapped later)."""
     import torch.nn as nn
     from transformers import AutoModelForCausalLM
+
+    skip_modules = set(skip_modules or [])
+    skip_prefixes = tuple(f"{m}." for m in skip_modules)
 
     with torch.device('meta'):
         model = AutoModelForCausalLM.from_config(
@@ -443,6 +450,8 @@ def build_model_from_chonk_buffer(config, model_buffer, dtype=torch.bfloat16, at
     typed = model_buffer.view(dtype)
     offset = 0
     for name, param in list(model.named_parameters()):
+        if name.startswith(skip_prefixes):
+            continue  # quantized: module swapped to QuantLinear after PEFT
         numel = param.numel()
         view = typed.narrow(0, offset, numel).view(param.shape)
         parts = name.split('.')
@@ -475,12 +484,93 @@ def build_model_from_chonk_buffer(config, model_buffer, dtype=torch.bfloat16, at
     return model
 
 
-def load_model_directly_to_chonk(model_path, config, pool: ChonkPool, dtype=torch.bfloat16, chunk_size_mb=512):
+def swap_quantized_base_layers(model, quant_dict, group_size=128, bits=8):
+    """After get_peft_model wrapped the (meta-weight) nn.Linear targets, swap
+    each LoraLayer's base_layer for a QuantLinear backed by pool buffers.
+    PEFT's LoraLayer.forward calls self.base_layer(x) generically, so this is
+    the only change needed; LoRA branches stay trainable on top."""
+    from vulkanvm_quant_py import QuantLinear
+
+    swapped = 0
+    for name, module in model.named_modules():
+        if not hasattr(module, "base_layer"):
+            continue
+        base = module.base_layer
+        if not hasattr(base, "in_features"):
+            continue
+        # Match against quant_dict keys (e.g. 'model.layers.3.self_attn.q_proj').
+        entry = quant_dict.get(name)
+        if entry is None:
+            # PEFT layer may sit under model.base_model.base.model.* prefix.
+            for m_name, (qw, sw, zw, bw) in quant_dict.items():
+                if name.endswith("." + m_name) or name == m_name:
+                    entry = (qw, sw, zw, bw)
+                    break
+        if entry is None:
+            continue
+        qw, sw, zw, bw = entry
+        module.base_layer = QuantLinear(
+            base.in_features, base.out_features, qw, sw, zw,
+            bits=bits, group_size=group_size, bias=bw)
+        swapped += 1
+    print(f"Swapped {swapped} quantized base layers into PEFT wrappers")
+    return swapped
+
+
+def replace_plain_quantized_layers(model, quant_dict, group_size=128, bits=8):
+    """Replace plain (non-PEFT-wrapped) nn.Linear modules whose weights were
+    quantized in the pool with QuantLinear. Used when quantizing ALL linear
+    layers (not just LoRA targets): the LoRA targets live inside PEFT wrappers
+    (handled by swap_quantized_base_layers); every other quantized Linear is a
+    standalone module and gets swapped here."""
+    from vulkanvm_quant_py import QuantLinear
+    import torch.nn as nn
+
+    replaced = 0
+    for name, module in list(model.named_modules()):
+        if not isinstance(module, nn.Linear):
+            continue
+        entry = quant_dict.get(name)
+        if entry is None:
+            for m_name, e in quant_dict.items():
+                if name.endswith("." + m_name) or name == m_name:
+                    entry = e
+                    break
+        if entry is None:
+            continue
+        qw, sw, zw, bw = entry
+        ql = QuantLinear(
+            module.in_features, module.out_features, qw, sw, zw,
+            bits=bits, group_size=group_size, bias=bw)
+        parts = name.split(".")
+        parent = model
+        for p in parts[:-1]:
+            parent = getattr(parent, p)
+        setattr(parent, parts[-1], ql)
+        replaced += 1
+    print(f"Replaced {replaced} plain quantized Linear layers")
+    return replaced
+
+
+def load_model_directly_to_chonk(model_path, config, pool: ChonkPool, dtype=torch.bfloat16,
+                                 chunk_size_mb=512, quantize_modules=None, quant_group_size=128,
+                                 quant_bits=8):
     """Load model weights directly from disk into Chonk Buffer without loading to CUDA first.
-    Uses meta device to create empty model structure, then loads weights directly to Chonk Buffer."""
+    Uses meta device to create empty model structure, then loads weights directly to Chonk Buffer.
+
+    If quantize_modules is given (list of module names, e.g. 'model.layers.0.self_attn.q_proj'),
+    those Linear weights are stored INT8/INT4-quantized in separate pool allocations instead of
+    bf16 in the flat model buffer. Returns (model_buffer, quant_dict) where quant_dict maps
+    module name -> (qweight, scales, zeros) pool-backed tensors (empty dict when disabled)."""
     import torch
     from transformers import AutoModelForCausalLM
-    
+    from vulkanvm_quant_py import quantize_weight
+
+    quantize_modules = set(quantize_modules or [])
+    quant_weight_names = {f"{m}.weight" for m in quantize_modules}
+    quant_bias_names = {f"{m}.bias" for m in quantize_modules}
+    quant_dict = {}
+
     # Create model on meta device (no memory allocation) using from_config
     print("Creating model on meta device...")
     with torch.device('meta'):
@@ -493,12 +583,42 @@ def load_model_directly_to_chonk(model_path, config, pool: ChonkPool, dtype=torc
     # Estimate memory and allocate in Chonk Buffer (use actual param count
     # from the meta model so the buffer matches the weights exactly)
     params_list = list(model.named_parameters())
-    total_numel = sum(p.numel() for _, p in params_list)
+    total_numel = sum(p.numel() for name, p in params_list
+                      if name not in quant_weight_names)
     total_bytes = total_numel * dtype.itemsize
     model_buffer = pool.alloc_model_weights(total_bytes, "model_weights")
     model_buffer_typed = model_buffer.view(dtype)
 
-    print(f"Loading weights directly to Chonk Buffer: {total_bytes / 1e9:.2f} GB...")
+    print(f"Loading weights directly to Chonk Buffer: {total_bytes / 1e9:.2f} GB "
+          f"(excluding {len(quantize_modules)} quantized modules)")
+
+    # Allocate ALL quantized weights as three flat buffers (qweight/scales/
+    # zeros) so the buddy allocator sees ~3 large allocations instead of
+    # ~3*len(quantize_modules) tiny ones. Tiny allocations fragment the
+    # sub-allocator and force fresh blocks during the position-growing steps.
+    quant_bytes = {"q": 0, "s": 0, "z": 0}
+    if quantize_modules:
+        for pname, p in params_list:
+            if pname not in quant_weight_names:
+                continue
+            out_f, in_f = p.shape
+            ng = max(1, in_f // quant_group_size)
+            quant_bytes["q"] += (out_f * in_f) if quant_bits == 8 else (out_f * in_f) // 2
+            quant_bytes["s"] += out_f * ng * 4
+            quant_bytes["z"] += out_f * ng
+        # +8 per module to cover the 8-byte alignment padding in the loop.
+        n_mod = len(quant_weight_names)
+        quant_bytes["q"] += n_mod * 8
+        quant_bytes["s"] += n_mod * 8
+        quant_bytes["z"] += n_mod * 8
+        quant_buffers = {
+            "q": pool.alloc_model_weights(quant_bytes["q"], "quant_qweight"),
+            "s": pool.alloc_model_weights(quant_bytes["s"], "quant_scales"),
+            "z": pool.alloc_model_weights(quant_bytes["z"], "quant_zeros"),
+        }
+        quant_offsets = {"q": 0, "s": 0, "z": 0}
+        print(f"Quant buffers: q={quant_bytes['q']/1e9:.2f}GB "
+              f"s={quant_bytes['s']/1e9:.2f}GB z={quant_bytes['z']/1e9:.2f}GB")
 
     # Load state dict and copy directly to Chonk Buffer
     from safetensors.torch import load_file
@@ -511,10 +631,13 @@ def load_model_directly_to_chonk(model_path, config, pool: ChonkPool, dtype=torc
 
     param_map = dict(params_list)
     # Precompute each param's slot offset in the flat buffer (layout follows
-    # named_parameters order). Offsets are computed ONCE, not per file.
+    # named_parameters order, skipping quantized params). Offsets are
+    # computed ONCE, not per file.
     slots = {}
     o = 0
     for name, param in param_map.items():
+        if name in quant_weight_names:
+            continue
         slots[name] = o
         o += param.numel()
 
@@ -545,6 +668,48 @@ def load_model_directly_to_chonk(model_path, config, pool: ChonkPool, dtype=torc
             numel = param.numel()
             param_bytes = numel * dtype.itemsize
 
+            if name in quant_bias_names:
+                # Tiny bf16 bias for a quantized module, kept in its own alloc.
+                module_name = name[: -len(".bias")]
+                b_buf = pool.alloc_model_weights(numel * dtype.itemsize,
+                                                 f"b_{module_name}")
+                b_view = b_buf.view(dtype).view_as(param)
+                b_view.copy_(tensor.to(dtype))
+                entry = quant_dict.setdefault(module_name, (None, None, None, None))
+                quant_dict[module_name] = (entry[0], entry[1], entry[2], b_view)
+                processed += 1
+                continue
+
+            if name in quant_weight_names:
+                # Quantize into the flat quant buffers (no bf16 copy).
+                module_name = name[: -len(".weight")]
+                qweight, scales, zeros = quantize_weight(
+                    tensor.to(torch.float32), bits=quant_bits,
+                    group_size=quant_group_size)
+                # Keep 8-byte element alignment inside the flat buffers so the
+                # float32 scales view is always well-aligned.
+                align8 = lambda x: (x + 7) & ~7
+                qo = align8(quant_offsets["q"])
+                so = align8(quant_offsets["s"])
+                zo = align8(quant_offsets["z"])
+                q_buf = quant_buffers["q"].narrow(0, qo, qweight.numel())
+                s_buf = quant_buffers["s"].narrow(0, so, scales.numel() * 4)
+                z_buf = quant_buffers["z"].narrow(0, zo, zeros.numel())
+                q_buf.view(torch.uint8).view_as(qweight).copy_(qweight)
+                s_buf.view(torch.float32).view_as(scales).copy_(scales)
+                z_buf.view(torch.uint8).view_as(zeros).copy_(zeros)
+                quant_offsets["q"] = qo + qweight.numel()
+                quant_offsets["s"] = so + scales.numel() * 4
+                quant_offsets["z"] = zo + zeros.numel()
+                quant_dict[module_name] = (
+                    q_buf.view(torch.uint8).view_as(qweight),
+                    s_buf.view(torch.float32).view_as(scales),
+                    z_buf.view(torch.uint8).view_as(zeros),
+                    None,
+                )
+                processed += 1
+                continue
+
             # Convert to target dtype
             tensor = tensor.to(dtype)
 
@@ -560,8 +725,8 @@ def load_model_directly_to_chonk(model_path, config, pool: ChonkPool, dtype=torc
                 bytes_copied = 0
 
     print(f"Loaded model directly to Chonk Buffer: {o * dtype.itemsize / 1e9:.2f} GB "
-          f"({processed} params copied)")
-    return model_buffer
+          f"({processed} params copied, {len(quant_dict)} quantized)")
+    return model_buffer, quant_dict
 
 
 def create_optimizer_states_in_chonk(params, pool: ChonkPool):
@@ -643,9 +808,11 @@ def patch_linear_cache_for_chunked_training():
 
 
 def build_lora_chonk_setup(model_path, config, batch_size, max_cache_len,
-                           lora_r=64, lora_alpha=128, lora_dropout=0.05,
-                           dtype=torch.bfloat16, chunk_size_mb=512,
-                           staging_gb=2.0, attn_implementation="eager"):
+                            lora_r=64, lora_alpha=128, lora_dropout=0.05,
+                            dtype=torch.bfloat16, chunk_size_mb=512,
+                            staging_gb=2.0, attn_implementation="eager",
+                            quantize=False, quant_group_size=128,
+                            quant_bits=8, act_budget_gb=2.0):
     """Complete LoRA training setup with EVERYTHING in Chonk Buffer:
       - pool + KV cache
       - base weights loaded directly from disk into the pool
@@ -653,9 +820,14 @@ def build_lora_chonk_setup(model_path, config, batch_size, max_cache_len,
       - LoRA adapters (trainable) in pool memory
       - AdamW fp32 states for LoRA params in pool memory
       - activation + staging buffers in pool memory
-    Returns a dict with pool, kv_cache, model, model_buffer, optimizer_states,
-    opt_buffer, act_buffer, staging_buffer, staging_host_ptr."""
+    quantize=True stores the LoRA target weights INT8/INT4 in the pool
+    (quant_bits=8 or 4; the PEFT base layers are swapped for QuantLinear
+    after wrapping). Returns a dict with pool, kv_cache, model, model_buffer,
+    optimizer_states, opt_buffer, act_buffer, staging_buffer, staging_host_ptr."""
     from peft import LoraConfig, get_peft_model
+
+    TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj",
+                      "gate_proj", "up_proj", "down_proj"]
 
     pool = ChonkPool()
 
@@ -663,20 +835,40 @@ def build_lora_chonk_setup(model_path, config, batch_size, max_cache_len,
     kv_cache = build_chonk_cache(config, batch_size, max_cache_len, pool)
 
     # 2. Base weights directly from disk into Chonk Buffer
-    model_buffer = load_model_directly_to_chonk(model_path, config, pool,
-                                                dtype=dtype, chunk_size_mb=chunk_size_mb)
+    quantize_modules = None
+    if quantize:
+        # Quantize ALL Linear layers into the pool (INT8/INT4); LoRA adapters
+        # only ever target TARGET_MODULES. Skipping every quantized weight from
+        # the bf16 flat buffer is the big memory win (the 27B model's non-target
+        # linears stay bf16 otherwise).
+        with torch.device("meta"):
+            from transformers import AutoModelForCausalLM
+            import torch.nn as nn
+            meta_model = AutoModelForCausalLM.from_config(
+                config, torch_dtype=dtype, trust_remote_code=True)
+        quantize_modules = [
+            name for name, m in meta_model.named_modules()
+            if isinstance(m, nn.Linear)
+        ]
+        print(f"Quantizing {len(quantize_modules)} Linear modules to "
+              f"INT{quant_bits} (group_size={quant_group_size})")
+
+    model_buffer, quant_dict = load_model_directly_to_chonk(
+        model_path, config, pool, dtype=dtype, chunk_size_mb=chunk_size_mb,
+        quantize_modules=quantize_modules, quant_group_size=quant_group_size,
+        quant_bits=quant_bits)
 
     # 3. Zero-copy model + freeze base
-    model = build_model_from_chonk_buffer(config, model_buffer, dtype=dtype,
-                                          attn_implementation=attn_implementation)
-    model.requires_grad_(False)
+    model = build_model_from_chonk_buffer(
+        config, model_buffer, dtype=dtype,
+        attn_implementation=attn_implementation,
+        skip_modules=quantize_modules)
 
     # 4. LoRA adapters
     lora_config = LoraConfig(
         r=lora_r,
         lora_alpha=lora_alpha,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                        "gate_proj", "up_proj", "down_proj"],
+        target_modules=TARGET_MODULES,
         lora_dropout=lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
@@ -686,6 +878,34 @@ def build_lora_chonk_setup(model_path, config, batch_size, max_cache_len,
     print(f"LoRA applied: {n_trainable / 1e6:.1f}M trainable params "
           f"({n_trainable * 2 / 1e9:.2f} GB bf16)")
 
+    # 4b. When target base weights were left on meta (quantized path), PEFT
+    #     creates the LoRA adapters on meta too (it dispatches adapters to
+    #     base_layer.weight.device). Re-materialize them on cuda with the
+    #     standard PEFT gaussian init before swapping in the QuantLinear.
+    for pname, p in list(model.named_parameters()):
+        if p.requires_grad and p.device.type == "meta":
+            fresh = torch.empty_like(p, device="cuda")
+            if "lora_A" in pname:
+                torch.nn.init.kaiming_uniform_(fresh, a=math.sqrt(5))
+            else:
+                torch.nn.init.zeros_(fresh)
+            parts = pname.split(".")
+            parent = model
+            for part in parts[:-1]:
+                parent = getattr(parent, part)
+            setattr(parent, parts[-1], torch.nn.Parameter(fresh))
+    if any(p.device.type == "meta" and p.requires_grad
+           for p in model.parameters()):
+        raise RuntimeError("trainable params left on meta after LoRA rematerialize")
+
+    # 4c. Swap quantized base layers inside the PEFT wrappers, then replace
+    #     the standalone (non-target) quantized Linears.
+    if quant_dict:
+        swap_quantized_base_layers(model, quant_dict, group_size=quant_group_size,
+                                   bits=quant_bits)
+        replace_plain_quantized_layers(model, quant_dict,
+                                       group_size=quant_group_size, bits=quant_bits)
+
     # 5. Optimizer states for trainable params in Chonk Buffer
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer_states, opt_buffer = create_optimizer_states_in_chonk(trainable, pool)
@@ -694,7 +914,7 @@ def build_lora_chonk_setup(model_path, config, batch_size, max_cache_len,
     text_cfg = config.get_text_config(decoder=True)
     act_buffer = create_activation_buffers(
         pool, batch_size, 0, text_cfg.hidden_size, text_cfg.num_hidden_layers,
-        dtype=dtype, chunk_size=4096, budget_gb=2.0,
+        dtype=dtype, chunk_size=4096, budget_gb=act_budget_gb,
     )
 
     # 7. Host-visible staging buffer

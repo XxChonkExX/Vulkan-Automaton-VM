@@ -62,10 +62,16 @@ CHONK_SMOKE = os.environ.get("CHONK_SMOKE", "0") == "1"        # smoke test: tin
 CHONK_ATTN = os.environ.get("CHONK_ATTN", "eager")             # eager (stable) | sdpa | flash_attention_2
 CHONK_ATTN_RECOMPUTE = os.environ.get("CHONK_ATTN_RECOMPUTE", "1") == "1"  # attention checkpointing (THE fix for the ~1.5MB/token eager-graph growth)
 CHONK_ALLOCATOR = os.environ.get("CHONK_ALLOCATOR", "1") == "1"  # pool-backed pluggable allocator for torch/HIP
+CHONK_QUANTIZE = os.environ.get("CHONK_QUANTIZE", "0") == "1"    # INT8/INT4-quantize LoRA target weights in the pool
+CHONK_QUANT_GROUP = int(os.environ.get("CHONK_QUANT_GROUP", "128"))
+CHONK_QUANT_BITS = int(os.environ.get("CHONK_QUANT_BITS", "8"))  # 8 or 4 bits per weight (4 = packed 2/byte, ~half the pool footprint)
+CHONK_ACT_GB = float(os.environ.get("CHONK_ACT_GB", "2.0"))      # activation scratch budget (mostly unused)
+CHONK_STAGING_GB = float(os.environ.get("CHONK_STAGING_GB", "2.0"))  # host-visible staging (unused w/o offload)
 
 # Training config
-MODEL_PATH = "/home/chonke/local_training/models/qwen36_27ablit"
-DATA_PATH = "/home/chonke/local_training/qwen_tokenized_128k"
+MODEL_PATH = os.environ.get("CHONK_MODEL_PATH", "/home/chonke/local_training/models/qwen36_27ablit")
+DATA_PATH = os.environ.get("CHONK_DATA_PATH", "/home/chonke/local_training/qwen_tokenized_128k")
+OUT_DIR = os.environ.get("CHONK_OUT_DIR", "/home/chonke/local_training/qwen_fine_tuned")
 SEQ_LEN = 131072
 BATCH_SIZE = 1
 CHUNK_SIZE = 1024  # 1024 validated stable; 2048 froze the machine, 4096 panicked
@@ -171,9 +177,11 @@ class ChonkAdamW(torch.optim.Optimizer):
                 exp_avg = state["exp_avg"]
                 exp_avg_sq = state["exp_avg_sq"]
 
-                # Weight decay
+                # Decoupled weight decay (standard AdamW): decay the weights
+                # directly instead of folding decay into the gradient, so the
+                # moment estimates stay unbiased by the L2 term.
                 if weight_decay != 0:
-                    grad = grad.add(p, alpha=weight_decay)
+                    p.mul_(1 - lr * weight_decay)
 
                 # Update moments
                 exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
@@ -357,6 +365,9 @@ def main():
         MODEL_PATH, config, BATCH_SIZE, MAX_CACHE_LEN,
         lora_r=64, lora_alpha=128, lora_dropout=0.05,
         attn_implementation=CHONK_ATTN,
+        quantize=CHONK_QUANTIZE, quant_group_size=CHONK_QUANT_GROUP,
+        quant_bits=CHONK_QUANT_BITS,
+        act_budget_gb=CHONK_ACT_GB, staging_gb=CHONK_STAGING_GB,
     )
     pool = setup["pool"]
     kv_cache = setup["kv_cache"]
@@ -494,7 +505,7 @@ def main():
 
         # Save checkpoint
         if step % SAVE_INTERVAL == 0 and step > 0:
-            save_path = f"/home/chonke/local_training/qwen_fine_tuned/chonk_step_{step}"
+            save_path = f"{OUT_DIR}/chonk_step_{step}"
             os.makedirs(save_path, exist_ok=True)
             model.save_pretrained(save_path)
             print(f"Checkpoint saved to {save_path}")
@@ -502,7 +513,7 @@ def main():
     # Final save
     # Apply EMA weights for final model
     ema.apply_shadow()
-    save_path = f"/home/chonke/local_training/qwen_fine_tuned/chonk_final"
+    save_path = f"{OUT_DIR}/chonk_final"
     os.makedirs(save_path, exist_ok=True)
     model.save_pretrained(save_path)
     print(f"\nFinal model saved to {save_path} (EMA weights applied)")

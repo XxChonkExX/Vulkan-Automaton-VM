@@ -379,47 +379,41 @@ static size_t minBlock() {
 
 ---
 
-## Next Phase: Quantization in the Chonk Buffer (Planned)
+## Quantization in the Chonk Buffer (COMPLETED, 2026-08-16)
 
-### Goal
-Train quantized model in the Chonk Buffer pipeline to unlock:
-- **131K @ chunk 1024** (or 2048) with headroom
-- **LoRA r=128-256** simultaneously  
-- **No architecture change** — everything stays in pool, pluggable allocator, grouped matmuls, terminal launcher
+### What was built
+Pure-Python per-group INT8/INT4 quantization, no C++/HIP kernel needed:
+- `vulkanvm_quant_py.py`: `quantize_weight_int8/int4` (vectorized, group_size=128, asymmetric with zero-point), packed INT4 (2 nibbles/byte), `dequantize_weight`, `QuantLinear`, and **`QuantMatmulFn`** — a custom autograd fn that saves ONLY the quantized buffers and re-dequants in backward. Without it, every chunk's forward left ~16GB of dequantized bf16 weights in the autograd graph (+55GB pool churn).
+- `chonk.py`: `load_model_directly_to_chonk(quantize_modules, quant_bits)`, `build_model_from_chonk_buffer(skip_modules)`, `swap_quantized_base_layers` (PEFT LoraLayer.base_layer swap — PEFT 0.13 rejects custom base modules as target_modules), `replace_plain_quantized_layers`, meta-LoRA rematerialize (PEFT dispatches adapters to base_layer.weight.device; meta weights → adapters on meta → backward dies "expected device meta but got cuda:0").
+- **Quantize-ALL**: all 497 Linear layers quantized (not just the 256 LoRA targets); bf16 flat buffer drops 16.21GB → 2.55GB (embeddings/norms only).
+- **Merged flat quant buffers**: qweight/scales/zeros each in ONE pool allocation (9 allocations instead of ~1500). This was THE fix for the position-growth steps: buddy-allocator fragmentation was forcing a fresh 8GB block every ~10-25 chunks; merging the buffers delayed the step-ups by ~60 chunks and enabled full 131K@1024.
 
-### Strategy: Hybrid Dequant-in-Pool (QLoRA-style, Stay in Buffer)
-**Why not Unsloth/bitsandbytes?** Unsloth uses Triton (AOTriton dead on gfx1151 — display resets). bitsandbytes ROCm support uncertain on gfx1151 (RDNA 3.5). Both lose the Chonk Buffer + 131K chunked-carry architecture we built.
+### Validated results (131K, r=128 LoRA unless noted)
+| Config | Result |
+|---|---|
+| 131K@512 bf16 r64 | COMPLETE, plateau 112.18GB (4GB blocks) |
+| 131K@1024 r128 INT8 targets-only (mb8) | OOM chunk ~82 (113.90GB + 8GB block > 122GB wall) |
+| 131K@2048 r64 INT4 targets-only (mb16) | OOM chunk 1-2: base 106.79GB, first 16GB block = 122.8GB > wall |
+| **131K@1024 r128 INT4 quantize-all + merged (mb8)** | **COMPLETE**: 99.31GB flat → 107.90 (step ~90) → 116.49 (step ~100) → flat to 131K. Adapter saved with EMA. |
+| 131K@2048 quantize-all + merged (projected) | Infeasible: base ~93GB + 16GB blocks × 3 crossings by 131K ≈ 125GB → OOM ~70K. 2048 cannot fit at 131K on this hardware. |
 
-**Path: Store weights INT4/INT8 in pool, dequant-on-the-fly via custom autograd fn**
-- Replace frozen `nn.Linear` with `QuantLinear` holding int4/int8 weight + scale in pool
-- Forward: `out = dequant(W_int) @ x + LoRA(x)` — dequant via custom autograd fn (read int4 from pool, expand to bf16 in registers/fused)
-- Backward: weight frozen → LoRA handles grad; dx recomputes dequant (don't save bf16)
-- Stays in pool: quant weights in pool, dequant transients via pluggable allocator, KV/LORA/OPT/transients unchanged
+### Memory accounting (setup, 131K@1024 r128 INT4-all)
+- Setup totalUsed: 39.18GB (vs 62.36GB INT8 targets-only; vs 85GB+ bf16)
+- KV 30.1GB fixed; quant buffers q=12.81GB s=0.80GB z=0.20GB; optimizer r128 ~7.6GB
+- Step-0 training footprint: 99.31GB (live; flat through step ~85)
 
-### Quantization Options
-| Scheme | Model Size | Savings | Pool @ 131K@512 | Unlocks |
-|---|---|---|---|---|
-| bf16 (current) | 53.8GB | — | 112.18GB | 131K@256/512, r=64 |
-| int8 (per-channel) | 27GB | -27GB | ~85GB | 131K@1024, r=128+ |
-| int4/NF4 (GPTQ-style) | 13.5GB | -40GB | ~72GB | 131K@2048, r=256+ |
+### Other changes this session
+- **ChonkAdamW**: decoupled weight decay (audit item 3) — `p.mul_(1 - lr*wd)` before moment updates instead of folding decay into the gradient.
+- **UnifiedMemoryPool destructor**: mutex-locked teardown (audit item 2). `_build/vulkanvm_pool_test.so` rebuilt from source (static lib needs `-fPIC`, module needs `-fvisibility=default` for the `chonk_allocator_*` ctypes exports, links `libamdhip64.so.7`). Backup: `_build/vulkanvm_pool_test.so.bak_0815`.
+- **Hard-coded paths** in train script → `CHONK_MODEL_PATH`/`CHONK_DATA_PATH`/`CHONK_OUT_DIR` env vars (audit item 4).
+- **Audit items 1 (buddy splitTo) / 5 (block rounding) / 6 (maxHeapFraction)**: NOT changed — allocator is field-validated; the 2^31-cliff is already handled by `CHONK_MIN_BLOCK_GB` (documented in Test 10); `maxHeapFraction=0` is intentional for APU unified memory.
+- Launcher: `--quant-bits` flag + `CHONK_QUANT_BITS` env.
 
-### Implementation Steps (Chonk-Native)
-1. **Quant step** (one-time, offline): Use GPTQ/bitsandbytes on CPU/other GPU to produce int4/int8 weights + scales for all 7 LoRA target modules. Save as safetensors.
-2. **Custom `QuantizedMatmul` autograd fn** (in `vulkanvm_autograd.hpp` + pybind): fused int4→bf16 dequant + matmul kernel (HIP or torch fallback). Reads int4 from pool, computes bf16 in registers, no bf16 intermediate saved.
-3. **Model surgery** (`chonk.py` `build_lora_chonk_setup`): replace target `nn.Linear` with `QuantLinear` holding int4 weight + scale (pool-allocated) + LoRA adapter.
-4. **Test** with 16K probe, alloc log, verify 4GB blocks still work (quant weights < 4GB).
-5. **Run 131K@1024** with `CHONK_MIN_BLOCK_GB=8` (p/scores max 6.4GB < 8GB).
-
-### Key Advantage
-- **Everything stays in the Chonk Buffer**: no architecture change, pluggable allocator handles quant weights + transients, grouped matmuls + split path + terminal launcher all unchanged.
-- **LoRA rank scales independently**: quant frees model RAM → headroom for r=256+.
-
-### Open Questions for Quantization R&D
-1. **int4 dequant kernel**: HIP vs torch fallback? AOTriton dead; hand-written HIP kernel or torch.view+bitops. Group size 128 typical.
-2. **Calibration**: GPTQ needs representative data — use tokenized Unreal PDFs.
-3. **Accuracy**: validate perplexity vs bf16 baseline (expect <0.5 PPL delta for int4 LoRA).
-4. **Backward recompute**: dx recomputes dequant → 2× dequant cost. Acceptable if kernel fast.
+### Conclusions
+- **The optimum for 131K on Strix Halo**: chunk 1024, r=128, INT4 quantize-all, merged quant buffers, trims act/staging 0.25GB, mb8. Peak 116.49GB / 122GB wall.
+- 2048/4096 chunks at 131K are memory-infeasible (16GB/32GB block granularity vs 122GB wall); chunk 2048 is possible only at shorter sequences (< ~70K context).
+- C++ quant path (`vulkanvm_quant.cpp` etc.) abandoned: pybind link issues + missing ROCm runtime libs on the system; superseded by the Python implementation.
 
 ---
 
-*End of log — quantization phase begins*
+*End of log*
