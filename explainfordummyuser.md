@@ -392,6 +392,8 @@ pool.uncommit(reservation, 64_GiB, 64_GiB);              // Release
 
 Zero-copy sharing with Android graphics pipeline (Surface, MediaCodec, Camera).
 
+**✅ Verified on Galaxy S24+ (API 36 / Android 16, Adreno GPU)**: AHardwareBuffer import works end-to-end with `VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID`. Test passes with 256×256 RGBA8 buffers, device address valid for shader access.
+
 ```bash
 ./scripts/build_android.sh arm64-v8a android-34 Release
 ```
