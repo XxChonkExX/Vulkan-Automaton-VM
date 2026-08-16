@@ -6,6 +6,10 @@
 #include <unistd.h>
 #endif
 
+#ifdef VVM_PLATFORM_ANDROID
+#include <android/hardware_buffer.h>
+#endif
+
 // Export macros for shared library (also defined in core.hpp)
 #if defined(VVM_BUILD_SHARED) && defined(VVM_EXPORT)
 #define VVM_API __attribute__((visibility("default")))
@@ -329,7 +333,22 @@ class ExternalHandle {
 public:
     ExternalHandle() = default;
     
-    #ifdef VVM_PLATFORM_LINUX
+    #ifdef VVM_PLATFORM_ANDROID
+    // Android: AHardwareBuffer handle
+    ExternalHandle(AHardwareBuffer* buffer) : hardwareBuffer_(buffer) {}
+    ~ExternalHandle() { if (hardwareBuffer_) AHardwareBuffer_release(hardwareBuffer_); }
+    
+    ExternalHandle(ExternalHandle&& other) noexcept : hardwareBuffer_(other.hardwareBuffer_) { other.hardwareBuffer_ = nullptr; }
+    ExternalHandle& operator=(ExternalHandle&& other) noexcept {
+        if (this != &other) { if (hardwareBuffer_) AHardwareBuffer_release(hardwareBuffer_); hardwareBuffer_ = other.hardwareBuffer_; other.hardwareBuffer_ = nullptr; }
+        return *this;
+    }
+    
+    AHardwareBuffer* get() const { return hardwareBuffer_; }
+    explicit operator bool() const { return hardwareBuffer_ != nullptr; }
+    AHardwareBuffer* release() { AHardwareBuffer* h = hardwareBuffer_; hardwareBuffer_ = nullptr; return h; }
+    
+    #elif defined(VVM_PLATFORM_LINUX)
     // Allow implicit construction from int (fd)
     ExternalHandle(int fd) : fd_(fd) {}
     ~ExternalHandle() { if (fd_ >= 0) close(fd_); }
@@ -359,29 +378,15 @@ public:
     explicit operator bool() const { return handle_ != nullptr; }
     HANDLE release() { HANDLE h = handle_; handle_ = nullptr; return h; }
     
-    #elif defined(VVM_PLATFORM_ANDROID)
-    // Android: AHardwareBuffer handle
-    ExternalHandle(AHardwareBuffer* buffer) : hardwareBuffer_(buffer) {}
-    ~ExternalHandle() { if (hardwareBuffer_) AHardwareBuffer_release(hardwareBuffer_); }
-    
-    ExternalHandle(ExternalHandle&& other) noexcept : hardwareBuffer_(other.hardwareBuffer_) { other.hardwareBuffer_ = nullptr; }
-    ExternalHandle& operator=(ExternalHandle&& other) noexcept {
-        if (this != &other) { if (hardwareBuffer_) AHardwareBuffer_release(hardwareBuffer_); hardwareBuffer_ = other.hardwareBuffer_; other.hardwareBuffer_ = nullptr; }
-        return *this;
-    }
-    
-    AHardwareBuffer* get() const { return hardwareBuffer_; }
-    explicit operator bool() const { return hardwareBuffer_ != nullptr; }
-    AHardwareBuffer* release() { AHardwareBuffer* h = hardwareBuffer_; hardwareBuffer_ = nullptr; return h; }
-#endif
+    #endif
     
     private:
-        #ifdef VVM_PLATFORM_LINUX
+        #ifdef VVM_PLATFORM_ANDROID
+        AHardwareBuffer* hardwareBuffer_ = nullptr;
+        #elif defined(VVM_PLATFORM_LINUX)
         int fd_ = -1;
         #elif defined(VVM_PLATFORM_WINDOWS)
         HANDLE handle_ = nullptr;
-        #elif defined(VVM_PLATFORM_ANDROID)
-        AHardwareBuffer* hardwareBuffer_ = nullptr;
         #endif
     };
 
@@ -440,7 +445,15 @@ struct ExternalMemoryInfo {
     copy.size = src.size;
     copy.memoryTypeIndex = src.memoryTypeIndex;
     copy.dedicatedAllocation = src.dedicatedAllocation;
-#ifdef VVM_PLATFORM_LINUX
+#ifdef VVM_PLATFORM_ANDROID
+    if (src.handle) {
+        // AHardwareBuffer is reference counted: bump the refcount so the
+        // source and the duplicate each own one release.
+        AHardwareBuffer* buf = src.handle.get();
+        AHardwareBuffer_acquire(buf);
+        copy.handle = ExternalHandle(buf);
+    }
+#elif defined(VVM_PLATFORM_LINUX)
     if (src.handle) {
         int dupFd = dup(src.handle.get());
         if (dupFd >= 0) copy.handle = ExternalHandle(dupFd);
@@ -453,14 +466,6 @@ struct ExternalMemoryInfo {
                             DUPLICATE_SAME_ACCESS)) {
             copy.handle = ExternalHandle(dupHandle);
         }
-    }
-#elif defined(VVM_PLATFORM_ANDROID)
-    if (src.handle) {
-        // AHardwareBuffer is reference counted: bump the refcount so the
-        // source and the duplicate each own one release.
-        AHardwareBuffer* buf = src.handle.get();
-        AHardwareBuffer_acquire(buf);
-        copy.handle = ExternalHandle(buf);
     }
 #endif
     return copy;
@@ -676,7 +681,15 @@ public:
             msg = detail::logFormat(fmt, std::forward<Args>(args)...);
         } else {
             char buffer[1024];
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-security"
+#pragma GCC diagnostic ignored "-Wnon-pod-varargs"
+#endif
             int len = snprintf(buffer, sizeof(buffer), fmt ? fmt : "", std::forward<Args>(args)...);
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
             if (len < 0) return;
             msg.assign(buffer, static_cast<size_t>(len));
         }

@@ -10,6 +10,7 @@ struct ExternalMemoryCaps {
     bool supportsD3D12Heap = false;
     bool supportsDmaBuf = false;
     bool supportsZirconHandle = false;
+    bool supportsAndroidHardwareBuffer = false;
     VkExternalMemoryHandleTypeFlags supportedHandleTypes = 0;
     VkExternalMemoryFeatureFlags supportedFeatures = 0;
 };
