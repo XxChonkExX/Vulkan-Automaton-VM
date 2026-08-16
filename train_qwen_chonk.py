@@ -15,6 +15,8 @@ Hardware: Strix Halo 395 (128GB unified RAM, 2GB VRAM carve)
 
 import os
 import sys
+import time
+import contextlib
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, IterableDataset
@@ -29,27 +31,44 @@ from transformers.modeling_utils import PreTrainedModel
 # Add VulkanVM to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "python", "vulkanvm_torch"))
 
-from vulkanvm_torch.chonk import (
+from chonk import (
     ChonkPool,
     build_chonk_cache,
     reset_chonk_cache,
-    build_full_chonk_training_setup,
+    build_lora_chonk_setup,
     load_model_into_chonk,
     create_optimizer_states_in_chonk,
     create_activation_buffers,
     estimate_model_memory,
+    patch_linear_cache_for_chunked_training,
+    install_chonk_allocator,
 )
 
-# ROCm/Strix Halo memory config
-os.environ["PYTORCH_HIP_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.6"
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.6"
+# ROCm/Strix Halo memory config.
+# NOTE: expandable_segments MUST stay False — (a) the pluggable allocator path
+# bypasses expandable segments anyway (no alloc/free hooks to swap), and
+# (b) expandable_segments:True crashes on ROCm/kernel 7.0
+# (pytorch/pytorch#187343, drm_suballoc_helper splits) — the recurring
+# display-driver resets.
+os.environ["PYTORCH_HIP_ALLOC_CONF"] = "expandable_segments:False,garbage_collection_threshold:0.4"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:False,garbage_collection_threshold:0.4"
+
+# Stability knobs (iGPU also drives the display; sustained compute can
+# starve it and reset the driver -> login screen)
+CHONK_COMPILE = os.environ.get("CHONK_COMPILE", "0") == "1"   # torch.compile (risky w/ fla kernels)
+CHONK_AUTOCAST = os.environ.get("CHONK_AUTOCAST", "0") == "1"  # bf16 autocast in train_step
+CHONK_PAUSE = float(os.environ.get("CHONK_PAUSE", "0.02"))     # sec pause per chunk (display breathing room)
+CHONK_SMOKE = os.environ.get("CHONK_SMOKE", "0") == "1"        # smoke test: tiny seq, 2 steps
+CHONK_ATTN = os.environ.get("CHONK_ATTN", "eager")             # eager (stable) | sdpa | flash_attention_2
+CHONK_ATTN_RECOMPUTE = os.environ.get("CHONK_ATTN_RECOMPUTE", "1") == "1"  # attention checkpointing (THE fix for the ~1.5MB/token eager-graph growth)
+CHONK_ALLOCATOR = os.environ.get("CHONK_ALLOCATOR", "1") == "1"  # pool-backed pluggable allocator for torch/HIP
 
 # Training config
 MODEL_PATH = "/home/chonke/local_training/models/qwen36_27ablit"
 DATA_PATH = "/home/chonke/local_training/qwen_tokenized_128k"
 SEQ_LEN = 131072
 BATCH_SIZE = 1
-CHUNK_SIZE = 4096  # 2K-4K recommended for ROCm stability
+CHUNK_SIZE = 1024  # 1024 validated stable; 2048 froze the machine, 4096 panicked
 MAX_CACHE_LEN = 131072
 LEARNING_RATE = 2e-5
 WEIGHT_DECAY = 0.01
@@ -60,26 +79,52 @@ GRAD_CLIP_NORM = 1.0  # EXP 1: Gradient clipping
 LOG_INTERVAL = 10
 SAVE_INTERVAL = 500
 
+if CHONK_SMOKE:
+    SEQ_LEN = int(os.environ.get("CHONK_SMOKE_SEQ", "2048"))
+    MAX_STEPS = int(os.environ.get("CHONK_SMOKE_STEPS", "2"))
+    CHUNK_SIZE = int(os.environ.get("CHONK_SMOKE_CHUNK", "1024"))
+
 # Chonk Buffer config
 # Total pool size: ~80-90GB (model ~22GB + optimizer ~44GB + KV ~10GB + activations ~8GB + staging ~2GB)
 
 
 def get_tokenized_dataset(data_path, seq_len, batch_size):
-    """Load tokenized dataset from disk."""
-    import glob
+    """Load tokenized dataset from disk (memmap tokens.bin + index.bin).
+    Tokens are packed into fixed seq_len blocks (variable-length documents
+    are concatenated, cache resets at block boundaries)."""
     import numpy as np
 
-    files = sorted(glob.glob(os.path.join(data_path, "*.npy")))
-    if not files:
-        raise FileNotFoundError(f"No .npy files found in {data_path}")
+    tokens_path = os.path.join(data_path, "tokens.bin")
+    index_path = os.path.join(data_path, "index.bin")
+    if not os.path.exists(tokens_path):
+        # Fallback: legacy .npy files
+        import glob
+
+        files = sorted(glob.glob(os.path.join(data_path, "*.npy")))
+        if not files:
+            raise FileNotFoundError(f"No data found in {data_path}")
+
+        def gen_npy():
+            for f in files:
+                data = np.load(f, mmap_mode="r")
+                for i in range(0, len(data) - seq_len, seq_len):
+                    chunk = data[i:i + seq_len]
+                    if len(chunk) == seq_len:
+                        yield torch.from_numpy(chunk.astype(np.int64))
+
+        return gen_npy()
+
+    tokens = np.memmap(tokens_path, dtype=np.uint32, mode="r")
+    index = np.memmap(index_path, dtype=np.int64, mode="r")
+    print(f"  Dataset: {len(tokens):,} tokens, {len(index) - 1:,} sequences "
+          f"(packed into {len(tokens) // seq_len:,} blocks of {seq_len:,})")
 
     def generator():
-        for f in files:
-            data = np.load(f, mmap_mode="r")
-            for i in range(0, len(data) - seq_len, seq_len):
-                chunk = data[i:i + seq_len]
-                if len(chunk) == seq_len:
-                    yield torch.from_numpy(chunk.astype(np.int64))
+        n_blocks = len(tokens) // seq_len
+        for b in range(n_blocks):
+            start = b * seq_len
+            chunk = tokens[start:start + seq_len]
+            yield torch.from_numpy(chunk.astype(np.int64))
 
     return generator()
 
@@ -193,12 +238,69 @@ def patch_sdpa_for_chonk():
     torch.nn.functional.scaled_dot_product_attention = patched_sdpa
 
 
+def patch_eager_attention_recompute(model, kv_cache):
+    """Route eager attention through the recompute-checkpointed autograd fn.
+
+    Plain eager saves the fp32 softmax probabilities per layer
+    ((B,H,q,pos) -> grows with position: ~1.5MB/token across 24 layers),
+    which is the per-chunk slab growth that OOMs at ~112GB (~chunk 25).
+    With recompute, backward re-derives the probs from q/k/v instead of
+    saving them (attention checkpointing; attention math runs in bf16 to
+    halve the position-proportional tensors, grads return in fp32).
+    Requires _build/vulkanvm_attn.so.
+    """
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "_build"))
+        import vulkanvm_attn as vvm_attn
+    except ImportError:
+        print("[warn] vulkanvm_attn.so not built; falling back to plain eager")
+        return
+    vvm_attn.set_attention_recompute(True)
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    first = next(l for l in base.model.layers if hasattr(l, "self_attn"))
+    attn_mod = type(first.self_attn).__module__
+    mod = sys.modules[attn_mod]
+    orig = mod.eager_attention_forward
+
+    def patched(module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs):
+        if dropout > 0:
+            return orig(module, query, key, value, attention_mask, scaling, dropout, **kwargs)
+        # Chunked cache: key/value are the full cat [cached | current]. Pass
+        # zero-copy views of the constant cached span so the autograd fn
+        # saves only the current chunk's rows (~1MB) instead of the whole
+        # cat (2KB/pos x layers -> 8+ GB at 131K).
+        layer = kv_cache.layers[module.layer_idx]
+        cached_k = cached_v = torch.empty(0, device=query.device, dtype=torch.bfloat16)
+        if hasattr(layer, "keys"):
+            cur_len = key.shape[-2] - query.shape[-2]
+            if cur_len > 0:
+                # Views of the POOL CELLS (permanent storage, retention-free);
+                # detached: the cells' shared storage is written by every
+                # layer's update, which would trip autograd's inplace-version
+                # check on the saved views (data is constant at backward).
+                cached_k = layer.keys[: key.shape[0], :, :cur_len].detach()
+                cached_v = layer.values[: key.shape[0], :, :cur_len].detach()
+        out = vvm_attn.vulkan_attention(query, key, value, scaling, attention_mask,
+                                        kv_repeat=module.num_key_value_groups,
+                                        cached_k=cached_k, cached_v=cached_v)
+        out = out.transpose(1, 2).contiguous()
+        return out, None
+
+    mod.eager_attention_forward = patched
+    print("[+] eager attention patched: fp32 attn probs recomputed in backward (not saved)")
+
+
 def train_step(model, chunk_ids, kv_cache, optimizer, chunk_start, chunk_end, seq_len):
     """Single training step on a chunk."""
     cp = torch.arange(chunk_start, chunk_end, device="cuda")
 
-    # EXP 4: BF16 autocast for forward pass
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+    if CHONK_AUTOCAST:
+        # EXP 4: BF16 autocast for forward pass (off by default: untested with Chonk path)
+        context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    else:
+        context = contextlib.nullcontext()
+
+    with context:
         outputs = model(
             input_ids=chunk_ids,
             past_key_values=kv_cache,
@@ -238,71 +340,53 @@ def main():
     # 1. Load config first (to estimate memory)
     print("\n[1/6] Loading model config...")
     config = AutoConfig.from_pretrained(MODEL_PATH, trust_remote_code=True)
-    print(f"  Hidden size: {config.hidden_size}")
-    print(f"  Num layers: {config.num_hidden_layers}")
-    print(f"  Num heads: {config.num_attention_heads}")
-    print(f"  Vocab size: {config.vocab_size}")
+    text_cfg = config.get_text_config(decoder=True)
+    print(f"  Hidden size: {text_cfg.hidden_size}")
+    print(f"  Num layers: {text_cfg.num_hidden_layers}")
+    print(f"  Num heads: {text_cfg.num_attention_heads}")
+    print(f"  Vocab size: {text_cfg.vocab_size}")
 
-    # 2. Initialize Chonk Pool and build KV cache BEFORE loading model
-    print("\n[2/6] Initializing Chonk Buffer pool...")
-    pool = ChonkPool()
+    # 2/3. Everything happens inside build_lora_chonk_setup (single pool):
+    #      KV cache, base weights, LoRA, optimizer states, staging
+    print("\n[2/6] Building LoRA training setup in Chonk Buffer...")
+    if CHONK_ALLOCATOR:
+        print("  [+] Installing pool-backed pluggable allocator "
+              "(torch segments draw from the Chonk Buffer)")
+        install_chonk_allocator()
+    setup = build_lora_chonk_setup(
+        MODEL_PATH, config, BATCH_SIZE, MAX_CACHE_LEN,
+        lora_r=64, lora_alpha=128, lora_dropout=0.05,
+        attn_implementation=CHONK_ATTN,
+    )
+    pool = setup["pool"]
+    kv_cache = setup["kv_cache"]
+    model = setup["model"]
+    optimizer_states = setup["optimizer_states"]
     print(f"  Device: {pool.device_name}")
-
-    print("\n[3/6] Building KV cache in Chonk Buffer...")
-    kv_cache = build_chonk_cache(config, BATCH_SIZE, MAX_CACHE_LEN, pool)
+    # Release torch's setup-phase cached segments back to the pool so the
+    # first forward doesn't spike on top of them (display shares the heap).
+    torch.cuda.empty_cache()
+    s = pool.stats()
+    print(f"  Pool after setup+empty_cache: {s['totalUsed'] / 1e9:.2f} GB used, "
+          f"{s['allocationCount']} allocations")
     print(f"  KV cache built for {len([l for l in kv_cache.layers if hasattr(l, 'keys')])} full-attention layers")
-
-    # 3. Load model (after Chonk Buffer is built to prevent fragmentation)
-    print("\n[4/6] Loading model...")
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_PATH,
-        config=config,
-        device_map=None,
-        low_cpu_mem_usage=True,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-        attn_implementation="flash_attention_2",  # EXP 3: Flash Attention 2
-    )
-    model = model.cuda()
-    print(f"  Model loaded, CUDA memory: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
-
-    # 4. Prepare for k-bit training (LoRA will be added)
-    print("\n[5/6] Preparing model for training...")
-    from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model
-
-    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
-    print("  Model prepared for k-bit training (gradient checkpointing disabled)")
-
-    # Add LoRA
-    lora_config = LoraConfig(
-        r=64,
-        lora_alpha=128,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        lora_dropout=0.05,
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
-    print(f"  CUDA memory after LoRA: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
 
-    # EXP 2: torch.compile for speedup
-    print("\n[Exp 2] Compiling model with torch.compile...")
-    model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
-    print("  Model compiled successfully")
+    # Patch linear-attention cache for chunked forward/backward (truncated BPTT)
+    patch_linear_cache_for_chunked_training()
 
-    # 5. Load model weights into Chonk Buffer
-    print("\n[6/6] Moving model weights to Chonk Buffer...")
-    model_buffer = load_model_into_chonk(model, pool)
-    print(f"  Model weights in Chonk Buffer")
+    if CHONK_ATTN == "eager" and CHONK_ATTN_RECOMPUTE:
+        patch_eager_attention_recompute(model, kv_cache)
 
-    # 6. Create optimizer states in Chonk Buffer
-    print("\n[7/6] Creating optimizer states in Chonk Buffer...")
-    optimizer_states, opt_buffer = create_optimizer_states_in_chonk(model, pool)
+    if CHONK_COMPILE:
+        # EXP 2: torch.compile for speedup (off by default: fla kernels are risky under dynamo)
+        print("\n[Exp 2] Compiling model with torch.compile...")
+        model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
+        print("  Model compiled successfully")
 
-    # 7. Create optimizer
+    # 6. Create optimizer
     optimizer = ChonkAdamW(
-        model.parameters(),
+        [p for p in model.parameters() if p.requires_grad],
         optimizer_states,
         lr=LEARNING_RATE,
         betas=(0.9, 0.999),
@@ -313,12 +397,6 @@ def main():
     # EXP 7: EMA for better final quality
     ema = EMAModel(model, decay=0.9999)
     print("  EMA model initialized (decay=0.9999)")
-
-    # 8. Create activation buffers
-    print("\n[8/6] Creating activation buffers...")
-    hidden_size = config.hidden_size
-    num_layers = config.num_hidden_layers
-    act_buffer = create_activation_buffers(pool, BATCH_SIZE, SEQ_LEN, hidden_size, num_layers, chunk_size=CHUNK_SIZE)
 
     # 9. Patch SDPA
     patch_sdpa_for_chonk()
@@ -340,6 +418,7 @@ def main():
 
     step = 0
     model.train()
+    t_seq_start = time.time()
 
     for input_ids in dataset_gen:
         if step >= MAX_STEPS:
@@ -361,12 +440,35 @@ def main():
             # Forward
             loss, outputs = train_step(model, chunk_ids, kv_cache, optimizer, chunk_start, chunk_end, SEQ_LEN)
 
+            if CHONK_PAUSE > 0:
+                time.sleep(CHONK_PAUSE)  # give the display pipeline breathing room
+
+            last_loss = float("nan")
             if loss is not None:
                 # Scale loss for gradient accumulation
                 loss = loss / GRAD_ACCUM_STEPS
+                last_loss = loss.item()
                 loss.backward()
+                del loss, outputs  # free the 2GB logits + graph ASAP
 
             chunks_this_seq += 1
+
+            # Return ALL cached segments to the slab EVERY chunk. The saved
+            # fp32 attn_weights grow with position (512 x pos x 16 layers), so
+            # every chunk's request is bigger than the last; torch's cached
+            # smaller segments never fit, forcing fresh 2GB blocks. Emptying
+            # the cache each chunk coalesces the whole slab so each chunk
+            # re-carves the same blocks (growth ~= intrinsic delta, ~4GB at
+            # 131K, not ~1GB/chunk -> OOM at 112GB). Blocks are never
+            # released (warmBlocks=512), so this is pure slab recycling.
+            torch.cuda.empty_cache()
+
+            # Heartbeat
+            if chunks_this_seq % 8 == 0:
+                ps = pool.stats()
+                print(f"  [seq] chunk {chunks_this_seq}/{SEQ_LEN // CHUNK_SIZE} "
+                      f"({time.time() - t_seq_start:.0f}s, loss={last_loss:.4f}, "
+                      f"pool={ps['totalUsed'] / 1e9:.2f}GB)", flush=True)
 
             # Step optimizer after GRAD_ACCUM_STEPS chunks (or end of sequence)
             if chunks_this_seq % GRAD_ACCUM_STEPS == 0 or chunk_end == SEQ_LEN:
@@ -382,7 +484,7 @@ def main():
             # Log (count optimizer steps, not chunks)
             if step % LOG_INTERVAL == 0:
                 stats = pool.stats()
-                print(f"Step {step}: loss={loss.item() * GRAD_ACCUM_STEPS if loss is not None else 0:.4f}, "
+                print(f"Step {step}: loss={last_loss * GRAD_ACCUM_STEPS:.4f}, "
                       f"lr={scheduler.get_last_lr()[0]:.2e}, pool_used={stats['totalUsed'] / 1e9:.2f} GB")
 
             step += 1

@@ -29,6 +29,7 @@
 namespace py = pybind11;
 
 using namespace vvm_torch;
+bool autograd::VulkanAttentionFn::recompute = false;
 
 // -----------------------------------------------------------------------------
 // Bind LoRAAdapter struct
@@ -242,6 +243,10 @@ void register_vulkanvm_autograd_bindings(py::module_& m) {
         py::arg("q"), py::arg("k"), py::arg("v"),
         py::arg("scale"), py::arg("mask") = torch::Tensor(),
         "VulkanVM custom-autograd scaled-dot-product attention");
+  m.def("set_attention_recompute",
+        [](bool on) { autograd::VulkanAttentionFn::setRecompute(on); },
+        py::arg("on"),
+        "Attention checkpointing: don't save fp32 softmax probs, recompute in backward");
   m.def("vulkan_lora_linear", &VulkanLoraLinearFn_apply,
         py::arg("input"), py::arg("weight"), py::arg("bias"),
         py::arg("lora_a"), py::arg("lora_b"), py::arg("scale"),
