@@ -1,0 +1,35 @@
+{
+ "chunk": 512,
+ "seq": 8192,
+ "status": "PASS",
+ "setup_s": 84.1,
+ "total_s": 74.7,
+ "hip_peaks_gb": [
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0
+ ],
+ "max_hip_peak_gb": 0.0,
+ "pool_stats": {
+  "totalAllocated": 102513246208,
+  "totalUsed": 101439504384,
+  "totalFree": 1073741824,
+  "largestFreeBlock": 1073741824,
+  "fragmentationRatio": 0.0,
+  "blockCount": 1,
+  "allocationCount": 20
+ }
+}
