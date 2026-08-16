@@ -1,6 +1,6 @@
 #include "vulkan_vm/vulkan_vm.hpp"
 #include "vulkan_vm/utils.hpp"
-#include "external_memory.hpp"
+#include "vulkan_vm/cross_gpu/external_memory.hpp"
 
 #include <algorithm>
 
