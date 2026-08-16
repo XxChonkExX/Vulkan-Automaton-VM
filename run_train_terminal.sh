@@ -42,6 +42,10 @@ RANK=64
 PAUSE=0.02
 WATCH=0
 MIN_BLOCK_GB=""
+QUANTIZE=0
+QUANT_BITS=""
+ACT_GB=""
+STAGING_GB=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -51,6 +55,10 @@ while [[ $# -gt 0 ]]; do
     --rank)   RANK="$2";   shift 2 ;;
     --pause)  PAUSE="$2";  shift 2 ;;
     --min-block-gb) MIN_BLOCK_GB="$2"; shift 2 ;;
+    --act-gb) ACT_GB="$2";  shift 2 ;;
+    --staging-gb) STAGING_GB="$2";  shift 2 ;;
+    --quantize) QUANTIZE=1; shift ;;
+    --quant-bits) QUANT_BITS="$2"; shift 2 ;;
     --watch)  WATCH=1;     shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -59,14 +67,16 @@ done
 TS="$(date +%Y%m%d_%H%M%S)"
 LOG="$LOG_DIR/train_${TS}_seq${SEQ}_chunk${CHUNK}_rank${RANK}${MIN_BLOCK_GB:+_mb${MIN_BLOCK_GB}}.log"
 
-echo "==> Config: seq=${SEQ} chunk=${CHUNK} steps=${STEPS} lora_rank=${RANK} pause=${PAUSE} min_block_gb=${MIN_BLOCK_GB:-2(default)}"
+echo "==> Config: seq=${SEQ} chunk=${CHUNK} steps=${STEPS} lora_rank=${RANK} pause=${PAUSE} min_block_gb=${MIN_BLOCK_GB:-2(default)} quantize=${QUANTIZE}${QUANT_BITS:+ bits=${QUANT_BITS}}"
 echo "==> Log:    $LOG"
 
 # --- LoRA rank != 64: run a sed-patched copy, original untouched -----------
 TRAIN="$REPO/train_qwen_chonk.py"
 if [[ "$RANK" != "64" ]]; then
   TRAIN="/tmp/opencode/train_qwen_chonk_rank${RANK}.py"
-  sed "s/lora_r=64/lora_r=${RANK}/g; s/lora_alpha=128/lora_alpha=${RANK}/g" \
+  sed "s/lora_r=64/lora_r=${RANK}/g; s/lora_alpha=128/lora_alpha=${RANK}/g; \
+       s|os.path.join(os.path.dirname(__file__), \"python\", \"vulkanvm_torch\")|\"$REPO/python/vulkanvm_torch\"|g; \
+       s|os.path.join(os.path.dirname(__file__), \"_build\")|\"$REPO/_build\"|g" \
       "$REPO/train_qwen_chonk.py" > "$TRAIN"
   echo "==> Rank override: running patched copy $TRAIN"
 fi
@@ -77,6 +87,10 @@ env CHONK_SMOKE=1 \
     CHONK_SMOKE_CHUNK="$CHUNK" \
     CHONK_SMOKE_STEPS="$STEPS" \
     CHONK_PAUSE="$PAUSE" \
+    ${QUANTIZE:+CHONK_QUANTIZE="1"} \
+    ${QUANT_BITS:+CHONK_QUANT_BITS="$QUANT_BITS"} \
+    ${ACT_GB:+CHONK_ACT_GB="$ACT_GB"} \
+    ${STAGING_GB:+CHONK_STAGING_GB="$STAGING_GB"} \
     ${MIN_BLOCK_GB:+CHONK_MIN_BLOCK_GB="$MIN_BLOCK_GB"} \
     setsid nohup "$PY" "$TRAIN" > "$LOG" 2>&1 < /dev/null &
 PID=$!

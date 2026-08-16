@@ -229,6 +229,9 @@ UnifiedMemoryPool& UnifiedMemoryPool::operator=(UnifiedMemoryPool&& other) noexc
 }
 
 UnifiedMemoryPool::~UnifiedMemoryPool() {
+    // Lock so a concurrent allocate/deallocate on another thread cannot race
+    // teardown (blocks_/dedicatedAllocations_ are mutated under mutex_).
+    std::lock_guard<std::mutex> lock(mutex_);
     if (device_) {
         // Clean up dedicated allocations (exportable/imported)
         for (auto& alloc : dedicatedAllocations_) {
