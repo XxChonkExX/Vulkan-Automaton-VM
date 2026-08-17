@@ -1,64 +1,86 @@
 #!/usr/bin/env bash
 # heartbeat_monitor.sh — zero-memory training heartbeat monitor.
 #
-# Pure bash + sleep: RSS stays ~2-4MB. Monitors the training process AND the
-# log file. Process-alive takes precedence over log freshness (training may
-# write to a terminal instead of a file, making the log legitimately stale).
+# Pure bash + sleep: RSS stays ~2-4MB. Monitors the training process AND
+# reads the trainer's status file (train_status.txt, written atomically by
+# train_qwen_chonk.py every 8 chunks) for live numbers. Falls back to the
+# log file when no status file exists.
 #
 # Status meanings:
-#   ALIVE    process running, log growing (or process running, log stale)
-#   RUNNING  process running, no log file configured/available
-#   IDLE     no process, log fresh
-#   STALE    no process, log stale (training died/hung)
-#   NO_LOG   no process, no log
+#   ALIVE    process running, fresh status/log data
+#   RUNNING  process running, no status file yet (still in setup/loading)
+#   STALE    process dead or status/log stale (training died/hung)
+#   NO_LOG   process dead, nothing to read
 #
 # Usage:
-#   ./scripts/heartbeat_monitor.sh [train_log] [interval_sec]
+#   ./scripts/heartbeat_monitor.sh [status_file] [interval_sec]
 #
 # The monitor itself is meant to be run detached:
 #   setsid nohup ./scripts/heartbeat_monitor.sh > /dev/null 2>&1 &
 
-LOG="${1:-/home/chonke/local_training/qwen_logs/train_262k.log}"
+STATUS="${1:-/home/chonke/local_training/qwen_logs/train_status.txt}"
+LOG="${STATUS%/*}/train_262k.log"
 INTERVAL="${2:-60}"          # seconds between checks
-HEARTBEAT="/home/chonke/local_training/qwen_logs/heartbeat.log"
-STALE_AFTER=300              # seconds without log growth => STALE
+HEARTBEAT="${STATUS%/*}/heartbeat.log"
+STALE_AFTER=300              # seconds without fresh data => STALE
 PATTERN="train_qwen_chonk.py"
 
 mkdir -p "$(dirname "$HEARTBEAT")"
 
-last_size=0
+get() { # get <file> <key>
+    awk -F= -v k="$2" '$1==k {sub(/^[^=]*=/, ""); print; exit}' "$1" 2>/dev/null
+}
+
 while true; do
-    # Process check first: pgrep -f matches the wrapper too, so filter to
-    # the actual python trainer (exclude grep/bash self-match).
     if pgrep -f "$PATTERN" | grep -v $$ >/dev/null 2>&1; then
         proc_alive=1
+        pid=$(pgrep -f "$PATTERN" | grep -v $$ | head -1)
     else
         proc_alive=0
+        pid=""
     fi
 
-    size=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
-    mtime=$(stat -c %Y "$LOG" 2>/dev/null || echo 0)
+    cpu="n/a"
+    rss="n/a"
+    [ -n "$pid" ] && cpu=$(ps -o pcpu= -p "$pid" 2>/dev/null | tr -d ' ')
+    [ -n "$pid" ] && rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+
+    # Prefer the status file; fall back to the log
+    src="$STATUS"
+    if [ ! -f "$STATUS" ]; then
+        src="$LOG"
+    fi
+    mtime=$(stat -c %Y "$src" 2>/dev/null || echo 0)
     now=$(date +%s)
+    age=$((now - mtime))
 
-    if [ "$proc_alive" -eq 1 ] && [ "$size" -eq 0 ]; then
-        status="RUNNING (no log)"
-    elif [ "$proc_alive" -eq 1 ] && [ "$size" -gt "$last_size" ]; then
-        status="ALIVE (log grew +$((size - last_size))B)"
-    elif [ "$proc_alive" -eq 1 ]; then
-        status="ALIVE (proc up; log stale $((now - mtime))s — terminal output)"
-    elif [ "$size" -eq 0 ]; then
-        status="NO_LOG"
-    elif [ $((now - mtime)) -gt "$STALE_AFTER" ]; then
-        status="STALE ($((now - mtime))s no growth)"
+    if [ "$src" = "$STATUS" ]; then
+        step=$(get "$src" step)
+        chunk=$(get "$src" chunk)
+        loss=$(get "$src" loss)
+        lr=$(get "$src" lr)
+        pool=$(get "$src" pool_gb)
+        data="fresh"
+    elif [ "$age" -le "$STALE_AFTER" ]; then
+        step=$(grep -oE "Step [0-9]+" "$src" 2>/dev/null | tail -1)
+        loss=$(grep -oE "loss=[0-9.]+" "$src" 2>/dev/null | tail -1)
+        chunk=""; lr=""; pool=""
+        data="log"
     else
-        status="IDLE (no proc, log fresh)"
+        step=""; chunk=""; loss=""; lr=""; pool=""
+        data="stale"
     fi
 
-    last_step=$(grep -oE "Step [0-9]+" "$LOG" 2>/dev/null | tail -1)
-    last_loss=$(grep -oE "loss=[0-9.]+" "$LOG" 2>/dev/null | tail -1)
-    cpu=$(ps -o pcpu= -p "$(pgrep -f "$PATTERN" | head -1)" 2>/dev/null | tr -d ' ')
+    if [ "$proc_alive" -eq 1 ] && [ "$data" = "fresh" ]; then
+        status="ALIVE"
+    elif [ "$proc_alive" -eq 1 ] && [ "$data" = "log" ]; then
+        status="ALIVE (log data)"
+    elif [ "$proc_alive" -eq 1 ]; then
+        status="ALIVE (no live data — restart trainer for status file)"
+    else
+        status="STALE"
+    fi
 
-    echo "$(date +%F\ %H:%M:%S) $status cpu=${cpu:-n/a}% $last_step $last_loss" >> "$HEARTBEAT"
-    last_size=$size
+    echo "$(date +%F\ %H:%M:%S) $status cpu=${cpu}% rss=$((rss/1024))MB age=${age}s step=${step:-?} chunk=${chunk:-?} loss=${loss:-?} lr=${lr:-?} pool=${pool:-?}GB" >> "$HEARTBEAT"
     sleep "$INTERVAL"
 done
