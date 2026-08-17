@@ -17,6 +17,7 @@ import os
 import sys
 import time
 import contextlib
+import shutil
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, IterableDataset
@@ -82,7 +83,8 @@ MAX_STEPS = 10000
 GRAD_ACCUM_STEPS = int(os.environ.get("CHONK_GRAD_ACCUM", "4"))  # Effective batch = 4
 GRAD_CLIP_NORM = 1.0  # EXP 1: Gradient clipping
 LOG_INTERVAL = 10
-SAVE_INTERVAL = 500
+SAVE_INTERVAL = int(os.environ.get("CHONK_SAVE_INTERVAL", "100"))
+KEEP_CHECKPOINTS = int(os.environ.get("CHONK_KEEP_CHECKPOINTS", "3"))
 
 # Live training: epoch-based with block subsampling (for 262K feasibility)
 CHONK_SUBSAMPLE = float(os.environ.get("CHONK_SUBSAMPLE", "1.0"))  # 1.0 = all blocks, 0.05 = 5%
@@ -358,6 +360,33 @@ def train_step(model, chunk_ids, kv_cache, optimizer, chunk_start, chunk_end, se
     return loss, outputs
 
 
+def cleanup_checkpoints(out_dir, keep=3):
+    """Keep the best (lowest loss), the latest, and the second-latest
+    checkpoints; delete the rest to save disk. chonk_final is never deleted."""
+    import glob
+    steps = sorted(int(os.path.basename(p)[len("chonk_step_"):])
+                   for p in glob.glob(f"{out_dir}/chonk_step_*"))
+    if len(steps) <= keep:
+        return
+    best_step = None
+    best_loss = float("inf")
+    for s in steps:
+        try:
+            with open(f"{out_dir}/chonk_step_{s}/.chonk_loss") as f:
+                loss = float(f.read().strip())
+            if loss < best_loss:
+                best_loss = loss
+                best_step = s
+        except (OSError, ValueError):
+            continue
+    protected = {max(steps), min(steps[-2:], default=None), best_step}
+    protected.discard(None)
+    for s in steps:
+        if s not in protected:
+            shutil.rmtree(f"{out_dir}/chonk_step_{s}", ignore_errors=True)
+            print(f"  [cleanup] removed chonk_step_{s}")
+
+
 def main():
     print("=" * 60)
     print("Qwen 27B Chonk Buffer Training")
@@ -560,7 +589,11 @@ def main():
             save_path = f"{OUT_DIR}/chonk_step_{step}"
             os.makedirs(save_path, exist_ok=True)
             model.save_pretrained(save_path)
-            print(f"Checkpoint saved to {save_path}")
+            saved_loss = last_loss * GRAD_ACCUM_STEPS
+            with open(f"{save_path}/.chonk_loss", "w") as f:
+                f.write(f"{saved_loss:.6f}")
+            print(f"Checkpoint saved to {save_path} (loss={saved_loss:.4f})")
+            cleanup_checkpoints(OUT_DIR, KEEP_CHECKPOINTS)
 
     # Final save
     # Apply EMA weights for final model
