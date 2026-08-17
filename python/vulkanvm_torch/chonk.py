@@ -242,17 +242,27 @@ class ChonkFullLayer(StaticLayer):
         if self._quantize:
             kv_elements = batch_size * num_heads * self.max_cache_len * head_dim
             elements_per_head = kv_elements // num_heads
+            packed_head_dim = head_dim // 2
+            bytes_per_head = elements_per_head // 2
             kv_bytes = int(kv_elements * 0.5)
-            scale_bytes = num_heads * 2 * self._compute_dtype.itemsize
-            total_bytes = kv_bytes + scale_bytes
+            # Per-position per-head scales: [max_cache_len, num_heads] for K and V
+            scale_per_pos_bytes = num_heads * self.max_cache_len * self._compute_dtype.itemsize
+            scale_bytes = 2 * scale_per_pos_bytes
+            # Layout: [k_data(kv_bytes)] [v_data(kv_bytes)] [k_scales] [v_scales]
+            total_bytes = 2 * kv_bytes + scale_bytes
 
             buf = self._pool_base.view(torch.uint8)
             offset = self._byte_offset
             self._k_data = buf.narrow(0, offset, kv_bytes)
             self._v_data = buf.narrow(0, offset + kv_bytes, kv_bytes)
+            scale_per_pos_bytes = num_heads * self.max_cache_len * self._compute_dtype.itemsize
             scale_offset = offset + 2 * kv_bytes
-            self._k_scales = buf.narrow(0, scale_offset, num_heads * self._compute_dtype.itemsize).view(self._compute_dtype)
-            self._v_scales = buf.narrow(0, scale_offset + num_heads * self._compute_dtype.itemsize, num_heads * self._compute_dtype.itemsize).view(self._compute_dtype)
+            self._k_scales = buf.narrow(0, scale_offset, scale_per_pos_bytes).view(
+                self._compute_dtype
+            ).view(self.max_cache_len, num_heads)
+            self._v_scales = buf.narrow(0, scale_offset + scale_per_pos_bytes, scale_per_pos_bytes).view(
+                self._compute_dtype
+            ).view(self.max_cache_len, num_heads)
 
             self._keys = None
             self._values = None
@@ -275,47 +285,13 @@ class ChonkFullLayer(StaticLayer):
         self.is_initialized = True
 
     @staticmethod
-    def _quantize_int4(tensor, scale):
-        """Quantize bf16 tensor to INT4 (packed uint8). Symmetric per-tensor.
-        Uses a conservative minimum scale (1e-3) to prevent numerical collapse
-        when K/V activations are small. If the actual scale is below this,
-        we store an "empty" flag (0x80) and the dequantize path will return
-        zeros instead of garbage values."""
-        with torch.no_grad():
-            if tensor.numel() == 0:
-                scale.fill_(1.0)
-                return torch.empty(0, dtype=torch.uint8, device=tensor.device)
-            max_val = tensor.abs().max()
-            # Conservative minimum scale: prevents collapse but still saves memory
-            min_scale = 1e-3
-            if max_val < min_scale * 7.0:
-                # Values too small for INT4; mark as empty, store zeros
-                scale.fill_(0.0)
-                packed = torch.zeros(tensor.shape[:-1] + (tensor.shape[-1] // 2,),
-                                    dtype=torch.uint8, device=tensor.device)
-                return packed
-            scale_val = max_val / 7.0
-            scale.copy_(scale_val)
-            quant = (tensor / scale_val).round().clamp(-7, 7).to(torch.int8)
-            even = (quant[..., 0::2] & 0xF)
-            odd = (quant[..., 1::2] & 0xF)
-            packed = even | (odd << 4)
-            return packed.to(torch.uint8)
-
-    @staticmethod
-    def _dequantize_int4(packed, scale):
-        """Dequantize INT4 (packed uint8) to bf16. Handles arbitrary dimensions
-        where the last dimension is half the target (2 INT4 values per byte).
-        Runs in no_grad - cached prefix is constant (truncated BPTT).
-        If scale is 0 (empty marker), returns zeros."""
+    def _dequantize_int4(packed, scales, start_pos, length, head_idx):
+        """Dequantize INT4 (packed uint8) to bf16. Per-position per-head scales.
+        If scale is 0 (empty marker), returns zeros for that position.
+        Runs in no_grad - cached prefix is constant (truncated BPTT)."""
         with torch.no_grad():
             if packed.numel() == 0:
                 return torch.empty(0, dtype=torch.bfloat16, device=packed.device)
-            # Check if this head was marked as "empty" (values too small to quantize)
-            scale_val = scale.item() if scale.numel() == 1 else scale
-            if scale.numel() == 1 and scale_val == 0.0:
-                return torch.zeros(*packed.shape[:-1], packed.shape[-1] * 2,
-                                  dtype=torch.bfloat16, device=packed.device)
             last_dim = packed.shape[-1]
             low = (packed & 0xF).to(torch.int8)
             high = ((packed >> 4) & 0xF).to(torch.int8)
@@ -323,40 +299,64 @@ class ChonkFullLayer(StaticLayer):
             high = torch.where(high >= 8, high - 16, high)
             interleaved = torch.stack([low, high], dim=-1)
             dequant = interleaved.reshape(*packed.shape[:-1], last_dim * 2)
-            return (dequant.to(torch.bfloat16) * scale)
+            # scales: (max_cache_len, num_heads), slice [start_pos:start_pos+length] for head_idx
+            scale_slice = scales[start_pos:start_pos + length, head_idx]  # (length,)
+            scale_slice = scale_slice.view(1, length, 1)  # broadcast: (1, length, 1)
+            return (dequant.to(torch.bfloat16) * scale_slice)
 
     def _write_quantized(self, key_states, value_states, start, kv_length):
         b = key_states.shape[0]
-        k_flat = key_states[:b, :, start:start+kv_length].reshape(b, self._num_kv_heads, -1)
-        v_flat = value_states[:b, :, start:start+kv_length].reshape(b, self._num_kv_heads, -1)
+        # key_states: (batch, num_heads, kv_length, head_dim) -- the incoming chunk
+        # We write to the cache at positions [start:start+kv_length]
+        k_chunk = key_states[:b]  # entire incoming chunk
+        v_chunk = value_states[:b]
 
         for h in range(self._num_kv_heads):
-            k_h = k_flat[:, h].to(self._compute_dtype)
-            v_h = v_flat[:, h].to(self._compute_dtype)
-            k_packed = self._quantize_int4(k_h, self._k_scales[h])
-            v_packed = self._quantize_int4(v_h, self._v_scales[h])
+            k_h = k_chunk[:, h].to(self._compute_dtype)  # (b, kv_length, head_dim)
+            v_h = v_chunk[:, h].to(self._compute_dtype)
 
-            elements_per_head = k_h.shape[-1]
-            bytes_per_head = elements_per_head // 2
-            offset = h * bytes_per_head
-            self._k_data[offset:offset+bytes_per_head].copy_(k_packed.view(-1))
-            self._v_data[offset:offset+bytes_per_head].copy_(v_packed.view(-1))
+            # Quantize per-position (per-token) within this head
+            abs_max = k_h.abs().amax(dim=-1)  # (b, kv_length)
+            min_scale = 1e-3
+            min_max = min_scale * 7.0
+            too_small = abs_max < min_max
+            k_scale_val = torch.where(too_small, torch.zeros_like(abs_max), abs_max / 7.0)
+            k_scale_val = torch.clamp(k_scale_val, min=min_scale)
+            self._k_scales[start:start+kv_length, h] = k_scale_val[0]
+
+            abs_max_v = v_h.abs().amax(dim=-1)
+            too_small_v = abs_max_v < min_max
+            v_scale_val = torch.where(too_small_v, torch.zeros_like(abs_max_v), abs_max_v / 7.0)
+            v_scale_val = torch.clamp(v_scale_val, min=min_scale)
+            self._v_scales[start:start+kv_length, h] = v_scale_val[0]
+
+            k_quant = (k_h / k_scale_val.unsqueeze(-1)).round().clamp(-7, 7).to(torch.int8)
+            v_quant = (v_h / v_scale_val.unsqueeze(-1)).round().clamp(-7, 7).to(torch.int8)
+
+            packed_head_dim = self._head_dim // 2
+            packed_stride = self.max_cache_len * packed_head_dim
+            offset = h * packed_stride + start * packed_head_dim
+            k_packed = (k_quant[..., 0::2] & 0xF) | ((k_quant[..., 1::2] & 0xF) << 4)
+            v_packed = (v_quant[..., 0::2] & 0xF) | ((v_quant[..., 1::2] & 0xF) << 4)
+            bytes_to_copy = kv_length * packed_head_dim
+            self._k_data[offset:offset+bytes_to_copy].copy_(k_packed.view(-1))
+            self._v_data[offset:offset+bytes_to_copy].copy_(v_packed.view(-1))
 
     def _dequantize_prefix(self, b, length):
-        """Dequantize prefix [0:length] into a temporary bf16 tensor."""
+        """Dequantize prefix [0:length] into a temporary bf16 tensor.
+        Uses per-position scales stored alongside the quantized data."""
         k_out = torch.empty(b, self._num_kv_heads, length, self._head_dim,
                            dtype=self._compute_dtype, device=self._prealloc_device)
         v_out = torch.empty(b, self._num_kv_heads, length, self._head_dim,
                            dtype=self._compute_dtype, device=self._prealloc_device)
         packed_head_dim = self._head_dim // 2
+        packed_stride = self.max_cache_len * packed_head_dim
         for h in range(self._num_kv_heads):
-            elements = length * self._head_dim
-            bytes_per_head = elements // 2
-            offset = h * bytes_per_head
-            k_packed = self._k_data[offset:offset+bytes_per_head].view(b, length, packed_head_dim)
-            v_packed = self._v_data[offset:offset+bytes_per_head].view(b, length, packed_head_dim)
-            k_out[:, h] = self._dequantize_int4(k_packed, self._k_scales[h])
-            v_out[:, h] = self._dequantize_int4(v_packed, self._v_scales[h])
+            offset = h * packed_stride
+            k_packed = self._k_data[offset:offset + length * packed_head_dim].view(1, length, packed_head_dim)
+            v_packed = self._v_data[offset:offset + length * packed_head_dim].view(1, length, packed_head_dim)
+            k_out[:, h] = self._dequantize_int4(k_packed, self._k_scales, 0, length, h)
+            v_out[:, h] = self._dequantize_int4(v_packed, self._v_scales, 0, length, h)
         return k_out, v_out
 
     def get_cached_kv(self, length):
@@ -488,7 +488,12 @@ def build_chonk_cache(config, batch_size, max_cache_len, pool=None):
 
     per_layer_kv_elements = 2 * batch_size * num_kv_heads * max_cache_len * head_dim
     per_layer_bytes = int(per_layer_kv_elements * bytes_per_element)
-    scale_bytes = num_kv_heads * 2 * compute_dtype.itemsize
+    if quantize_kv:
+        # Per-position per-head scales (fp16): 2 * num_kv_heads * max_cache_len
+        scale_per_pos_bytes = num_kv_heads * max_cache_len * compute_dtype.itemsize
+        scale_bytes = 2 * scale_per_pos_bytes
+    else:
+        scale_bytes = 0
     per_layer_total = per_layer_bytes + scale_bytes
     total = per_layer_total * n_full
 
