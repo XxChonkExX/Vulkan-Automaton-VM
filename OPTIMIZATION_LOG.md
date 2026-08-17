@@ -480,10 +480,22 @@ Config additions:
 - **Throughput**: ~190s/chunk at 196K (192 chunks/step → ~10h/step). 304 blocks/epoch × 10 epochs = 3040 steps (~30 days).
 - **Stability fixes validated**: grad accum 16 (reduces optimizer kernel bursts), EMA every 4 steps, optimizer pause 0.5s, chunk pause 0.05s — eliminates display starvation.
 
-### Next validation targets
-1. **2048 chunks at 196K** — potential 2× speedup, risk: activation memory spike OOM. Test with `CHONK_CHUNK=2048`, `CHONK_GRAD_ACCUM=8`, `CHONK_OPTIMIZER_PAUSE=1.0`.
-2. **262K with multi-block allocator** — same config at full 262K. If OOM persists, next lever: `CHONK_POOL_BLOCK_SIZES_GB=2,4,8,16,32` (larger max block for KV/exportables).
-3. **Even larger blocks for super-long-context** — if 262K works, test 524K/1M with `blockSizes` extending to 64GB+.
+### Wall finding: 2048 chunks at 196K = OOM
+- 2048-token chunks at 196K need ~4× activation memory per chunk (attention is O(n²)).
+- OOMs instantly on startup — **1024 chunk is the practical ceiling** at 196K on this hardware.
+- 262K is not viable with current model/hardware (even with multi-block allocator).
+
+### Final stable config (196K @ 1024 chunk)
+| Setting | Value |
+|---|---|
+| Seq / cache | 196,608 |
+| Chunk | 1024 |
+| Grad accum | 16 (effective batch 16) |
+| LoRA | r=128, α=128 |
+| Pool blocks | 1/2/4/8GB multi-size |
+| Subsample | 10% (304 blocks/epoch) |
+| Epochs | 10 |
+| Pool | 104.81GB/122GB flat |
 
 ---
 
