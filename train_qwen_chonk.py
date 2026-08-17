@@ -307,15 +307,16 @@ def patch_eager_attention_recompute(model, kv_cache):
         # cat (2KB/pos x layers -> 8+ GB at 131K).
         layer = kv_cache.layers[module.layer_idx]
         cached_k = cached_v = torch.empty(0, device=query.device, dtype=torch.bfloat16)
-        if hasattr(layer, "keys"):
+        if hasattr(layer, "get_cached_kv"):
             cur_len = key.shape[-2] - query.shape[-2]
             if cur_len > 0:
                 # Views of the POOL CELLS (permanent storage, retention-free);
                 # detached: the cells' shared storage is written by every
                 # layer's update, which would trip autograd's inplace-version
                 # check on the saved views (data is constant at backward).
-                cached_k = layer.keys[: key.shape[0], :, :cur_len].detach()
-                cached_v = layer.values[: key.shape[0], :, :cur_len].detach()
+                cached_k, cached_v = layer.get_cached_kv(cur_len)
+                cached_k = cached_k[: key.shape[0], :, :cur_len].detach()
+                cached_v = cached_v[: key.shape[0], :, :cur_len].detach()
         out = vvm_attn.vulkan_attention(query, key, value, scaling, attention_mask,
                                         kv_repeat=module.num_key_value_groups,
                                         cached_k=cached_k, cached_v=cached_v)

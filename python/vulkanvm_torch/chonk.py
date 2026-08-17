@@ -254,17 +254,17 @@ class ChonkFullLayer(StaticLayer):
             self._k_scales = buf.narrow(0, scale_offset, num_heads * self._compute_dtype.itemsize).view(self._compute_dtype)
             self._v_scales = buf.narrow(0, scale_offset + num_heads * self._compute_dtype.itemsize, num_heads * self._compute_dtype.itemsize).view(self._compute_dtype)
 
-            self.keys = None
-            self.values = None
+            self._keys = None
+            self._values = None
             self._is_quantized = True
         else:
             per_t = batch_size * num_heads * self.max_cache_len * head_dim
             offset_el = self._byte_offset // self._storage_dtype.itemsize
             buf = self._pool_base.view(self._storage_dtype)
-            self.keys = buf.narrow(0, offset_el, per_t).view(
+            self._keys = buf.narrow(0, offset_el, per_t).view(
                 batch_size, num_heads, self.max_cache_len, head_dim
             )
-            self.values = buf.narrow(0, offset_el + per_t, per_t).view(
+            self._values = buf.narrow(0, offset_el + per_t, per_t).view(
                 batch_size, num_heads, self.max_cache_len, head_dim
             )
             self._is_quantized = False
@@ -276,33 +276,37 @@ class ChonkFullLayer(StaticLayer):
 
     @staticmethod
     def _quantize_int4(tensor, scale):
-        """Quantize bf16 tensor to INT4 (packed uint8). Symmetric per-tensor."""
-        if tensor.numel() == 0:
-            scale.fill_(1.0)
-            return torch.empty(0, dtype=torch.uint8, device=tensor.device)
-        max_val = tensor.abs().max().clamp(min=1e-8)
-        scale_val = max_val / 7.0
-        scale.copy_(scale_val)
-        quant = (tensor / scale_val).round().clamp(-8, 7).to(torch.int8)
-        even = (quant[..., 0::2] & 0xF)
-        odd = (quant[..., 1::2] & 0xF)
-        packed = even | (odd << 4)
-        return packed.to(torch.uint8)
+        """Quantize bf16 tensor to INT4 (packed uint8). Symmetric per-tensor.
+        Runs in no_grad to prevent autograd edges from scale updates."""
+        with torch.no_grad():
+            if tensor.numel() == 0:
+                scale.fill_(1.0)
+                return torch.empty(0, dtype=torch.uint8, device=tensor.device)
+            max_val = tensor.abs().max().clamp(min=1e-8)
+            scale_val = max_val / 7.0
+            scale.copy_(scale_val)
+            quant = (tensor / scale_val).round().clamp(-8, 7).to(torch.int8)
+            even = (quant[..., 0::2] & 0xF)
+            odd = (quant[..., 1::2] & 0xF)
+            packed = even | (odd << 4)
+            return packed.to(torch.uint8)
 
     @staticmethod
     def _dequantize_int4(packed, scale):
         """Dequantize INT4 (packed uint8) to bf16. Handles arbitrary dimensions
-        where the last dimension is half the target (2 INT4 values per byte)."""
-        if packed.numel() == 0:
-            return torch.empty(0, dtype=torch.bfloat16, device=packed.device)
-        last_dim = packed.shape[-1]
-        low = (packed & 0xF).to(torch.int8)
-        high = ((packed >> 4) & 0xF).to(torch.int8)
-        low = torch.where(low >= 8, low - 16, low)
-        high = torch.where(high >= 8, high - 16, high)
-        interleaved = torch.stack([low, high], dim=-1)
-        dequant = interleaved.reshape(*packed.shape[:-1], last_dim * 2)
-        return (dequant.to(torch.bfloat16) * scale)
+        where the last dimension is half the target (2 INT4 values per byte).
+        Runs in no_grad - cached prefix is constant (truncated BPTT)."""
+        with torch.no_grad():
+            if packed.numel() == 0:
+                return torch.empty(0, dtype=torch.bfloat16, device=packed.device)
+            last_dim = packed.shape[-1]
+            low = (packed & 0xF).to(torch.int8)
+            high = ((packed >> 4) & 0xF).to(torch.int8)
+            low = torch.where(low >= 8, low - 16, low)
+            high = torch.where(high >= 8, high - 16, high)
+            interleaved = torch.stack([low, high], dim=-1)
+            dequant = interleaved.reshape(*packed.shape[:-1], last_dim * 2)
+            return (dequant.to(torch.bfloat16) * scale)
 
     def _write_quantized(self, key_states, value_states, start, kv_length):
         b = key_states.shape[0]
@@ -338,6 +342,16 @@ class ChonkFullLayer(StaticLayer):
             v_out[:, h] = self._dequantize_int4(v_packed, self._v_scales[h])
         return k_out, v_out
 
+    def get_cached_kv(self, length):
+        """Return dequantized keys/values for the first 'length' tokens.
+        Returns (k, v) with shape (batch, num_heads, length, head_dim).
+        Used by attention recompute patch."""
+        if not self._quantize:
+            return self.keys, self.values
+        b = 1
+        k, v = self._dequantize_prefix(b, length)
+        return k, v
+
     def lazy_initialization(self, key_states, value_states):
         self.dtype, self.device = key_states.dtype, key_states.device
         self.batch_size, self.num_heads = key_states.shape[:2]
@@ -369,12 +383,46 @@ class ChonkFullLayer(StaticLayer):
 
         if self._quantize:
             k_cached, v_cached = self._dequantize_prefix(b, start)
-            k = torch.cat([k_cached, ks], dim=-2)
-            v = torch.cat([v_cached, vs], dim=-2)
+            k = torch.cat([k_cached.detach(), ks], dim=-2)
+            v = torch.cat([v_cached.detach(), vs], dim=-2)
         else:
             k = torch.cat([self.keys[:b, :, :start].detach(), ks], dim=-2)
             v = torch.cat([self.values[:b, :, :start].detach(), vs], dim=-2)
         return k, v
+
+    @property
+    def keys(self):
+        """Access keys for attention patch. In quantized mode, dequantizes on the fly."""
+        if self._quantize:
+            b = 1
+            length = int(self.cumulative_length.item())
+            if length == 0:
+                return torch.empty(1, self._num_kv_heads, 0, self._head_dim,
+                                  dtype=self._compute_dtype, device=self._prealloc_device)
+            k, _ = self._dequantize_prefix(b, length)
+            return k
+        return self._keys
+
+    @property
+    def values(self):
+        """Access values for attention patch. In quantized mode, dequantizes on the fly."""
+        if self._quantize:
+            b = 1
+            length = int(self.cumulative_length.item())
+            if length == 0:
+                return torch.empty(1, self._num_kv_heads, 0, self._head_dim,
+                                  dtype=self._compute_dtype, device=self._prealloc_device)
+            _, v = self._dequantize_prefix(b, length)
+            return v
+        return self._values
+
+    @keys.setter
+    def keys(self, val):
+        self._keys = val
+
+    @values.setter
+    def values(self, val):
+        self._values = val
 
     def get_mask_sizes(self, query_length: int) -> tuple[int, int]:
         return int(self.cumulative_length.item()) + query_length, 0
