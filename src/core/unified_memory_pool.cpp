@@ -72,12 +72,25 @@ PoolConfig PoolConfig::forDevice(VkPhysicalDevice physicalDevice) {
             cfg.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            cfg.blockSizes = {
+                256ull * 1024 * 1024,
+                512ull * 1024 * 1024,
+                1024ull * 1024 * 1024,
+                2048ull * 1024 * 1024,
+                4096ull * 1024 * 1024,
+            };
             break;
         case MemoryTopologyType::Hybrid:
             cfg.blockSize = isHighVRAM ? 2048ull * 1024 * 1024 : 512ull * 1024 * 1024;
             cfg.maxBlocks = isHighVRAM ? 24 : 12;
             cfg.maxHeapFraction = 0.75f;
             cfg.hostShadowMultiplier = 2.0f;  // Smaller shadow for hybrid
+            cfg.blockSizes = {
+                256ull * 1024 * 1024,
+                512ull * 1024 * 1024,
+                1024ull * 1024 * 1024,
+                2048ull * 1024 * 1024,
+            };
             break;
         case MemoryTopologyType::Discrete:
         default:
@@ -88,6 +101,12 @@ PoolConfig PoolConfig::forDevice(VkPhysicalDevice physicalDevice) {
             cfg.maxBlocks = isHighVRAM ? 64 : 16;
             cfg.maxHeapFraction = isHighVRAM ? 0.8f : 0.75f;
             cfg.hostShadowMultiplier = isHighVRAM ? 2.0f : 4.0f;
+            cfg.blockSizes = {
+                512ull * 1024 * 1024,
+                1024ull * 1024 * 1024,
+                2048ull * 1024 * 1024,
+                4096ull * 1024 * 1024,
+            };
             break;
     }
     return cfg;
@@ -113,6 +132,14 @@ PoolConfig PoolConfig::forAPU(VkDeviceSize totalSystemRAM) {
     // APU VRAM is host-visible; shadow buffer is redundant
     cfg.hostShadowMultiplier = 0.0f;
     cfg.maxHostShadowBytes = 0;
+    // Multi-block sizes for flexible routing on APUs
+    cfg.blockSizes = {
+        256ull * 1024 * 1024,   // 256 MB
+        512ull * 1024 * 1024,   // 512 MB
+        1024ull * 1024 * 1024,  // 1 GB
+        2048ull * 1024 * 1024,  // 2 GB
+        4096ull * 1024 * 1024,  // 4 GB
+    };
     return cfg;
 }
 
@@ -133,6 +160,13 @@ PoolConfig PoolConfig::forHighVRAM(VkPhysicalDevice physicalDevice) {
     }
     cfg.hostShadowMultiplier = 2.0f;
     cfg.maxHostShadowBytes = 4ull * 1024 * 1024 * 1024;  // Cap at 4GB
+    cfg.blockSizes = {
+        512ull * 1024 * 1024,
+        1024ull * 1024 * 1024,
+        2048ull * 1024 * 1024,
+        4096ull * 1024 * 1024,
+        8192ull * 1024 * 1024,
+    };
     (void)vram;  // kept for future heuristics (e.g. block count scaling)
     return cfg;
 }
@@ -966,14 +1000,31 @@ std::optional<Allocation> UnifiedMemoryPool::allocate(VkDeviceSize size,
         return std::nullopt;
     }
 
+    // Pick the best block size for this request
+    VkDeviceSize blockSize = config_.blockSize;
+    if (!config_.blockSizes.empty()) {
+        // Pick the smallest block size >= request size (aligned)
+        VkDeviceSize alignedSize = alignUp(size, config_.minAlignment);
+        for (VkDeviceSize bs : config_.blockSizes) {
+            if (bs >= alignedSize) {
+                blockSize = bs;
+                break;
+            }
+        }
+        // If no blockSize in blockSizes fits, fall back to largest available
+        if (blockSize == config_.blockSize && !config_.blockSizes.empty()) {
+            blockSize = *std::max_element(config_.blockSizes.begin(), config_.blockSizes.end());
+        }
+    }
+    
     // Budget check: fail soft instead of stealing VRAM past the configured cap.
-    if (wouldExceedBudget(config_.blockSize)) {
+    if (wouldExceedBudget(blockSize)) {
         return std::nullopt;
     }
     
-    // Request larger than any single block: allocate dedicated memory instead
+    // Request larger than the picked block: allocate dedicated memory instead
     // of growing the pool by a block that still couldn't hold the request.
-    if (size > config_.blockSize) {
+    if (size > blockSize) {
         return allocateDedicated(size, usage, flags);
     }
     
@@ -981,7 +1032,7 @@ std::optional<Allocation> UnifiedMemoryPool::allocate(VkDeviceSize size,
         ? (hostVisibleMemoryType_ != UINT32_MAX ? hostVisibleMemoryType_ : deviceLocalMemoryType_)
         : deviceLocalMemoryType_;
     
-    if (!allocateBlock(config_.blockSize, memType).has_value()) {
+    if (!allocateBlock(blockSize, memType).has_value()) {
         return std::nullopt;
     }
     

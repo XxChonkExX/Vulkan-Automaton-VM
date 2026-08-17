@@ -128,8 +128,43 @@ static py::dict initPool() {
         throw std::runtime_error("vkCreateDevice failed");
     }
 
+    // Configurable pool block size via env var (default 1GB; use 16/32GB for 262K
+    // to reduce buddy fragmentation and leave contiguous space for dedicated
+    // exportable allocations).
+    size_t poolBlockGB = 1;
+    const char* pBlock = getenv("CHONK_POOL_BLOCK_GB");
+    if (pBlock) {
+        double gb = atof(pBlock);
+        if (gb >= 1.0) poolBlockGB = (size_t)gb;
+    }
+    
+    // Configurable block sizes vector for multi-size routing (comma-separated GB values)
+    std::vector<size_t> poolBlockSizesGB;
+    const char* pBlockSizes = getenv("CHONK_POOL_BLOCK_SIZES_GB");
+    if (pBlockSizes) {
+        std::string str(pBlockSizes);
+        size_t start = 0;
+        size_t end = str.find(',');
+        while (end != std::string::npos) {
+            std::string token = str.substr(start, end - start);
+            double gb = atof(token.c_str());
+            if (gb >= 1.0) poolBlockSizesGB.push_back((size_t)gb);
+            start = end + 1;
+            end = str.find(',', start);
+        }
+        std::string token = str.substr(start);
+        double gb = atof(token.c_str());
+        if (gb >= 1.0) poolBlockSizesGB.push_back((size_t)gb);
+    }
+    
     PoolConfig cfg = PoolConfig::forAPU(128ull * 1024 * 1024 * 1024);
-    cfg.blockSize = 1024ull * 1024 * 1024;
+    cfg.blockSize = poolBlockGB * 1024ull * 1024 * 1024;
+    if (!poolBlockSizesGB.empty()) {
+        cfg.blockSizes.clear();
+        for (size_t gb : poolBlockSizesGB) {
+            cfg.blockSizes.push_back(gb * 1024ull * 1024 * 1024);
+        }
+    }
     cfg.maxBlocks = 64;
     cfg.maxHeapFraction = 0.0f;  // Disable budget check for Chonk Buffer training
     cfg.enableHostVisible = true;
