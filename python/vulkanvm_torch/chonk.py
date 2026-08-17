@@ -688,6 +688,8 @@ def load_model_directly_to_chonk(model_path, config, pool: ChonkPool, dtype=torc
             if name in quant_weight_names:
                 # Quantize into the flat quant buffers (no bf16 copy).
                 module_name = name[: -len(".weight")]
+                if processed % 25 == 0:
+                    print(f"  Quantizing [{processed}/~{len(param_map)}]: {module_name}...")
                 qweight, scales, zeros = quantize_weight(
                     tensor.to(torch.float32), bits=quant_bits,
                     group_size=quant_group_size)
