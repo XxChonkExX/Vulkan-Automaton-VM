@@ -277,15 +277,26 @@ class ChonkFullLayer(StaticLayer):
     @staticmethod
     def _quantize_int4(tensor, scale):
         """Quantize bf16 tensor to INT4 (packed uint8). Symmetric per-tensor.
-        Runs in no_grad to prevent autograd edges from scale updates."""
+        Uses a conservative minimum scale (1e-3) to prevent numerical collapse
+        when K/V activations are small. If the actual scale is below this,
+        we store an "empty" flag (0x80) and the dequantize path will return
+        zeros instead of garbage values."""
         with torch.no_grad():
             if tensor.numel() == 0:
                 scale.fill_(1.0)
                 return torch.empty(0, dtype=torch.uint8, device=tensor.device)
-            max_val = tensor.abs().max().clamp(min=1e-8)
+            max_val = tensor.abs().max()
+            # Conservative minimum scale: prevents collapse but still saves memory
+            min_scale = 1e-3
+            if max_val < min_scale * 7.0:
+                # Values too small for INT4; mark as empty, store zeros
+                scale.fill_(0.0)
+                packed = torch.zeros(tensor.shape[:-1] + (tensor.shape[-1] // 2,),
+                                    dtype=torch.uint8, device=tensor.device)
+                return packed
             scale_val = max_val / 7.0
             scale.copy_(scale_val)
-            quant = (tensor / scale_val).round().clamp(-8, 7).to(torch.int8)
+            quant = (tensor / scale_val).round().clamp(-7, 7).to(torch.int8)
             even = (quant[..., 0::2] & 0xF)
             odd = (quant[..., 1::2] & 0xF)
             packed = even | (odd << 4)
@@ -295,10 +306,16 @@ class ChonkFullLayer(StaticLayer):
     def _dequantize_int4(packed, scale):
         """Dequantize INT4 (packed uint8) to bf16. Handles arbitrary dimensions
         where the last dimension is half the target (2 INT4 values per byte).
-        Runs in no_grad - cached prefix is constant (truncated BPTT)."""
+        Runs in no_grad - cached prefix is constant (truncated BPTT).
+        If scale is 0 (empty marker), returns zeros."""
         with torch.no_grad():
             if packed.numel() == 0:
                 return torch.empty(0, dtype=torch.bfloat16, device=packed.device)
+            # Check if this head was marked as "empty" (values too small to quantize)
+            scale_val = scale.item() if scale.numel() == 1 else scale
+            if scale.numel() == 1 and scale_val == 0.0:
+                return torch.zeros(*packed.shape[:-1], packed.shape[-1] * 2,
+                                  dtype=torch.bfloat16, device=packed.device)
             last_dim = packed.shape[-1]
             low = (packed & 0xF).to(torch.int8)
             high = ((packed >> 4) & 0xF).to(torch.int8)
@@ -458,7 +475,8 @@ def build_chonk_cache(config, batch_size, max_cache_len, pool=None):
     )
     device = "cuda"
 
-    quantize_kv = os.environ.get("CHONK_QUANTIZE_KV", "0") == "1"
+    quantize_threshold = int(os.environ.get("CHONK_KV_QUANTIZE_THRESHOLD", "131072"))
+    quantize_kv = os.environ.get("CHONK_QUANTIZE_KV", "0") == "1" and max_cache_len > quantize_threshold
     if quantize_kv:
         storage_dtype = torch.uint8
         compute_dtype = torch.bfloat16
