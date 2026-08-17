@@ -284,22 +284,25 @@ class ChonkFullLayer(StaticLayer):
         scale_val = max_val / 7.0
         scale.copy_(scale_val)
         quant = (tensor / scale_val).round().clamp(-8, 7).to(torch.int8)
-        packed = (quant[..., 0::2] & 0xF) | ((quant[..., 1::2] & 0xF) << 4)
+        even = (quant[..., 0::2] & 0xF)
+        odd = (quant[..., 1::2] & 0xF)
+        packed = even | (odd << 4)
         return packed.to(torch.uint8)
 
     @staticmethod
     def _dequantize_int4(packed, scale):
-        """Dequantize INT4 (packed uint8) to bf16."""
+        """Dequantize INT4 (packed uint8) to bf16. Handles arbitrary dimensions
+        where the last dimension is half the target (2 INT4 values per byte)."""
         if packed.numel() == 0:
             return torch.empty(0, dtype=torch.bfloat16, device=packed.device)
+        last_dim = packed.shape[-1]
         low = (packed & 0xF).to(torch.int8)
         high = ((packed >> 4) & 0xF).to(torch.int8)
         low = torch.where(low >= 8, low - 16, low)
         high = torch.where(high >= 8, high - 16, high)
-        dequant = torch.empty(packed.shape[-1] * 2, dtype=torch.int8, device=packed.device)
-        dequant[0::2] = low
-        dequant[1::2] = high
-        return (dequant.to(torch.bfloat16) * scale).view(packed.shape[0], packed.shape[1], packed.shape[2], -1)
+        interleaved = torch.stack([low, high], dim=-1)
+        dequant = interleaved.reshape(*packed.shape[:-1], last_dim * 2)
+        return (dequant.to(torch.bfloat16) * scale)
 
     def _write_quantized(self, key_states, value_states, start, kv_length):
         b = key_states.shape[0]
