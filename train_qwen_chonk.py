@@ -72,6 +72,7 @@ CHONK_STAGING_GB = float(os.environ.get("CHONK_STAGING_GB", "2.0"))  # host-visi
 MODEL_PATH = os.environ.get("CHONK_MODEL_PATH", "/home/chonke/local_training/models/Qwen3.8-AEON-Ultimate")
 DATA_PATH = os.environ.get("CHONK_DATA_PATH", "/home/chonke/local_training/qwen_tokenized_128k")
 OUT_DIR = os.environ.get("CHONK_OUT_DIR", "/home/chonke/local_training/qwen_fine_tuned")
+STATUS_FILE = os.environ.get("CHONK_STATUS_FILE", "/home/chonke/local_training/qwen_logs/train_status.txt")
 SEQ_LEN = int(os.environ.get("CHONK_SEQ_LEN", "131072"))     # 262144 = the long-context target
 BATCH_SIZE = 1
 CHUNK_SIZE = int(os.environ.get("CHONK_CHUNK", "1024"))  # 1024 validated stable; 2048 froze the machine, 4096 panicked
@@ -555,6 +556,20 @@ def main():
                 print(f"  [seq] chunk {chunks_this_seq}/{SEQ_LEN // CHUNK_SIZE} "
                       f"({time.time() - t_seq_start:.0f}s, loss={last_loss:.4f}, "
                       f"pool={ps['totalUsed'] / 1e9:.2f}GB)", flush=True)
+
+            # Status file (atomic rename): live numbers for the heartbeat
+            # monitor without touching the (possibly terminal-bound) log.
+            if chunks_this_seq % 8 == 0:
+                status = (f"time={time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                          f"step={step}\n"
+                          f"chunk={chunks_this_seq}/{SEQ_LEN // CHUNK_SIZE}\n"
+                          f"loss={last_loss:.4f}\n"
+                          f"lr={scheduler.get_last_lr()[0]:.2e}\n"
+                          f"pool_gb={ps['totalUsed'] / 1e9:.2f}\n")
+                tmp = STATUS_FILE + ".tmp"
+                with open(tmp, "w") as f:
+                    f.write(status)
+                os.replace(tmp, STATUS_FILE)
 
             # Step optimizer after GRAD_ACCUM_STEPS chunks (or end of sequence)
             if chunks_this_seq % GRAD_ACCUM_STEPS == 0 or chunk_end == SEQ_LEN:

@@ -221,30 +221,119 @@ class ChonkPool:
 class ChonkFullLayer(StaticLayer):
     """Static full-attention cache layer whose keys/values live in Chonk
     Buffer pool memory. Writes in place and returns a view of only the
-    tokens seen so far, so masks/attention span the current length."""
+    tokens seen so far, so masks/attention span the current length.
+    Supports INT4 quantization (packed uint8) when enabled via CHONK_QUANTIZE_KV.
+    In quantized mode, only INT4 data lives in the pool; bf16 tensors are
+    materialized transiently during the forward pass."""
 
-    def __init__(self, max_cache_len, pool_base, byte_offset, dtype, device):
+    def __init__(self, max_cache_len, pool_base, byte_offset, storage_dtype, compute_dtype, device, quantize_kv, num_kv_heads, head_dim):
         super().__init__(max_cache_len=max_cache_len)
         self._pool_base = pool_base
         self._byte_offset = byte_offset
-        self._prealloc_dtype = dtype
+        self._storage_dtype = storage_dtype
+        self._compute_dtype = compute_dtype
         self._prealloc_device = device
+        self._quantize = quantize_kv
+        self._num_kv_heads = num_kv_heads
+        self._head_dim = head_dim
+        self._kv_elements_per_layer = 2 * num_kv_heads * max_cache_len * head_dim
 
     def _prealloc(self, batch_size, num_heads, head_dim):
-        per_t = batch_size * num_heads * self.max_cache_len * head_dim
-        el_per = per_t
-        offset_el = self._byte_offset // self._prealloc_dtype.itemsize
-        buf = self._pool_base.view(self._prealloc_dtype)
-        self.keys = buf.narrow(0, offset_el, per_t).view(
-            batch_size, num_heads, self.max_cache_len, head_dim
-        )
-        self.values = buf.narrow(0, offset_el + per_t, per_t).view(
-            batch_size, num_heads, self.max_cache_len, head_dim
-        )
-        self.dtype = self._prealloc_dtype
+        if self._quantize:
+            kv_elements = batch_size * num_heads * self.max_cache_len * head_dim
+            elements_per_head = kv_elements // num_heads
+            kv_bytes = int(kv_elements * 0.5)
+            scale_bytes = num_heads * 2 * self._compute_dtype.itemsize
+            total_bytes = kv_bytes + scale_bytes
+
+            buf = self._pool_base.view(torch.uint8)
+            offset = self._byte_offset
+            self._k_data = buf.narrow(0, offset, kv_bytes)
+            self._v_data = buf.narrow(0, offset + kv_bytes, kv_bytes)
+            scale_offset = offset + 2 * kv_bytes
+            self._k_scales = buf.narrow(0, scale_offset, num_heads * self._compute_dtype.itemsize).view(self._compute_dtype)
+            self._v_scales = buf.narrow(0, scale_offset + num_heads * self._compute_dtype.itemsize, num_heads * self._compute_dtype.itemsize).view(self._compute_dtype)
+
+            self.keys = None
+            self.values = None
+            self._is_quantized = True
+        else:
+            per_t = batch_size * num_heads * self.max_cache_len * head_dim
+            offset_el = self._byte_offset // self._storage_dtype.itemsize
+            buf = self._pool_base.view(self._storage_dtype)
+            self.keys = buf.narrow(0, offset_el, per_t).view(
+                batch_size, num_heads, self.max_cache_len, head_dim
+            )
+            self.values = buf.narrow(0, offset_el + per_t, per_t).view(
+                batch_size, num_heads, self.max_cache_len, head_dim
+            )
+            self._is_quantized = False
+
+        self.dtype = self._compute_dtype
         self.device = self._prealloc_device
         self.cumulative_length = torch.tensor(0, dtype=int, device=self._prealloc_device)
         self.is_initialized = True
+
+    @staticmethod
+    def _quantize_int4(tensor, scale):
+        """Quantize bf16 tensor to INT4 (packed uint8). Symmetric per-tensor."""
+        if tensor.numel() == 0:
+            scale.fill_(1.0)
+            return torch.empty(0, dtype=torch.uint8, device=tensor.device)
+        max_val = tensor.abs().max().clamp(min=1e-8)
+        scale_val = max_val / 7.0
+        scale.copy_(scale_val)
+        quant = (tensor / scale_val).round().clamp(-8, 7).to(torch.int8)
+        packed = (quant[..., 0::2] & 0xF) | ((quant[..., 1::2] & 0xF) << 4)
+        return packed.to(torch.uint8)
+
+    @staticmethod
+    def _dequantize_int4(packed, scale):
+        """Dequantize INT4 (packed uint8) to bf16."""
+        if packed.numel() == 0:
+            return torch.empty(0, dtype=torch.bfloat16, device=packed.device)
+        low = (packed & 0xF).to(torch.int8)
+        high = ((packed >> 4) & 0xF).to(torch.int8)
+        low = torch.where(low >= 8, low - 16, low)
+        high = torch.where(high >= 8, high - 16, high)
+        dequant = torch.empty(packed.shape[-1] * 2, dtype=torch.int8, device=packed.device)
+        dequant[0::2] = low
+        dequant[1::2] = high
+        return (dequant.to(torch.bfloat16) * scale).view(packed.shape[0], packed.shape[1], packed.shape[2], -1)
+
+    def _write_quantized(self, key_states, value_states, start, kv_length):
+        b = key_states.shape[0]
+        k_flat = key_states[:b, :, start:start+kv_length].reshape(b, self._num_kv_heads, -1)
+        v_flat = value_states[:b, :, start:start+kv_length].reshape(b, self._num_kv_heads, -1)
+
+        for h in range(self._num_kv_heads):
+            k_h = k_flat[:, h].to(self._compute_dtype)
+            v_h = v_flat[:, h].to(self._compute_dtype)
+            k_packed = self._quantize_int4(k_h, self._k_scales[h])
+            v_packed = self._quantize_int4(v_h, self._v_scales[h])
+
+            elements_per_head = k_h.shape[-1]
+            bytes_per_head = elements_per_head // 2
+            offset = h * bytes_per_head
+            self._k_data[offset:offset+bytes_per_head].copy_(k_packed.view(-1))
+            self._v_data[offset:offset+bytes_per_head].copy_(v_packed.view(-1))
+
+    def _dequantize_prefix(self, b, length):
+        """Dequantize prefix [0:length] into a temporary bf16 tensor."""
+        k_out = torch.empty(b, self._num_kv_heads, length, self._head_dim,
+                           dtype=self._compute_dtype, device=self._prealloc_device)
+        v_out = torch.empty(b, self._num_kv_heads, length, self._head_dim,
+                           dtype=self._compute_dtype, device=self._prealloc_device)
+        packed_head_dim = self._head_dim // 2
+        for h in range(self._num_kv_heads):
+            elements = length * self._head_dim
+            bytes_per_head = elements // 2
+            offset = h * bytes_per_head
+            k_packed = self._k_data[offset:offset+bytes_per_head].view(b, length, packed_head_dim)
+            v_packed = self._v_data[offset:offset+bytes_per_head].view(b, length, packed_head_dim)
+            k_out[:, h] = self._dequantize_int4(k_packed, self._k_scales[h])
+            v_out[:, h] = self._dequantize_int4(v_packed, self._v_scales[h])
+        return k_out, v_out
 
     def lazy_initialization(self, key_states, value_states):
         self.dtype, self.device = key_states.dtype, key_states.device
@@ -260,25 +349,28 @@ class ChonkFullLayer(StaticLayer):
         b = key_states.shape[0]
         kv_length = key_states.shape[-2]
         start = int(self.cumulative_length.item())
-        # Store into the pool with DETACHED sources: cached tokens are
-        # constants (truncated BPTT), so later chunks never reference a
-        # previous chunk's freed autograd graph.
-        # The cells are bf16; the model runs fp32, so cast the inputs to the
-        # cells' dtype BEFORE the cat: an fp32 cat would promote the whole
-        # cached span to fp32 and double the dominant position-proportional
-        # memory term (the cats grow 128KB/pos in fp32 vs 64KB/pos bf16).
-        ks = key_states.to(self.keys.dtype)
-        vs = value_states.to(self.values.dtype)
-        self.keys[:b, :, start : start + kv_length].copy_(ks.detach())
-        self.values[:b, :, start : start + kv_length].copy_(vs.detach())
+
+        if self._quantize:
+            ks = key_states.to(self._compute_dtype)
+            vs = value_states.to(self._compute_dtype)
+            self._write_quantized(ks, vs, start, kv_length)
+        else:
+            ks = key_states.to(self.keys.dtype)
+            vs = value_states.to(self.values.dtype)
+            self.keys[:b, :, start:start+kv_length].copy_(ks.detach())
+            self.values[:b, :, start:start+kv_length].copy_(vs.detach())
+
         self.cumulative_length.add_(kv_length)
         if start == 0:
-            # First chunk: nothing cached yet, keep the graph fully alive
             return ks, vs
-        # Previous tokens are constants; the current chunk's K/V stay
-        # differentiable so grads flow to its own projections.
-        k = torch.cat([self.keys[:b, :, :start].detach(), ks], dim=-2)
-        v = torch.cat([self.values[:b, :, :start].detach(), vs], dim=-2)
+
+        if self._quantize:
+            k_cached, v_cached = self._dequantize_prefix(b, start)
+            k = torch.cat([k_cached, ks], dim=-2)
+            v = torch.cat([v_cached, vs], dim=-2)
+        else:
+            k = torch.cat([self.keys[:b, :, :start].detach(), ks], dim=-2)
+            v = torch.cat([self.values[:b, :, :start].detach(), vs], dim=-2)
         return k, v
 
     def get_mask_sizes(self, query_length: int) -> tuple[int, int]:
@@ -313,13 +405,23 @@ def build_chonk_cache(config, batch_size, max_cache_len, pool=None):
     head_dim = getattr(text_cfg, "head_dim", None) or (
         text_cfg.hidden_size // text_cfg.num_attention_heads
     )
-    dtype = torch.bfloat16
     device = "cuda"
 
-    per_layer_bytes = (
-        2 * batch_size * num_kv_heads * max_cache_len * head_dim * dtype.itemsize
-    )  # K + V
-    total = per_layer_bytes * n_full
+    quantize_kv = os.environ.get("CHONK_QUANTIZE_KV", "0") == "1"
+    if quantize_kv:
+        storage_dtype = torch.uint8
+        compute_dtype = torch.bfloat16
+        bytes_per_element = 0.5
+    else:
+        storage_dtype = torch.bfloat16
+        compute_dtype = torch.bfloat16
+        bytes_per_element = storage_dtype.itemsize
+
+    per_layer_kv_elements = 2 * batch_size * num_kv_heads * max_cache_len * head_dim
+    per_layer_bytes = int(per_layer_kv_elements * bytes_per_element)
+    scale_bytes = num_kv_heads * 2 * compute_dtype.itemsize
+    per_layer_total = per_layer_bytes + scale_bytes
+    total = per_layer_total * n_full
 
     if pool is None:
         pool = ChonkPool()
@@ -330,16 +432,16 @@ def build_chonk_cache(config, batch_size, max_cache_len, pool=None):
     byte_off = 0
     for i, lt in enumerate(layer_types):
         if lt in ("full_attention", "attention"):
-            layer = ChonkFullLayer(max_cache_len, base, byte_off, dtype, device)
+            layer = ChonkFullLayer(max_cache_len, base, byte_off, storage_dtype, compute_dtype, device, quantize_kv, num_kv_heads, head_dim)
             layer._prealloc(batch_size, num_kv_heads, head_dim)
-            byte_off += per_layer_bytes
+            byte_off += per_layer_total
         else:
             layer = LinearAttentionLayer(**layer_kwargs)
         layers.append(layer)
 
     cache = Cache(layers=layers)
     cache.pool = pool
-    cache.full_layer_bytes = per_layer_bytes
+    cache.full_layer_bytes = per_layer_total
     cache._batch_size = batch_size
     return cache
 
