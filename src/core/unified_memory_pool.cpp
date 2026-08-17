@@ -78,6 +78,9 @@ PoolConfig PoolConfig::forDevice(VkPhysicalDevice physicalDevice) {
                 1024ull * 1024 * 1024,
                 2048ull * 1024 * 1024,
                 4096ull * 1024 * 1024,
+                8192ull * 1024 * 1024,
+                16384ull * 1024 * 1024,
+                32768ull * 1024 * 1024,
             };
             break;
         case MemoryTopologyType::Hybrid:
@@ -90,6 +93,9 @@ PoolConfig PoolConfig::forDevice(VkPhysicalDevice physicalDevice) {
                 512ull * 1024 * 1024,
                 1024ull * 1024 * 1024,
                 2048ull * 1024 * 1024,
+                4096ull * 1024 * 1024,
+                8192ull * 1024 * 1024,
+                16384ull * 1024 * 1024,
             };
             break;
         case MemoryTopologyType::Discrete:
@@ -106,6 +112,9 @@ PoolConfig PoolConfig::forDevice(VkPhysicalDevice physicalDevice) {
                 1024ull * 1024 * 1024,
                 2048ull * 1024 * 1024,
                 4096ull * 1024 * 1024,
+                8192ull * 1024 * 1024,
+                16384ull * 1024 * 1024,
+                32768ull * 1024 * 1024,
             };
             break;
     }
@@ -132,13 +141,16 @@ PoolConfig PoolConfig::forAPU(VkDeviceSize totalSystemRAM) {
     // APU VRAM is host-visible; shadow buffer is redundant
     cfg.hostShadowMultiplier = 0.0f;
     cfg.maxHostShadowBytes = 0;
-    // Multi-block sizes for flexible routing on APUs
+    // Multi-block sizes for flexible routing on APUs (scaled for future hardware)
     cfg.blockSizes = {
         256ull * 1024 * 1024,   // 256 MB
         512ull * 1024 * 1024,   // 512 MB
         1024ull * 1024 * 1024,  // 1 GB
         2048ull * 1024 * 1024,  // 2 GB
         4096ull * 1024 * 1024,  // 4 GB
+        8192ull * 1024 * 1024,  // 8 GB
+        16384ull * 1024 * 1024, // 16 GB
+        32768ull * 1024 * 1024, // 32 GB
     };
     return cfg;
 }
@@ -166,6 +178,8 @@ PoolConfig PoolConfig::forHighVRAM(VkPhysicalDevice physicalDevice) {
         2048ull * 1024 * 1024,
         4096ull * 1024 * 1024,
         8192ull * 1024 * 1024,
+        16384ull * 1024 * 1024,
+        32768ull * 1024 * 1024,
     };
     (void)vram;  // kept for future heuristics (e.g. block count scaling)
     return cfg;
