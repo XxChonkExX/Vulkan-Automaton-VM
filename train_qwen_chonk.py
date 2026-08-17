@@ -596,6 +596,17 @@ def main():
                     total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
                     if total_norm != total_norm:  # NaN check
                         print(f"  [NaN grad norm detected, skipping step {step}]", flush=True)
+                        nan_params = []
+                        for name, p in model.named_parameters():
+                            if p.grad is not None and torch.isnan(p.grad).any():
+                                nan_params.append(name)
+                        if nan_params:
+                            print(f"  [NaN grads in: {nan_params[:5]}... ({len(nan_params)} total)]", flush=True)
+                        else:
+                            print(f"  [NaN in grad norm but no individual param NaN - checking non-params]", flush=True)
+                            for name, buf in model.named_buffers() if hasattr(model, 'named_buffers') else []:
+                                if buf is not None and torch.isnan(buf).any():
+                                    print(f"  [NaN in buffer: {name}]", flush=True)
                         optimizer.zero_grad()
                         torch.cuda.empty_cache()
                         continue
