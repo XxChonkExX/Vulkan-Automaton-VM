@@ -519,6 +519,7 @@ def main():
 
         # Gradient accumulation: track chunks per sequence
         chunks_this_seq = 0
+        skip_step = False
 
         # Process in chunks
         for chunk_start in range(0, SEQ_LEN, CHUNK_SIZE):
@@ -532,12 +533,21 @@ def main():
                 time.sleep(CHONK_PAUSE)  # give the display pipeline breathing room
 
             last_loss = float("nan")
+            skip_step = False
             if loss is not None:
                 # Scale loss for gradient accumulation
                 loss = loss / GRAD_ACCUM_STEPS
                 last_loss = loss.item()
                 loss.backward()
-                del loss, outputs  # free the 2GB logits + graph ASAP
+                # Early NaN check - skip this chunk's contribution
+                if last_loss != last_loss:
+                    print(f"  [NaN loss detected in chunk {chunks_this_seq}, skipping]", flush=True)
+                    optimizer.zero_grad()
+                    del loss, outputs
+                    torch.cuda.empty_cache()
+                    skip_step = True
+                else:
+                    del loss, outputs  # free the 2GB logits + graph ASAP
 
             chunks_this_seq += 1
 
@@ -574,12 +584,25 @@ def main():
 
             # Step optimizer after GRAD_ACCUM_STEPS chunks (or end of sequence)
             if chunks_this_seq % GRAD_ACCUM_STEPS == 0 or chunk_end == SEQ_LEN:
-                # Gradient clipping
+                # Skip if any chunk had NaN loss
+                if skip_step:
+                    print(f"  [Skipping step {step} due to prior NaN]", flush=True)
+                    optimizer.zero_grad()
+                    torch.cuda.empty_cache()
+                    skip_step = False
+                    continue
+                # Gradient clipping with NaN guard
                 if GRAD_CLIP_NORM > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+                    total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+                    if total_norm != total_norm:  # NaN check
+                        print(f"  [NaN grad norm detected, skipping step {step}]", flush=True)
+                        optimizer.zero_grad()
+                        torch.cuda.empty_cache()
+                        continue
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
+                skip_step = False  # reset for next accumulation cycle
 
                 # EXP 7: Update EMA (reduced frequency to reduce kernel pressure)
                 if CHONK_EMA_UPDATE_EVERY > 0 and step % CHONK_EMA_UPDATE_EVERY == 0:
