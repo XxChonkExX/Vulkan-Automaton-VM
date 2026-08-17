@@ -50,6 +50,11 @@ struct VVM_API PoolConfig {
     // For high-VRAM cards (RTX 4090 24GB, RTX 6000 48GB), consider 1GB or 2GB.
     VkDeviceSize blockSize = 512ull * 1024 * 1024;  // 512MB per block
     
+    // Optional: multiple block sizes for flexible routing.
+    // If set, the allocator picks the smallest block size >= request size.
+    // Falls back to blockSize if empty.
+    std::vector<VkDeviceSize> blockSizes;
+    
     // Minimum allocation alignment (power of two). 256KB for tensor cores.
     VkDeviceSize minAlignment = 256 * 1024;
     

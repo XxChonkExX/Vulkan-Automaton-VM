@@ -56,7 +56,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:False,garbage_collection
 # starve it and reset the driver -> login screen)
 CHONK_COMPILE = os.environ.get("CHONK_COMPILE", "0") == "1"   # torch.compile (risky w/ fla kernels)
 CHONK_AUTOCAST = os.environ.get("CHONK_AUTOCAST", "0") == "1"  # bf16 autocast in train_step
-CHONK_PAUSE = float(os.environ.get("CHONK_PAUSE", "0.02"))     # sec pause per chunk (display breathing room)
+CHONK_PAUSE = float(os.environ.get("CHONK_PAUSE", "0.05"))     # sec pause per chunk (display breathing room)
 CHONK_SMOKE = os.environ.get("CHONK_SMOKE", "0") == "1"        # smoke test: tiny seq, 2 steps
 CHONK_ATTN = os.environ.get("CHONK_ATTN", "eager")             # eager (stable) | sdpa | flash_attention_2
 CHONK_ATTN_RECOMPUTE = os.environ.get("CHONK_ATTN_RECOMPUTE", "1") == "1"  # attention checkpointing (THE fix for the ~1.5MB/token eager-graph growth)
@@ -79,10 +79,19 @@ LEARNING_RATE = 2e-5
 WEIGHT_DECAY = 0.01
 WARMUP_STEPS = 100
 MAX_STEPS = 10000
-GRAD_ACCUM_STEPS = 4  # EXP 1: Effective batch = 4
+GRAD_ACCUM_STEPS = int(os.environ.get("CHONK_GRAD_ACCUM", "4"))  # Effective batch = 4
 GRAD_CLIP_NORM = 1.0  # EXP 1: Gradient clipping
 LOG_INTERVAL = 10
 SAVE_INTERVAL = 500
+
+# Live training: epoch-based with block subsampling (for 262K feasibility)
+CHONK_SUBSAMPLE = float(os.environ.get("CHONK_SUBSAMPLE", "1.0"))  # 1.0 = all blocks, 0.05 = 5%
+CHONK_EPOCHS = int(os.environ.get("CHONK_EPOCHS", "1"))
+
+# Display-starvation mitigations (Strix Halo iGPU drives display)
+CHONK_PAUSE = float(os.environ.get("CHONK_PAUSE", "0.02"))     # sec pause per chunk (display breathing room)
+CHONK_OPTIMIZER_PAUSE = float(os.environ.get("CHONK_OPTIMIZER_PAUSE", "0.5"))  # extra pause on optimizer step
+CHONK_EMA_UPDATE_EVERY = int(os.environ.get("CHONK_EMA_UPDATE_EVERY", "1"))  # update EMA every N optimizer steps
 
 if CHONK_SMOKE:
     SEQ_LEN = int(os.environ.get("CHONK_SMOKE_SEQ", "2048"))
@@ -93,11 +102,17 @@ if CHONK_SMOKE:
 # Total pool size: ~80-90GB (model ~22GB + optimizer ~44GB + KV ~10GB + activations ~8GB + staging ~2GB)
 
 
-def get_tokenized_dataset(data_path, seq_len, batch_size):
+def get_tokenized_dataset(data_path, seq_len, batch_size, subsample=1.0, epoch=0):
     """Load tokenized dataset from disk (memmap tokens.bin + index.bin).
     Tokens are packed into fixed seq_len blocks (variable-length documents
-    are concatenated, cache resets at block boundaries)."""
+    are concatenated, cache resets at block boundaries).
+    
+    Args:
+        subsample: fraction of blocks to use (1.0 = all, 0.05 = 5%)
+        epoch: epoch number for deterministic random seed
+    """
     import numpy as np
+    import random
 
     tokens_path = os.path.join(data_path, "tokens.bin")
     index_path = os.path.join(data_path, "index.bin")
@@ -121,12 +136,23 @@ def get_tokenized_dataset(data_path, seq_len, batch_size):
 
     tokens = np.memmap(tokens_path, dtype=np.uint32, mode="r")
     index = np.memmap(index_path, dtype=np.int64, mode="r")
+    n_blocks = len(tokens) // seq_len
     print(f"  Dataset: {len(tokens):,} tokens, {len(index) - 1:,} sequences "
-          f"(packed into {len(tokens) // seq_len:,} blocks of {seq_len:,})")
+          f"(packed into {n_blocks:,} blocks of {seq_len:,})")
+
+    if subsample >= 1.0:
+        # Use all blocks
+        block_indices = list(range(n_blocks))
+    else:
+        # Deterministic random subsample per epoch
+        n_take = max(1, int(n_blocks * subsample))
+        rng = random.Random(epoch * 1337 + 42)
+        block_indices = rng.sample(range(n_blocks), n_take)
+        block_indices.sort()
+        print(f"  Subsample {subsample:.1%}: {len(block_indices):,} blocks (epoch {epoch})")
 
     def generator():
-        n_blocks = len(tokens) // seq_len
-        for b in range(n_blocks):
+        for b in block_indices:
             start = b * seq_len
             chunk = tokens[start:start + seq_len]
             yield torch.from_numpy(chunk.astype(np.int64))
@@ -423,22 +449,37 @@ def main():
         optimizer, num_warmup_steps=WARMUP_STEPS, num_training_steps=MAX_STEPS
     )
 
-    # 11. Load dataset
-    print("\n[9/6] Loading dataset...")
-    dataset_gen = get_tokenized_dataset(DATA_PATH, SEQ_LEN, BATCH_SIZE)
+    # Calculate total steps for scheduler (per epoch blocks × epochs)
+    import numpy as np
+    n_blocks_full = len(np.memmap(os.path.join(DATA_PATH, "tokens.bin"), dtype=np.uint32, mode="r")) // SEQ_LEN
+    n_blocks_per_epoch = max(1, int(n_blocks_full * CHONK_SUBSAMPLE))
+    total_steps = n_blocks_per_epoch * CHONK_EPOCHS
+    print(f"  Total steps: {total_steps} ({n_blocks_per_epoch} blocks/epoch × {CHONK_EPOCHS} epochs)")
 
-    # 12. Training loop
+    # 11. Learning rate scheduler
+    # Lazy import: transformers' schedule module initializes torch CUDA at
+    # import time, which breaks the Chonk allocator swap.
+    from transformers import get_cosine_schedule_with_warmup
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, num_warmup_steps=WARMUP_STEPS, num_training_steps=total_steps
+    )
+
+    # 12. Training loop (epoch-based with subsampling)
     print("\n" + "=" * 60)
     print("Starting training...")
     print("=" * 60)
 
     step = 0
     model.train()
-    t_seq_start = time.time()
 
-    for input_ids in dataset_gen:
-        if step >= MAX_STEPS:
-            break
+    for epoch in range(CHONK_EPOCHS):
+        dataset_gen = get_tokenized_dataset(DATA_PATH, SEQ_LEN, BATCH_SIZE, CHONK_SUBSAMPLE, epoch)
+        t_seq_start = time.time()
+        print(f"\n--- Epoch {epoch + 1}/{CHONK_EPOCHS} ---")
+
+        for input_ids in dataset_gen:
+            if step >= total_steps:
+                break
 
         input_ids = input_ids.unsqueeze(0).cuda()  # [1, seq_len]
 
@@ -494,8 +535,14 @@ def main():
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
-                # EXP 7: Update EMA
-                ema.update()
+
+                # EXP 7: Update EMA (reduced frequency to reduce kernel pressure)
+                if CHONK_EMA_UPDATE_EVERY > 0 and step % CHONK_EMA_UPDATE_EVERY == 0:
+                    ema.update()
+
+                # Extra pause around optimizer step to let display driver breathe
+                if CHONK_OPTIMIZER_PAUSE > 0:
+                    time.sleep(CHONK_OPTIMIZER_PAUSE)
 
             # Log (count optimizer steps, not chunks)
             if step % LOG_INTERVAL == 0:

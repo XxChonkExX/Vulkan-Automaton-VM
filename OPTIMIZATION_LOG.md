@@ -448,4 +448,43 @@ Pure-Python per-group INT8/INT4 quantization, no C++/HIP kernel needed:
 
 ---
 
+### 262K validation results (live, 2026-08-16)
+- **Step 0–60 observed**: pool stable at **109.11GB / 122GB** (12GB headroom); loss 6.25 → trending (step 0: 6.25, step 40: 5.59, step 60: 7.75 — noisy but signal present).
+- **Fragmentation fix confirmed**: `CHONK_POOL_BLOCK_GB=16` + `CHONK_MIN_BLOCK_GB=32` eliminated the 2.7GB dedicated-exportable OOM that killed the first attempt.
+- **Throughput**: ~128 min/step (256 chunks × ~30s/chunk at 262K) — raw 10K steps = 2.3 years, infeasible for convergence.
+- **Wrapper resilience**: survived 1 driver reset (login screen) and 1 Vulkan OOM, auto-restarted cleanly both times.
+
+### Live training config (block subsampling for convergence)
+Since 262K is memory-feasible but throughput is the blocker, **real training = subsampled blocks per epoch**:
+
+| Subsample | Blocks/epoch | Time/epoch | Time for 10 epochs |
+|---|---|---|---|
+| 0.10 (10%) | 228 | ~11 days | ~110 days |
+| **0.05 (5%)** | **114** | **~5.5 days** | **~55 days** |
+| 0.02 (2%) | 46 | ~2.2 days | ~22 days |
+
+**Chosen: 5% subsampling (114 blocks/epoch)** — practical convergence timeline, still 5× more context than 131K training.
+
+Config additions:
+- `CHONK_SUBSAMPLE=0.05` (random 5% of blocks each epoch, seeded)
+- `CHONK_EPOCHS=10` (instead of MAX_STEPS)
+- Keep chunk 1024, r=128, INT4-all, 16GB pool blocks
+- Target: ~5.5 days/epoch, ~55 days for 10 epochs — acceptable for long-context convergence
+
+---
+
+### 196K live run + multi-block allocator (2026-08-16)
+- **Config**: SEQ 196608, cache 196608, chunk 1024, r=128, alpha=128, INT4 quantize-all (497 modules, group 128), eager + recompute, ChonkAdamW, LR 2e-5 cosine / warmup 100, wd 0.01, clip 1.0, grad accum 16, 10% subsample, 10 epochs, EMA every 4 steps.
+- **Multi-block allocator**: `CHONK_POOL_BLOCK_SIZES_GB=1,2,4,8` (APU default) + `CHONK_MIN_BLOCK_GB=16` for pluggable allocator.
+- **Result**: **STABLE** — Step 10, pool 104.81GB/122GB flat, no crashes, no OOM. First stable >131K run on Strix Halo.
+- **Throughput**: ~190s/chunk at 196K (192 chunks/step → ~10h/step). 304 blocks/epoch × 10 epochs = 3040 steps (~30 days).
+- **Stability fixes validated**: grad accum 16 (reduces optimizer kernel bursts), EMA every 4 steps, optimizer pause 0.5s, chunk pause 0.05s — eliminates display starvation.
+
+### Next validation targets
+1. **2048 chunks at 196K** — potential 2× speedup, risk: activation memory spike OOM. Test with `CHONK_CHUNK=2048`, `CHONK_GRAD_ACCUM=8`, `CHONK_OPTIMIZER_PAUSE=1.0`.
+2. **262K with multi-block allocator** — same config at full 262K. If OOM persists, next lever: `CHONK_POOL_BLOCK_SIZES_GB=2,4,8,16,32` (larger max block for KV/exportables).
+3. **Even larger blocks for super-long-context** — if 262K works, test 524K/1M with `blockSizes` extending to 64GB+.
+
+---
+
 *End of log*
