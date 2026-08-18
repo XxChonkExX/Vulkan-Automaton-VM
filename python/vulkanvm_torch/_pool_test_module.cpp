@@ -564,13 +564,15 @@ static void allocatorDestroyBlock(AllocBlock* b);
 
 static bool allocatorCreateBlock(size_t need) {
     if (!g_pool) return false;
-    // Round UP to the nearest configured bucket so one block absorbs the
-    // monotonic growth of recompute attention temporaries (freed chunk
-    // merges back to the full bucket and serves the next, slightly larger,
-    // request). Previously blocks were exact-fit -> every ~3 chunks a new
-    // dedicated block, never released -> GTT ceiling -> "data is not
-    // allocated yet" crash in backward.
-    size_t blockSize = ChonkAllocator::roundToBucket(need);
+    // Proven sizing: exact-fit above the min-block floor (the validated
+    // 196K recipe sets CHONK_MIN_BLOCK_GB=16). A 16GB block absorbs the
+    // entire recompute-attention growth curve (2.4GB -> 9.7GB): the freed
+    // chunk merges back to the full block and the next, slightly larger,
+    // request reuses it - no new blocks, flat GTT. Bucket rounding is NOT
+    // applied to base allocations (it inflated them by ~10GB). It is only
+    // used below as the pressure-relief retry escalation.
+    size_t blockSize = std::max(ChonkAllocator::minBlock(),
+                                (need + ChonkAllocator::kAlign - 1) / ChonkAllocator::kAlign * ChonkAllocator::kAlign);
     vvm::AllocDesc desc;
     desc.size = blockSize;
     desc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -599,6 +601,18 @@ static bool allocatorCreateBlock(size_t need) {
             fprintf(stderr, "[allocator] released %zu empty block(s) under pressure; retrying %zu bytes\n",
                     before - g_allocator.blocks.size(), need);
             allocOpt = g_pool->allocate(desc);
+        }
+        if (!allocOpt) {
+            // Second escalation: re-round the block up to the nearest
+            // configured bucket (CHONK_POOL_BLOCK_SIZES_GB) so the freed
+            // chunks merge into a bucket-sized span that absorbs future
+            // growth without new blocks, then retry once more.
+            size_t bucketSize = ChonkAllocator::roundToBucket(need);
+            if (bucketSize > blockSize) {
+                fprintf(stderr, "[allocator] pressure: escalating %zu -> %zu bucket\n", blockSize, bucketSize);
+                desc.size = bucketSize;
+                allocOpt = g_pool->allocate(desc);
+            }
         }
     }
     if (!allocOpt) return false;
