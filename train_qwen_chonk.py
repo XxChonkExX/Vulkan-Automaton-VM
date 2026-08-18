@@ -623,6 +623,17 @@ def main():
                 if CHONK_OPTIMIZER_PAUSE > 0:
                     time.sleep(CHONK_OPTIMIZER_PAUSE)
 
+            # Save checkpoint (before step increment so step 20, 40, 60... save correctly)
+            if step % SAVE_INTERVAL == 0 and step > 0:
+                save_path = f"{OUT_DIR}/chonk_step_{step}"
+                os.makedirs(save_path, exist_ok=True)
+                model.save_pretrained(save_path)
+                saved_loss = last_loss * GRAD_ACCUM_STEPS
+                with open(f"{save_path}/.chonk_loss", "w") as f:
+                    f.write(f"{saved_loss:.6f}")
+                print(f"Checkpoint saved to {save_path} (loss={saved_loss:.4f})")
+                cleanup_checkpoints(OUT_DIR, KEEP_CHECKPOINTS)
+
             # Log (count optimizer steps, not chunks)
             if step % LOG_INTERVAL == 0:
                 stats = pool.stats()
@@ -633,17 +644,6 @@ def main():
 
             if step >= MAX_STEPS:
                 break
-
-        # Save checkpoint
-        if step % SAVE_INTERVAL == 0 and step > 0:
-            save_path = f"{OUT_DIR}/chonk_step_{step}"
-            os.makedirs(save_path, exist_ok=True)
-            model.save_pretrained(save_path)
-            saved_loss = last_loss * GRAD_ACCUM_STEPS
-            with open(f"{save_path}/.chonk_loss", "w") as f:
-                f.write(f"{saved_loss:.6f}")
-            print(f"Checkpoint saved to {save_path} (loss={saved_loss:.4f})")
-            cleanup_checkpoints(OUT_DIR, KEEP_CHECKPOINTS)
 
     # Final save
     # Apply EMA weights for final model
