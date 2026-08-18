@@ -451,13 +451,23 @@ struct ChonkAllocator {
     std::mutex mtx;
     std::vector<std::unique_ptr<AllocBlock>> blocks;
     std::unordered_map<void*, size_t> liveSizes;
-    // Never release blocks back to the pool: every block is a dedicated
-    // exportable VkDeviceMemory, so releasing only sends pages to the TTM
-    // page pool and the next chunk re-creates fresh blocks (GTT churn ->
-    // driver memory pressure). Keeping every block warm means torch's
-    // empty_cache just returns chunks to the slab and the footprint stays
-    // at the first-step peak (stable at ~88GB for the 131K run).
-    size_t warmBlocks = 512;
+    // Block retention policy:
+    //   warmBlocks   - fully-free blocks are kept warm up to this many blocks
+    //                  (avoids GTT churn from release/re-create ping-pong)
+    //   maxBlocks    - hard cap; when a new block is needed and we are at the
+    //                  cap, fully-free blocks are released first to make room
+    //                  (bounded GTT commitment - the "better router")
+    // Previously blocks were NEVER released (warm=512). That made the
+    // monotonic growth of backward-attention temporaries (recompute
+    // re-materializes attn weights that grow with kv_len; freed chunks are
+    // always smaller than the next request) accumulate exact-fit blocks until
+    // the driver's GTT ceiling refused vkAllocateMemory -> zero-storage tensor
+    // -> "data is not allocated yet" crash. Bucket-rounded block sizes make a
+    // single block absorb the whole growth curve up to its bucket size, and
+    // release-on-cap keeps committed GTT bounded.
+    size_t warmBlocks = 8;
+    size_t maxBlocks = 24;
+    size_t minBlocksOnOOM = 4;  // floor kept when releasing under pressure
 
     static constexpr size_t kAlign = 512;
     static constexpr size_t kMinBlock = 2ull * 1024 * 1024 * 1024;  // 2 GB
@@ -468,6 +478,52 @@ struct ChonkAllocator {
             if (gb >= 1.0) return (size_t)(gb * 1024.0 * 1024.0 * 1024.0);
         }
         return kMinBlock;
+    }
+    static size_t envSize(const char* name, size_t def) {
+        const char* p = getenv(name);
+        if (p) {
+            double v = atof(p);
+            if (v >= 1.0) return (size_t)v;
+        }
+        return def;
+    }
+    // Bucket list (GB) parsed once from CHONK_POOL_BLOCK_SIZES_GB - the same
+    // env var that configures the pool's multi-size blocks. New blocks are
+    // rounded UP to the smallest bucket >= the request so a single block
+    // absorbs the monotonic growth of recompute attention temporaries
+    // (freed chunk merges back to the full bucket and serves the next,
+    // slightly larger, request). Falls back to power-of-two rounding.
+    static std::vector<size_t> buckets() {
+        static std::vector<size_t> b = [] {
+            std::vector<size_t> out;
+            const char* p = getenv("CHONK_POOL_BLOCK_SIZES_GB");
+            if (p) {
+                std::string str(p);
+                size_t start = 0;
+                for (;;) {
+                    size_t end = str.find(',', start);
+                    std::string token = str.substr(start, end == std::string::npos ? std::string::npos : end - start);
+                    double gb = atof(token.c_str());
+                    if (gb >= 1.0) out.push_back((size_t)(gb * 1024.0 * 1024.0 * 1024.0));
+                    if (end == std::string::npos) break;
+                    start = end + 1;
+                }
+            }
+            std::sort(out.begin(), out.end());
+            out.erase(std::unique(out.begin(), out.end()), out.end());
+            return out;
+        }();
+        return b;
+    }
+    static size_t roundToBucket(size_t need) {
+        for (size_t b : buckets()) {
+            if (b >= need) return b;
+        }
+        // No bucket fits: round up to the next power of two (min 2 GB).
+        size_t b = std::max(minBlock(), need);
+        size_t p = 1;
+        while (p < b) p <<= 1;
+        return p;
     }
 };
 
@@ -504,10 +560,17 @@ static void* hipImportFromFd(int fd, size_t size, hipExternalMemory_t* outExt) {
     return base;
 }
 
+static void allocatorDestroyBlock(AllocBlock* b);
+
 static bool allocatorCreateBlock(size_t need) {
     if (!g_pool) return false;
-    size_t blockSize = std::max(ChonkAllocator::minBlock(),
-                                (need + ChonkAllocator::kAlign - 1) & ~(ChonkAllocator::kAlign - 1));
+    // Round UP to the nearest configured bucket so one block absorbs the
+    // monotonic growth of recompute attention temporaries (freed chunk
+    // merges back to the full bucket and serves the next, slightly larger,
+    // request). Previously blocks were exact-fit -> every ~3 chunks a new
+    // dedicated block, never released -> GTT ceiling -> "data is not
+    // allocated yet" crash in backward.
+    size_t blockSize = ChonkAllocator::roundToBucket(need);
     vvm::AllocDesc desc;
     desc.size = blockSize;
     desc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -519,6 +582,25 @@ static bool allocatorCreateBlock(size_t need) {
     desc.exportable = true;
     desc.name = "torch_segment";
     auto allocOpt = g_pool->allocate(desc);
+    if (!allocOpt) {
+        // Pressure relief: we are at (or near) the driver's ceiling. Release
+        // fully-free blocks down to a small warm floor, then retry once
+        // before giving up (auto-allocation under pressure).
+        size_t before = g_allocator.blocks.size();
+        for (auto it = g_allocator.blocks.begin(); it != g_allocator.blocks.end();) {
+            if ((*it)->liveBytes == 0 && g_allocator.blocks.size() > g_allocator.minBlocksOnOOM) {
+                allocatorDestroyBlock(it->get());
+                it = g_allocator.blocks.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (g_allocator.blocks.size() < before) {
+            fprintf(stderr, "[allocator] released %zu empty block(s) under pressure; retrying %zu bytes\n",
+                    before - g_allocator.blocks.size(), need);
+            allocOpt = g_pool->allocate(desc);
+        }
+    }
     if (!allocOpt) return false;
     vvm::Allocation a = std::move(*allocOpt);
     auto info = g_pool->exportMemory(a, vvm::ExternalHandleType::OpaqueFd);
@@ -558,7 +640,15 @@ static void allocatorDestroyBlock(AllocBlock* b) {
 
 static void allocatorMaybeReleaseEmptyBlock(AllocBlock* blk) {
     if (blk->liveBytes != 0) return;
-    if (g_allocator.blocks.size() <= g_allocator.warmBlocks) return;
+    // Keep a warm set of empty blocks for slab reuse (avoids GTT churn from
+    // release/re-create ping-pong), but never let the block count exceed the
+    // hard cap: above it, empty blocks are returned to the pool so committed
+    // GTT stays bounded (the old policy never released below 512 blocks, which
+    // let monotonically-growing backward temporaries accumulate until the
+    // driver refused vkAllocateMemory).
+    size_t warm = ChonkAllocator::envSize("CHONK_ALLOCATOR_WARM_BLOCKS", g_allocator.warmBlocks);
+    size_t maxb = ChonkAllocator::envSize("CHONK_ALLOCATOR_MAX_BLOCKS", g_allocator.maxBlocks);
+    if (g_allocator.blocks.size() <= warm || g_allocator.blocks.size() <= maxb) return;
     for (auto bi = g_allocator.blocks.begin(); bi != g_allocator.blocks.end(); ++bi) {
         if (bi->get() == blk) {
             allocatorDestroyBlock(blk);
