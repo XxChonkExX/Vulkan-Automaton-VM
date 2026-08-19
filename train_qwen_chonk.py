@@ -72,6 +72,7 @@ CHONK_STAGING_GB = float(os.environ.get("CHONK_STAGING_GB", "2.0"))  # host-visi
 MODEL_PATH = os.environ.get("CHONK_MODEL_PATH", "/home/chonke/local_training/models/Qwen3.8-AEON-Ultimate")
 DATA_PATH = os.environ.get("CHONK_DATA_PATH", "/home/chonke/local_training/qwen_tokenized_128k")
 OUT_DIR = os.environ.get("CHONK_OUT_DIR", "/home/chonke/local_training/qwen_fine_tuned")
+RESUME_DIR = os.environ.get("CHONK_RESUME_DIR", "")
 STATUS_FILE = os.environ.get("CHONK_STATUS_FILE", "/home/chonke/local_training/qwen_logs/train_status.txt")
 SEQ_LEN = int(os.environ.get("CHONK_SEQ_LEN", "131072"))     # 262144 = the long-context target
 BATCH_SIZE = 1
@@ -500,150 +501,183 @@ def main():
     print("Starting training...")
     print("=" * 60)
 
-    step = 0
+    # Resume from checkpoint if CHONK_RESUME_DIR is set
+    resume_step = 0
+    resume_epoch = 0
+    if RESUME_DIR:
+        print(f"\n[Resume] Loading from {RESUME_DIR}...")
+        state_path = os.path.join(RESUME_DIR, "training_state.pt")
+        if os.path.exists(state_path):
+            checkpoint = torch.load(state_path, map_location="cpu")
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            scheduler.load_state_dict(checkpoint["scheduler"])
+            ema.shadow = checkpoint["ema"]
+            resume_step = checkpoint["step"]
+            resume_epoch = checkpoint["epoch"]
+            print(f"  Resumed from step {resume_step}, epoch {resume_epoch}")
+        else:
+            print(f"  [warn] training_state.pt not found in {RESUME_DIR}")
+
+    step = resume_step
     model.train()
 
-    for epoch in range(CHONK_EPOCHS):
+    for epoch in range(resume_epoch, CHONK_EPOCHS):
         dataset_gen = get_tokenized_dataset(DATA_PATH, SEQ_LEN, BATCH_SIZE, CHONK_SUBSAMPLE, epoch)
         t_seq_start = time.time()
         print(f"\n--- Epoch {epoch + 1}/{CHONK_EPOCHS} ---")
+
+        # If resuming within this epoch, skip already-processed sequences
+        steps_to_skip = resume_step - epoch * (total_steps // CHONK_EPOCHS) if epoch == resume_epoch else 0
+        steps_skipped = 0
 
         for input_ids in dataset_gen:
             if step >= total_steps:
                 break
 
-        input_ids = input_ids.unsqueeze(0).cuda()  # [1, seq_len]
+            if steps_to_skip > 0 and steps_skipped < steps_to_skip:
+                steps_skipped += 1
+                continue
 
-        # Reset cache for new sequence
-        reset_chonk_cache(kv_cache)
+            input_ids = input_ids.unsqueeze(0).cuda()  # [1, seq_len]
 
-        # Gradient accumulation: track chunks per sequence
-        chunks_this_seq = 0
-        skip_step = False
+            # Reset cache for new sequence
+            reset_chonk_cache(kv_cache)
 
-        # Process in chunks
-        for chunk_start in range(0, SEQ_LEN, CHUNK_SIZE):
-            chunk_end = min(chunk_start + CHUNK_SIZE, SEQ_LEN)
-            chunk_ids = input_ids[:, chunk_start:chunk_end]
-
-            # Forward
-            loss, outputs = train_step(model, chunk_ids, kv_cache, optimizer, chunk_start, chunk_end, SEQ_LEN)
-
-            if CHONK_PAUSE > 0:
-                time.sleep(CHONK_PAUSE)  # give the display pipeline breathing room
-
-            last_loss = float("nan")
+            # Gradient accumulation: track chunks per sequence
+            chunks_this_seq = 0
             skip_step = False
-            if loss is not None:
-                # Scale loss for gradient accumulation
-                loss = loss / GRAD_ACCUM_STEPS
-                last_loss = loss.item()
-                loss.backward()
-                # Early NaN check - skip this chunk's contribution
-                if last_loss != last_loss:
-                    print(f"  [NaN loss detected in chunk {chunks_this_seq}, skipping]", flush=True)
-                    optimizer.zero_grad()
-                    del loss, outputs
-                    torch.cuda.empty_cache()
-                    skip_step = True
-                else:
-                    del loss, outputs  # free the 2GB logits + graph ASAP
 
-            chunks_this_seq += 1
+            # Process in chunks
+            for chunk_start in range(0, SEQ_LEN, CHUNK_SIZE):
+                chunk_end = min(chunk_start + CHUNK_SIZE, SEQ_LEN)
+                chunk_ids = input_ids[:, chunk_start:chunk_end]
 
-            # Return ALL cached segments to the slab EVERY chunk. The saved
-            # fp32 attn_weights grow with position (512 x pos x 16 layers), so
-            # every chunk's request is bigger than the last; torch's cached
-            # smaller segments never fit, forcing fresh 2GB blocks. Emptying
-            # the cache each chunk coalesces the whole slab so each chunk
-            # re-carves the same blocks (growth ~= intrinsic delta, ~4GB at
-            # 131K, not ~1GB/chunk -> OOM at 112GB). Blocks are never
-            # released (warmBlocks=512), so this is pure slab recycling.
-            torch.cuda.empty_cache()
+                # Forward
+                loss, outputs = train_step(model, chunk_ids, kv_cache, optimizer, chunk_start, chunk_end, SEQ_LEN)
 
-            # Heartbeat
-            if chunks_this_seq % 8 == 0:
-                ps = pool.stats()
-                print(f"  [seq] chunk {chunks_this_seq}/{SEQ_LEN // CHUNK_SIZE} "
-                      f"({time.time() - t_seq_start:.0f}s, loss={last_loss:.4f}, "
-                      f"pool={ps['totalUsed'] / 1e9:.2f}GB)", flush=True)
+                if CHONK_PAUSE > 0:
+                    time.sleep(CHONK_PAUSE)  # give the display pipeline breathing room
 
-            # Status file (atomic rename): live numbers for the heartbeat
-            # monitor without touching the (possibly terminal-bound) log.
-            if chunks_this_seq % 8 == 0:
-                status = (f"time={time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                          f"step={step}\n"
-                          f"chunk={chunks_this_seq}/{SEQ_LEN // CHUNK_SIZE}\n"
-                          f"loss={last_loss:.4f}\n"
-                          f"lr={scheduler.get_last_lr()[0]:.2e}\n"
-                          f"pool_gb={ps['totalUsed'] / 1e9:.2f}\n")
-                tmp = STATUS_FILE + ".tmp"
-                with open(tmp, "w") as f:
-                    f.write(status)
-                os.replace(tmp, STATUS_FILE)
+                last_loss = float("nan")
+                skip_step = False
+                if loss is not None:
+                    # Scale loss for gradient accumulation
+                    loss = loss / GRAD_ACCUM_STEPS
+                    last_loss = loss.item()
+                    loss.backward()
+                    # Early NaN check - skip this chunk's contribution
+                    if last_loss != last_loss:
+                        print(f"  [NaN loss detected in chunk {chunks_this_seq}, skipping]", flush=True)
+                        optimizer.zero_grad()
+                        del loss, outputs
+                        torch.cuda.empty_cache()
+                        skip_step = True
+                    else:
+                        del loss, outputs  # free the 2GB logits + graph ASAP
 
-            # Step optimizer after GRAD_ACCUM_STEPS chunks (or end of sequence)
-            if chunks_this_seq % GRAD_ACCUM_STEPS == 0 or chunk_end == SEQ_LEN:
-                # Skip if any chunk had NaN loss
-                if skip_step:
-                    print(f"  [Skipping step {step} due to prior NaN]", flush=True)
-                    optimizer.zero_grad()
-                    torch.cuda.empty_cache()
-                    skip_step = False
-                    continue
-                # Gradient clipping with NaN guard
-                if GRAD_CLIP_NORM > 0:
-                    total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
-                    if total_norm != total_norm:  # NaN check
-                        print(f"  [NaN grad norm detected, skipping step {step}]", flush=True)
-                        nan_params = []
-                        for name, p in model.named_parameters():
-                            if p.grad is not None and torch.isnan(p.grad).any():
-                                nan_params.append(name)
-                        if nan_params:
-                            print(f"  [NaN grads in: {nan_params[:5]}... ({len(nan_params)} total)]", flush=True)
-                        else:
-                            print(f"  [NaN in grad norm but no individual param NaN - checking non-params]", flush=True)
-                            for name, buf in model.named_buffers() if hasattr(model, 'named_buffers') else []:
-                                if buf is not None and torch.isnan(buf).any():
-                                    print(f"  [NaN in buffer: {name}]", flush=True)
+                chunks_this_seq += 1
+
+                # Return ALL cached segments to the slab EVERY chunk. The saved
+                # fp32 attn_weights grow with position (512 x pos x 16 layers), so
+                # every chunk's request is bigger than the last; torch's cached
+                # smaller segments never fit, forcing fresh 2GB blocks. Emptying
+                # the cache each chunk coalesces the whole slab so each chunk
+                # re-carves the same blocks (growth ~= intrinsic delta, ~4GB at
+                # 131K, not ~1GB/chunk -> OOM at 112GB). Blocks are never
+                # released (warmBlocks=512), so this is pure slab recycling.
+                torch.cuda.empty_cache()
+
+                # Heartbeat
+                if chunks_this_seq % 8 == 0:
+                    ps = pool.stats()
+                    print(f"  [seq] chunk {chunks_this_seq}/{SEQ_LEN // CHUNK_SIZE} "
+                          f"({time.time() - t_seq_start:.0f}s, loss={last_loss:.4f}, "
+                          f"pool={ps['totalUsed'] / 1e9:.2f}GB)", flush=True)
+
+                # Status file (atomic rename): live numbers for the heartbeat
+                # monitor without touching the (possibly terminal-bound) log.
+                if chunks_this_seq % 8 == 0:
+                    status = (f"time={time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                              f"step={step}\n"
+                              f"chunk={chunks_this_seq}/{SEQ_LEN // CHUNK_SIZE}\n"
+                              f"loss={last_loss:.4f}\n"
+                              f"lr={scheduler.get_last_lr()[0]:.2e}\n"
+                              f"pool_gb={ps['totalUsed'] / 1e9:.2f}\n")
+                    tmp = STATUS_FILE + ".tmp"
+                    with open(tmp, "w") as f:
+                        f.write(status)
+                    os.replace(tmp, STATUS_FILE)
+
+                # Step optimizer after GRAD_ACCUM_STEPS chunks (or end of sequence)
+                if chunks_this_seq % GRAD_ACCUM_STEPS == 0 or chunk_end == SEQ_LEN:
+                    # Skip if any chunk had NaN loss
+                    if skip_step:
+                        print(f"  [Skipping step {step} due to prior NaN]", flush=True)
                         optimizer.zero_grad()
                         torch.cuda.empty_cache()
+                        skip_step = False
                         continue
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-                skip_step = False  # reset for next accumulation cycle
+                    # Gradient clipping with NaN guard
+                    if GRAD_CLIP_NORM > 0:
+                        total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+                        if total_norm != total_norm:  # NaN check
+                            print(f"  [NaN grad norm detected, skipping step {step}]", flush=True)
+                            nan_params = []
+                            for name, p in model.named_parameters():
+                                if p.grad is not None and torch.isnan(p.grad).any():
+                                    nan_params.append(name)
+                            if nan_params:
+                                print(f"  [NaN grads in: {nan_params[:5]}... ({len(nan_params)} total)]", flush=True)
+                            else:
+                                print(f"  [NaN in grad norm but no individual param NaN - checking non-params]", flush=True)
+                                for name, buf in model.named_buffers() if hasattr(model, 'named_buffers') else []:
+                                    if buf is not None and torch.isnan(buf).any():
+                                        print(f"  [NaN in buffer: {name}]", flush=True)
+                            optimizer.zero_grad()
+                            torch.cuda.empty_cache()
+                            continue
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    skip_step = False  # reset for next accumulation cycle
 
-                # EXP 7: Update EMA (reduced frequency to reduce kernel pressure)
-                if CHONK_EMA_UPDATE_EVERY > 0 and step % CHONK_EMA_UPDATE_EVERY == 0:
-                    ema.update()
+                    # EXP 7: Update EMA (reduced frequency to reduce kernel pressure)
+                    if CHONK_EMA_UPDATE_EVERY > 0 and step % CHONK_EMA_UPDATE_EVERY == 0:
+                        ema.update()
 
-                # Extra pause around optimizer step to let display driver breathe
-                if CHONK_OPTIMIZER_PAUSE > 0:
-                    time.sleep(CHONK_OPTIMIZER_PAUSE)
+                    # Extra pause around optimizer step to let display driver breathe
+                    if CHONK_OPTIMIZER_PAUSE > 0:
+                        time.sleep(CHONK_OPTIMIZER_PAUSE)
 
-            # Save checkpoint (before step increment so step 20, 40, 60... save correctly)
-            if step % SAVE_INTERVAL == 0 and step > 0:
-                save_path = f"{OUT_DIR}/chonk_step_{step}"
-                os.makedirs(save_path, exist_ok=True)
-                model.save_pretrained(save_path)
-                saved_loss = last_loss * GRAD_ACCUM_STEPS
-                with open(f"{save_path}/.chonk_loss", "w") as f:
-                    f.write(f"{saved_loss:.6f}")
-                print(f"Checkpoint saved to {save_path} (loss={saved_loss:.4f})")
-                cleanup_checkpoints(OUT_DIR, KEEP_CHECKPOINTS)
+                # Save checkpoint (before step increment so step 20, 40, 60... save correctly)
+                if step % SAVE_INTERVAL == 0 and step > 0:
+                    save_path = f"{OUT_DIR}/chonk_step_{step}"
+                    os.makedirs(save_path, exist_ok=True)
+                    model.save_pretrained(save_path)
+                    # Save optimizer, scheduler, EMA, and training metadata for resume
+                    torch.save({
+                        "optimizer": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict(),
+                        "ema": ema.shadow,
+                        "step": step,
+                        "epoch": epoch,
+                    }, f"{save_path}/training_state.pt")
+                    saved_loss = last_loss * GRAD_ACCUM_STEPS
+                    with open(f"{save_path}/.chonk_loss", "w") as f:
+                        f.write(f"{saved_loss:.6f}")
+                    print(f"Checkpoint saved to {save_path} (loss={saved_loss:.4f})")
+                    cleanup_checkpoints(OUT_DIR, KEEP_CHECKPOINTS)
 
-            # Log (count optimizer steps, not chunks)
-            if step % LOG_INTERVAL == 0:
-                stats = pool.stats()
-                print(f"Step {step}: loss={last_loss * GRAD_ACCUM_STEPS:.4f}, "
-                      f"lr={scheduler.get_last_lr()[0]:.2e}, pool_used={stats['totalUsed'] / 1e9:.2f} GB")
+                # Log (count optimizer steps, not chunks)
+                if step % LOG_INTERVAL == 0:
+                    stats = pool.stats()
+                    print(f"Step {step}: loss={last_loss * GRAD_ACCUM_STEPS:.4f}, "
+                          f"lr={scheduler.get_last_lr()[0]:.2e}, pool_used={stats['totalUsed'] / 1e9:.2f} GB")
 
-            step += 1
+                step += 1
 
-            if step >= MAX_STEPS:
-                break
+                if step >= MAX_STEPS:
+                    break
 
     # Final save
     # Apply EMA weights for final model
