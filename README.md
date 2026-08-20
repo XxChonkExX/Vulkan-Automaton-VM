@@ -2,14 +2,6 @@
 
 **VulkanVM** is a **cross-vendor GPU networking and RDMA library** that enables zero-copy GPU���GPU transfers over TCP, RDMA, and GPU-direct NIC DMA across AMD, NVIDIA, and Intel GPUs. Built on a hardened, zero-fragmentation Vulkan memory pool (the "Chonk Buffer"), it provides Hugging Face–style model distribution, capacity-first shard placement, and a unified tensor transport for AI inference clusters. One header, one library, zero system changes — link it into your application.
 
-**Version**: 0.2.0-pre (pre-release)
-
-> **⚠️ Please pull latest `main` before continuing work — see [docs/AUDIT_NOTES_2026-08-15.md](docs/AUDIT_NOTES_2026-08-15.md)** (external audit recommendations + recent changes + field-testing comparison for sync).
->
-> **Cross-Machine GPU Sharing**: Verified working between Windows (Intel Arc B70) and Linux (AMD Strix Halo) over TCP. See [docs/cross_machine_gpu_sharing.md](docs/cross_machine_gpu_sharing.md) for setup guide.
->
-> **NEW: Chonk Buffer Training (v0.2.1-dev)**: Full LLM training with *everything* in Chonk Buffer — model weights, optimizer states, KV cache, activations, staging. See [train_qwen_chonk.py](train_qwen_chonk.py) for Qwen 27B @ 128K context on Strix Halo (128GB unified RAM). Active optimization experiments documented in [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md).
-
 ---
 Notice! Help wanted desperately-
 Alot of this hinges upon hardware that I do not own. Nvidia in particular. I have tested AMD with my 7900xtx and Strix Halo, Intel B70 tested for multi-pool but it needs network testing and Nvidia definitely needs some love since I am too poor to pay the Nvidia tax :( Android AHardwareBuffer import is tested and passing on Galaxy S24+ (API 36, Adreno), but broader device coverage (Mali, PowerVR, Xclipse) is still wanted. Tenstorrent cards are loosely supported and I have built a Vulkan ICD to play nice; I have submitted to TT (honestly I do not know if it is a steaming pile of 5#!7 or not) but if you need it to test let me know and I will ship it your way. This repo is solid but highly highly experimental in several aspects. Local power! Homebrewed with love. -Mike/ChonkE
