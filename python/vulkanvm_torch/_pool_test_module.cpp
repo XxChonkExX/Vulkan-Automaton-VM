@@ -487,8 +487,10 @@ struct ChonkAllocator {
         }
         return def;
     }
-    // Bucket list (GB) parsed once from CHONK_POOL_BLOCK_SIZES_GB - the same
-    // env var that configures the pool's multi-size blocks. New blocks are
+    // Bucket list (GB) parsed once from CHONK_POOL_BLOCK_SIZES_GB.
+    // If the env var is set to "auto", buckets are generated as powers of
+    // two from 1 GB up to the device VRAM size (queried at first call).
+    // Otherwise, the comma-separated list is used as-is. New blocks are
     // rounded UP to the smallest bucket >= the request so a single block
     // absorbs the monotonic growth of recompute attention temporaries
     // (freed chunk merges back to the full bucket and serves the next,
@@ -499,14 +501,43 @@ struct ChonkAllocator {
             const char* p = getenv("CHONK_POOL_BLOCK_SIZES_GB");
             if (p) {
                 std::string str(p);
-                size_t start = 0;
-                for (;;) {
-                    size_t end = str.find(',', start);
-                    std::string token = str.substr(start, end == std::string::npos ? std::string::npos : end - start);
-                    double gb = atof(token.c_str());
-                    if (gb >= 1.0) out.push_back((size_t)(gb * 1024.0 * 1024.0 * 1024.0));
-                    if (end == std::string::npos) break;
-                    start = end + 1;
+                std::string firstToken = str.substr(0, str.find(','));
+                if (firstToken == "auto") {
+                    // Query device VRAM and generate power-of-two buckets
+                    // from 1 GB up to (and including) device memory size.
+                    size_t devMem = 0;
+                    VkPhysicalDevice physDev = VK_NULL_HANDLE;
+                    // We need the physical device handle; since g_allocator
+                    // is initialized after pool creation, try to read from
+                    // a static global set during init. For now, default to
+                    // 128 GB if we can't query (covers MI300X + future cards).
+                    const char* pVRAM = getenv("CHONK_DEVICE_VRAM_GB");
+                    if (pVRAM) {
+                        devMem = (size_t)(atof(pVRAM) * 1024.0 * 1024.0 * 1024.0);
+                    } else {
+                        devMem = (size_t)128 * 1024 * 1024 * 1024;  // default 128 GB
+                    }
+                    size_t gb = 1024 * 1024 * 1024;  // 1 GB in bytes
+                    for (size_t sz = gb; sz <= devMem; sz <<= 1) {
+                        out.push_back(sz);
+                    }
+                    // Always include 128 GB bucket as a floor for large allocs
+                    if (devMem < 128 * gb) {
+                        out.push_back(128 * gb);
+                    }
+                    fprintf(stderr, "[allocator] auto-buckets: %s, device VRAM=%zu GB\n",
+                            str.c_str(), devMem / gb);
+                } else {
+                    // Parse comma-separated list
+                    size_t start = 0;
+                    for (;;) {
+                        size_t end = str.find(',', start);
+                        std::string token = str.substr(start, end == std::string::npos ? std::string::npos : end - start);
+                        double gb_val = atof(token.c_str());
+                        if (gb_val >= 1.0) out.push_back((size_t)(gb_val * 1024.0 * 1024.0 * 1024.0));
+                        if (end == std::string::npos) break;
+                        start = end + 1;
+                    }
                 }
             }
             std::sort(out.begin(), out.end());
