@@ -503,30 +503,19 @@ struct ChonkAllocator {
                 std::string str(p);
                 std::string firstToken = str.substr(0, str.find(','));
                 if (firstToken == "auto") {
-                    // Query device VRAM and generate power-of-two buckets
-                    // from 1 GB up to (and including) device memory size.
-                    size_t devMem = 0;
-                    VkPhysicalDevice physDev = VK_NULL_HANDLE;
-                    // We need the physical device handle; since g_allocator
-                    // is initialized after pool creation, try to read from
-                    // a static global set during init. For now, default to
-                    // 128 GB if we can't query (covers MI300X + future cards).
-                    const char* pVRAM = getenv("CHONK_DEVICE_VRAM_GB");
-                    if (pVRAM) {
-                        devMem = (size_t)(atof(pVRAM) * 1024.0 * 1024.0 * 1024.0);
-                    } else {
-                        devMem = (size_t)128 * 1024 * 1024 * 1024;  // default 128 GB
+                    // Graduated ladder: 1 GB steps through 16 GB (where all
+                    // transient training traffic lives - peak measured demand
+                    // was 8 GiB + 16 MiB), then coarser rungs up to 128 GB
+                    // for large model/optimizer-scale requests.
+                    static const size_t kLadderGB[] = {
+                        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                        20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128,
+                    };
+                    for (size_t gb : kLadderGB) {
+                        out.push_back(gb * 1024ull * 1024ull * 1024ull);
                     }
-                    size_t gb = 1024 * 1024 * 1024;  // 1 GB in bytes
-                    for (size_t sz = gb; sz <= devMem; sz <<= 1) {
-                        out.push_back(sz);
-                    }
-                    // Always include 128 GB bucket as a floor for large allocs
-                    if (devMem < 128 * gb) {
-                        out.push_back(128 * gb);
-                    }
-                    fprintf(stderr, "[allocator] auto-buckets: %s, device VRAM=%zu GB\n",
-                            str.c_str(), devMem / gb);
+                    fprintf(stderr, "[allocator] auto-buckets: graduated %zu-rung ladder, 1..128 GB\n",
+                            sizeof(kLadderGB) / sizeof(kLadderGB[0]));
                 } else {
                     // Parse comma-separated list
                     size_t start = 0;
@@ -635,11 +624,16 @@ static bool allocatorCreateBlock(size_t need) {
         }
         if (!allocOpt) {
             // Second escalation: re-round the block up to the nearest
-            // configured bucket (CHONK_POOL_BLOCK_SIZES_GB) so the freed
-            // chunks merge into a bucket-sized span that absorbs future
-            // growth without new blocks, then retry once more.
+            // configured bucket (CHONK_POOL_BLOCK_SIZES_GB; with the
+            // graduated auto-ladder this is a tight fit, e.g. 8.02 GB ->
+            // 9 GB rung). Bound the overshoot: escalating far past `need`
+            // after a driver OOM is guaranteed to fail again and just
+            // thrashes the allocator, so skip escalation when the next
+            // rung exceeds need + slack.
             size_t bucketSize = ChonkAllocator::roundToBucket(need);
-            if (bucketSize > blockSize) {
+            size_t slack = ChonkAllocator::envSize("CHONK_ESCALATE_SLACK_GB", 2)
+                           * 1024ull * 1024ull * 1024ull;
+            if (bucketSize > blockSize && bucketSize <= need + slack) {
                 fprintf(stderr, "[allocator] pressure: escalating %zu -> %zu bucket\n", blockSize, bucketSize);
                 desc.size = bucketSize;
                 allocOpt = g_pool->allocate(desc);
