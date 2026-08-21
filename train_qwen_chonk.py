@@ -506,6 +506,15 @@ def main():
     resume_epoch = 0
     if RESUME_DIR:
         print(f"\n[Resume] Loading from {RESUME_DIR}...")
+        adapter_path = os.path.join(RESUME_DIR, "adapter_model.safetensors")
+        if os.path.exists(adapter_path):
+            from safetensors.torch import load_file
+            from peft import set_peft_model_state_dict
+            adapter_sd = load_file(adapter_path, device="cpu")
+            set_peft_model_state_dict(model, adapter_sd)
+            print(f"  LoRA adapters loaded ({len(adapter_sd)} tensors)")
+        else:
+            print(f"  [warn] adapter_model.safetensors not found in {RESUME_DIR}")
         state_path = os.path.join(RESUME_DIR, "training_state.pt")
         if os.path.exists(state_path):
             checkpoint = torch.load(state_path, map_location="cpu")
