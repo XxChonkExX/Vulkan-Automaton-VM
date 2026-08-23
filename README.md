@@ -626,6 +626,24 @@ pool->reloadToDevice(allocation);
 
 Uses GPU copy engine (DMA engines), not `madvise`/`mprotect` (unsafe on driver mappings).
 
+### Inference Benchmarks — Pooled Multi-GPU LLM (Phase 0, 2026-08-23)
+
+First pooling study for llama.cpp inference: RX 7900 XTX (24GB) + Arc Pro B70 (32GB), stock llama.cpp b10588 Vulkan backend. Full data and analysis in [docs/inference_benchmarks.md](docs/inference_benchmarks.md).
+
+Qwen3.6-40B Q4_K_M (24.10 GiB weights — exceeds XTX VRAM alone):
+
+| Config | pp512 | tg128 |
+|---|---:|---:|
+| XTX solo (PCIe spill) | 446 t/s | 13.44 t/s |
+| B70 solo (fits in 32 GB) | 534 t/s | 18.01 t/s |
+| **Layer-split both, bandwidth-weighted** | 474 t/s | **21.89 t/s** |
+
+Findings:
+- **Pooling beats every solo config** (+54% decode vs XTX solo) once the model exceeds one card's comfortable capacity; splitting halves per-card weight reads and keeps both engines busy.
+- Splitting a model that *fits* one card is a regression (pipeline overhead) — placement policy matters.
+- The B70's stock Pro driver (8861) was ~24× broken for compute; fixed by upgrading to the consumer-branch WHQL (8974).
+- **This 21.9 t/s stock result is the bar**: the planned Chonk-backed ggml buffer type must match it while adding tensor-granular placement (`ShardPlacer`), KV-in-pool, and DMA offload tiers.
+
 ---
 
 ## Sparse / Residency Virtual Memory
