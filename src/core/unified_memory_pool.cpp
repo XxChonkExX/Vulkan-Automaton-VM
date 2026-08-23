@@ -318,6 +318,27 @@ bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig&
     if (!validateDeviceCapabilities()) {
         return false;
     }
+
+    // Chonk Chunks validation: both knobs must be set together, sizes must be
+    // powers of two, and a chunk must hold at least one min-aligned allocation.
+    auto pow2 = [](VkDeviceSize v) { return v != 0 && (v & (v - 1)) == 0; };
+    if (config_.smallAllocThreshold > 0 || config_.chunkBlockSize > 0) {
+        if (config_.smallAllocThreshold == 0 || config_.chunkBlockSize == 0 ||
+            !pow2(config_.chunkBlockSize) ||
+            config_.chunkBlockSize < config_.minAlignment ||
+            config_.chunkBlockSize < config_.smallAllocThreshold) {
+            VVM_LOG_ERROR("Invalid Chonk Chunks config: smallAllocThreshold={} chunkBlockSize={} "
+                          "(both required, chunk must be a power of two >= threshold and >= minAlignment)",
+                          config_.smallAllocThreshold, config_.chunkBlockSize);
+            return false;
+        }
+    }
+    if (config_.allocationAlignment != 0 &&
+        (!pow2(config_.allocationAlignment) || config_.allocationAlignment < config_.minAlignment)) {
+        VVM_LOG_ERROR("Invalid allocationAlignment {} (must be power of two >= minAlignment {})",
+                      config_.allocationAlignment, config_.minAlignment);
+        return false;
+    }
     
     // Use MemoryTypeSelector for optimal memory type selection
     MemoryTypeSelector selector(deviceConfig_.physicalDevice);
@@ -590,7 +611,7 @@ bool UnifiedMemoryPool::validateDeviceCapabilities() const {
 }
 
 std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
-    VkDeviceSize size, uint32_t memoryTypeIndex) {
+    VkDeviceSize size, uint32_t memoryTypeIndex, bool isChunk) {
     
     VkMemoryAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -662,6 +683,7 @@ std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
     block.memoryFlags = memFlags;
     block.isHostVisible = isHostVisible;
     block.isCoherent = isCoherent;
+    block.isChunk = isChunk;
     
     // Create buddy allocator for this block
     block.buddy = std::make_unique<BuddyAllocator>(size, config_.minAlignment);
@@ -1026,21 +1048,34 @@ std::optional<Allocation> UnifiedMemoryPool::allocate(VkDeviceSize size,
     
     // Align size
     size = alignUp(size, config_.minAlignment);
-    
-    // Try existing blocks first - check buddy allocator. Only consider blocks
-    // of the requested memory class: handing out host-visible memory when the
-    // caller asked for device-local (or vice versa) breaks the mapping
-    // contract silently.
+
+    // Chonk Chunks: route small requests to chunk blocks (size-class routing).
+    const bool wantChunk = config_.smallAllocThreshold > 0 &&
+                           config_.chunkBlockSize > 0 &&
+                           size <= config_.smallAllocThreshold;
+
+    // Best-fit block selection within the size class: pick the block with the
+    // SMALLEST largest-free that still fits. First-fit scattered allocations
+    // across blocks; best-fit packs them tightly and avoids spawning extra
+    // partially-filled blocks.
     const bool wantHostVisible = (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+    int bestIdx = -1;
+    VkDeviceSize bestFree = UINT64_MAX;
     for (uint32_t i = 0; i < blocks_.size(); ++i) {
         const auto& block = blocks_[i];
         if (!block.buddy) continue;
         if (block.isHostVisible != wantHostVisible) continue;
-        if (block.buddy->getLargestFree() >= size) {
-            return subAllocate(size, config_.minAlignment, i, usage);
+        if (block.isChunk != wantChunk) continue;
+        const VkDeviceSize lf = block.buddy->getLargestFree();
+        if (lf >= size && lf < bestFree) {
+            bestFree = lf;
+            bestIdx = static_cast<int>(i);
         }
     }
-    
+    if (bestIdx >= 0) {
+        return subAllocate(size, config_.minAlignment, bestIdx, usage);
+    }
+
     // Need new block
     // maxBlocks == 0 means unlimited (documented contract in PoolConfig).
     if (config_.maxBlocks > 0 && blocks_.size() >= config_.maxBlocks) {
@@ -1052,9 +1087,10 @@ std::optional<Allocation> UnifiedMemoryPool::allocate(VkDeviceSize size,
         return std::nullopt;
     }
 
-    // Pick the best block size for this request
-    VkDeviceSize blockSize = config_.blockSize;
-    if (!config_.blockSizes.empty()) {
+    // Pick the block size for this request: chunks get chunkBlockSize,
+    // regular allocations use the configured ladder (if any).
+    VkDeviceSize blockSize = wantChunk ? config_.chunkBlockSize : config_.blockSize;
+    if (!wantChunk && !config_.blockSizes.empty()) {
         // Pick the smallest block size >= request size (aligned)
         VkDeviceSize alignedSize = alignUp(size, config_.minAlignment);
         for (VkDeviceSize bs : config_.blockSizes) {
@@ -1084,7 +1120,7 @@ std::optional<Allocation> UnifiedMemoryPool::allocate(VkDeviceSize size,
         ? (hostVisibleMemoryType_ != UINT32_MAX ? hostVisibleMemoryType_ : deviceLocalMemoryType_)
         : deviceLocalMemoryType_;
     
-    if (!allocateBlock(blockSize, memType).has_value()) {
+    if (!allocateBlock(blockSize, memType, wantChunk).has_value()) {
         return std::nullopt;
     }
     
@@ -1667,8 +1703,12 @@ std::optional<Allocation> UnifiedMemoryPool::subAllocate(VkDeviceSize size,
     // Align size
     size = alignUp(size, alignment);
     
-    // Allocate from buddy allocator
-    auto offsetOpt = block.buddy->allocate(size);
+    // Allocate from buddy allocator. Honor the configured base alignment
+    // (e.g. 2 MB) so buffer starts sit on driver memory-page boundaries;
+    // slack is returned to the free lists by the buddy.
+    VkDeviceSize baseAlign = config_.allocationAlignment;
+    if (baseAlign < alignment) baseAlign = alignment;
+    auto offsetOpt = block.buddy->allocateAligned(size, baseAlign);
     if (!offsetOpt) {
         return std::nullopt;
     }

@@ -93,49 +93,94 @@ std::optional<VkDeviceSize> BuddyAllocator::splitTo(int order, int targetOrder) 
 
 std::optional<VkDeviceSize> BuddyAllocator::allocate(VkDeviceSize size) {
     return withLock([this, size]() -> std::optional<VkDeviceSize> {
-        if (maxOrder_ < 0) {
-            VVM_LOG_ERROR("BuddyAllocator: not properly initialized");
-            return std::nullopt;
-        }
-        if (size == 0) return std::nullopt;
+        return allocateUnlocked(size);
+    });
+}
 
-        int target = sizeToOrder(size);
-        if (target < 0) return std::nullopt;
+std::optional<VkDeviceSize> BuddyAllocator::allocateUnlocked(VkDeviceSize size) {
+    if (maxOrder_ < 0) {
+        VVM_LOG_ERROR("BuddyAllocator: not properly initialized");
+        return std::nullopt;
+    }
+    if (size == 0) return std::nullopt;
 
-        // Find the smallest order >= target that has a free block.
-        int order = target;
-        while (order <= maxOrder_ && freeLists_[order].empty()) {
-            ++order;
-        }
-        if (order > maxOrder_) {
-            return std::nullopt;   // completely full
-        }
+    int target = sizeToOrder(size);
+    if (target < 0) return std::nullopt;
 
-        std::optional<VkDeviceSize> result;
-        if (order == target) {
-            result = popFree(order);
-        } else {
-            result = splitTo(order, target);
-        }
+    // Find the smallest order >= target that has a free block.
+    int order = target;
+    while (order <= maxOrder_ && freeLists_[order].empty()) {
+        ++order;
+    }
+    if (order > maxOrder_) {
+        return std::nullopt;   // completely full
+    }
 
-        if (!result) return std::nullopt;
+    std::optional<VkDeviceSize> result;
+    if (order == target) {
+        result = popFree(order);
+    } else {
+        result = splitTo(order, target);
+    }
 
-        // Exact-fit grant: hand out only the requested size (rounded up to
-        // minSize_) and return the unused tail of the order-sized block to the
-        // free lists. This eliminates the classic buddy power-of-two rounding
-        // waste (e.g. a 1.1 GiB request no longer consumes a 2 GiB order).
-        const VkDeviceSize blockLen = orderToSize(target);
-        VkDeviceSize granted = size;
-        if (granted < minSize_) granted = minSize_;
+    if (!result) return std::nullopt;
+
+    // Exact-fit grant: hand out only the requested size (rounded up to
+    // minSize_) and return the unused tail of the order-sized block to the
+    // free lists. This eliminates the classic buddy power-of-two rounding
+    // waste (e.g. a 1.1 GiB request no longer consumes a 2 GiB order).
+    const VkDeviceSize blockLen = orderToSize(target);
+    VkDeviceSize granted = size;
+    if (granted < minSize_) granted = minSize_;
+    granted = ((granted + minSize_ - 1) / minSize_) * minSize_;
+    if (granted > blockLen) granted = blockLen;
+
+    if (granted < blockLen) {
+        pushFreeRange(*result + granted, blockLen - granted);
+    }
+
+    allocated_[*result] = {target, granted};
+    return result;
+}
+
+std::optional<VkDeviceSize> BuddyAllocator::allocateAligned(VkDeviceSize size, VkDeviceSize alignment) {
+    if (alignment <= minSize_) {
+        return allocate(size);
+    }
+    if (!isPowerOfTwo(alignment) || alignment > blockSize_) {
+        return std::nullopt;
+    }
+
+    return withLock([this, size, alignment]() -> std::optional<VkDeviceSize> {
+        if (maxOrder_ < 0) return std::nullopt;
+        VkDeviceSize granted = size < minSize_ ? minSize_ : size;
         granted = ((granted + minSize_ - 1) / minSize_) * minSize_;
-        if (granted > blockLen) granted = blockLen;
 
-        if (granted < blockLen) {
-            pushFreeRange(*result + granted, blockLen - granted);
+        // Over-allocate enough to guarantee an alignment-aligned start inside
+        // the grant: worst-case misalignment is (alignment - minSize_).
+        const VkDeviceSize padded = granted + alignment - minSize_;
+        auto raw = allocateUnlocked(padded);
+        if (!raw.has_value()) return std::nullopt;
+
+        // allocateUnlocked() recorded {order, padded} at *raw; re-shape the
+        // grant: free the leading slack and the trailing tail, record the
+        // aligned region as its own exact-fit allocation.
+        auto it = allocated_.find(*raw);
+        const int order = it->second.order;
+        allocated_.erase(it);
+
+        const VkDeviceSize aligned = ((*raw + alignment - 1) / alignment) * alignment;
+        if (aligned != *raw) {
+            pushFreeRange(*raw, aligned - *raw);            // leading slack
+        }
+        const VkDeviceSize tailStart = aligned + granted;
+        const VkDeviceSize tailLen = (*raw + padded) - tailStart;
+        if (tailLen > 0) {
+            pushFreeRange(tailStart, tailLen);              // trailing tail
         }
 
-        allocated_[*result] = {target, granted};
-        return result;
+        allocated_[aligned] = {order, granted};
+        return aligned;
     });
 }
 

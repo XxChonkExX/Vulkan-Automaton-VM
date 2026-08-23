@@ -98,6 +98,19 @@ struct VVM_API PoolConfig {
     // VRAM). Some drivers place/map ReBAR memory differently than pure
     // DEVICE_LOCAL; benchmark both when chasing bandwidth parity.
     bool preferPureDeviceLocal = false;
+
+    // Alignment for allocation START offsets within a block (power of two).
+    // 0 = minAlignment. Larger values (e.g. 2 MB) keep buffer bases on driver
+    // memory-page boundaries; costs at most (alignment - minAlignment) slack
+    // per allocation, which is returned to the free lists.
+    VkDeviceSize allocationAlignment = 0;
+
+    // Chonk Chunks: size-class routing for small allocations. Requests
+    // <= smallAllocThreshold are served from dedicated chunk blocks of
+    // chunkBlockSize bytes instead of claiming space in (or spawning)
+    // full-size blocks. Both 0 = disabled.
+    VkDeviceSize smallAllocThreshold = 0;
+    VkDeviceSize chunkBlockSize = 0;
     
     // Hard cap on total pool memory in bytes (0 = no explicit cap).
     VkDeviceSize maxPoolBytes = 0;
@@ -200,6 +213,7 @@ struct VVM_API BlockInfo {
     VkMemoryPropertyFlags memoryFlags = 0;
     bool isHostVisible = false;
     bool isCoherent = false;
+    bool isChunk = false;   // Chonk Chunk block (serves small allocations)
 };
 
 // ============================================================================
@@ -423,7 +437,8 @@ private:
     std::optional<uint32_t> findMemoryType(VkMemoryPropertyFlags required,
                                            VkMemoryPropertyFlags preferred);
     std::optional<VkDeviceMemory> allocateBlock(VkDeviceSize size,
-                                                 uint32_t memoryTypeIndex);
+                                                 uint32_t memoryTypeIndex,
+                                                 bool isChunk = false);
     std::optional<Allocation> subAllocate(VkDeviceSize size,
                                           VkDeviceSize alignment,
                                           uint32_t blockIndex,

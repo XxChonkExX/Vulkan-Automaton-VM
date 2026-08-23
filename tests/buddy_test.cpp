@@ -283,6 +283,43 @@ int main() {
         CHECK(exs.checkInvariants());
     }
 
+    // --- 16. Aligned allocation: buffer bases at page-aligned offsets ---
+    {
+        constexpr VkDeviceSize kBig = 16 * 1024 * 1024;
+        constexpr VkDeviceSize kGran = 1 * 1024 * 1024;
+        BuddyAllocator al(kBig, kGran);
+
+        // 3 MB aligned to 4 MB: fresh block grants at 0 (already aligned).
+        auto a = al.allocateAligned(3 * kGran, 4 * kGran);
+        CHECK(a.has_value());
+        CHECK(*a % (4 * kGran) == 0);
+        CHECK(*a == 0);
+        CHECK(al.checkInvariants());
+
+        // Second aligned grant must land on the next 4 MB boundary.
+        auto b = al.allocateAligned(1 * kGran, 4 * kGran);
+        CHECK(b.has_value());
+        CHECK(*b % (4 * kGran) == 0);
+        CHECK(*b >= 4 * kGran);
+        CHECK(al.checkInvariants());
+
+        // Free both; block must coalesce fully (slack + tails merge back).
+        al.deallocate(*a, 3 * kGran);
+        al.deallocate(*b, 1 * kGran);
+        CHECK(al.getLargestFree() == kBig);
+        CHECK(al.getFragmentation() == 0.0f);
+        CHECK(al.checkInvariants());
+
+        // Alignment larger than remaining space must fail cleanly, not misalign.
+        auto big = al.allocate(12 * kGran);
+        CHECK(big.has_value());
+        auto impossible = al.allocateAligned(3 * kGran, 4 * kGran);
+        if (impossible.has_value()) {
+            CHECK(*impossible % (4 * kGran) == 0);
+        }
+        CHECK(al.checkInvariants());
+    }
+
     if (failures == 0) {
         std::printf("=== ALL BUDDY TESTS PASSED (0 failures) ===\n");
         return 0;
