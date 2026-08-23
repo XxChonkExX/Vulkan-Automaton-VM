@@ -500,3 +500,68 @@ Config additions:
 ---
 
 *End of log*
+---
+
+## 196K campaign: the 111GB wall + resume infrastructure (2026-08-17 → 2026-08-22)
+
+### Wall characterization
+- Runs at chunk 1024 repeatedly died around step 110-172: pool ratcheted
+  102.66GB → 111.25GB near chunk ~80-90 of a sequence, then
+  `VK_ERROR_OUT_OF_DEVICE_MEMORY` during backward.
+- **Masked failure mode**: when the pluggable allocator fails, torch receives
+  an unmaterialized tensor instead of an OOM exception; the custom
+  `vulkan_attention` kernel then throws the misleading
+  `RuntimeError: tensor has non-zero elements, but its data is not allocated`
+  (or the process hangs outright).
+- Root cause arithmetic: baseline committed (~103GB) + peak position-proportional
+  attention workspace (measured **8 GiB + 16 MiB** at deep sequence positions)
+  exceeded the ~111.x GB practical ceiling. Peak single-allocation demand missed
+  the 8GB bucket by 16 MB, forcing 16GB commits under pressure escalation.
+
+### Fixes landed (in commit order)
+1. `8ef7403` — **resume capability**: `CHONK_RESUME_DIR` +
+   `training_state.pt` (optimizer/scheduler/EMA shadow/step/epoch) saved each
+   checkpoint; epoch loop resumes from checkpointed epoch. Also fixed a
+   pre-existing indentation bug that left the training body *outside*
+   `for input_ids in dataset_gen:` (only one sequence per epoch was processed).
+2. `cf0cf98` — **LoRA adapter load on resume** (`set_peft_model_state_dict`)
+   — previously resume restored optimizer state but left adapters freshly
+   initialized, silently discarding weight progress. Plus first-cut auto-bucket
+   allocator.
+3. Launch script: per-attempt resume re-detection (auto-detect originally ran
+   once before the retry loop; after cleanup deleted the resumed-from dir,
+   retries pointed at a ghost dir and silently restarted from step 0 —
+   ~7.5h GPU time wasted). Watchdog added: kills trainer when
+   `train_status.txt` goes stale (>15 min running / >45 min startup);
+   hangs now self-heal into clean retries.
+4. `dbaec12` — **graduated bucket ladder** (`CHONK_POOL_BLOCK_SIZES_GB=auto`):
+   1 GB steps through 16 GB, then coarser rungs to 128 GB; pressure escalation
+   bounded to need + `CHONK_ESCALATE_SLACK_GB` (default 2) so a failed 8 GB
+   alloc never thrashes trying 16 GB at driver ceiling.
+
+### THE FIX: CHONK_CHUNK=512 (2026-08-22)
+Ladder/escalation tuning could not beat arithmetic — the 8 GB spike was real
+demand, not rounding waste. Halving chunk size halves the position-proportional
+attention workspace (~8 GB → ~4 GB), which fits in headroom:
+
+| Metric | chunk 1024 | chunk 512 |
+|---|---|---|
+| Run length | ~170 steps then crash | **2,300+ steps uninterrupted** |
+| Pool | ratchets to 111.25 GB → OOM | **flat 102.66 GB, zero OOMs** |
+| Net pace | ~60 steps/h (restart tax) | ~85 steps/h sustained |
+
+384 chunks/sequence ÷ grad accum 16 = 24 steps/sequence.
+
+### Current run status (post power outage, 2026-08-22)
+- Clean checkpoint at **step 3116** of 9135 target (log ends immediately after
+  the save — textbook power-cut signature, nothing lost).
+- Loss trajectory: 6.25 → 2.89 (step 770) → 1.78 (step 2330); per-chunk losses
+  0.12-0.19. LR 2e-05 climbing toward cosine peak (~step 4567).
+- Effective training shape: ends partway into epoch 0 at total_steps cap —
+  full epochs are ~73k steps each; 9135-step schedule completes the cosine
+  cycle exactly.
+- Remaining ~6,000 steps ≈ 2.5-3 days. Run in VT only: desktop session eats
+  0.5-2GB of the same unified memory out of a ~4-8GB margin (chunk 2048
+  historically froze the machine).
+
+*End of log*
