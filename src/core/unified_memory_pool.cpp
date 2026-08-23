@@ -321,19 +321,38 @@ bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig&
     
     // Use MemoryTypeSelector for optimal memory type selection
     MemoryTypeSelector selector(deviceConfig_.physicalDevice);
-    
+
     // Prefer DEVICE_LOCAL for primary allocations
     auto devLocalResult = selector.select(
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         config_.preferredFlags,
         config_.blockSize  // Ensure enough budget for at least one block
     );
-    
+
     if (devLocalResult.memoryTypeIndex == UINT32_MAX) {
         VVM_LOG_ERROR("Failed to find DEVICE_LOCAL memory type with sufficient budget");
         return false;
     }
     deviceLocalMemoryType_ = devLocalResult.memoryTypeIndex;
+
+    // Experiment knob: some drivers place/map ReBAR-mapped VRAM (types with
+    // DEVICE_LOCAL|HOST_VISIBLE) differently from pure DEVICE_LOCAL. When
+    // requested, swap to the first pure DEVICE_LOCAL type.
+    if (config_.preferPureDeviceLocal) {
+        auto memPropsEarly = getDeviceMemoryInfo().memProps;
+        VkMemoryPropertyFlags selFlags{};
+        getMemoryTypeProperties(deviceLocalMemoryType_, selFlags, memPropsEarly);
+        if (selFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+            auto pure = findMemoryTypeIndex(memPropsEarly,
+                                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (pure.has_value()) {
+                deviceLocalMemoryType_ = *pure;
+                VVM_LOG_INFO("preferPureDeviceLocal: switched to memory type {}", *pure);
+            }
+        }
+    }
+
     VVM_LOG_INFO("Selected DEVICE_LOCAL memory type {} (heap budget: {} MB, utilization: {} percent)",
                  deviceLocalMemoryType_,
                  devLocalResult.heapBudget / (1024*1024),
@@ -582,7 +601,7 @@ std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
     // allocateDedicatedExportable() which gives each exported allocation its
     // own dedicated VkDeviceMemory (required for reliable external import).
     void* pNext = nullptr;
-    
+
     // Device address support for bindless
     VkMemoryAllocateFlagsInfo flagsInfo{};
     if (config_.enableDeviceAddress) {
@@ -591,12 +610,23 @@ std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
         flagsInfo.pNext = pNext;
         pNext = &flagsInfo;
     }
-    
+
+    // Memory priority (VK_EXT_memory_priority): without this the driver may
+    // evict/degrade low-priority allocations when the heap fills up, which
+    // silently turns VRAM-resident blocks into PCIe-bound memory.
+    VkMemoryPriorityAllocateInfoEXT priorityInfo{};
+    if (config_.memoryPriority > 0.0f) {
+        priorityInfo.sType = VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT;
+        priorityInfo.priority = config_.memoryPriority;
+        priorityInfo.pNext = pNext;
+        pNext = &priorityInfo;
+    }
+
     // NOTE: Do NOT chain VkMemoryDedicatedAllocateInfo here for sub-allocated blocks.
     // A dedicated allocation is bound to a SINGLE resource. Sub-allocating multiple
     // buffers from one "dedicated" memory violates the spec. Exportable allocations
     // should use allocateDedicatedExportable() instead.
-    
+
     allocInfo.pNext = pNext;
     
     VkDeviceMemory memory;
@@ -909,10 +939,17 @@ std::optional<Allocation> UnifiedMemoryPool::allocateDedicated(
     VkMemoryAllocateFlagsInfo flagsInfo{};
     flagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
     flagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryPriorityAllocateInfoEXT priorityInfo{};
+    if (config_.memoryPriority > 0.0f) {
+        priorityInfo.sType = VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT;
+        priorityInfo.priority = config_.memoryPriority;
+    }
     if (config_.enableDeviceAddress) {
         dedicatedInfo.pNext = &flagsInfo;
+        flagsInfo.pNext = (config_.memoryPriority > 0.0f) ? &priorityInfo : nullptr;
         allocInfo.pNext = &dedicatedInfo;
     } else {
+        dedicatedInfo.pNext = (config_.memoryPriority > 0.0f) ? &priorityInfo : nullptr;
         allocInfo.pNext = &dedicatedInfo;
     }
 
@@ -1005,7 +1042,8 @@ std::optional<Allocation> UnifiedMemoryPool::allocate(VkDeviceSize size,
     }
     
     // Need new block
-    if (blocks_.size() >= config_.maxBlocks) {
+    // maxBlocks == 0 means unlimited (documented contract in PoolConfig).
+    if (config_.maxBlocks > 0 && blocks_.size() >= config_.maxBlocks) {
         // Oversized allocation: can't create another pool block. Fall back to
         // a dedicated VkDeviceMemory if the request still fits the budget.
         if (size > config_.blockSize) {
@@ -1728,7 +1766,10 @@ void UnifiedMemoryPool::subDeallocate(Allocation&& alloc) {
 
     auto& block = blocks_[alloc.blockIndex];
     if (block.buddy) {
-        block.buddy->deallocate(alloc.offset, alloc.size);
+        // Pass size=0: the buddy recorded the rounded (order) size at allocate
+        // time and deallocates using its own record. Passing the original
+        // requested size here would log a benign size-mismatch warning.
+        block.buddy->deallocate(alloc.offset, 0);
     }
     block.used -= alloc.size;
 }
@@ -1749,6 +1790,13 @@ VkDeviceSize UnifiedMemoryPool::alignUp(VkDeviceSize value, VkDeviceSize alignme
         alignment++;
     }
     return (value + alignment - 1) & ~(alignment - 1);
+}
+
+// RAII factory: the only way to construct a UniqueAllocation. The private
+// constructor pairs the allocation with uniqueAllocationDeleter so reset()
+// routes back through pool->deallocate().
+UniqueAllocation UniqueAllocation::make(UnifiedMemoryPool* pool, Allocation&& alloc) {
+    return UniqueAllocation(pool, std::move(alloc));
 }
 
 } // namespace vvm

@@ -10,11 +10,19 @@
 #include <android/hardware_buffer.h>
 #endif
 
-// Export macros for shared library (also defined in core.hpp)
+// Export macros for shared library (canonical definition in core.hpp)
+#ifndef VVM_API
 #if defined(VVM_BUILD_SHARED) && defined(VVM_EXPORT)
-#define VVM_API __attribute__((visibility("default")))
+#  if defined(_MSC_VER)
+#    define VVM_API __declspec(dllexport)
+#  else
+#    define VVM_API __attribute__((visibility("default")))
+#  endif
+#elif defined(VVM_BUILD_SHARED) && defined(_MSC_VER)
+#  define VVM_API __declspec(dllimport)
 #else
-#define VVM_API
+#  define VVM_API
+#endif
 #endif
 
 #include <vector>

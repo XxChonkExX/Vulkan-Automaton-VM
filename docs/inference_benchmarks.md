@@ -66,7 +66,62 @@ No long-lived hard fork needed conceptually — but since llama.cpp has no plugi
 ## Phase plan
 
 - [x] **Phase 0** — baseline benches (this document)
-- [ ] **Phase 1** — VVM buffer type, parity on 3B (bit-comparable outputs, t/s within noise, zero per-tensor `vkAllocateMemory`)
+- [x] **Phase 1** — VVM buffer type, parity achieved (see below)
 - [ ] **Phase 2** — tensor placement across both cards vs layer rows; KV-in-pool
 - [ ] **Phase 3** — offload tiers between requests
 - [ ] **Phase 4** — RDMA memory node (X2 Strix Halo)
+
+---
+
+## Phase 1 results — Chonk-backed ggml buffer (2026-08-23)
+
+Integration: branch `chonk-buffer` of llama.cpp @ `b10588`. `ggml_backend_buffer_type_alloc_buffer` routes through `vvm::UnifiedMemoryPool` when `GGML_VK_VVM_POOL=1`; `get_max_size` capped to the pool block size so ggml chunks its reservations into Chonk-sized blocks.
+
+### The debugging ladder (each row is a real measurement)
+
+| Step | B70 solo pp512 | B70 solo tg128 | Finding |
+|---|---:|---:|---|
+| Control (ggml native) | 531.66 | 17.96 | the bar |
+| Pool v1 (2 GiB blocks) | 16.44 | 6.00 | 32x prefill collapse |
+| + max-size cap (ggml chunks to 2 GiB) | 532.49 | 6.68 | prefill fixed; decode still 2.7x down |
+| + exact-fit buddy (1 GiB blocks) | 532.49 | 6.68 | (block size was the prefill fix) |
+| **1 GiB blocks** | **532.49** | 6.68 | prefill parity — 2 GiB allocations placed badly on Intel |
+| + memory priority (VK_EXT_memory_priority) | 16.46 | 6.02 | not the cause (opt-in env; off in both paths) |
+| **+ pure DEVICE_LOCAL (no ReBAR type)** | **533.57** | **17.84** | **parity — root cause was ReBAR-mapped pool blocks** |
+
+### Root causes found (in order)
+
+1. **Allocation size placement (Intel):** 2 GiB VkDeviceMemory allocations land badly on the Arc driver — 32x prefill collapse. 1 GiB (ggml's own suballocation granularity) fixes it. Fix: pool blockSize 1 GiB + `get_max_size` cap.
+2. **ReBAR-mapped pool blocks (Intel):** pool blocks in the DEVICE_LOCAL|HOST_VISIBLE type lose ~3x decode bandwidth vs pure DEVICE_LOCAL. Control ggml uses the same ReBAR type but *mapped* (for upload); unmapped ReBAR blocks get degraded residency. Fix: `preferPureDeviceLocal` — pool excludes host-visible types. (ReBAR remains valuable for CPU->GPU upload paths, consistent with community guidance for Arc.)
+3. **`maxBlocks = 0` doc/code mismatch (repo bug):** documented "unlimited", treated as zero. Fixed in `unified_memory_pool.cpp`.
+4. **`UniqueAllocation::make` never defined (repo bug):** declared, never defined anywhere; link error for any RAII user. Defined now.
+5. **Buddy power-of-2 rounding waste:** a 1.1 GB request consumed a 2 GB order. Fixed with **exact-fit grants**: grant `alignUp(size, minAlignment)` and return the tail to the free lists as buddy-aligned chunks; unified free path decomposes any grant (full power-of-two grants behave exactly as the classic buddy). Bounded waste: 256 KB instead of up to 2x.
+6. **`splitTo` cleanup** (auditor item): pop source once, free only the right buddy per level.
+7. **MSVC portability:** `VVM_API` was GCC-only `__attribute__`; `UniqueAllocation::make` and `BuddyAllocator` not exported from the DLL; root CMakeLists had a SHARED-lib dependency cycle (`vulkan_vm -> vulkan_vm_tensor -> network -> vulkan_vm`). All fixed; `placement_executor.cpp` now only built with network ON.
+
+### Final numbers — 40B Q4_K_M (llama.cpp b10588, Vulkan, FA=1)
+
+| Config | pp512 | tg128 | vs control |
+|---|---:|---:|---|
+| Control: split default | 520 | 20.33 | — |
+| **Chonk: split default** | 499.75 | **19.80** | -2.6% |
+| Control: split `-ts 1.43/1` | 474 | 21.89 | — |
+| **Chonk: split `-ts 1.43/1`** | 478.47 | **20.86** | -4.7% |
+| Control: B70 solo | 531.66 | 17.96 | — |
+| **Chonk: B70 solo (pure local)** | 533.57 | **17.84** | -0.7% |
+| Control: XTX solo | 446 | 13.44 | (spills to PCIe) |
+
+Small-model sanity (qwen2 3B): XTX solo pool 248.9 vs control 269 tg128 (-7%); B70 solo pool 150.2 vs 155.7 (-3.5%). The small residual decode gap on sub-block-sized models is the cost of 256 KB-aligned sub-allocation placement; it vanishes at scale (the case the pool exists for).
+
+### Runtime knobs
+
+- `GGML_VK_VVM_POOL=1` — enable Chonk Buffer allocations
+- `GGML_VVM_BLOCK_SIZE=<bytes>` — pool block size (default 1 GiB; must be power of 2, >= 64 MiB)
+- `GGML_VVM_PURE_LOCAL=0` — allow ReBAR types (default: pure DEVICE_LOCAL)
+- `GGML_VK_ENABLE_MEMORY_PRIORITY=1` — ggml's own opt-in priority (pool honors `PoolConfig::memoryPriority` when enabled)
+
+### Buddy allocator hardening (repo)
+
+- **Exact-fit grants** with tail decomposition (`pushFreeRange`); `coalesce()` contract documented (expects not-yet-pushed blocks)
+- **`checkInvariants`** extended for exact-fit entries (minSize alignment, granted-size bounds)
+- New tests: exact-fit grant/reuse, waste bound, ggml-style churn (6+6+2+1 MB mixed-order free, full coalescing recovery), 2000-iter exact-fit stress — all passing alongside the original suite

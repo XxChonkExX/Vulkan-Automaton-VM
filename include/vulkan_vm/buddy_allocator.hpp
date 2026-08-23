@@ -11,7 +11,25 @@
 
 namespace vvm {
 
-class BuddyAllocator {
+// Export marker for shared-library builds. Canonical definition lives in
+// core.hpp; this fallback keeps the header self-contained.
+#ifndef VVM_API
+#ifdef VVM_BUILD_SHARED
+#if defined(_MSC_VER)
+#ifdef VVM_EXPORT
+#define VVM_API __declspec(dllexport)
+#else
+#define VVM_API __declspec(dllimport)
+#endif
+#else
+#define VVM_API __attribute__((visibility("default")))
+#endif
+#else
+#define VVM_API
+#endif
+#endif
+
+class VVM_API BuddyAllocator {
 public:
     // blockSize and minSize MUST be powers of two, blockSize >= minSize.
     // Recommended defaults for general use: minSize = 4 * 1024 (or 64 * 1024 for tensors).
@@ -54,6 +72,12 @@ private:
         ++v;
         return v;
     }
+    static VkDeviceSize floorPowerOfTwo(VkDeviceSize v) {
+        if (v == 0) return 0;
+        VkDeviceSize r = 1;
+        while ((r << 1) != 0 && (r << 1) <= v) r <<= 1;
+        return r;
+    }
 
     // Order 0 = minSize, order maxOrder_ = blockSize.
     int sizeToOrder(VkDeviceSize size) const;
@@ -64,6 +88,13 @@ private:
     // Pop the LOWEST free block of exactly this order (or nullopt).
     // O(log n) using std::set ordered by offset.
     std::optional<VkDeviceSize> popFree(int order);
+
+    // Decompose the region [offset, offset+len) into buddy-aligned power-of-two
+    // chunks and push each onto its free list, coalescing as we go. Both offset
+    // and len must be multiples of minSize_. This is the unified free path: a
+    // full power-of-two grant decomposes to a single chunk (identical to the
+    // classic buddy free), while exact-fit grants decompose into O(log) chunks.
+    void pushFreeRange(VkDeviceSize offset, VkDeviceSize len);
 
     // Split a block of `order` down until we obtain a block of `targetOrder`.
     // Returns the offset of the resulting target-sized block, or nullopt.
@@ -83,8 +114,10 @@ private:
     // Validation / size recovery only. Not on the hot path for performance-critical
     // code that already knows the size. Can be disabled with a compile flag later.
     struct AllocInfo {
-        int order;
-        VkDeviceSize size;          // power-of-two size actually granted
+        int order;                  // block order the grant was carved from
+        VkDeviceSize size;          // granted size: multiple of minSize_, <= orderToSize(order).
+                                    // Exact-fit grants may be non-power-of-two; the unused
+                                    // tail was returned to the free lists at allocate time.
     };
     std::unordered_map<VkDeviceSize, AllocInfo> allocated_;
 

@@ -20,9 +20,16 @@
 
 // Export macros for shared library
 #if defined(VVM_BUILD_SHARED) && defined(VVM_EXPORT)
-#define VVM_API __attribute__((visibility("default")))
+#  if defined(_MSC_VER)
+#    define VVM_API __declspec(dllexport)
+#  else
+#    define VVM_API __attribute__((visibility("default")))
+#  endif
+#elif defined(VVM_BUILD_SHARED) && defined(_MSC_VER)
+// Consumer of the shared lib on MSVC: import symbols
+#  define VVM_API __declspec(dllimport)
 #else
-#define VVM_API
+#  define VVM_API
 #endif
 
 #include <cstdint>
@@ -79,6 +86,18 @@ struct VVM_API PoolConfig {
     // static heap size. When the budget would be exceeded, allocate() fails
     // soft (falls back to offload/host memory) instead of stealing VRAM.
     float maxHeapFraction = 0.0f;
+
+    // Memory priority for block/dedicated allocations (VK_EXT_memory_priority).
+    // 0 = default (driver may degrade/evict allocations under heap pressure).
+    // >0 chains VkMemoryPriorityAllocateInfoEXT on every vkAllocateMemory.
+    // Requires the extension to be ENABLED on the VkDevice at creation time.
+    // Inference workloads filling most of VRAM should use 1.0f.
+    float memoryPriority = 0.0f;
+
+    // Exclude HOST_VISIBLE types from the device-local selection (ReBAR-mapped
+    // VRAM). Some drivers place/map ReBAR memory differently than pure
+    // DEVICE_LOCAL; benchmark both when chasing bandwidth parity.
+    bool preferPureDeviceLocal = false;
     
     // Hard cap on total pool memory in bytes (0 = no explicit cap).
     VkDeviceSize maxPoolBytes = 0;

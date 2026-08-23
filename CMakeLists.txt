@@ -101,6 +101,8 @@ endif()
 
 # Include directories (target-based)
 # Library
+# placement_executor.cpp requires the network module (MultiNodePoolManager/ModelHub),
+# so it is only part of the library when VVM_BUILD_NETWORK is ON.
 if(VVM_BUILD_SHARED)
     add_library(vulkan_vm SHARED
         src/core/unified_memory_pool.cpp
@@ -112,7 +114,6 @@ if(VVM_BUILD_SHARED)
         src/utils/vulkan_utils.cpp
         src/utils/error_handling.cpp
         src/placement/shard_placer.cpp
-        src/placement/placement_executor.cpp
     )
 else()
     add_library(vulkan_vm STATIC
@@ -125,8 +126,11 @@ else()
         src/utils/vulkan_utils.cpp
         src/utils/error_handling.cpp
         src/placement/shard_placer.cpp
-        src/placement/placement_executor.cpp
     )
+endif()
+
+if(VVM_BUILD_NETWORK)
+    target_sources(vulkan_vm PRIVATE src/placement/placement_executor.cpp)
 endif()
 
 target_include_directories(vulkan_vm
@@ -178,7 +182,12 @@ endif()
 option(VVM_BUILD_TENSOR_TRANSPORT "Build tensor transport module" ON)
 if(VVM_BUILD_TENSOR_TRANSPORT AND VVM_BUILD_NETWORK)
     add_subdirectory(src/tensor)
-    target_link_libraries(vulkan_vm PUBLIC vulkan_vm_tensor)
+    # NOTE: no back-edge here — vulkan_vm does NOT link vulkan_vm_tensor.
+    # Consumers link what they need:
+    #   target_link_libraries(app PRIVATE vulkan_vm vulkan_vm_network vulkan_vm_tensor)
+    # A PUBLIC link from vulkan_vm -> vulkan_vm_tensor creates a static-lib
+    # dependency cycle (tensor -> network -> vulkan_vm) that CMake rejects
+    # whenever any member is a SHARED library.
 endif()
 
 # Shader compilation for tensor transport
