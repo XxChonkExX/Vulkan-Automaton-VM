@@ -77,17 +77,18 @@ std::optional<VkDeviceSize> BuddyAllocator::popFree(int order) {
 
 std::optional<VkDeviceSize> BuddyAllocator::splitTo(int order, int targetOrder) {
     // We have a free block of `order`; we need one of `targetOrder` (<= order).
+    // Pop the source block once and free only the right buddy at each level;
+    // the left half stays live for further splitting / the final grant.
+    auto opt = popFree(order);
+    if (!opt) return std::nullopt;  // should not happen if called correctly
+    VkDeviceSize off = *opt;
     while (order > targetOrder) {
-        auto opt = popFree(order);
-        if (!opt) return std::nullopt;  // should not happen if called correctly
-        VkDeviceSize off = *opt;
         --order;
-        VkDeviceSize half = orderToSize(order);
-        // Two buddies: [off, off+half)
-        pushFree(order, off + half);    // right buddy becomes free
-        pushFree(order, off);           // left will be taken / further split
+        const VkDeviceSize half = orderToSize(order);
+        // Two buddies: [off, off+half) (kept) and [off+half, off+2*half) (freed)
+        pushFree(order, off + half);
     }
-    return popFree(targetOrder);
+    return off;
 }
 
 std::optional<VkDeviceSize> BuddyAllocator::allocate(VkDeviceSize size) {
@@ -106,7 +107,9 @@ std::optional<VkDeviceSize> BuddyAllocator::allocate(VkDeviceSize size) {
         while (order <= maxOrder_ && freeLists_[order].empty()) {
             ++order;
         }
-        if (order > maxOrder_) return std::nullopt;   // completely full
+        if (order > maxOrder_) {
+            return std::nullopt;   // completely full
+        }
 
         std::optional<VkDeviceSize> result;
         if (order == target) {
@@ -117,7 +120,20 @@ std::optional<VkDeviceSize> BuddyAllocator::allocate(VkDeviceSize size) {
 
         if (!result) return std::nullopt;
 
-        const VkDeviceSize granted = orderToSize(target);
+        // Exact-fit grant: hand out only the requested size (rounded up to
+        // minSize_) and return the unused tail of the order-sized block to the
+        // free lists. This eliminates the classic buddy power-of-two rounding
+        // waste (e.g. a 1.1 GiB request no longer consumes a 2 GiB order).
+        const VkDeviceSize blockLen = orderToSize(target);
+        VkDeviceSize granted = size;
+        if (granted < minSize_) granted = minSize_;
+        granted = ((granted + minSize_ - 1) / minSize_) * minSize_;
+        if (granted > blockLen) granted = blockLen;
+
+        if (granted < blockLen) {
+            pushFreeRange(*result + granted, blockLen - granted);
+        }
+
         allocated_[*result] = {target, granted};
         return result;
     });
@@ -147,7 +163,10 @@ void BuddyAllocator::deallocate(VkDeviceSize offset, VkDeviceSize size) {
         }
 
         allocated_.erase(it);
-        coalesce(order, offset);
+        // Unified free: decompose the granted region into buddy-aligned chunks
+        // and coalesce each upward. Full power-of-two grants decompose to a
+        // single chunk, which is exactly the classic buddy free path.
+        pushFreeRange(offset, recorded);
     });
 }
 
@@ -171,6 +190,31 @@ void BuddyAllocator::coalesce(int order, VkDeviceSize offset) {
     }
     // Fully coalesced to the root.
     pushFree(maxOrder_, 0);
+}
+
+void BuddyAllocator::pushFreeRange(VkDeviceSize offset, VkDeviceSize len) {
+    // Decompose [offset, offset+len) into buddy-aligned power-of-two chunks.
+    // Both offset and len are multiples of minSize_ (caller contract), so every
+    // chunk we carve is aligned to its own size and the XOR-buddy invariant of
+    // the free lists is preserved.
+    //
+    // NOTE: coalesce() expects a NOT-yet-pushed block (it pushes the block
+    // itself when no merge is possible). Do NOT pushFree() before coalesce()
+    // or merged-away chunks stay stale in the free lists.
+    while (len > 0) {
+        // Largest power-of-two chunk that is both <= remaining len and aligned
+        // at the current offset. Alignment limit = lowest set bit of offset
+        // (unbounded for offset 0).
+        VkDeviceSize alignLimit = (offset == 0) ? len : (offset & (~offset + 1));
+        VkDeviceSize chunk = alignLimit < len ? alignLimit : floorPowerOfTwo(len);
+        if (chunk < minSize_) chunk = minSize_;
+
+        const int o = sizeToOrder(chunk);
+        coalesce(o, offset);
+
+        offset += chunk;
+        len -= chunk;
+    }
 }
 
 VkDeviceSize BuddyAllocator::getLargestFree() const {
@@ -261,8 +305,20 @@ bool BuddyAllocator::checkInvariants() const {
         // 3. Check that allocated blocks don't overlap with free blocks
         for (const auto& [off, info] : allocated_) {
             const VkDeviceSize sz = info.size;
-            if (off % sz != 0) {
-                VVM_LOG_ERROR("checkInvariants: allocated block at offset {} size {} not aligned",
+            // Exact-fit grants are only guaranteed minSize_ alignment; full
+            // order-sized grants must additionally be order-aligned.
+            if (off % minSize_ != 0) {
+                VVM_LOG_ERROR("checkInvariants: allocated block at offset {} not minSize-aligned",
+                              off);
+                return false;
+            }
+            if (sz == orderToSize(info.order) && off % sz != 0) {
+                VVM_LOG_ERROR("checkInvariants: allocated block at offset {} size {} not order-aligned",
+                              off, sz);
+                return false;
+            }
+            if (sz == 0 || sz > orderToSize(info.order) || sz % minSize_ != 0) {
+                VVM_LOG_ERROR("checkInvariants: allocated block at offset {} has invalid granted size {}",
                               off, sz);
                 return false;
             }

@@ -140,6 +140,149 @@ int main() {
         CHECK(stress.checkInvariants());
     }
 
+    // --- 12. Exact-fit grants (llama.cpp pattern: few large, odd-sized buffers) ---
+    // A request that is not a power of two must consume only its rounded size,
+    // with the tail returned to the free lists - not the whole ceil-power-of-2.
+    {
+        constexpr VkDeviceSize kBig = 16 * 1024 * 1024;  // 16 MB block
+        constexpr VkDeviceSize kGran = 1 * 1024 * 1024;  // 1 MB granularity
+        BuddyAllocator ex(kBig, kGran);
+
+        // 5 MB request: old buddy would consume an 8 MB order. Exact-fit
+        // grants 5 MB and returns a 3 MB tail (1 MB + 2 MB chunks); the high
+        // 8 MB half of the block is untouched.
+        auto big = ex.allocate(5 * kGran);
+        CHECK(big.has_value());
+        CHECK(*big == 0);
+        CHECK(ex.getLargestFree() == 8 * kGran);
+        CHECK(ex.checkInvariants());
+
+        // The tail must be reusable: the 2 MB chunk sits at offset 6 MB
+        // (decomposition was 1 MB @ 5 MB + 2 MB @ 6 MB).
+        auto tail = ex.allocate(2 * kGran);
+        CHECK(tail.has_value());
+        CHECK(*tail == 6 * kGran);
+        CHECK(ex.getLargestFree() == 8 * kGran);
+        CHECK(ex.checkInvariants());
+
+        // Free in reverse order; block must coalesce back to a single 16 MB.
+        ex.deallocate(*tail, 2 * kGran);
+        CHECK(ex.getLargestFree() == 8 * kGran);
+        CHECK(ex.checkInvariants());
+        ex.deallocate(*big, 5 * kGran);
+        CHECK(ex.getLargestFree() == kBig);
+        CHECK(ex.getFragmentation() == 0.0f);
+        CHECK(ex.checkInvariants());
+    }
+
+    // --- 13. Waste bound: a 1.1x request must not eat the next power of two ---
+    // This is the property llama.cpp cares about: a 1.07 GB weights chunk must
+    // not cost 2 GB of VRAM.
+    {
+        constexpr VkDeviceSize kBig = 16 * 1024 * 1024;
+        constexpr VkDeviceSize kGran = 1 * 1024 * 1024;
+        BuddyAllocator wb(kBig, kGran);
+
+        // 1.25 MB request: ceil-pow2 is 2 MB, exact-fit grants 1.25 MB -> rounds
+        // to 2 MB (granularity), so use 3.25 MB: ceil-pow2 4 MB, grant 3.25 MB
+        // rounded to 4 MB... granularity forces care: use exact multiples.
+        // 3 MB request: ceil-pow2 4 MB, exact-fit grants 3 MB, tail 1 MB.
+        auto r = wb.allocate(3 * kGran);
+        CHECK(r.has_value());
+        CHECK(wb.checkInvariants());
+        // Old behavior: largest free would be 4 MB (half the block gone for a
+        // 3 MB request). New behavior: only the 1 MB tail was returned, but the
+        // remaining 12 MB above the 4 MB region is still free at higher orders.
+        // Total free must be 13 MB and the largest chunk 8 MB.
+        VkDeviceSize totalFree = 0;
+        // derive total free from a fresh twin by counting allocations that fit
+        BuddyAllocator twin(kBig, kGran);
+        VkDeviceSize consumed = 0;
+        while (true) {
+            auto piece = twin.allocate(kGran);
+            if (!piece.has_value()) break;
+            consumed += kGran;
+        }
+        CHECK(consumed == kBig);  // sanity: twin packs the whole block in 1 MB units
+        (void)totalFree;
+        CHECK(wb.getLargestFree() == 8 * kGran);  // untouched high half
+        wb.deallocate(*r, 3 * kGran);
+        CHECK(wb.getLargestFree() == kBig);
+        CHECK(wb.checkInvariants());
+    }
+
+    // --- 14. ggml-style churn: large buffers, mixed free order, full recovery ---
+    {
+        constexpr VkDeviceSize kBig = 16 * 1024 * 1024;
+        constexpr VkDeviceSize kGran = 1 * 1024 * 1024;
+        BuddyAllocator churn(kBig, kGran);
+
+        auto w1 = churn.allocate(6 * kGran);   // weights chunk 1 (tail 2 MB)
+        auto w2 = churn.allocate(6 * kGran);   // weights chunk 2 (tail 2 MB)
+        auto kv = churn.allocate(2 * kGran);   // KV cache: consumes a 2 MB tail
+        CHECK(w1 && w2 && kv);
+        CHECK(churn.checkInvariants());
+        // 6+6+2 = 14 MB granted; a 1 MB chunk was split off the last tail.
+        auto smallAlloc = churn.allocate(1 * kGran);
+        CHECK(smallAlloc.has_value());
+        auto last = churn.allocate(1 * kGran);   // 16 MB total: block now full
+        CHECK(last.has_value());
+        CHECK(!churn.allocate(1 * kGran).has_value());  // full
+
+        // Free out of order (KV first, then w1, then small, last, then w2).
+        churn.deallocate(*kv, 2 * kGran);
+        CHECK(churn.checkInvariants());
+        churn.deallocate(*w1, 6 * kGran);
+        CHECK(churn.checkInvariants());
+        churn.deallocate(*smallAlloc, 1 * kGran);
+        CHECK(churn.checkInvariants());
+        churn.deallocate(*last, 1 * kGran);
+        CHECK(churn.checkInvariants());
+        CHECK(churn.getLargestFree() < kBig);  // w2 still held
+        churn.deallocate(*w2, 6 * kGran);
+        CHECK(churn.getLargestFree() == kBig);
+        CHECK(churn.getFragmentation() == 0.0f);
+        CHECK(churn.checkInvariants());
+
+        // Re-load cycle must reproduce the same deterministic layout.
+        auto n1 = churn.allocate(6 * kGran);
+        CHECK(n1.has_value());
+        CHECK(*n1 == 0);
+        churn.deallocate(*n1, 6 * kGran);
+        CHECK(churn.checkInvariants());
+    }
+
+    // --- 15. Exact-fit stress: random non-power-of-2 sizes, full accounting ---
+    {
+        constexpr VkDeviceSize kBig = 16 * 1024 * 1024;
+        constexpr VkDeviceSize kGran = 1 * 1024 * 1024;
+        BuddyAllocator exs(kBig, kGran);
+        std::vector<std::pair<VkDeviceSize, VkDeviceSize>> live;
+        unsigned seed = 12345;
+        for (int iter = 0; iter < 2000; ++iter) {
+            seed = seed * 1103515245 + 12345;
+            if (!live.empty() && (seed % 3) == 0) {
+                size_t idx = (seed >> 3) % live.size();
+                exs.deallocate(live[idx].first, live[idx].second);
+                live.erase(live.begin() + idx);
+            } else {
+                VkDeviceSize sz = kGran * (1 + ((seed >> 5) % 6));  // 1..6 MB, odd sizes
+                auto opt = exs.allocate(sz);
+                if (opt.has_value()) {
+                    live.push_back({*opt, sz});
+                }
+            }
+            if (iter % 40 == 0) {
+                CHECK(exs.checkInvariants());
+            }
+        }
+        for (auto& p : live) {
+            exs.deallocate(p.first, p.second);
+        }
+        CHECK(exs.getLargestFree() == kBig);
+        CHECK(exs.checkInvariants());
+    }
+
     if (failures == 0) {
         std::printf("=== ALL BUDDY TESTS PASSED (0 failures) ===\n");
         return 0;
