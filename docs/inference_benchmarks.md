@@ -125,3 +125,34 @@ Small-model sanity (qwen2 3B): XTX solo pool 248.9 vs control 269 tg128 (-7%); B
 - **Exact-fit grants** with tail decomposition (`pushFreeRange`); `coalesce()` contract documented (expects not-yet-pushed blocks)
 - **`checkInvariants`** extended for exact-fit entries (minSize alignment, granted-size bounds)
 - New tests: exact-fit grant/reuse, waste bound, ggml-style churn (6+6+2+1 MB mixed-order free, full coalescing recovery), 2000-iter exact-fit stress — all passing alongside the original suite
+
+---
+
+## Phase 1.5 — Chonk Chunks: small-block routing (2026-08-23)
+
+Three routing upgrades to the pool, aimed at the small-allocation weakness:
+
+1. **Best-fit block selection** — `allocate()` now picks the block with the *smallest* sufficient largest-free within the size class, instead of first-fit. Packs tightly; stops small allocations from spawning extra partially-filled blocks.
+2. **`allocationAlignment` (buffer-base alignment)** — allocation *starts* can be aligned to driver memory-page boundaries (2 MB default in the llama integration). Leading slack + tail are returned to the free lists; waste stays bounded. Implemented as `BuddyAllocator::allocateAligned()` (over-allocate → align → free slack), no buddy-core changes.
+3. **Chonk Chunks (size-class routing)** — requests ≤ `smallAllocThreshold` (16 MiB) are served from dedicated 64 MiB chunk blocks instead of claiming space in (or spawning) full-size 1 GiB blocks. A small tensor now costs 64 MiB of VRAM footprint, not 1 GiB.
+
+### Results (llama.cpp b10588 + Chonk pool, pure-DEVICE_LOCAL)
+
+| Case | ggml control | Pool v2 (parity work) | **Pool v3 (Chonk Chunks)** | Gap |
+|---|---:|---:|---:|---|
+| 40B split default (tg128) | 20.33 | 19.80 (−2.6%) | **20.16** | **−0.8%** |
+| 40B split `-ts 1.43/1` (tg128) | 21.89 | 20.86 (−4.7%) | **21.22** | **−3.1%** |
+| B70 3B solo (tg128) | 155.68 | 150.18 (−3.5%) | **155.80** | **+0.1% (parity)** |
+| XTX 3B solo (tg128) | 269.0 | 249.65 (−7%) | 249.90 | −7% (XTX residual) |
+
+Findings:
+- **B70 small-model gap eliminated** (−3.5% → parity). The 2 MB buffer-base alignment was the fix there.
+- **40B split improved** to −0.8%/−3.1%.
+- **XTX 3B residual (−7%) is XTX-specific**: unaffected by base alignment and by pure-vs-ReBAR type. Suspects: descriptor/scheduling overhead on the primary device, or AMD-specific sub-allocation placement. Open item.
+- Chunk routing's win is *capacity*, not t/s on these benches: a 18 MB ggml buffer now costs a 64 MiB chunk instead of a 1 GiB block — matters for multi-model residency and KV-heavy workloads.
+
+### Runtime knobs (llama integration)
+
+- `GGML_VVM_BASE_ALIGN=<bytes>` — buffer-base alignment (default 2 MiB; `0` = minAlignment)
+- `GGML_VVM_CHUNK_MB=<n>` — chunk block size in MiB (default 64; `0` disables routing)
+- `GGML_VVM_BLOCK_SIZE=<bytes>` — regular block size (default 1 GiB)
