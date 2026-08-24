@@ -42,6 +42,12 @@ struct NetworkConfig {
     // TCP transport limits
     uint64_t maxBodySize = 1024 * 1024 * 1024;  // 1 GB max body size
     uint64_t maxStreamSize = 1024 * 1024 * 1024;  // 1 GB max stream size
+    // Hardening (THREAT_MODEL §5): concurrent-connection cap per transport
+    // (excess accepts are closed immediately) and the body-read slice size
+    // (body buffers grow only as bytes actually arrive, so a declared
+    // bodyLen cannot force an up-front host allocation).
+    size_t maxConnections = 64;
+    size_t bodyReadSliceSize = 4 * 1024 * 1024;  // 4 MiB
     
     // Security (optional)
     bool useTls = false;

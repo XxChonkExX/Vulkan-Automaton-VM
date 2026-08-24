@@ -1,15 +1,50 @@
 cmake_minimum_required(VERSION 3.20)
 
-# Set Windows SDK version BEFORE project() to avoid defaulting to unavailable 10.0.28000.0
+# Windows SDK selection: respect a user-provided CMAKE_SYSTEM_VERSION; only
+# fall back to a known-good SDK when nothing is set (some machines have a
+# partial newest SDK missing rc.exe/mt.exe - do NOT hard-pin paths; CMake and
+# MSBuild locate the tools from the selected SDK's bin directory).
 if(WIN32)
-    set(CMAKE_SYSTEM_VERSION "10.0.26100.0" CACHE STRING "Windows SDK version" FORCE)
-    set(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION "10.0.26100.0" CACHE STRING "Windows SDK version" FORCE)
-    # Explicitly set RC compiler and MT (manifest tool) to avoid SDK 10.0.28000.0 which lacks them
-    set(CMAKE_RC_COMPILER "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/rc.exe" CACHE STRING "Windows RC compiler" FORCE)
-    set(CMAKE_MT "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/mt.exe" CACHE STRING "Windows Manifest Tool" FORCE)
+    if(NOT DEFINED CMAKE_SYSTEM_VERSION AND NOT DEFINED CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION)
+        # Pick the newest INSTALLED SDK that actually has rc.exe (guards
+        # against partial installs), preferring newer versions.
+        set(_vvm_best_sdk "")
+        file(GLOB _vvm_sdk_dirs "C:/Program Files (x86)/Windows Kits/10/Include/10.*")
+        foreach(_d ${_vvm_sdk_dirs})
+            string(REGEX REPLACE ".*/Include/" "" _ver "${_d}")
+            if(EXISTS "${_d}/um" AND EXISTS "C:/Program Files (x86)/Windows Kits/10/bin/${_ver}/x64/rc.exe")
+                if(_ver VERSION_GREATER _vvm_best_sdk)
+                    set(_vvm_best_sdk "${_ver}")
+                endif()
+            endif()
+        endforeach()
+        if(NOT _vvm_best_sdk)
+            set(_vvm_best_sdk "10.0.26100.0")  # sensible floor
+        endif()
+        set(CMAKE_SYSTEM_VERSION "${_vvm_best_sdk}" CACHE STRING "Windows SDK version")
+        set(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION "${_vvm_best_sdk}" CACHE STRING "Windows SDK version")
+        message(STATUS "VulkanVM: using Windows SDK ${_vvm_best_sdk}")
+    endif()
+    # Optional overrides for exotic setups (do not force):
+    if(DEFINED ENV{VVM_RC_COMPILER})
+        set(CMAKE_RC_COMPILER "$ENV{VVM_RC_COMPILER}" CACHE STRING "Windows RC compiler")
+    endif()
+    if(DEFINED ENV{VVM_MT})
+        set(CMAKE_MT "$ENV{VVM_MT}" CACHE STRING "Windows Manifest Tool")
+    endif()
 endif()
 
-project(VulkanVM LANGUAGES CXX VERSION 0.2.0)
+project(VulkanVM LANGUAGES CXX VERSION 0.3.0)
+
+# Convenience: core-only = Chonk Buffer standalone (no transport/tensor/
+# bindings). Individual options still override if set explicitly after this.
+option(VVM_BUILD_CORE_ONLY "Build only the core Chonk Buffer library (no transport/tensor/bindings)" OFF)
+if(VVM_BUILD_CORE_ONLY)
+    set(VVM_BUILD_NETWORK OFF CACHE BOOL "" FORCE)
+    set(VVM_BUILD_TENSOR_TRANSPORT OFF CACHE BOOL "" FORCE)
+    set(VVM_BUILD_PYTORCH OFF CACHE BOOL "" FORCE)
+    set(VVM_BUILD_ONNX OFF CACHE BOOL "" FORCE)
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -284,6 +319,7 @@ install(EXPORT VulkanVMTargets
     FILE VulkanVMTargets.cmake
     DESTINATION lib/cmake/VulkanVM
 )
+
 
 
 

@@ -139,7 +139,7 @@ std::optional<VkDeviceSize> BuddyAllocator::allocateUnlocked(VkDeviceSize size) 
         pushFreeRange(*result + granted, blockLen - granted);
     }
 
-    allocated_[*result] = {target, granted};
+    allocated_[*result] = {target, granted, size};
     return result;
 }
 
@@ -179,7 +179,7 @@ std::optional<VkDeviceSize> BuddyAllocator::allocateAligned(VkDeviceSize size, V
             pushFreeRange(tailStart, tailLen);              // trailing tail
         }
 
-        allocated_[aligned] = {order, granted};
+        allocated_[aligned] = {order, granted, granted};
         return aligned;
     });
 }
@@ -271,6 +271,16 @@ VkDeviceSize BuddyAllocator::getLargestFree() const {
             }
         }
         return 0;
+    });
+}
+
+size_t BuddyAllocator::internalWasteBytes() const {
+    return withLock([this]() -> size_t {
+        size_t waste = 0;
+        for (const auto& kv : allocated_) {
+            if (kv.second.size > kv.second.requested) waste += (size_t)(kv.second.size - kv.second.requested);
+        }
+        return waste;
     });
 }
 
@@ -411,3 +421,5 @@ bool BuddyAllocator::checkInvariants() const {
 }
 
 } // namespace vvm
+
+

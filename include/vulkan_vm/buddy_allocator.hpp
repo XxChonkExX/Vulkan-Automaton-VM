@@ -53,6 +53,9 @@ public:
 
     VkDeviceSize getLargestFree() const;
     float getFragmentation() const;
+    // Internal fragmentation: sum(granted - requested) over live allocations.
+    // Near zero with exact-fit grants (granularity waste only).
+    size_t internalWasteBytes() const;
     size_t getAllocationCount() const;
     bool isValid() const;
 
@@ -127,6 +130,7 @@ private:
         VkDeviceSize size;          // granted size: multiple of minSize_, <= orderToSize(order).
                                     // Exact-fit grants may be non-power-of-two; the unused
                                     // tail was returned to the free lists at allocate time.
+        VkDeviceSize requested = 0; // pre-rounding request (for waste metrics)
     };
     std::unordered_map<VkDeviceSize, AllocInfo> allocated_;
 

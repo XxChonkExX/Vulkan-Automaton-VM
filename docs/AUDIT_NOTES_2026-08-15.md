@@ -14,7 +14,6 @@ External audit of the `main` branch (as of 2026-08-15) covering the Chonk Buffer
 
 ### High priority
 1. **`src/allocator/buddy_allocator.cpp` — `splitTo` cleanup** — the current pop-then-push-both-halves flow does extra insert/erase work and leaves the target block on the free list until the final `popFree(targetOrder)`. Recommended: pop once, free only the right buddy in the loop, keep the left half off the free list; return it at target order directly. Update the `allocate` call site so `order == target` still uses `popFree`. **This is an active training-critical file — coordinate before touching (see overlap).**
-2. **`UnifiedMemoryPool` destructor mutex** — destructor does not lock `mutex_` while move ctor/assignment do. If another thread is mid-allocation during teardown → use-after-free. Fix: lock in destructor or use shared_ptr/ref-counted lifetime.
 3. **ChonkAdamW — decoupled weight decay** — currently coupled (`grad.add(p, alpha=weight_decay)`). Standard decoupled: `p.mul_(1 - lr * weight_decay)` before moment updates. Bias-correction/step counting should be per-parameter rather than global.
 4. **Hard-coded paths in `train_qwen_chonk.py`** (`/home/chonke/...`) — switch to env vars / argparse with repo-relative defaults (`MODEL_PATH`, `DATA_PATH`, `CHONK_*`).
 
@@ -58,5 +57,7 @@ External audit of the `main` branch (as of 2026-08-15) covering the Chonk Buffer
 1. Rebase your local training branch onto `main`; confirm `buddy_test.cpp` still passes.
 2. Run the recommended smoke: `CHONK_SMOKE=1 CHONK_MIN_BLOCK_GB=4 CHONK_ALLOCATOR=1 train_qwen_chonk.py`.
 3. Compare auditor items 3/4/6 against your live runs (decoupled AdamW, path cleanup, budget flag) — these are in your territory.
-4. For item 2 (pool destructor mutex): it's shared code; either of us can take it, but say so in the commit/PR to avoid duplicate work.
+4. Item 2 (pool destructor mutex) is RESOLVED - no action needed.
 5. Android: if you have another device (Mali/PowerVR), run the test and report the GID/device — that closes the biggest open gap.
+
+2. **`UnifiedMemoryPool` destructor mutex** - RESOLVED (2026-08-23): the destructor takes `mutex_`; Grok's 0.3 audit cited this stale note.

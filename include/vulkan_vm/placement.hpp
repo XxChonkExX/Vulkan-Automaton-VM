@@ -208,7 +208,7 @@ struct PlacementPolicy {
 // Core API
 // ============================================================================
 
-class ShardPlacer {
+class VVM_API ShardPlacer {
 public:
     // Pure function: no I/O, no Vulkan — easy to unit test
     static PlacementPlan plan(const ModelManifest& model,

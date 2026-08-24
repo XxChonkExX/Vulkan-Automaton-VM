@@ -69,11 +69,11 @@ CHONK_ACT_GB = float(os.environ.get("CHONK_ACT_GB", "2.0"))      # activation sc
 CHONK_STAGING_GB = float(os.environ.get("CHONK_STAGING_GB", "2.0"))  # host-visible staging (unused w/o offload)
 
 # Training config
-MODEL_PATH = os.environ.get("CHONK_MODEL_PATH", "/home/chonke/local_training/models/Qwen3.8-AEON-Ultimate")
-DATA_PATH = os.environ.get("CHONK_DATA_PATH", "/home/chonke/local_training/qwen_tokenized_128k")
-OUT_DIR = os.environ.get("CHONK_OUT_DIR", "/home/chonke/local_training/qwen_fine_tuned")
+MODEL_PATH = os.environ.get("CHONK_MODEL_PATH", "models/qwen-chonk")
+DATA_PATH = os.environ.get("CHONK_DATA_PATH", "data/qwen-tokenized-128k")
+OUT_DIR = os.environ.get("CHONK_OUT_DIR", "out/qwen-fine-tuned")
 RESUME_DIR = os.environ.get("CHONK_RESUME_DIR", "")
-STATUS_FILE = os.environ.get("CHONK_STATUS_FILE", "/home/chonke/local_training/qwen_logs/train_status.txt")
+STATUS_FILE = os.environ.get("CHONK_STATUS_FILE", "out/train_status.txt")
 SEQ_LEN = int(os.environ.get("CHONK_SEQ_LEN", "131072"))     # 262144 = the long-context target
 BATCH_SIZE = 1
 CHUNK_SIZE = int(os.environ.get("CHONK_CHUNK", "1024"))  # 1024 validated stable; 2048 froze the machine, 4096 panicked
