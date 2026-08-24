@@ -227,3 +227,49 @@ Vulkan path used here.
 | `GGML_VVM_NO_DEDICATED` | off | `1` drops the dedicated-allocate hint |
 | `GGML_VVM_PASSTHROUGH_ALLOC` | off | `1` pool init runs, buffers via ggml native path |
 | `VVM_SKIP_CMDPOOL` / `VVM_SKIP_INITBLOCK` | off | `1` skips those init steps (diagnostics) |
+
+---
+
+## Phase 2.5 - `--vvm-split` tensor placement + `/vvm/stats` endpoint (2026-08-23)
+
+The Chonk-backed llama.cpp branch now exposes tensor-granular placement and
+live pool telemetry - the controls stock ggml does not have.
+
+### `-vsplit` / `--vvm-split "<pattern>=<target>[;...]"`
+
+Route any regex-matched tensor to a specific Vulkan GPU, or distribute
+matched tensors across all Vulkan GPUs weighted by free VRAM:
+
+```bash
+# experts distributed by free VRAM, attention on the XTX:
+llama-server -m model.gguf -ngl 99 \
+  -vsplit "exps=auto" \
+  -vsplit "attn_.*=Vulkan0"
+
+# everything auto-balanced (small/medium models):
+llama-bench -m model.gguf -vsplit ".*=auto"
+```
+
+- `auto` snapshots per-device free VRAM (minus 512 MiB headroom) at load
+  start, then assigns each matching tensor to the device with the most
+  remaining budget - capacity-aware placement at load time.
+- Explicit targets (`Vulkan0`, `Vulkan1`, ...) behave like `-ot`.
+- Works in llama-server (via common args) and llama-bench.
+
+### `GET /vvm/stats` (llama-server)
+
+Live JSON of every Chonk Buffer pool:
+
+```json
+[{"device":"Vulkan0","blockSize":1073741824,"blocks":4,"allocations":5,
+  "dedicated":0,"capacityBytes":4294967296,"usedBytes":3241934848,
+  "freeBytes":1053032448,"largestFreeBytes":536870912,"fragmentation":0.490}]
+```
+
+### Known limitation
+
+`.*=auto` on very large models (40B, ~1275 tensors) can hit an uncaught
+exception in ggml-vulkan's cross-device upload path during loading
+(upstream robustness issue with many alternating device copies). Use scoped
+patterns (`exps=auto`) or explicit targets for large models - verified
+working: `exps=auto` on the 40B (512.8 / 19.76 t/s), `.*=auto` on the 3B.
