@@ -201,7 +201,7 @@ OpenSSL (optional TLS), libibverbs (optional RDMA), UCX (optional).
 The core memory pool is affectionately nicknamed the **Chonk Buffer**
 ("chunk" - a contiguous block of memory). One big chonk of VRAM, zero
 fragmentation, every framework welcome. The name stuck; the architecture
-earned it.
+earned it. The keeper of this library is also known as ChonkE.
 
 ## Licenses
 
