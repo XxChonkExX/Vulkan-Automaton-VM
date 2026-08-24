@@ -43,6 +43,16 @@ target_include_directories(buddy_test PRIVATE
 )
 add_test(NAME buddy_test COMMAND buddy_test)
 
+# CPU-only Chonk slab allocator invariants + fuzz (audit Priority 3).
+# No Vulkan/HIP - the slab core is provider-agnostic.
+add_executable(chonk_slab_test chonk_slab_test.cpp
+    ${CMAKE_SOURCE_DIR}/python/vulkanvm_torch/allocator/chonk_slab.cpp
+)
+target_include_directories(chonk_slab_test PRIVATE
+    ${CMAKE_SOURCE_DIR}
+)
+add_test(NAME chonk_slab_test COMMAND chonk_slab_test)
+
 # CPU-only external-handle ownership tests (dup/multi-import, consume semantics)
 add_executable(external_handle_test external_handle_test.cpp)
 target_link_libraries(external_handle_test PRIVATE vulkan_vm)
