@@ -132,6 +132,8 @@ else()
     add_library(vulkan_vm_network STATIC ${NETWORK_CORE_SRCS})
 endif()
 
+add_library(VulkanVM::Transport ALIAS vulkan_vm_network)
+
 target_include_directories(vulkan_vm_network PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src/cross_gpu
@@ -174,6 +176,7 @@ target_include_directories(vulkan_vm_network PUBLIC
 )
 
 # Install
+
 install(TARGETS vulkan_vm_network
     EXPORT VulkanVMTargets
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -196,6 +199,11 @@ install(FILES
     include/vulkan_vm/ucx_transport.hpp
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/vulkan_vm/network
 )
+
+
+
+
+
 
 
 

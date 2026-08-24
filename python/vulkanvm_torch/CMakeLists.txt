@@ -51,7 +51,10 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../include ${VULKAN_SDK_INCLUDE}
 # Pool test module sources (no torch needed - built directly via
 # scripts/build_pool_test.sh; also available as a CMake target here)
 set(POOL_TEST_SRCS
-    _pool_test_module.cpp
+    bindings/pool_bindings.cpp
+    device/pool_device.cpp
+    allocator/chonk_allocator.cpp
+    interop/hip_external_memory.cpp
 )
 
 # Create pool test module

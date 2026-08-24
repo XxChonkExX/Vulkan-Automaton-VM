@@ -31,7 +31,7 @@ cmake -S "$REPO" -B "$LIB_BUILD_DIR" \
     -DVVM_BUILD_SHARED=OFF
 cmake --build "$LIB_BUILD_DIR" -j"$(nproc)"
 
-echo "[build_pool_test] step 2/3: compiling _pool_test_module.cpp..."
+echo "[build_pool_test] step 2/3: compiling the split integration modules..."
 PYBIND11_INC="$("$PYTHON" -c 'import pybind11; print(pybind11.get_include())')"
 PYTHON_INC="$("$PYTHON" -c 'import sysconfig; print(sysconfig.get_paths()["include"])')"
 
@@ -41,7 +41,10 @@ g++ -O3 -std=c++20 -fPIC -shared \
     -I"$REPO/python/vulkanvm_torch" \
     -I"$PYBIND11_INC" \
     -I"$PYTHON_INC" \
-    "$REPO/python/vulkanvm_torch/_pool_test_module.cpp" \
+    "$REPO/python/vulkanvm_torch/bindings/pool_bindings.cpp" \
+    "$REPO/python/vulkanvm_torch/device/pool_device.cpp" \
+    "$REPO/python/vulkanvm_torch/allocator/chonk_allocator.cpp" \
+    "$REPO/python/vulkanvm_torch/interop/hip_external_memory.cpp" \
     "$LIB_BUILD_DIR/libvulkan_vm.a" \
     -lhiprtc -lamdhip64 -lvulkan -lpthread -ldl \
     -o "$OUT_DIR/vulkanvm_pool_test.so"

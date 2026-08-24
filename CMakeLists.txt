@@ -99,7 +99,20 @@ if(VVM_BUILD_NETWORK)
     endif()
 endif()
 
+# Layer aliases (namespaced, QoL for find_package/consumers)
 # Include directories (target-based)
+# ============================================================================
+# LAYER MODEL (0.3)
+#   VulkanVM::Core      (vulkan_vm)          - pools, external memory,
+#                                              multi-GPU, host staging
+#   VulkanVM::Transport (vulkan_vm_network)  - TCP, RDMA, UCX, NDK, cluster
+#   VulkanVM::Compute   (vulkan_vm_tensor)   - tensor ops, collectives,
+#                                              layout conversion
+#   Integrations        (vulkanvm_torch/onnx)- PyTorch, ONNX, Android apps
+# Dependency direction: Integrations -> {Compute, Core};
+#                       Compute -> Core (collectives add Transport);
+#                       Transport -> Core. Core depends on nothing but Vulkan.
+# ============================================================================
 # Library
 # NOTE layering: vulkan_vm (core) = pool/allocator/offload/cross-GPU/sparse/
 # ShardPlacer - zero network dependencies. placement_executor.cpp (needs
@@ -132,6 +145,7 @@ else()
 endif()
 
 # PlacementExecutor lives in vulkan_vm_network (see layering note above).
+add_library(VulkanVM::Core ALIAS vulkan_vm)
 target_include_directories(vulkan_vm
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -270,6 +284,9 @@ install(EXPORT VulkanVMTargets
     FILE VulkanVMTargets.cmake
     DESTINATION lib/cmake/VulkanVM
 )
+
+
+
 
 
 
