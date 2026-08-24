@@ -2,6 +2,7 @@
 # The core network module (TCP control plane + host-staged migration) builds
 # without any external dependencies. gRPC and RDMA/verbs are optional extras.
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake)
+find_package(Vulkan REQUIRED)
 find_package(Protobuf QUIET)
 find_package(gRPC QUIET)
 find_package(ibverbs QUIET)
@@ -46,6 +47,7 @@ set(NETWORK_CORE_SRCS
     multi_node_manager.cpp
     network.cpp
     model_registry.cpp
+    ../placement/placement_executor.cpp
 )
 
 set(NETWORK_PRIV_DEFS
@@ -141,6 +143,7 @@ target_include_directories(vulkan_vm_network PRIVATE
 )
 
 target_link_libraries(vulkan_vm_network PUBLIC vulkan_vm)
+target_link_libraries(vulkan_vm_network PRIVATE Vulkan::Vulkan)
 target_link_libraries(vulkan_vm_network PRIVATE
     Threads::Threads
     ${VVM_NETWORK_GRPC_LIBS}
@@ -193,5 +196,7 @@ install(FILES
     include/vulkan_vm/ucx_transport.hpp
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/vulkan_vm/network
 )
+
+
 
 

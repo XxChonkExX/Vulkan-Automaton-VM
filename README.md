@@ -1,8 +1,48 @@
 # VulkanVM — High-Performance GPU Networking & RDMA + Unified Memory Pool (Chonk Buffer)
 
 **VulkanVM** is a **cross-vendor GPU networking and RDMA library** that enables zero-copy GPU���GPU transfers over TCP, RDMA, and GPU-direct NIC DMA across AMD, NVIDIA, and Intel GPUs. Built on a hardened, zero-fragmentation Vulkan memory pool (the "Chonk Buffer"), it provides Hugging Face–style model distribution, capacity-first shard placement, and a unified tensor transport for AI inference clusters. One header, one library, zero system changes — link it into your application.
+---
+
+## Architecture (0.3 layering)
+
+VulkanVM is layered so the core memory pool builds and ships **standalone** —
+zero network dependencies — and the transport/framework layers stack on top
+only if you need them:
+
+```
+VulkanVM
+│
+├── Core (vulkan_vm)                    # include "vulkan_vm/vulkan_vm.hpp"
+│   ├── Chonk Buffer unified memory pool
+│   ├── Buddy allocator (exact-fit, Chonk Chunks)
+│   ├── Host offload / DMA migration
+│   ├── External memory (DMA-BUF / Win32 / AHardwareBuffer)
+│   ├── Cross-GPU sharing
+│   ├── Sparse virtual memory
+│   └── Shard placement planning (pure logic)
+│
+├── Transport (vulkan_vm_network)       # include "vulkan_vm/transport.hpp"  [optional]
+│   ├── TCP / RDMA / UCX / NDK transports
+│   ├── Cluster client/server, multi-node pools
+│   └── Placement execution (cluster-aware)
+│
+├── Framework adapters                  # optional
+│   ├── PyTorch (vulkanvm_torch + Chonk allocator)
+│   └── ONNX Runtime (vulkanvm_onnx)
+│
+└── Experimental tooling                # examples/, scripts/, training
+    ├── ModelHub & model registry
+    ├── Long-context Qwen training
+    └── Quantization experiments
+```
+
+Build modes: `-DVVM_BUILD_NETWORK=OFF` (default OFF for consumers) gives you
+the standalone Chonk Buffer library; `ON` adds the transport layer. See
+[docs/AUDIT_NOTES_2026-08-15.md](docs/AUDIT_NOTES_2026-08-15.md) and
+[docs/inference_benchmarks.md](docs/inference_benchmarks.md).
 
 ---
+
 Notice! Help wanted desperately-
 Alot of this hinges upon hardware that I do not own. Nvidia in particular. I have tested AMD with my 7900xtx and Strix Halo, Intel B70 tested for multi-pool but it needs network testing and Nvidia definitely needs some love since I am too poor to pay the Nvidia tax :( Android AHardwareBuffer import is tested and passing on Galaxy S24+ (API 36, Adreno), but broader device coverage (Mali, PowerVR, Xclipse) is still wanted. Tenstorrent cards are loosely supported and I have built a Vulkan ICD to play nice; I have submitted to TT (honestly I do not know if it is a steaming pile of 5#!7 or not) but if you need it to test let me know and I will ship it your way. This repo is solid but highly highly experimental in several aspects. Local power! Homebrewed with love. -Mike/ChonkE
 ---

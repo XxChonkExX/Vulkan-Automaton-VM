@@ -314,6 +314,12 @@ struct VVM_API ResultT {
 };
 
 class VVM_API OffloadManager;  // forward declaration for UnifiedMemoryPool
+// Custom deleter keeps OffloadManager incomplete in this header, so the core
+// pool header has zero dependency on the offload implementation. The
+// operator() is defined in unified_memory_pool.cpp where the type is complete.
+struct VVM_API OffloadManagerDeleter {
+    void operator()(OffloadManager* p) const;
+};
 
 // ============================================================================
 // Unified Memory Pool (core definition)
@@ -476,8 +482,8 @@ private:
     bool debugUtilsEnabled_ = false;
     PFN_vkSetDebugUtilsObjectNameEXT fnSetDebugName_ = nullptr;
     
-    // Offload manager for host swap
-    std::unique_ptr<OffloadManager> offloadManager_;
+    // Offload manager for host swap (created lazily by initializeOffload)
+    std::unique_ptr<OffloadManager, OffloadManagerDeleter> offloadManager_;
     
     // Generation counter for handle validation (prevents stale handle use)
     uint64_t generationCounter_ = 0;
