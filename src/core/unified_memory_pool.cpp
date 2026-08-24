@@ -421,6 +421,10 @@ VVM_LOG_INFO("Selected HOST_VISIBLE memory type {} (heap budget: {} MB)",
     }
     
     // Create transfer command pool
+    // Bisect knobs (GGML_VVM_NO_CMDPOOL / GGML_VVM_NO_INITBLOCK via env are
+    // handled by the integration layer flipping these config-adjacent statics;
+    // here we only honor the internal skip flags).
+    if (!getenv("VVM_SKIP_CMDPOOL")) {
     VkCommandPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     poolInfo.queueFamilyIndex = deviceConfig_.transferQueueFamily != UINT32_MAX 
@@ -432,9 +436,11 @@ VVM_LOG_INFO("Selected HOST_VISIBLE memory type {} (heap budget: {} MB)",
         VVM_LOG_ERROR("Failed to create transfer command pool");
         return false;
     }
+    }
     
     // Pre-allocate first block (pool blocks are never exportable). Respect the
     // budget cap: do not steal memory past maxHeapFraction / maxPoolBytes.
+    if (!getenv("VVM_SKIP_INITBLOCK")) {
     if (wouldExceedBudget(config_.blockSize)) {
         VVM_LOG_ERROR("Initial pool block ({} MB) exceeds configured budget; "
                       "lower blockSize or raise maxHeapFraction/maxPoolBytes",
@@ -444,6 +450,7 @@ VVM_LOG_INFO("Selected HOST_VISIBLE memory type {} (heap budget: {} MB)",
     if (!allocateBlock(config_.blockSize, deviceLocalMemoryType_).has_value()) {
         VVM_LOG_ERROR("Failed to allocate initial memory block");
         return false;
+    }
     }
     
     // Create OffloadManager if offload is enabled
@@ -949,6 +956,10 @@ std::optional<Allocation> UnifiedMemoryPool::allocateDedicated(
     dedicatedInfo.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
     dedicatedInfo.buffer = buffer;
     dedicatedInfo.image = VK_NULL_HANDLE;
+    // Optional hint: some drivers place dedicated-hinted allocations
+    // differently. PoolConfig::dedicatedAllocateInfo = false allocates
+    // generically (matching callers that never use the hint).
+    const bool useDedicatedHint = config_.dedicatedAllocateInfo;
 
     VkMemoryAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -966,13 +977,16 @@ std::optional<Allocation> UnifiedMemoryPool::allocateDedicated(
         priorityInfo.sType = VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT;
         priorityInfo.priority = config_.memoryPriority;
     }
-    if (config_.enableDeviceAddress) {
-        dedicatedInfo.pNext = &flagsInfo;
-        flagsInfo.pNext = (config_.memoryPriority > 0.0f) ? &priorityInfo : nullptr;
-        allocInfo.pNext = &dedicatedInfo;
-    } else {
-        dedicatedInfo.pNext = (config_.memoryPriority > 0.0f) ? &priorityInfo : nullptr;
-        allocInfo.pNext = &dedicatedInfo;
+    {
+        VkMemoryPriorityAllocateInfoEXT* tail = (config_.memoryPriority > 0.0f) ? &priorityInfo : nullptr;
+        if (config_.enableDeviceAddress) {
+            flagsInfo.pNext = tail;
+            dedicatedInfo.pNext = &flagsInfo;
+            allocInfo.pNext = useDedicatedHint ? static_cast<void*>(&dedicatedInfo) : static_cast<void*>(&flagsInfo);
+        } else {
+            dedicatedInfo.pNext = tail;
+            allocInfo.pNext = useDedicatedHint ? static_cast<void*>(&dedicatedInfo) : static_cast<void*>(tail);
+        }
     }
 
     VkDeviceMemory memory;
@@ -1073,7 +1087,13 @@ std::optional<Allocation> UnifiedMemoryPool::allocate(VkDeviceSize size,
         }
     }
     if (bestIdx >= 0) {
-        return subAllocate(size, config_.minAlignment, bestIdx, usage);
+        auto sub = subAllocate(size, config_.minAlignment, bestIdx, usage);
+        if (sub.has_value()) {
+            return sub;
+        }
+        // Aligned grant didn't fit the chosen block (e.g. base-alignment
+        // padding overflows a full block) - fall through and create a fresh
+        // block instead of failing the allocation.
     }
 
     // Need new block
@@ -1124,7 +1144,12 @@ std::optional<Allocation> UnifiedMemoryPool::allocate(VkDeviceSize size,
         return std::nullopt;
     }
     
-    return subAllocate(size, config_.minAlignment, blocks_.size() - 1, usage);
+    auto sub = subAllocate(size, config_.minAlignment, blocks_.size() - 1, usage);
+    if (sub.has_value()) {
+        return sub;
+    }
+    // Last resort: dedicated memory (e.g. aligned grant could not fit).
+    return allocateDedicated(size, usage, flags);
 }
 
 std::optional<Allocation> UnifiedMemoryPool::allocate(const AllocDesc& desc) {
@@ -1705,10 +1730,14 @@ std::optional<Allocation> UnifiedMemoryPool::subAllocate(VkDeviceSize size,
     
     // Allocate from buddy allocator. Honor the configured base alignment
     // (e.g. 2 MB) so buffer starts sit on driver memory-page boundaries;
-    // slack is returned to the free lists by the buddy.
+    // slack is returned to the free lists by the buddy. Requests whose
+    // alignment padding would overflow the block fall back to unaligned.
     VkDeviceSize baseAlign = config_.allocationAlignment;
     if (baseAlign < alignment) baseAlign = alignment;
     auto offsetOpt = block.buddy->allocateAligned(size, baseAlign);
+    if (!offsetOpt) {
+        offsetOpt = block.buddy->allocate(size);
+    }
     if (!offsetOpt) {
         return std::nullopt;
     }

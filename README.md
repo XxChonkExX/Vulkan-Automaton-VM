@@ -626,23 +626,25 @@ pool->reloadToDevice(allocation);
 
 Uses GPU copy engine (DMA engines), not `madvise`/`mprotect` (unsafe on driver mappings).
 
-### Inference Benchmarks — Pooled Multi-GPU LLM (Phase 0, 2026-08-23)
+### Inference Benchmarks — Pooled Multi-GPU LLM (Phases 0-2, 2026-08-23)
 
-First pooling study for llama.cpp inference: RX 7900 XTX (24GB) + Arc Pro B70 (32GB), stock llama.cpp b10588 Vulkan backend. Full data and analysis in [docs/inference_benchmarks.md](docs/inference_benchmarks.md).
+Chonk-backed llama.cpp integration (branch `chonk-buffer`, llama.cpp b10588 Vulkan): tensor buffers sourced from `UnifiedMemoryPool` via `GGML_VK_VVM_POOL=1`. Full data, debugging ladder, and knobs in [docs/inference_benchmarks.md](docs/inference_benchmarks.md).
 
-Qwen3.6-40B Q4_K_M (24.10 GiB weights — exceeds XTX VRAM alone):
+**Final parity matrix** (Qwen3.6-40B Q4_K_M = 24.10 GiB; RX 7900 XTX 24 GB + Arc Pro B70 32 GB):
 
-| Config | pp512 | tg128 |
-|---|---:|---:|
-| XTX solo (PCIe spill) | 446 t/s | 13.44 t/s |
-| B70 solo (fits in 32 GB) | 534 t/s | 18.01 t/s |
-| **Layer-split both, bandwidth-weighted** | 474 t/s | **21.89 t/s** |
+| Case | ggml control (pp512 / tg128) | Chonk Buffer | Gap |
+|---|---:|---:|---|
+| 40B dual-GPU split, tuned `-ts 1.43/1` | 474 / 21.89 | 486.8 / **21.50** | -1.8% |
+| 40B dual-GPU split, default | 520 / 20.33 | 504.4 / **19.93** | -2.0% |
+| 40B B70 solo (fits in 32 GB) | 531.7 / 17.96 | 533.6 / **17.84** | -0.7% |
+| 3B XTX solo | 5729 / 269.2 | 5626 / **267.0** | -0.8% |
+| 3B B70 solo | — / 155.7 | — / **155.8** | +0.1% |
 
 Findings:
-- **Pooling beats every solo config** (+54% decode vs XTX solo) once the model exceeds one card's comfortable capacity; splitting halves per-card weight reads and keeps both engines busy.
-- Splitting a model that *fits* one card is a regression (pipeline overhead) — placement policy matters.
-- The B70's stock Pro driver (8861) was ~24× broken for compute; fixed by upgrading to the consumer-branch WHQL (8974).
-- **This 21.9 t/s stock result is the bar**: the planned Chonk-backed ggml buffer type must match it while adding tensor-granular placement (`ShardPlacer`), KV-in-pool, and DMA offload tiers.
+- **Full parity achieved** (worst case -2%) with the Chonk pool sub-allocating every tensor buffer — zero per-tensor `vkAllocateMemory`, fragmentation-free packing, bounded 256 KB waste via exact-fit grants.
+- **Pooling beats every solo config** (+54% decode vs XTX solo) once the model exceeds one card's comfortable capacity.
+- Two driver-placement pitfalls found and fixed: 2 GiB allocations place badly on Arc (use 1 GiB); ReBAR-mapped pool blocks lose decode bandwidth on both vendors — pure DEVICE_LOCAL + the `DEVICE_ADDRESS` allocate flag are required for parity.
+- Buddy allocator upgraded with **exact-fit grants** (power-of-2 rounding waste eliminated) and **Chonk Chunks** size-class routing (small tensors cost 64 MiB chunks, not 1 GiB blocks).
 
 ---
 
