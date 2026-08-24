@@ -1,0 +1,135 @@
+# VulkanVM CI - compile matrix + CPU-only tests.
+#
+# Hardware-dependent tests (GPU pools, RDMA, Android devices) are NOT run
+# here; they require opt-in hardware runners (see docs/HARDWARE_SUPPORT.md).
+#
+# Matrix:
+#   - Linux GCC + Clang: core-only build, full build (network), CPU tests
+#   - Windows MSVC: core-only build, full build, CPU tests
+#
+# The CPU-only tests (buddy_test, chonk_slab_test, placement_test) are the
+# regression backbone: they need no GPU and run everywhere.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Linux (${{ matrix.cc }}) ${{ matrix.mode }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+        mode: [core, full]
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cc == 'gcc' && 'g++' || 'clang++' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Vulkan SDK (headers/loader, no GPU needed to compile)
+        run: |
+          wget -qO- https://packages.lunarg.com/vulkan/lunarg-vulkan.key | sudo apt-key add -
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-noble.list https://packages.lunarg.com/vulkan/lunarg-vulkan-noble.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq vulkan-sdk
+
+      - name: Configure (core-only)
+        if: matrix.mode == 'core'
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DVVM_BUILD_SHARED=ON -DVVM_BUILD_NETWORK=OFF
+          -DVVM_BUILD_TESTS=ON -DVVM_BUILD_EXAMPLES=OFF
+          -DVVM_ENABLE_VALIDATION=OFF
+
+      - name: Configure (full stack)
+        if: matrix.mode == 'full'
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DVVM_BUILD_SHARED=ON -DVVM_BUILD_NETWORK=ON
+          -DVVM_BUILD_TESTS=ON -DVVM_BUILD_EXAMPLES=OFF
+          -DVVM_ENABLE_VALIDATION=OFF
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: CPU-only tests
+        run: |
+          ctest --test-dir build -R "buddy_test|chonk_slab_test|placement_test" --output-on-failure
+          # 100k-op slab fuzz (fast); nightly-scale runs are manual:
+          ./build/tests/chonk_slab_test 100000
+
+  windows:
+    name: Windows (MSVC) ${{ matrix.mode }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [core, full]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Vulkan SDK
+        run: |
+          Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe" -OutFile vulkan-sdk.exe
+          .\vulkan-sdk.exe --silent --accept-licenses --default-answer --confirm-command install
+
+      - name: Configure (core-only)
+        if: matrix.mode == 'core'
+        run: >
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          -DCMAKE_BUILD_TYPE=Release -DVVM_BUILD_SHARED=ON
+          -DVVM_BUILD_NETWORK=OFF -DVVM_BUILD_TESTS=ON
+          -DVVM_BUILD_EXAMPLES=OFF -DVVM_ENABLE_VALIDATION=OFF
+
+      - name: Configure (full stack)
+        if: matrix.mode == 'full'
+        run: >
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          -DCMAKE_BUILD_TYPE=Release -DVVM_BUILD_SHARED=ON
+          -DVVM_BUILD_NETWORK=ON -DVVM_BUILD_TESTS=ON
+          -DVVM_BUILD_EXAMPLES=OFF -DVVM_ENABLE_VALIDATION=OFF
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: CPU-only tests
+        run: |
+          ctest --test-dir build -C Release -R "buddy_test|chonk_slab_test|placement_test" --output-on-failure
+          .\build\tests\Release\chonk_slab_test.exe 100000
+
+  android:
+    name: Android (arm64-v8a) compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install NDK + Vulkan headers
+        run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-r27-linux.zip
+          unzip -q android-ndk-r27-linux.zip
+          wget -qO- https://packages.lunarg.com/vulkan/lunarg-vulkan.key | sudo apt-key add -
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-noble.list https://packages.lunarg.com/vulkan/lunarg-vulkan-noble.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq vulkan-sdk
+
+      - name: Configure + build (arm64-v8a)
+        run: >
+          cmake -S . -B build-android
+          -DCMAKE_TOOLCHAIN_FILE=$PWD/android-ndk-r27/build/cmake/android.toolchain.cmake
+          -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=34
+          -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DVVM_BUILD_SHARED=ON -DVVM_BUILD_NETWORK=OFF
+          -DVVM_BUILD_TESTS=OFF -DVVM_BUILD_EXAMPLES=OFF
+        shell: bash
+
+      - name: Build
+        run: cmake --build build-android -j"$(nproc)"
+        shell: bash
