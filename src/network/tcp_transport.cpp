@@ -1352,6 +1352,17 @@ void TcpTransport::acceptLoop() {
 #endif
         }
         setTimeouts(client, 30000);
+        // Connection cap (THREAT_MODEL §5): reject excess concurrent
+        // connections immediately instead of spawning a serve thread.
+        {
+            std::lock_guard<std::mutex> lock(impl_->connsMutex);
+            if (impl_->conns.size() >= impl_->netConfig.maxConnections) {
+                VVM_LOG_WARN("acceptLoop: connection cap {} reached; rejecting peer",
+                             impl_->netConfig.maxConnections);
+                closeSocket(client);
+                continue;
+            }
+        }
         uint64_t id = impl_->nextConnId++;
         {
             std::lock_guard<std::mutex> lock(impl_->connsMutex);
@@ -1421,8 +1432,28 @@ void TcpTransport::serveConnection(uint64_t connId, uintptr_t sRaw) {
         req.flags = nh.flags;
         req.seq = nh.seq;
         if (nh.bodyLen > 0) {
-            req.body.resize(nh.bodyLen);
-            if (!impl_->readAllTls(s, req.body.data(), nh.bodyLen, tlsConn.get())) break;
+            // Chunked body read (THREAT_MODEL §5): grow the buffer only as
+            // bytes actually arrive, in fixed slices. A peer declaring a
+            // legal 1 GiB body but sending nothing now costs one 4 MiB slice
+            // (bounded by the 30 s socket timeout) instead of an up-front
+            // 1 GiB host allocation.
+            const size_t slice = impl_->netConfig.bodyReadSliceSize > 0
+                                     ? impl_->netConfig.bodyReadSliceSize
+                                     : 4 * 1024 * 1024;
+            req.body.reserve(static_cast<size_t>(std::min<uint64_t>(nh.bodyLen, 4 * slice)));
+            size_t received = 0;
+            bool failed = false;
+            while (received < static_cast<size_t>(nh.bodyLen)) {
+                const size_t chunk =
+                    std::min<size_t>(slice, static_cast<size_t>(nh.bodyLen) - received);
+                req.body.resize(received + chunk);
+                if (!impl_->readAllTls(s, req.body.data() + received, chunk, tlsConn.get())) {
+                    failed = true;
+                    break;
+                }
+                received += chunk;
+            }
+            if (failed) break;
         }
 
         TcpMessage resp;

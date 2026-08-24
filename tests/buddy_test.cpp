@@ -5,7 +5,10 @@
 
 #include <vulkan_vm/buddy_allocator.hpp>
 
+#include <atomic>
 #include <cstdio>
+#include <thread>
+#include <random>
 #include <vector>
 #include <cstdlib>
 
@@ -138,6 +141,37 @@ int main() {
             stress.deallocate(p.first, p.second);
         }
         CHECK(stress.checkInvariants());
+    }
+
+    // --- 11b. Concurrent allocate/free stress (threadSafe=true)
+    {
+        BuddyAllocator conc(kBlock, kMin, /*threadSafe=*/true);
+        constexpr int kThreads = 4;
+        constexpr int kIters = 2000;
+        std::atomic<int> ok{1};
+        std::vector<std::thread> threads;
+        for (int t = 0; t < kThreads; ++t) {
+            threads.emplace_back([&, t] {
+                std::mt19937 rng(static_cast<unsigned>(t * 7919 + 1));
+                std::vector<std::pair<VkDeviceSize, VkDeviceSize>> local;
+                for (int i = 0; i < kIters; ++i) {
+                    if (!local.empty() && (rng() % 2)) {
+                        size_t idx = rng() % local.size();
+                        conc.deallocate(local[idx].first, local[idx].second);
+                        local.erase(local.begin() + idx);
+                    } else {
+                        VkDeviceSize sz = 256 * 1024 * (1 + (rng() % 4));
+                        auto opt = conc.allocate(sz);
+                        if (opt) local.push_back({*opt, sz});
+                    }
+                }
+                for (auto& p : local) conc.deallocate(p.first, p.second);
+            });
+        }
+        for (auto& th : threads) th.join();
+        CHECK(conc.checkInvariants());
+        CHECK(conc.getLargestFree() == kBlock);
+        CHECK(ok.load() == 1);
     }
 
     // --- 12. Exact-fit grants (llama.cpp pattern: few large, odd-sized buffers) ---
@@ -327,3 +361,5 @@ int main() {
     std::printf("=== SOME TESTS FAILED (%d failures) ===\n", failures);
     return 1;
 }
+
+
