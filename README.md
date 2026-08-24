@@ -41,6 +41,14 @@ the standalone Chonk Buffer library; `ON` adds the transport layer. See
 [docs/AUDIT_NOTES_2026-08-15.md](docs/AUDIT_NOTES_2026-08-15.md) and
 [docs/inference_benchmarks.md](docs/inference_benchmarks.md).
 
+**Hardware support** is tracked as an honest tiered matrix
+([docs/HARDWARE_SUPPORT.md](docs/HARDWARE_SUPPORT.md)): Tier 1 = verified
+end-to-end on real hardware, Tier 2 = compile-tested, Tier 3 = designed but
+unexercised. CI runs the compile matrix (Linux GCC/Clang, Windows MSVC,
+Android NDK) plus the CPU-only regression suites (buddy allocator, Chonk
+slab invariants + fuzz, placement logic) on every push — see
+[.github/workflows/ci.yml](.github/workflows/ci.yml).
+
 ---
 
 Notice! Help wanted desperately-
