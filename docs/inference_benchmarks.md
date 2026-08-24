@@ -156,3 +156,74 @@ Findings:
 - `GGML_VVM_BASE_ALIGN=<bytes>` — buffer-base alignment (default 2 MiB; `0` = minAlignment)
 - `GGML_VVM_CHUNK_MB=<n>` — chunk block size in MiB (default 64; `0` disables routing)
 - `GGML_VVM_BLOCK_SIZE=<bytes>` — regular block size (default 1 GiB)
+
+---
+
+## Phase 2 - XTX residual SOLVED: the DEVICE_ADDRESS allocate flag (2026-08-23)
+
+The remaining XTX 3B decode gap (-7%) survived an exhaustive elimination matrix:
+memory type (ReBAR/pure), block size (256 MB/512 MB/1 GiB), base alignment
+(256 KB/2 MB), dedicated hint, memory priority, command pool, initial block,
+run order, and even **pass-through mode with byte-identical dedicated
+allocations**. Interleaved A/B/A confirmed it was deterministic (250 vs 268,
+no overlap) and not driver-state flakiness.
+
+**Root cause**: `VkMemoryAllocateFlagsInfo` with `DEVICE_ADDRESS` on the
+*memory allocation*. ggml always sets both the buffer's
+`SHADER_DEVICE_ADDRESS` usage **and** the allocate-time flag; the pool had
+only partially matched (usage flag present, allocate flag missing). On AMD
+RDNA3, memory allocated without the device-address flag is placed differently
+by the driver - worth ~7% of streaming-read bandwidth. Intel Arc was
+unaffected (its issue was allocation *size* placement, fixed separately).
+
+**Fix**: `pcfg.enableDeviceAddress = device->buffer_device_address` - the
+pool now mirrors ggml exactly: usage flag AND allocate flag whenever the
+device has the feature.
+
+### Final matrix - all cases at parity
+
+| Case | ggml control (pp512 / tg128) | Chonk Buffer | Gap |
+|---|---:|---:|---|
+| 40B split default | 520 / 20.33 | 504.4 / 19.93 | -2.0% |
+| 40B split `-ts 1.43/1` | 474 / 21.89 | 486.8 / 21.50 | -1.8% |
+| 40B B70 solo | 531.7 / 17.96 | 533.6 / 17.84 | -0.7% |
+| XTX 3B solo | 5729 / 269.16 | 5626 / 266.96 | -0.8% |
+| B70 3B solo | - / 155.68 | - / 155.83 | +0.1% |
+
+### Robustness fixes added along the way
+
+- **Aligned-grant fallback**: requests whose alignment padding overflows a
+  full block (e.g. ~1 GiB chunk + 2 MiB alignment in a 1 GiB block) fall
+  back to unaligned grants instead of failing.
+- **Dedicated fallback**: if sub-allocation fails even in a fresh block, the
+  pool serves the request from dedicated memory.
+- **Best-fit fallthrough**: a failed sub-allocation in the best-fit block now
+  falls through to new-block creation instead of failing the allocation.
+- Diagnostics (env-gated, default off): `VVM_SKIP_CMDPOOL`,
+  `VVM_SKIP_INITBLOCK`, `GGML_VVM_PASSTHROUGH_ALLOC`,
+  `GGML_VVM_NO_DEDICATED`.
+
+Elimination matrix (for posterity): the XTX gap was invariant to memory type,
+block size, base alignment, dedicated hint, memory priority, command pool,
+initial block, and run order - only the DEVICE_ADDRESS allocate flag moved it.
+
+Research notes: AMD GPUOpen recommends ~256 MB allocations on Windows (WDDM
+per-allocation costs); RDNA Performance Guide recommends staying under 80%
+heap usage to avoid eviction; llama.cpp issue #22646 documents probabilistic
+AMD Windows driver slow states (driver reset recovers) - worth remembering
+when chasing "impossible" perf regressions. TheRock (ROCm 7.9+) is AMD's new
+unified build super-repo; Linux-centric, not applicable to the Windows
+Vulkan path used here.
+
+### Consolidated runtime knobs (llama integration)
+
+| Knob | Default | Effect |
+|---|---|---|
+| `GGML_VK_VVM_POOL` | `0` | `1` enables Chonk Buffer allocations |
+| `GGML_VVM_BLOCK_SIZE` | `1 GiB` | regular block size (pow2, >= 256 KiB; 256 KiB = pass-through/dedicated mode) |
+| `GGML_VVM_BASE_ALIGN` | `2 MiB` | buffer-base alignment (`0` = minAlignment) |
+| `GGML_VVM_CHUNK_MB` | `64` | chunk block size in MiB (`0` disables size-class routing) |
+| `GGML_VVM_PURE_LOCAL` | on | `0` allows ReBAR (host-visible) VRAM types |
+| `GGML_VVM_NO_DEDICATED` | off | `1` drops the dedicated-allocate hint |
+| `GGML_VVM_PASSTHROUGH_ALLOC` | off | `1` pool init runs, buffers via ggml native path |
+| `VVM_SKIP_CMDPOOL` / `VVM_SKIP_INITBLOCK` | off | `1` skips those init steps (diagnostics) |

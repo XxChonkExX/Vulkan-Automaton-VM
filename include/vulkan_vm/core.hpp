@@ -111,6 +111,11 @@ struct VVM_API PoolConfig {
     // full-size blocks. Both 0 = disabled.
     VkDeviceSize smallAllocThreshold = 0;
     VkDeviceSize chunkBlockSize = 0;
+
+    // Chain VkMemoryDedicatedAllocateInfo on dedicated allocations (default
+    // true). ggml's native path does NOT use the dedicated hint; on some
+    // drivers the hint changes placement strategy. Benchmark both.
+    bool dedicatedAllocateInfo = true;
     
     // Hard cap on total pool memory in bytes (0 = no explicit cap).
     VkDeviceSize maxPoolBytes = 0;
