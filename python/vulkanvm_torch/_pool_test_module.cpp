@@ -642,6 +642,11 @@ static bool allocatorCreateBlock(size_t need) {
     }
     if (!allocOpt) return false;
     vvm::Allocation a = std::move(*allocOpt);
+    // The pool's granted size is authoritative: the pressure-escalation path
+    // above re-requests at bucketSize, so the Vulkan allocation may be larger
+    // than the original `blockSize`. The HIP import and slab bookkeeping MUST
+    // describe the same memory object as the Vulkan allocation.
+    const size_t actualBlockSize = a.size;
     auto info = g_pool->exportMemory(a, vvm::ExternalHandleType::OpaqueFd);
     if (!info) {
         g_pool->deallocate(std::move(a));
@@ -649,7 +654,7 @@ static bool allocatorCreateBlock(size_t need) {
     }
     int fd = info->handle.release();
     hipExternalMemory_t ext = nullptr;
-    void* base = hipImportFromFd(fd, blockSize, &ext);
+    void* base = hipImportFromFd(fd, actualBlockSize, &ext);
     if (!base) {
         g_pool->deallocate(std::move(a));
         return false;
@@ -659,10 +664,10 @@ static bool allocatorCreateBlock(size_t need) {
     block->fd = fd;
     block->ext = ext;
     block->base = base;
-    block->size = blockSize;
-    block->freeChunks.push_back({0, blockSize});
+    block->size = actualBlockSize;
+    block->freeChunks.push_back({0, actualBlockSize});
     g_allocator.blocks.push_back(std::move(block));
-    allocLog("B", base, blockSize);
+    allocLog("B", base, actualBlockSize);
     return true;
 }
 
@@ -699,6 +704,7 @@ static void allocatorMaybeReleaseEmptyBlock(AllocBlock* blk) {
 
 extern "C" void* chonk_allocator_alloc(ssize_t size, int device, void* stream) {
     (void)device; (void)stream;
+    if (size < 0) return nullptr;  // ABI boundary: reject negative sizes explicitly
     if (!g_pool) return nullptr;  // pool must be initialized before install
     std::lock_guard<std::mutex> lock(g_allocator.mtx);
     size_t aligned = ((size_t)size + ChonkAllocator::kAlign - 1) &

@@ -1,4 +1,5 @@
 #include "vulkan_vm/sparse.hpp"
+#include "vulkan_vm/offload.hpp"
 #include "vulkan_vm/utils.hpp"
 
 #include <algorithm>

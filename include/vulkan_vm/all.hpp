@@ -1,12 +1,9 @@
 #pragma once
 
-#include "vulkan_vm/vulkan_vm.hpp"
-#include "offload.hpp"
-#include "utils.hpp"
+// VulkanVM "everything" umbrella: core memory pool + transport layer.
+// For core-only usage (Chonk Buffer standalone), include
+// "vulkan_vm/vulkan_vm.hpp" instead - it has zero network dependencies.
 
-namespace vvm {
-
-// Convenience: all-in-one include
-// #include <vulkan_vm/vulkan_vm.hpp> includes everything
-
-} // namespace vvm
+#include "vulkan_vm/vulkan_vm.hpp"      // core: pool, allocator, offload,
+                                        // cross-GPU, sparse, placement planning
+#include "vulkan_vm/transport.hpp"      // optional: network, tensor transport

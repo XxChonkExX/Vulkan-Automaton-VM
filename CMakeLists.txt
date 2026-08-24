@@ -101,8 +101,10 @@ endif()
 
 # Include directories (target-based)
 # Library
-# placement_executor.cpp requires the network module (MultiNodePoolManager/ModelHub),
-# so it is only part of the library when VVM_BUILD_NETWORK is ON.
+# NOTE layering: vulkan_vm (core) = pool/allocator/offload/cross-GPU/sparse/
+# ShardPlacer - zero network dependencies. placement_executor.cpp (needs
+# MultiNodePoolManager) is built into vulkan_vm_network instead, because on
+# Windows a core DLL cannot link the network DLL that depends on it.
 if(VVM_BUILD_SHARED)
     add_library(vulkan_vm SHARED
         src/core/unified_memory_pool.cpp
@@ -129,10 +131,7 @@ else()
     )
 endif()
 
-if(VVM_BUILD_NETWORK)
-    target_sources(vulkan_vm PRIVATE src/placement/placement_executor.cpp)
-endif()
-
+# PlacementExecutor lives in vulkan_vm_network (see layering note above).
 target_include_directories(vulkan_vm
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -271,3 +270,6 @@ install(EXPORT VulkanVMTargets
     FILE VulkanVMTargets.cmake
     DESTINATION lib/cmake/VulkanVM
 )
+
+
+

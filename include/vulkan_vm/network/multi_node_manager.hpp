@@ -3,6 +3,9 @@
 #include "vulkan_vm/vulkan_vm.hpp"
 #include "vulkan_vm/network/network_types.hpp"
 #include "vulkan_vm/network/tcp_transport.hpp"
+#include "vulkan_vm/network/cluster_client.hpp"
+#include "vulkan_vm/network/cluster_server.hpp"
+#include "vulkan_vm/network/rdma_transport.hpp"
 #include <memory>
 #include <vector>
 #include <optional>

@@ -8,6 +8,12 @@
 
 namespace vvm {
 
+// OffloadManager deleter: declared in core.hpp (keeps OffloadManager
+// incomplete there), defined here where the complete type is available.
+void OffloadManagerDeleter::operator()(OffloadManager* p) const {
+    delete p;
+}
+
 // ============================================================================
 // UnifiedMemoryPool Implementation
 // ============================================================================
@@ -470,7 +476,8 @@ VVM_LOG_INFO("Selected HOST_VISIBLE memory type {} (heap budget: {} MB)",
             ? deviceConfig_.transferQueueFamily 
             : deviceConfig_.graphicsQueueFamily;
         
-        offloadManager_ = std::make_unique<OffloadManager>(this, offloadConfig);
+        offloadManager_ = std::unique_ptr<OffloadManager, OffloadManagerDeleter>(
+            new OffloadManager(this, offloadConfig));
         VVM_LOG_INFO("OffloadManager created with host shadow size: {} MB", 
                      offloadConfig.hostShadowSize / (1024*1024));
     }

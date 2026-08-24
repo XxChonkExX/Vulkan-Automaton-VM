@@ -376,6 +376,9 @@ bool writeAll(SocketType s, const void* buf, size_t len) {
 struct TlsContext {
 #if defined(VVM_NETWORK_HAS_TLS)
     SSL_CTX* ctx = nullptr;
+    // Owned storage for the encoded ALPN protocol list passed to the ALPN
+    // select callback. Must outlive ctx; freed with the context in cleanup().
+    std::vector<unsigned char> alpnWire_;
 #endif
     bool enabled = false;
     bool serverMode = false;
@@ -392,6 +395,7 @@ struct TlsContext {
             SSL_CTX_free(ctx);
             ctx = nullptr;
         }
+        alpnWire_.clear();
 #endif
         enabled = false;
     }
@@ -443,14 +447,14 @@ struct TlsContext {
 
         // ALPN
         if (!config.alpnProtocols.empty()) {
-            std::vector<unsigned char> alpnWire = encodeAlpnProtocols(config.alpnProtocols);
+            alpnWire_ = encodeAlpnProtocols(config.alpnProtocols);
             SSL_CTX_set_alpn_select_cb(ctx, [](SSL* ssl, const unsigned char** out, unsigned char* outlen, const unsigned char* in, unsigned int inlen, void* arg) -> int {
                 const std::vector<unsigned char>* protos = static_cast<const std::vector<unsigned char>*>(arg);
                 if (SSL_select_next_proto(const_cast<unsigned char**>(out), outlen, protos->data(), static_cast<unsigned int>(protos->size()), in, inlen) == OPENSSL_NPN_NEGOTIATED) {
                     return SSL_TLSEXT_ERR_OK;
                 }
                 return SSL_TLSEXT_ERR_NOACK;
-            }, new std::vector<unsigned char>(std::move(alpnWire)));
+            }, &alpnWire_);
         }
 
         enabled = true;

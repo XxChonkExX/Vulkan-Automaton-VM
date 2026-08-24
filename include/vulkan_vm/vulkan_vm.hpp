@@ -7,6 +7,11 @@
 #include "vulkan_vm/core.hpp"
 #include "vulkan_vm/cross_gpu.hpp"
 #include "vulkan_vm/offload.hpp"
-#include "vulkan_vm/network.hpp"
 #include "vulkan_vm/placement.hpp"
 #include "vulkan_vm/sparse.hpp"
+// Transport layers (network, tensor transport, RDMA/UCX) are OPTIONAL and
+// live in separate headers/targets so the core memory pool (Chonk Buffer)
+// builds and ships standalone:
+//   #include "vulkan_vm/network.hpp"          // cluster / multi-node
+//   #include "vulkan_vm/tensor_transport.hpp" // unified tensor transport
+// or include "vulkan_vm/all.hpp" for everything.

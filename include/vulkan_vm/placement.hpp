@@ -1,6 +1,8 @@
 #pragma once
 
-#include "vulkan_vm/vulkan_vm.hpp"
+// Shard placement planning - pure logic, no I/O, no network. Part of the
+// CORE layer: usable standalone with just the memory pool.
+#include "vulkan_vm/core.hpp"
 #include <vector>
 #include <string>
 #include <optional>
