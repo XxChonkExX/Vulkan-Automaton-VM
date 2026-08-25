@@ -66,7 +66,14 @@ std::optional<SparseVirtualMemoryPool> SparseVirtualMemoryPool::create(
     pool.device_ = device.device;
     pool.sparseQueueFamily_ = queueFamily;
     vkGetDeviceQueue(device.device, queueFamily, 0, &pool.sparseQueue_);
-    if (!pool.sparseQueue_) return std::nullopt;
+    if (!pool.sparseQueue_) {
+        VVM_LOG_ERROR(
+            "SparseVirtualMemoryPool: sparse queue family {} has no created queue - "
+            "the logical device was not created with this family enabled "
+            "(enable every queue family that reports VK_QUEUE_SPARSE_BINDING_BIT)",
+            queueFamily);
+        return std::nullopt;
+    }
 
     // Sparse residency granularity. The sparse buffer requirements API is not
     // available in every SDK header set; we use a conservative power-of-two

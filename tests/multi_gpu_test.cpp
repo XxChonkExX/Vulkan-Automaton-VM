@@ -43,6 +43,7 @@ static bool createDeviceForPool(const DeviceScore& score, const std::string& nam
         VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
 #else
         VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+        VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
 #endif
         VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME,
         VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
@@ -56,6 +57,9 @@ static bool createDeviceForPool(const DeviceScore& score, const std::string& nam
     dci.pEnabledFeatures = &feats;
     dci.pNext = &v12;
     dci.enabledExtensionCount = 5;
+#ifndef _WIN32
+    dci.enabledExtensionCount = 6;  // + VK_EXT_external_memory_dma_buf
+#endif
     dci.ppEnabledExtensionNames = exts;
 
     VkDevice device = VK_NULL_HANDLE;

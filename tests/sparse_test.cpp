@@ -38,6 +38,36 @@ static bool initDevice() {
     auto queues = findQueueFamilies(s_physicalDevice);
     s_transferFamily = queues.transfer.value_or(queues.graphics.value_or(0));
 
+    // The sparse pool binds pages via a queue from a family with
+    // VK_QUEUE_SPARSE_BINDING_BIT and fetches it with vkGetDeviceQueue.
+    // Some drivers (e.g. ANV on Battlemage) expose a pure-transfer family
+    // WITHOUT the sparse bit; if the device is created only on that family,
+    // the pool's vkGetDeviceQueue returns NULL and creation fails. Prefer a
+    // transfer-capable family that also reports the sparse bit.
+    {
+        uint32_t famCount = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(s_physicalDevice, &famCount, nullptr);
+        std::vector<VkQueueFamilyProperties> fams(famCount);
+        vkGetPhysicalDeviceQueueFamilyProperties(s_physicalDevice, &famCount, fams.data());
+        auto hasSparse = [&](uint32_t i) {
+            return i < famCount && (fams[i].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) != 0;
+        };
+        if (!hasSparse(s_transferFamily)) {
+            for (uint32_t i = 0; i < famCount; ++i) {
+                if ((fams[i].queueFlags & VK_QUEUE_TRANSFER_BIT) && hasSparse(i)) {
+                    s_transferFamily = i;
+                    break;
+                }
+            }
+            // Last resort: any sparse-capable family.
+            if (!hasSparse(s_transferFamily)) {
+                for (uint32_t i = 0; i < famCount; ++i) {
+                    if (hasSparse(i)) { s_transferFamily = i; break; }
+                }
+            }
+        }
+    }
+
     const float prio = 1.0f;
     VkDeviceQueueCreateInfo qci{};
     qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
