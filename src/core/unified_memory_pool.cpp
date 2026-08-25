@@ -1493,7 +1493,7 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
     }
     
     allocInfo.pNext = pNext;
-    
+
     VkDeviceMemory memory;
     VkResult allocResult = vkAllocateMemory(device_, &allocInfo, nullptr, &memory);
     if (allocResult != VK_SUCCESS) {
@@ -1509,14 +1509,14 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
     // On success the driver owns the OS handle (FD/HANDLE). Release it from
     // the RAII wrapper so its destructor does NOT double-close it.
     info.handle.release();
-    
+
     // Step 5: Bind buffer to memory
     VkBindBufferMemoryInfo bindInfo{};
     bindInfo.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO;
     bindInfo.buffer = buffer;
     bindInfo.memory = memory;
     bindInfo.memoryOffset = 0;
-    
+
     if (vkBindBufferMemory2(device_, 1, &bindInfo) != VK_SUCCESS) {
         VVM_LOG_ERROR("Failed to bind imported memory");
         vkDestroyBuffer(device_, buffer, nullptr);

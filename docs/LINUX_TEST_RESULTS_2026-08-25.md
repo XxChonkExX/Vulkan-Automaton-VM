@@ -239,3 +239,109 @@ SoftRoCE loopback in one process. Suggested HARDWARE_SUPPORT.md row:
 Still open: the process hangs at exit after PASS (raw transports hit the
 same teardown-join family as finding 4 above); default (no-env) ctest runs
 now SKIP cleanly on loopback instead of crashing.
+
+---
+
+# Phase 4 — Teardown hang FIXED, ANV import crash characterized (same day, post-reinstall)
+
+Machine re-provisioned mid-campaign (fresh Ubuntu GNOME, same kernel
+`7.0.0-30-generic`, Mesa **26.0.3-1ubuntu1**, CMake 4.2.3 / GCC). Environment
+rebuilt from packages only: `libvulkan-dev vulkan-tools glslang-tools
+libibverbs-dev librdmacm-dev rdma-core rdmacm-utils ibverbs-utils libssl-dev
+vulkan-validationlayers`. SoftRoCE recreated (`scripts/softroce_persist.sh`
+updated for native NIC `enp14s0`, module persisted via
+`/etc/modules-load.d/rdma_rxe.conf`); fresh-clone shader build failure fixed
+(`CMakeLists.txt` now makes the SPIR-V output directory before glslang runs).
+
+## Fixed: the teardown hang (findings 4 / Phase 3b "hangs at exit")
+
+Root cause captured by live backtrace of the hung process:
+
+```
+main: ~MultiNodePoolManager -> cleanup() -> VerbsRdmaTransport::shutdown()
+      -> std::thread::join()                      [blocked forever]
+listenerEventLoop threads (x2 transports):
+      rdma_get_cm_event() -> write() [kernel GET_EVENT]   [blocked forever]
+```
+
+`shutdown()` destroyed the event channel *before* joining, assuming
+`rdma_destroy_event_channel()` wakes a thread parked in `rdma_get_cm_event()`.
+On librdmacm 61 / kernel 7.0 it does not: the thread sleeps inside a kernel
+`GET_EVENT` write that only an actual CM event can satisfy - and after peer
+disconnect no event ever arrives.
+
+**Fix** (`src/network/rdma_transport.cpp`): all CM event channels are created
+`O_NONBLOCK`; `listenerEventLoop()`, `connectionEventLoop()` and
+`waitCmEvent()` now `poll()` the channel fd with a bounded timeout and treat
+`EAGAIN` as "no event yet", so every loop observes `shuttingDown_` and exits on
+its own. `shutdown()` order flipped to join-then-destroy. No synthesized events,
+no busy waiting (100 ms tick).
+
+| Suite | Before | After |
+|---|---|---|
+| `multi_vendor_rdma_test` | PASS then **hang at exit** | PASS, **exit 0** |
+| `tensor_collective_test` | collectives ran, **hang at teardown** | **exit 0**, PASS |
+| `network_test` | checks passed, **hang at teardown** | **exit 0**, ALL TESTS PASSED |
+
+Full ctest (11/11) and core-only ctest (7/7) pass with clean exits.
+
+## Characterized: cross-vendor import segfault is an ANV regression in Mesa 26.0.3
+
+With ZC enabled and an ANV destination, the process died in
+`vkAllocateMemory` inside `libvulkan_intel.so`. Instrumented + bisected:
+
+- Importing device: BMG G31 (ANV), source export: RX 7900 XTX (RADV),
+  dedicated allocation, BDA allocate-flag chain - identical call sequence that
+  succeeds RADV->RADV in `multi_gpu_test`.
+- Crash reproduces with **both** `OPAQUE_FD` and `DMA_BUF` handle types.
+- Not caused by `VK_EXT_memory_budget`, missing
+  `VK_KHR_dedicated_allocation`, or memory-type selection (all bisected).
+- KHR validation layers are otherwise clean up to the crash point.
+
+Conclusion: ANV 26.0.3 segfaults importing another driver's external heap
+where the previous stack imported fine; upstream-report material. The doc's
+earlier "cross-vendor DMA-BUF P2P verified" row stands for the older Mesa;
+re-verify after a Mesa update.
+
+**Mitigation:** `examples/network_test.cpp` now creates node A on the best
+device and node B on a different-vendor hardware device when available
+(llvmpipe excluded - its DMA-BUF export is a stub and crashes importers), and
+auto-disables same-process ZC for cross-vendor pairs
+(`VVM_ALLOW_CROSSVENDOR_ZC=1` forces attempts). With ZC off, the zero-copy
+check reports SKIP (host-staged migration is what's under test and passes:
+"Pull verify: PASS", 16 MiB migrated).
+
+## Validation-layer findings en route (real bugs, still open)
+
+- `VUID-VkBufferDeviceAddressInfo-buffer-02601`: `vkGetBufferDeviceAddress`
+  is called on buffers whose usage lacks
+  `VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT` (pool allocates with the
+  allocate-flag but not the usage bit; tolerated by RADV, flagged by
+  validation).
+- `VUID-VkMemoryGetFdInfoKHR-handleType-00671`: the verbs GPUDirect path asks
+  for DMA-BUF fds on memories never allocated with export capability
+  (`gpu_direct_registration` / RDMA register path); fails non-fatally today.
+- `vkUnmapMemory: Invalid device` at multi_gpu_test teardown now escalates to
+  SIGABRT under the current loader (was an error print): still-open, plus the
+  stale-generation deallocate warning.
+
+## SoftRoCE notes
+
+`rxe0` on `enp14s0`: `ibv_devinfo` PORT_ACTIVE; `ucmatose` PASS;
+`rstream` full latency/BW matrix PASS (~5.2 Gb/s @1 MiB, 3.9 us @64 B) but
+`-T v` data verification fails **deterministically at byte 217753681** (~208
+MiB into the default run) with server-side resets - kernel rxe/rsockets data
+corruption below our transport layer (raw-verbs path unaffected;
+`multi_vendor_rdma_test` passes over the same device). Upstream-report
+candidate alongside the known kernel 7.0 rxe CVEs.
+
+## Repro / verify commands
+
+```
+cmake -S . -B build_rdma -DCMAKE_BUILD_TYPE=Release -DVVM_BUILD_NETWORK=ON
+cmake --build build_rdma -j$(nproc)
+ctest --test-dir build_rdma                                        # 11/11, no hangs
+VVM_RDMA_CONNECT_HOST=<lan-ip> ./build_rdma/tests/multi_vendor_rdma_test
+./build_rdma/examples/network_test                                 # exit 0
+VVM_ALLOW_CROSSVENDOR_ZC=1 ./build_rdma/examples/network_test     # will hit the ANV bug
+```
