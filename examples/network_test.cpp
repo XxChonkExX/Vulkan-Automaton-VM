@@ -114,7 +114,10 @@ static bool initTestDevice() {
         VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
         VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
         VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
-#ifdef VVM_PLATFORM_WINDOWS
+#ifdef VVM_PLATFORM_LINUX
+        VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+        VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+#else
         VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
 #endif
         VK_EXT_MEMORY_BUDGET_EXTENSION_NAME
@@ -212,15 +215,17 @@ static vvm::PoolConfig makePoolConfig() {
 static vvm::network::NetworkConfig makeNetConfig(const std::string& listen, const std::vector<std::string>& seeds) {
     vvm::network::NetworkConfig cfg;
     cfg.listenAddress = listen;
+    // Advertise exactly what we bind, so single-box (loopback) clusters
+    // connect to themselves instead of the auto-detected LAN IP.
+    // NOTE: advertiseAddress is host-only; the port comes from listenAddress.
+    cfg.advertiseAddress = listen.substr(0, listen.rfind(':'));
     cfg.seedNodes = seeds;
     cfg.enableRdma = false;
     cfg.enableGpuDirect = false;
     cfg.enableHostStagedFallback = true;
-    // Opt-in smoke path for the experimental windowed push/pull pipeline.
-    if (std::getenv("VVM_TEST_WINDOWED")) {
-        cfg.enableAdaptiveWindow = true;
-        cfg.streamPipelineBuffers = 4;
-    }
+    // NOTE: windowed push/pull streaming is now opted into per request via
+    // StreamIO window callbacks (see tcp_transport.hpp); NetworkConfig no
+    // longer carries enableAdaptiveWindow/streamPipelineBuffers.
     return cfg;
 }
 
