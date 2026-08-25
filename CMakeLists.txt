@@ -246,7 +246,8 @@ if(VVM_BUILD_TENSOR_TRANSPORT)
         DOC "glslangValidator for SPIR-V compilation")
     
     if(GLSLANG_VALIDATOR)
-        # Compile layout conversion shader
+        # Compile layout conversion shader (output dir must exist before glslang runs)
+        file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/shaders)
         add_custom_command(
             OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/shaders/layout_conversion.spv
             COMMAND ${GLSLANG_VALIDATOR} -V ${CMAKE_CURRENT_SOURCE_DIR}/shaders/layout_conversion.comp

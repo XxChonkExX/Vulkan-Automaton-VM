@@ -8,6 +8,8 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <sys/mman.h>
 
 #include <cstring>
@@ -108,11 +110,20 @@ public:
             return false;
         }
 
-        // Listener: separate event channel owned by the CM thread.
+        // Listener: separate event channel owned by the CM thread. The fd is
+        // O_NONBLOCK so rdma_get_cm_event() returns EAGAIN instead of parking
+        // in the kernel forever when no CM event ever arrives - a blocking
+        // channel here wedged shutdown() at cmThread_.join() (backtrace:
+        // listenerEventLoop stuck in GET_EVENT write, librdmacm 61 / kernel
+        // 7.0 rxe; destroying the channel does NOT wake that sleep).
         struct rdma_event_channel* ec = rdma_create_event_channel();
         if (!ec) {
             VVM_LOG_ERROR("Failed to create RDMA event channel");
             return false;
+        }
+        {
+            int flags = fcntl(ec->fd, F_GETFL, 0);
+            if (flags >= 0) fcntl(ec->fd, F_SETFL, flags | O_NONBLOCK);
         }
 
         struct rdma_cm_id* listener = nullptr;
@@ -165,13 +176,15 @@ public:
         }
 
         if (cmThread_.joinable()) {
-            // Destroying the event channel wakes the listener thread blocked in
-            // rdma_get_cm_event (returns ECANCELED), so the join below completes.
-            if (eventChannel_) {
-                rdma_destroy_event_channel(eventChannel_);
-                eventChannel_ = nullptr;
-            }
+            // The listener loop polls its (O_NONBLOCK) channel fd with a short
+            // timeout, so it observes shuttingDown_ and exits on its own; the
+            // join below completes without needing a CM event. Resources are
+            // released only AFTER the thread is gone.
             cmThread_.join();
+        }
+        if (eventChannel_) {
+            rdma_destroy_event_channel(eventChannel_);
+            eventChannel_ = nullptr;
         }
         if (listener_) {
             rdma_destroy_id(listener_);
@@ -487,27 +500,41 @@ public:
     static int waitCmEvent(struct rdma_event_channel* ec, enum rdma_cm_event_type want,
                            const std::string& host, uint32_t port) {
         struct rdma_cm_event* ev = nullptr;
-        while (rdma_get_cm_event(ec, &ev) == 0) {
-            enum rdma_cm_event_type t = ev->event;
-            rdma_ack_cm_event(ev);
-            if (t == want) return 0;
-            switch (t) {
-                case RDMA_CM_EVENT_ADDR_ERROR:
-                case RDMA_CM_EVENT_ROUTE_ERROR:
-                case RDMA_CM_EVENT_REJECTED:
-                case RDMA_CM_EVENT_CONNECT_ERROR:
-                case RDMA_CM_EVENT_UNREACHABLE:
-                case RDMA_CM_EVENT_DISCONNECTED:
-                    VVM_LOG_WARN("connect: CM error while awaiting {}: {} ({})",
-                                 rdma_event_str(want), rdma_event_str(t), static_cast<int>(t));
-                    return -1;
-                default:
-                    break;  // transient intermediate event - keep waiting
+        for (;;) {
+            // Channels are O_NONBLOCK; wait for an event to actually be
+            // available instead of spinning on EAGAIN. Bounded tick keeps the
+            // loop responsive and mirrors the 5s resolve timeouts below.
+            struct pollfd pfd{};
+            pfd.fd = ec->fd;
+            pfd.events = POLLIN;
+            int pr = ::poll(&pfd, 1, 5000);
+            if (pr < 0 && errno == EINTR) continue;
+
+            if (rdma_get_cm_event(ec, &ev) == 0) {
+                enum rdma_cm_event_type t = ev->event;
+                rdma_ack_cm_event(ev);
+                if (t == want) return 0;
+                switch (t) {
+                    case RDMA_CM_EVENT_ADDR_ERROR:
+                    case RDMA_CM_EVENT_ROUTE_ERROR:
+                    case RDMA_CM_EVENT_REJECTED:
+                    case RDMA_CM_EVENT_CONNECT_ERROR:
+                    case RDMA_CM_EVENT_UNREACHABLE:
+                    case RDMA_CM_EVENT_DISCONNECTED:
+                        VVM_LOG_WARN("connect: CM error while awaiting {}: {} ({})",
+                                     rdma_event_str(want), rdma_event_str(t), static_cast<int>(t));
+                        return -1;
+                    default:
+                        break;  // transient intermediate event - keep waiting
+                }
+            } else if (errno == EAGAIN || errno == EINTR) {
+                continue;  // no event yet (or signal) - keep polling
+            } else {
+                VVM_LOG_WARN("connect: rdma_get_cm_event failed awaiting {} for {}:{}: {}",
+                             rdma_event_str(want), host, port, strerror(errno));
+                return -1;
             }
         }
-        VVM_LOG_WARN("connect: rdma_get_cm_event failed awaiting {} for {}:{}: {}",
-                     rdma_event_str(want), host, port, strerror(errno));
-        return -1;
     }
 
     std::optional<RdmaConnection> connect(
@@ -522,6 +549,12 @@ public:
         if (!ec) {
             VVM_LOG_ERROR("connect: failed to create event channel");
             return std::nullopt;
+        }
+        {
+            // O_NONBLOCK: keeps waitCmEvent/connectionEventLoop poll-driven
+            // so shutdown never has to synthesize a CM event to unstick them.
+            int flags = fcntl(ec->fd, F_GETFL, 0);
+            if (flags >= 0) fcntl(ec->fd, F_SETFL, flags | O_NONBLOCK);
         }
 
         struct rdma_cm_id* id = nullptr;
@@ -836,8 +869,18 @@ private:
     // own thread so it never contends with the listener's event loop.
     void connectionEventLoop(const std::shared_ptr<ConnectionInfo>& info) {
         if (!info || !info->ec) return;
+        const int efd = info->ec->fd;  // captured: ec is owned by info and outlives this loop
         struct rdma_cm_event* event = nullptr;
-        while (rdma_get_cm_event(info->ec, &event) == 0) {
+        while (!shuttingDown_.load()) {
+            struct pollfd pfd{};
+            pfd.fd = efd;
+            pfd.events = POLLIN;
+            int pr = ::poll(&pfd, 1, 100);
+            if (pr <= 0) continue;  // timeout/spurious - re-check shuttingDown_
+            if (rdma_get_cm_event(info->ec, &event) != 0) {
+                if (errno == EAGAIN || errno == EINTR) continue;
+                break;  // channel dead - fall through to cleanup below
+            }
             struct rdma_cm_event evt = *event;
             rdma_ack_cm_event(event);
 
@@ -887,8 +930,22 @@ private:
 
     // ---- Listener (server) event loop ----
     void listenerEventLoop() {
+        if (!eventChannel_) return;
+        const int efd = eventChannel_->fd;  // captured: channel is destroyed only after join
         struct rdma_cm_event* event = nullptr;
-        while (!shuttingDown_.load() && rdma_get_cm_event(eventChannel_, &event) == 0) {
+        while (!shuttingDown_.load()) {
+            // O_NONBLOCK + poll: the stop flag is honored even when no CM event
+            // ever arrives. (A blocking rdma_get_cm_event here could not be
+            // woken by rdma_destroy_event_channel and wedged shutdown().)
+            struct pollfd pfd{};
+            pfd.fd = efd;
+            pfd.events = POLLIN;
+            int pr = ::poll(&pfd, 1, 100);
+            if (pr <= 0) continue;  // timeout/spurious - re-check shuttingDown_
+            if (rdma_get_cm_event(eventChannel_, &event) != 0) {
+                if (errno == EAGAIN || errno == EINTR) continue;
+                break;  // channel dead - exit; shutdown() cleans up
+            }
             struct rdma_cm_event evt = *event;
             rdma_ack_cm_event(event);
 

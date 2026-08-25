@@ -644,7 +644,7 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
             VkPhysicalDevice physDev = localPools_[0].getPhysicalDevice();
             VkPhysicalDeviceProperties props{};
             vkGetPhysicalDeviceProperties(physDev, &props);
-            
+
             // AMD/Intel on Linux: prefer DMA-BUF for better cross-vendor compatibility
             // NVIDIA: OPAQUE_FD is fine
             if (props.vendorID == 0x1002 || props.vendorID == 0x8086) {

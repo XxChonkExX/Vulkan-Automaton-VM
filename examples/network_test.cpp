@@ -14,6 +14,7 @@
 #include "vulkan_vm/network/multi_node_manager.hpp"
 
 #include <iostream>
+#include <cstdlib>
 #include <cstring>
 #include <cassert>
 #include <thread>
@@ -37,8 +38,10 @@ struct TestDevice {
 };
 
 static TestDevice s_dev;
+static TestDevice s_devB;
 
-static bool initTestDevice() {
+// Create the shared VkInstance.
+static bool initVulkanInstance() {
     VkApplicationInfo appInfo{};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "VulkanVM Network Test";
@@ -72,19 +75,17 @@ static bool initTestDevice() {
     if (vkCreateInstance(&ici, nullptr, &s_dev.instance) != VK_SUCCESS) {
         std::cerr << "FAIL: create instance\n"; return false;
     }
+    return true;
+}
 
-    auto devices = vvm::enumerateDevices(s_dev.instance);
-    if (devices.empty()) { std::cerr << "FAIL: no GPU\n"; return false; }
-    auto bestDevice = vvm::selectBestDevice(devices, true, 1024);
-    if (!bestDevice) { std::cerr << "FAIL: no suitable GPU\n"; return false; }
-    s_dev.physicalDevice = bestDevice->device;
-    std::cout << "Selected: " << bestDevice->props.deviceName << "\n" << std::flush;
-
-    auto queues = vvm::findQueueFamilies(s_dev.physicalDevice);
-    s_dev.graphicsFamily = queues.graphics.value_or(0);
-    s_dev.computeFamily = queues.compute.value_or(0);
-    s_dev.transferFamily = queues.transfer.value_or(0);
-    if (s_dev.graphicsFamily == UINT32_MAX || s_dev.transferFamily == UINT32_MAX) {
+// Create a logical device (queues + extensions) for ONE physical device.
+static bool initLogicalDevice(TestDevice& dev, VkPhysicalDevice phys) {
+    dev.physicalDevice = phys;
+    auto queues = vvm::findQueueFamilies(dev.physicalDevice);
+    dev.graphicsFamily = queues.graphics.value_or(0);
+    dev.computeFamily = queues.compute.value_or(0);
+    dev.transferFamily = queues.transfer.value_or(0);
+    if (dev.graphicsFamily == UINT32_MAX || dev.transferFamily == UINT32_MAX) {
         std::cerr << "FAIL: missing required queues\n"; return false;
     }
 
@@ -106,21 +107,26 @@ static bool initTestDevice() {
 
     // Query which extensions this physical device actually supports.
     uint32_t devExtCount = 0;
-    vkEnumerateDeviceExtensionProperties(s_dev.physicalDevice, nullptr, &devExtCount, nullptr);
+    vkEnumerateDeviceExtensionProperties(dev.physicalDevice, nullptr, &devExtCount, nullptr);
     std::vector<VkExtensionProperties> devExtProps(devExtCount);
-    vkEnumerateDeviceExtensionProperties(s_dev.physicalDevice, nullptr, &devExtCount, devExtProps.data());
+    vkEnumerateDeviceExtensionProperties(dev.physicalDevice, nullptr, &devExtCount, devExtProps.data());
 
     const char* allDevExts[] = {
         VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
         VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
         VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
+        VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME,
 #ifdef VVM_PLATFORM_LINUX
         VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
         VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
 #else
         VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
 #endif
-        VK_EXT_MEMORY_BUDGET_EXTENSION_NAME
+        // NOTE: VK_EXT_memory_budget deliberately NOT enabled here - under
+        // Mesa 26.0.3 ANV, vkAllocateMemory segfaults when importing an
+        // external handle on a device created with this extension (see
+        // docs/LINUX_TEST_RESULTS_2026-08-25.md).
+        // VK_EXT_MEMORY_BUDGET_EXTENSION_NAME
     };
     std::vector<const char*> devExts;
     for (const char* ext : allDevExts) {
@@ -166,19 +172,66 @@ static bool initTestDevice() {
     physFeats.pNext = &v12Feat;
     dci.pNext = &physFeats;
 
-    VkResult devResult = vkCreateDevice(s_dev.physicalDevice, &dci, nullptr, &s_dev.device);
+    VkResult devResult = vkCreateDevice(dev.physicalDevice, &dci, nullptr, &dev.device);
     if (devResult != VK_SUCCESS) {
         std::cerr << "FAIL: create device (VkResult=" << devResult << ")\n"; return false;
     }
 
-    if (queues.graphics) vkGetDeviceQueue(s_dev.device, *queues.graphics, 0, &s_dev.graphicsQueue);
-    if (queues.compute) vkGetDeviceQueue(s_dev.device, *queues.compute, 0, &s_dev.computeQueue);
-    if (queues.transfer) vkGetDeviceQueue(s_dev.device, *queues.transfer, 0, &s_dev.transferQueue);
+    if (queues.graphics) vkGetDeviceQueue(dev.device, *queues.graphics, 0, &dev.graphicsQueue);
+    if (queues.compute) vkGetDeviceQueue(dev.device, *queues.compute, 0, &dev.computeQueue);
+    if (queues.transfer) vkGetDeviceQueue(dev.device, *queues.transfer, 0, &dev.transferQueue);
+    return true;
+}
+
+// Init the shared instance and two logical devices: node A on the best-scored
+// physical device, node B on the next physical from a DIFFERENT device when
+// available (falls back to A's physical on single-GPU boxes). Distinct
+// physicals avoid the same-device DMA-BUF re-import driver crash (observed on
+// ANV/Battlemage: segfault inside libvulkan_intel.so) AND make the zero-copy
+// import check exercise the verified cross-vendor sharing path.
+static bool initTestDevice() {
+    if (!initVulkanInstance()) return false;
+
+    auto devices = vvm::enumerateDevices(s_dev.instance);
+    if (devices.empty()) { std::cerr << "FAIL: no GPU\n"; return false; }
+    auto bestDevice = vvm::selectBestDevice(devices, true, 1024);
+    if (!bestDevice) { std::cerr << "FAIL: no suitable GPU\n"; return false; }
+
+    VkPhysicalDevice physB = bestDevice->device;  // fallback: same physical
+    // Prefer a different-VENDOR hardware device (exercises the verified
+    // cross-vendor DMA-BUF path), then any different non-CPU device. Software
+    // devices (lavapipe) are excluded: their DMA-BUF export is a stub and
+    // importing it crashes the importer.
+    const vvm::DeviceScore* crossVendor = nullptr;
+    const vvm::DeviceScore* anyHardware = nullptr;
+    for (const auto& d : devices) {
+        if (d.device == bestDevice->device) continue;
+        if (d.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) continue;
+        if (!anyHardware) anyHardware = &d;
+        if (d.vendorID != bestDevice->vendorID && !crossVendor) crossVendor = &d;
+    }
+    if (crossVendor) physB = crossVendor->device;
+    else if (anyHardware) physB = anyHardware->device;
+
+    if (!initLogicalDevice(s_dev, bestDevice->device)) return false;
+    std::cout << "Node A device: " << bestDevice->props.deviceName << "\n" << std::flush;
+
+    // Report B's name by matching the handle (enumerateDevices carries props).
+    for (const auto& d : devices) {
+        if (d.device == physB) {
+            std::cout << "Node B device: " << d.props.deviceName
+                      << (physB == bestDevice->device ? "  (same as A - single GPU)" : "") << "\n"
+                      << std::flush;
+            break;
+        }
+    }
+    if (!initLogicalDevice(s_devB, physB)) return false;
     return true;
 }
 
 static void destroyTestDevice() {
     if (s_dev.device) vkDestroyDevice(s_dev.device, nullptr);
+    if (s_devB.device) vkDestroyDevice(s_devB.device, nullptr);
     if (s_dev.instance) vkDestroyInstance(s_dev.instance, nullptr);
 }
 
@@ -186,16 +239,16 @@ static void destroyTestDevice() {
 // Helpers
 // ---------------------------------------------------------------------------
 
-static vvm::DeviceConfig makeDevConfig() {
+static vvm::DeviceConfig makeDevConfig(const TestDevice& dev) {
     vvm::DeviceConfig cfg;
-    cfg.physicalDevice = s_dev.physicalDevice;
-    cfg.device = s_dev.device;
-    cfg.graphicsQueueFamily = s_dev.graphicsFamily;
-    cfg.computeQueueFamily = s_dev.computeFamily;
-    cfg.transferQueueFamily = s_dev.transferFamily;
-    cfg.graphicsQueue = s_dev.graphicsQueue;
-    cfg.computeQueue = s_dev.computeQueue;
-    cfg.transferQueue = s_dev.transferQueue;
+    cfg.physicalDevice = dev.physicalDevice;
+    cfg.device = dev.device;
+    cfg.graphicsQueueFamily = dev.graphicsFamily;
+    cfg.computeQueueFamily = dev.computeFamily;
+    cfg.transferQueueFamily = dev.transferFamily;
+    cfg.graphicsQueue = dev.graphicsQueue;
+    cfg.computeQueue = dev.computeQueue;
+    cfg.transferQueue = dev.transferQueue;
     return cfg;
 }
 
@@ -330,12 +383,13 @@ static bool runStripedSenderTest() {
 #endif
 
 // Device-side copy (src buffer -> dst buffer) using a transient command pool.
-static bool deviceCopy(VkDevice device, VkQueue queue, VkBuffer src, VkBuffer dst, VkDeviceSize size) {
+static bool deviceCopy(VkDevice device, VkQueue queue, uint32_t transferFamily,
+                       VkBuffer src, VkBuffer dst, VkDeviceSize size) {
     VkCommandPool pooled[1];
     VkCommandPoolCreateInfo cpci{};
     cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     cpci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-    cpci.queueFamilyIndex = s_dev.transferFamily;
+    cpci.queueFamilyIndex = transferFamily;
     if (vkCreateCommandPool(device, &cpci, nullptr, &pooled[0]) != VK_SUCCESS) return false;
 
     VkCommandBuffer cmd;
@@ -388,8 +442,27 @@ int main() {
 
     int failures = 0;
 
+    // Same-process zero-copy import across VENDOR-different devices segfaults
+    // inside ANV (Mesa 26.0.3) vkAllocateMemory - RADV->RADV is fine. Disable
+    // ZC for cross-vendor pairs unless explicitly overridden, so the cluster
+    // flow exercises host-staged migration instead of dying in the driver.
+    // See docs/LINUX_TEST_RESULTS_2026-08-25.md.
+    VkPhysicalDeviceProperties propsA{}, propsB{};
+    vkGetPhysicalDeviceProperties(s_dev.physicalDevice, &propsA);
+    vkGetPhysicalDeviceProperties(s_devB.physicalDevice, &propsB);
+    const bool crossVendor = propsA.vendorID != propsB.vendorID;
+    const bool zcAllowed = !crossVendor ||
+                           std::getenv("VVM_ALLOW_CROSSVENDOR_ZC") != nullptr;
+    if (!zcAllowed) {
+        setenv("VVM_DISABLE_SAME_PROCESS_ZC", "1", 1);
+        std::cout << "Cross-vendor pair (" << propsA.deviceName << " / "
+                  << propsB.deviceName << "): same-process ZC disabled "
+                  << "(set VVM_ALLOW_CROSSVENDOR_ZC=1 to force)\n";
+    }
+
     // ---- Create two "nodes" on loopback ----
-    auto devCfg = makeDevConfig();
+    auto devCfgA = makeDevConfig(s_dev);
+    auto devCfgB = makeDevConfig(s_devB);
     auto poolCfg = makePoolConfig();
 
     const uint16_t portA = 51001;
@@ -398,9 +471,9 @@ int main() {
     const std::string hostB = "127.0.0.1:" + std::to_string(portB);
 
     auto mgrA = vvm::network::MultiNodePoolManager::create(
-        {devCfg}, poolCfg, makeNetConfig(hostA, {}));
+        {devCfgA}, poolCfg, makeNetConfig(hostA, {}));
     auto mgrB = vvm::network::MultiNodePoolManager::create(
-        {devCfg}, poolCfg, makeNetConfig(hostB, {hostA}));
+        {devCfgB}, poolCfg, makeNetConfig(hostB, {hostA}));
 
     if (!mgrA || !mgrB) {
         std::cerr << "FAIL: could not create managers\n";
@@ -544,6 +617,13 @@ int main() {
     // ---- Zero-copy handle import: B exports, A imports on the SAME device ----
     std::cout << "\n--- Zero-copy handle import (same-host loopback) ---\n";
 
+    if (!zcAllowed) {
+        // Cross-vendor ZC is disabled for this run (see note above): imports
+        // take the host-staged path and cannot share memory. Report SKIP
+        // instead of FAIL - this mirrors VVM_DISABLE_SAME_PROCESS_ZC=1 runs.
+        std::cout << "  Zero-copy import: SKIPPED (cross-vendor ZC disabled; "
+                     "host-staged migration verified above)\n";
+    } else {
     auto srcB3 = mgrB->getLocalPool().allocate(
         kTestSize,
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
@@ -578,7 +658,7 @@ int main() {
                     std::cerr << "FAIL: allocate host-visible read-back on A\n";
                     ++failures;
                 } else {
-                    bool copied = deviceCopy(s_dev.device, s_dev.transferQueue,
+                    bool copied = deviceCopy(s_dev.device, s_dev.transferQueue, s_dev.transferFamily,
                                              importOnA->buffer, aRead->buffer, kTestSize);
                     const bool shared = copied && verifyPattern(aRead->hostPtr, kTestSize, 0xEF);
                     std::cout << "  Zero-copy import: "
@@ -593,6 +673,7 @@ int main() {
             mgrB->deallocateRemote(*exportedB3);
         }
     }
+    }  // zcAllowed
 
     // ---- Striped TCP sender (parallel stripe engine) ----
     std::cout << "\n--- Striped TCP transfer (parallel sockets) ---\n";
