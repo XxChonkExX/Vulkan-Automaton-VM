@@ -56,7 +56,9 @@ jobs:
           -DVVM_ENABLE_VALIDATION=OFF
 
       - name: Build
-        run: cmake --build build -j"$(nproc)"
+        run: |
+          set -o pipefail
+          cmake --build build -j"$(nproc)" 2>&1 | tee build.log || { echo "=== BUILD ERROR (last 120 lines) ==="; tail -n 120 build.log; exit 1; }
 
       - name: CPU-only tests
         run: |
@@ -84,11 +86,15 @@ jobs:
       - name: Verify Vulkan SDK present
         shell: pwsh
         run: |
-          if (-not (Test-Path "$env:VULKAN_SDK\Include\vulkan")) {
+          echo "VULKAN_SDK=$env:VULKAN_SDK"
+          if (Test-Path "$env:VULKAN_SDK\Include\vulkan") { echo "SDK headers OK" }
+          else {
+            echo "SDK missing - installing..."
             Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe" -OutFile vulkan-sdk.exe
             .\vulkan-sdk.exe --silent --accept-licenses --default-answer --confirm-command install
-          } else {
-            echo "VULKAN_SDK=$env:VULKAN_SDK"
+            echo "post-install VULKAN_SDK check:"
+            Get-ChildItem "C:\Program Files\LunarG" -Directory -ErrorAction SilentlyContinue | ForEach-Object { "  $($_.FullName)" }
+            if (-not (Test-Path "$env:VULKAN_SDK\Include\vulkan")) { echo "SDK INSTALL FAILED"; exit 1 }
           }
 
       - name: Set up MSVC environment
@@ -113,7 +119,7 @@ jobs:
         shell: cmd
 
       - name: Build
-        run: cmake --build build --config Release
+        run: cmake --build build --config Release > build.log 2>&1 || (type build.log & exit /b 1)
         shell: cmd
 
       - name: CPU-only tests
@@ -149,4 +155,6 @@ jobs:
             -DVVM_BUILD_TESTS=OFF -DVVM_BUILD_EXAMPLES=OFF
           cmake --build build-android -j"$(nproc)"
         shell: bash
+
+
 
