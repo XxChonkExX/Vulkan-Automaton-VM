@@ -86,16 +86,27 @@ jobs:
       - name: Verify Vulkan SDK present
         shell: pwsh
         run: |
-          echo "VULKAN_SDK=$env:VULKAN_SDK"
-          if (Test-Path "$env:VULKAN_SDK\Include\vulkan") { echo "SDK headers OK" }
-          else {
-            echo "SDK missing - installing..."
+          # The runner may have the SDK installed WITHOUT the VULKAN_SDK env
+          # (observed: C:\VulkanSDK\1.4.357.0 present, env empty). Detect it.
+          $sdk = $env:VULKAN_SDK
+          if (-not $sdk -or -not (Test-Path "$sdk\Include\vulkan")) {
+            $found = Get-ChildItem "C:\VulkanSDK" -Directory -ErrorAction SilentlyContinue |
+                     Sort-Object Name -Version | Select-Object -Last 1
+            if ($found) { $sdk = $found.FullName }
+          }
+          if (-not $sdk -or -not (Test-Path "$sdk\Include\vulkan")) {
+            echo "No SDK found - installing latest..."
             Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe" -OutFile vulkan-sdk.exe
             .\vulkan-sdk.exe --silent --accept-licenses --default-answer --confirm-command install
-            echo "post-install VULKAN_SDK check:"
-            Get-ChildItem "C:\Program Files\LunarG" -Directory -ErrorAction SilentlyContinue | ForEach-Object { "  $($_.FullName)" }
-            if (-not (Test-Path "$env:VULKAN_SDK\Include\vulkan")) { echo "SDK INSTALL FAILED"; exit 1 }
+            $found = Get-ChildItem "C:\VulkanSDK" -Directory -ErrorAction SilentlyContinue |
+                     Sort-Object Name -Version | Select-Object -Last 1
+            $sdk = $found.FullName
           }
+          echo "VULKAN_SDK=$sdk"
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=$sdk"
+          Add-Content $env:GITHUB_PATH "$sdk\Bin"
+          if (-not (Test-Path "$sdk\Include\vulkan")) { echo "SDK INSTALL FAILED"; exit 1 }
+          echo "SDK headers OK"
 
       - name: Set up MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -155,6 +166,7 @@ jobs:
             -DVVM_BUILD_TESTS=OFF -DVVM_BUILD_EXAMPLES=OFF
           cmake --build build-android -j"$(nproc)"
         shell: bash
+
 
 
 

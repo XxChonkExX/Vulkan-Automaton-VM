@@ -190,8 +190,7 @@ target_include_directories(vulkan_vm
     PRIVATE
         ${Vulkan_INCLUDE_DIRS}
 )
-target_link_libraries(vulkan_vm PRIVATE
-    ${Vulkan_LIBRARIES}
+target_link_libraries(vulkan_vm PUBLIC ${Vulkan_LIBRARIES}
     Threads::Threads
 )
 
@@ -321,6 +320,7 @@ install(EXPORT VulkanVMTargets
     FILE VulkanVMTargets.cmake
     DESTINATION lib/cmake/VulkanVM
 )
+
 
 
 

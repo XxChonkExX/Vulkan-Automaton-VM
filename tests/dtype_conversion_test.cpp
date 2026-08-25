@@ -4,6 +4,7 @@
 
 #include "vulkan_vm/tensor_transport.hpp"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -218,3 +219,4 @@ int main() {
     std::printf("\n%d checks, %d failures\n", checks, failures);
     return failures > 0 ? 1 : 0;
 }
+
