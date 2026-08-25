@@ -545,7 +545,15 @@ bool UnifiedMemoryPool::wouldExceedBudget(VkDeviceSize additionalBytes) const {
                 heapBudget = memProps.memoryHeaps[deviceLocalHeapIndex_].size;
             }
         }
-        const VkDeviceSize cap = static_cast<VkDeviceSize>(heapBudget * config_.maxHeapFraction);
+        // Cap against the STATIC heap size, not the dynamic budget: VK_EXT
+        // budget fluctuates with desktop/other-process VRAM usage, so a
+        // budget-based cap fails unpredictably (measured: 256K q8 workload
+        // at ~92% VRAM failed at fraction 0.95/0.98). Spill occurs when
+        // system-wide usage crosses the heap size - that is the ceiling.
+        const VkDeviceSize heapSize = (deviceLocalHeapIndex_ < memProps.memoryHeapCount)
+            ? memProps.memoryHeaps[deviceLocalHeapIndex_].size
+            : heapBudget;
+        const VkDeviceSize cap = static_cast<VkDeviceSize>(heapSize * config_.maxHeapFraction);
         if (heapUsed + additionalBytes > cap) {
             VVM_LOG_WARN("budget: heap usage {} MB + {} MB would exceed {} MB ({:.0f}% of {} MB); allocate() failing soft instead of stealing VRAM",
                          heapUsed / (1024 * 1024), additionalBytes / (1024 * 1024),
@@ -663,13 +671,32 @@ std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
     // should use allocateDedicatedExportable() instead.
 
     allocInfo.pNext = pNext;
-    
+
     VkDeviceMemory memory;
     VkResult result = vkAllocateMemory(device_, &allocInfo, nullptr, &memory);
     if (result != VK_SUCCESS) {
-        VVM_LOG_ERROR("vkAllocateMemory failed: {} (size={}, type={})", 
+        VVM_LOG_ERROR("vkAllocateMemory failed: {} (size={}, type={})",
                       vkResultToString(result).c_str(), size, memoryTypeIndex);
         return std::nullopt;
+    }
+
+    // VRAM high-water warning (VRAM_OVERFLOW_FINDINGS.md): committing past
+    // ~90% of the device-local heap lets the driver spill to shared memory,
+    // which silently halves decode throughput. Warn once per pool.
+    if (config_.maxHeapFraction > 0.0f && !warnedHighWater_) {
+        auto info = getDeviceMemoryInfo();
+        if (deviceLocalHeapIndex_ < VK_MAX_MEMORY_HEAPS) {
+            const VkDeviceSize budget = info.budget.heapBudget[deviceLocalHeapIndex_];
+            const VkDeviceSize used = info.budget.heapUsage[deviceLocalHeapIndex_];
+            if (budget > 0 && used > (VkDeviceSize)(budget * 0.90)) {
+                VVM_LOG_WARN("heap {} is {}% committed - the driver may spill to "
+                             "shared memory and ~2x decode throughput. Reduce "
+                             "context/model or rebalance across GPUs.",
+                             deviceLocalHeapIndex_,
+                             (int)(used * 100 / budget));
+                warnedHighWater_ = true;
+            }
+        }
     }
     
     // Map if host-visible
