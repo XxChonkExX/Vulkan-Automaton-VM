@@ -91,7 +91,7 @@ jobs:
           $sdk = $env:VULKAN_SDK
           if (-not $sdk -or -not (Test-Path "$sdk\Include\vulkan")) {
             $found = Get-ChildItem "C:\VulkanSDK" -Directory -ErrorAction SilentlyContinue |
-                     Sort-Object Name -Version | Select-Object -Last 1
+                     Sort-Object Name | Select-Object -Last 1
             if ($found) { $sdk = $found.FullName }
           }
           if (-not $sdk -or -not (Test-Path "$sdk\Include\vulkan")) {
@@ -99,7 +99,7 @@ jobs:
             Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe" -OutFile vulkan-sdk.exe
             .\vulkan-sdk.exe --silent --accept-licenses --default-answer --confirm-command install
             $found = Get-ChildItem "C:\VulkanSDK" -Directory -ErrorAction SilentlyContinue |
-                     Sort-Object Name -Version | Select-Object -Last 1
+                     Sort-Object Name | Select-Object -Last 1
             $sdk = $found.FullName
           }
           echo "VULKAN_SDK=$sdk"
@@ -166,6 +166,7 @@ jobs:
             -DVVM_BUILD_TESTS=OFF -DVVM_BUILD_EXAMPLES=OFF
           cmake --build build-android -j"$(nproc)"
         shell: bash
+
 
 
 
