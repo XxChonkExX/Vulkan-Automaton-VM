@@ -151,7 +151,7 @@ static void shutdown() {
     if (!vvm_torch::pool()) return;
     // Allocator blocks hold pool memory: release them first, then the pool
     // (shutdownPoolCore also disposes any kept allocations).
-    vvm_torch_chonk_allocator_reset();
+    vvm_torch::vvm_torch_chonk_allocator_reset();
     vvm_torch::shutdownPoolCore();
 }
 
