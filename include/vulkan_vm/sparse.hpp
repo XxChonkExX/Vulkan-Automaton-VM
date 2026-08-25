@@ -53,7 +53,7 @@ struct SparsePage {
     bool bound = false;
 };
 
-class SparseVirtualMemoryPool {
+class VVM_API SparseVirtualMemoryPool {
 public:
     static std::optional<SparseVirtualMemoryPool> create(
         const DeviceConfig& device,
