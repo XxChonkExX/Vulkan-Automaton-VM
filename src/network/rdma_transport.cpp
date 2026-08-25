@@ -190,6 +190,11 @@ public:
         }
 
         registeredRegions_.clear();
+        if (connPd_) {
+            ibv_dealloc_pd(connPd_);
+            connPd_ = nullptr;
+        }
+        connCtx_ = nullptr;
         if (pd_) {
             ibv_dealloc_pd(pd_);
             pd_ = nullptr;
@@ -214,7 +219,8 @@ public:
         VkDeviceSize size,
         VkBuffer buffer) override {
 
-        if (!pd_ || !memory || size == 0) return std::nullopt;
+        struct ibv_pd* regPd = effectivePd(connCtx_);
+        if (!regPd || !memory || size == 0) return std::nullopt;
 
         GpuDirectConfig gpuConfig;
         gpuConfig.vkDevice = device_;
@@ -263,7 +269,7 @@ public:
                 const int accessFlags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                                         IBV_ACCESS_REMOTE_READ;
                 void* barAddr = reg->remoteAddress;
-                mr = ibv_reg_mr(pd_, barAddr, size, accessFlags);
+                mr = ibv_reg_mr(effectivePd(connCtx_), barAddr, size, accessFlags);
                 if (mr) {
                     VVM_LOG_INFO("NVIDIA GPUDirect registered with peermem: lkey={}, rkey={}",
                                  mr->lkey, mr->rkey);
@@ -304,7 +310,7 @@ public:
 
             const int accessFlags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                                     IBV_ACCESS_REMOTE_READ;
-            struct ibv_mr* mr = ibv_reg_dmabuf_mr(pd_, offset, size, 0, dmaBufFd, accessFlags);
+            struct ibv_mr* mr = ibv_reg_dmabuf_mr(effectivePd(connCtx_), offset, size, 0, dmaBufFd, accessFlags);
             if (!mr) {
                 VVM_LOG_WARN("ibv_reg_dmabuf_mr failed for Intel ({}), falling back to mmap",
                              strerror(errno));
@@ -314,7 +320,7 @@ public:
                     close(dmaBufFd);
                     return std::nullopt;
                 }
-                mr = ibv_reg_mr(pd_, mappedVa, size, accessFlags);
+                mr = ibv_reg_mr(effectivePd(connCtx_), mappedVa, size, accessFlags);
                 if (!mr) {
                     VVM_LOG_ERROR("ibv_reg_mr on mapped DMA-BUF failed: {}", strerror(errno));
                     munmap(mappedVa, size);
@@ -324,7 +330,8 @@ public:
                 region.addr = mappedVa;
                 region.lkey = mr->lkey;
                 region.rkey = mr->rkey;
-                region.rdmaAddr = 0;
+                // CPU VA of the mapped DMA-BUF is the remote-accessible address.
+                region.rdmaAddr = reinterpret_cast<uint64_t>(mappedVa);
                 {
                     std::lock_guard<std::mutex> lock(regionsMutex_);
                     registeredRegions_[mr] = region;
@@ -370,7 +377,7 @@ public:
             const int accessFlags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                                     IBV_ACCESS_REMOTE_READ;
 
-            struct ibv_mr* mr = ibv_reg_dmabuf_mr(pd_, offset, size, 0, dmaBufFd, accessFlags);
+            struct ibv_mr* mr = ibv_reg_dmabuf_mr(effectivePd(connCtx_), offset, size, 0, dmaBufFd, accessFlags);
             if (!mr) {
                 VVM_LOG_WARN("ibv_reg_dmabuf_mr failed for AMD ({}), falling back to mmap",
                              strerror(errno));
@@ -380,7 +387,7 @@ public:
                     close(dmaBufFd);
                     return std::nullopt;
                 }
-                mr = ibv_reg_mr(pd_, mappedVa, size, accessFlags);
+                mr = ibv_reg_mr(effectivePd(connCtx_), mappedVa, size, accessFlags);
                 if (!mr) {
                     VVM_LOG_ERROR("ibv_reg_mr on mapped DMA-BUF failed: {}", strerror(errno));
                     munmap(mappedVa, size);
@@ -390,7 +397,8 @@ public:
                 region.addr = mappedVa;
                 region.lkey = mr->lkey;
                 region.rkey = mr->rkey;
-                region.rdmaAddr = 0;
+                // CPU VA of the mapped DMA-BUF is the remote-accessible address.
+                region.rdmaAddr = reinterpret_cast<uint64_t>(mappedVa);
                 {
                     std::lock_guard<std::mutex> lock(regionsMutex_);
                     registeredRegions_[mr] = region;
@@ -419,12 +427,13 @@ public:
     }
 
     std::optional<RdmaMemoryRegion> registerHostMemory(void* ptr, size_t size) override {
-        if (!pd_ || !ptr || size == 0) return std::nullopt;
+        struct ibv_pd* regPd = effectivePd(connCtx_);
+        if (!regPd || !ptr || size == 0) return std::nullopt;
 
         int accessFlags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                           IBV_ACCESS_REMOTE_READ;
 
-        struct ibv_mr* mr = ibv_reg_mr(pd_, ptr, size, accessFlags);
+        struct ibv_mr* mr = ibv_reg_mr(regPd, ptr, size, accessFlags);
         if (!mr) {
             VVM_LOG_ERROR("Failed to register host memory: {}", strerror(errno));
             return std::nullopt;
@@ -438,6 +447,9 @@ public:
         region.ownsMemory = false;
         region.vkMemory = VK_NULL_HANDLE;
         region.vkBuffer = VK_NULL_HANDLE;
+        // The registered CPU VA is the remote-accessible address for host
+        // memory (this is what peers put into wr.wr.rdma.remote_addr).
+        region.rdmaAddr = reinterpret_cast<uint64_t>(ptr);
 
         {
             std::lock_guard<std::mutex> lock(regionsMutex_);
@@ -466,13 +478,45 @@ public:
     // Connections
     // ------------------------------------------------------------------------
 
+    // Pump the connection's event channel until the wanted completion (or an
+    // error) arrives. NOTE: do NOT use librdmacm's synchronous mode here
+    // (calling rdma_resolve_route without draining events): on rdma-core 61
+    // with kernel >= 6.15 rxe that segfaults inside rdma_resolve_route()
+    // (reproduced standalone). Event-driven resolution is the pattern every
+    // rdma-core tool uses and works on the same stack.
+    static int waitCmEvent(struct rdma_event_channel* ec, enum rdma_cm_event_type want,
+                           const std::string& host, uint32_t port) {
+        struct rdma_cm_event* ev = nullptr;
+        while (rdma_get_cm_event(ec, &ev) == 0) {
+            enum rdma_cm_event_type t = ev->event;
+            rdma_ack_cm_event(ev);
+            if (t == want) return 0;
+            switch (t) {
+                case RDMA_CM_EVENT_ADDR_ERROR:
+                case RDMA_CM_EVENT_ROUTE_ERROR:
+                case RDMA_CM_EVENT_REJECTED:
+                case RDMA_CM_EVENT_CONNECT_ERROR:
+                case RDMA_CM_EVENT_UNREACHABLE:
+                case RDMA_CM_EVENT_DISCONNECTED:
+                    VVM_LOG_WARN("connect: CM error while awaiting {}: {} ({})",
+                                 rdma_event_str(want), rdma_event_str(t), static_cast<int>(t));
+                    return -1;
+                default:
+                    break;  // transient intermediate event - keep waiting
+            }
+        }
+        VVM_LOG_WARN("connect: rdma_get_cm_event failed awaiting {} for {}:{}: {}",
+                     rdma_event_str(want), host, port, strerror(errno));
+        return -1;
+    }
+
     std::optional<RdmaConnection> connect(
         const std::string& host,
         uint32_t port,
         uint32_t nodeIndex) override {
 
         if (!isReady()) return std::nullopt;
-        std::lock_guard<std::mutex> lock(connCreateMutex_);
+        std::lock_guard<std::recursive_mutex> lock(connCreateMutex_);
 
         struct rdma_event_channel* ec = rdma_create_event_channel();
         if (!ec) {
@@ -505,6 +549,11 @@ public:
             rdma_destroy_event_channel(ec);
             return std::nullopt;
         }
+        if (waitCmEvent(ec, RDMA_CM_EVENT_ADDR_RESOLVED, host, port)) {
+            rdma_destroy_id(id);
+            rdma_destroy_event_channel(ec);
+            return std::nullopt;
+        }
         if (rdma_resolve_route(id, 5000)) {
             VVM_LOG_ERROR("connect: rdma_resolve_route failed for {}: {}",
                           host, strerror(errno));
@@ -512,8 +561,24 @@ public:
             rdma_destroy_event_channel(ec);
             return std::nullopt;
         }
+        if (waitCmEvent(ec, RDMA_CM_EVENT_ROUTE_RESOLVED, host, port)) {
+            rdma_destroy_id(id);
+            rdma_destroy_event_channel(ec);
+            return std::nullopt;
+        }
 
-        struct ibv_cq* cq = ibv_create_cq(context_, 1024, nullptr, nullptr, 0);
+        // The CM bound this id to its own ibv_context; PD and CQ must live on
+        // that same context or rdma_create_qp fails with EINVAL.
+        struct ibv_context* vctx = id->verbs;
+        struct ibv_pd* qpd = effectivePd(vctx);
+        if (!qpd) {
+            VVM_LOG_ERROR("connect: no usable protection domain");
+            rdma_destroy_id(id);
+            rdma_destroy_event_channel(ec);
+            return std::nullopt;
+        }
+
+        struct ibv_cq* cq = ibv_create_cq(vctx, 1024, nullptr, nullptr, 0);
         if (!cq) {
             VVM_LOG_ERROR("connect: failed to create CQ");
             rdma_destroy_id(id);
@@ -531,7 +596,7 @@ public:
         qpAttr.recv_cq = cq;
         qpAttr.sq_sig_all = 1;
 
-        if (rdma_create_qp(id, pd_, &qpAttr)) {
+        if (rdma_create_qp(id, qpd, &qpAttr)) {
             VVM_LOG_ERROR("connect: failed to create QP: {}", strerror(errno));
             ibv_destroy_cq(cq);
             rdma_destroy_id(id);
@@ -553,6 +618,14 @@ public:
             rdma_destroy_event_channel(ec);
             return std::nullopt;
         }
+        // Wait for ESTABLISHED (or an error) on the connection's channel.
+        if (waitCmEvent(ec, RDMA_CM_EVENT_ESTABLISHED, host, port)) {
+            rdma_destroy_qp(id);
+            ibv_destroy_cq(cq);
+            rdma_destroy_id(id);
+            rdma_destroy_event_channel(ec);
+            return std::nullopt;
+        }
 
         auto info = std::make_shared<ConnectionInfo>();
         info->id = id;
@@ -563,6 +636,10 @@ public:
         info->remoteHost = host;
         info->remotePort = port;
         info->nodeIndex = nodeIndex;
+        // NOTE: ESTABLISHED was already confirmed by waitCmEvent() above; the
+        // per-connection event loop from here on only handles DISCONNECTED
+        // and friends, so no condvar wait for connected is needed.
+        info->connected = true;
 
         {
             std::lock_guard<std::mutex> cLock(connectionsMutex_);
@@ -572,23 +649,6 @@ public:
         {
             std::lock_guard<std::mutex> tLock(connThreadsMutex_);
             connThreads_.emplace_back(&VerbsRdmaTransport::connectionEventLoop, this, info);
-        }
-
-        // Block until ESTABLISHED (or a definitive failure).
-        {
-            std::unique_lock<std::mutex> wLock(info->mutex);
-            if (!info->cv.wait_for(wLock, std::chrono::seconds(15),
-                                   [&] { return info->connected || info->failed; })) {
-                VVM_LOG_ERROR("connect: timed out establishing RDMA connection to {}:{}",
-                              host, port);
-                rdma_disconnect(id);
-                // Let the event loop clean up asynchronously.
-                return std::nullopt;
-            }
-            if (!info->connected) {
-                VVM_LOG_ERROR("connect: RDMA connection to {}:{} failed", host, port);
-                return std::nullopt;
-            }
         }
 
         VVM_LOG_INFO("connect: RDMA established to {}:{} (ports {} qp {} rkey-ready)",
@@ -850,7 +910,17 @@ private:
     }
 
     void handleConnectRequest(struct rdma_cm_id* id) {
-        struct ibv_cq* cq = ibv_create_cq(context_, 1024, nullptr, nullptr, 0);
+        // The child id lives on the listener CM's ibv_context (id->verbs);
+        // PD and CQ must come from that same context (see effectivePd note).
+        struct ibv_context* vctx = id->verbs;
+        struct ibv_pd* qpd = effectivePd(vctx);
+        if (!qpd) {
+            VVM_LOG_ERROR("accept: no usable protection domain");
+            rdma_reject(id, nullptr, 0);
+            return;
+        }
+
+        struct ibv_cq* cq = ibv_create_cq(vctx, 1024, nullptr, nullptr, 0);
         if (!cq) {
             VVM_LOG_ERROR("accept: failed to create CQ");
             rdma_reject(id, nullptr, 0);
@@ -867,7 +937,7 @@ private:
         qpAttr.recv_cq = cq;
         qpAttr.sq_sig_all = 1;
 
-        if (rdma_create_qp(id, pd_, &qpAttr)) {
+        if (rdma_create_qp(id, qpd, &qpAttr)) {
             VVM_LOG_ERROR("accept: failed to create QP: {}", strerror(errno));
             ibv_destroy_cq(cq);
             rdma_reject(id, nullptr, 0);
@@ -1021,6 +1091,14 @@ private:
 
     struct ibv_context* context_ = nullptr;
     struct ibv_pd* pd_ = nullptr;
+    // PD/context for connection QPs. rdma_create_qp(id, pd, ...) requires the
+    // PD to come from the SAME ibv_context the CM bound the id to (id->verbs),
+    // which is NOT necessarily the context from our own ibv_open_device call
+    // (observed with rdma-core 61: mismatch -> rdma_create_qp EINVAL). Lazily
+    // allocate a PD on the CM's context at first connect and use it for QP
+    // creation AND all MR registrations so keys stay QP-compatible.
+    struct ibv_context* connCtx_ = nullptr;
+    struct ibv_pd* connPd_ = nullptr;
     struct rdma_event_channel* eventChannel_ = nullptr;
     struct rdma_cm_id* listener_ = nullptr;
 
@@ -1035,7 +1113,25 @@ private:
     std::unordered_map<struct ibv_mr*, RdmaMemoryRegion> registeredRegions_;
     mutable std::mutex regionsMutex_;
 
-    std::mutex connCreateMutex_;
+    // Recursive: connect() holds this for its whole body and also calls
+    // effectivePd() internally.
+    std::recursive_mutex connCreateMutex_;
+
+    // Returns the PD that QPs and MR registrations should use. Prefers a PD
+    // allocated on the CM-bound context once known.
+    struct ibv_pd* effectivePd(struct ibv_context* preferred) {
+        std::lock_guard<std::recursive_mutex> lock(connCreateMutex_);
+        if (preferred && preferred != connCtx_) {
+            if (connPd_) { ibv_dealloc_pd(connPd_); connPd_ = nullptr; }
+            connCtx_ = nullptr;
+        }
+        if (preferred && !connPd_) {
+            connPd_ = ibv_alloc_pd(preferred);
+            if (connPd_) connCtx_ = preferred;
+            else VVM_LOG_WARN("effectivePd: ibv_alloc_pd on CM context failed: {}", strerror(errno));
+        }
+        return connPd_ ? connPd_ : pd_;
+    }
 };
 
 // ============================================================================

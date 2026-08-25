@@ -104,6 +104,7 @@ static bool initTestDevice() {
         VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,  // Windows
 #endif
         VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,     // Linux (DMA-BUF)
+        VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME, // Linux: required for DMA-BUF fd ops
         VK_EXT_MEMORY_BUDGET_EXTENSION_NAME
     };
     std::vector<const char*> devExts;

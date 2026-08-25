@@ -128,12 +128,22 @@ static bool tryCreateVulkan(VkInstance* outInstance, VkPhysicalDevice* outPhysDe
     }
 
     // Create devices for both GPUs
+    // NOTE: the WIN32 extension name is only declared when the Win32 platform
+    // is enabled; on Linux request the fd variant instead.
+#if defined(VK_USE_PLATFORM_WIN32_KHR) || defined(_WIN32)
     const char* wantDevExts[] = {
         VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
-        VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
         VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
         VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
     };
+#else
+    const char* wantDevExts[] = {
+        VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+        VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+        VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
+        VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
+    };
+#endif
     auto createDevice = [&](VkPhysicalDevice pd, VkDevice* outDev) -> bool {
         uint32_t devAvailCount = 0;
         vkEnumerateDeviceExtensionProperties(pd, nullptr, &devAvailCount, nullptr);
@@ -231,7 +241,14 @@ static bool testCrossVendorExportImport(VkPhysicalDevice pd0, VkDevice dev0, VkP
     std::printf("Transport 1 ready on port %u (backend: %s)\n", port1, transport1->getBackendName().c_str());
 
     // Try to connect (loopback on same machine)
-    auto conn = transport1->connect("127.0.0.1", port0, 0);
+    // NOTE: the destination must route over an interface that has an RDMA
+    // device (e.g. rxe on enpX). 127.0.0.1 routes via lo, which has no RDMA
+    // device unless rxe was added on lo, and rdma_resolve_route() crashes in
+    // librdmacm instead of failing cleanly. Allow overriding via argv[1] /
+    // VVM_RDMA_CONNECT_HOST for Soft-RoCE loopback testing.
+    const char* connectHost = std::getenv("VVM_RDMA_CONNECT_HOST");
+    if (!connectHost) connectHost = "127.0.0.1";
+    auto conn = transport1->connect(connectHost, port0, 0);
     if (!conn.has_value()) {
         std::printf("SKIP: Cross-vendor transport connection not supported in this config\n");
         return true;
@@ -280,6 +297,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Set VVM_ND_PROVIDER_DLL if not already set (for Windows/ND fake provider)
+#ifdef _WIN32
     if (!std::getenv("VVM_ND_PROVIDER_DLL")) {
         char exePath[MAX_PATH];
         if (GetModuleFileNameA(nullptr, exePath, MAX_PATH)) {
@@ -294,6 +312,7 @@ int main(int argc, char* argv[]) {
             }
         }
     }
+#endif
 
     std::printf("Starting multi-vendor RDMA test\n");
 

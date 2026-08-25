@@ -375,6 +375,27 @@ void MultiNodePoolManager::stop() {
     stopHeartbeat_ = true;
     if (heartbeatThread_.joinable()) heartbeatThread_.join();
 
+    // Sever peer links BEFORE stopping our own transport. Otherwise a peer
+    // that stops later keeps heartbeating into our serve threads, resetting
+    // their SO_RCVTIMEO windows so TcpTransport::stop()'s join on those
+    // threads never completes (cross-manager teardown deadlock observed as a
+    // hang after "MultiNodePoolManager stopped" in network_test /
+    // tensor_collective_test).
+    {
+        std::unordered_map<std::string, TcpTransport::ConnId> peers;
+        {
+            std::lock_guard<std::mutex> lock(connsMutex_);
+            peers.swap(peerConns_);
+        }
+        for (auto& [key, connId] : peers) {
+            if (!tcpTransport_) break;
+            size_t colon = key.rfind(':');
+            if (colon == std::string::npos) continue;
+            tcpTransport_->shutdownConnectionPool(key.substr(0, colon),
+                                                  static_cast<uint16_t>(std::stoul(key.substr(colon + 1))));
+        }
+    }
+
     if (tcpTransport_) {
         tcpTransport_->stop();
         tcpTransport_.reset();
@@ -1530,7 +1551,13 @@ std::optional<Allocation> MultiNodePoolManager::createLocalAllocationForImport(
     // Same-process zero-copy path: if THIS process still owns the exported
     // handle (registry keyed by owner node + allocId), import it directly.
     // Consuming moves the handle into the driver (or closes it on failure).
-    {
+    // VVM_DISABLE_SAME_PROCESS_ZC=1 forces the host-staged path; useful when
+    // a driver crashes on same-device DMA-BUF re-import (observed: ANV /
+    // Battlemage G31 segfaults inside libvulkan_intel.so when a dma-buf
+    // exported from one VkDevice is imported on a second VkDevice over the
+    // SAME physical device; cross-vendor RADV->ANV import is unaffected).
+    static const bool zcDisabled = std::getenv("VVM_DISABLE_SAME_PROCESS_ZC") != nullptr;
+    if (!zcDisabled) {
         std::lock_guard<std::mutex> lock(g_pendingExportsMutex);
         auto it = g_pendingExports.find(pendingKey(desc.owner, desc.localAllocId));
         if (it != g_pendingExports.end()) {
