@@ -1,0 +1,36 @@
+# gpu-ci.yml - HARDWARE gate: runs on the self-hosted GPU boxes only.
+#
+# SECURITY: this workflow executes on YOUR machines. It triggers ONLY on
+# push to main and manual dispatch - NEVER on pull_request events (a fork
+# PR would otherwise run arbitrary code on the runner). Keep it that way.
+#
+# Runner labels expected:
+#   this box (Windows, XTX + B70):  [self-hosted, Windows, gpu]
+#   X2 (Linux, Strix Halo/ROCm):    [self-hosted, Linux, gpu]
+# If a runner is offline the job queues (bounded by timeout-minutes).
+
+name: gpu-ci
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  windows-gpu:
+    name: GPU gate (Windows, XTX + B70)
+    runs-on: [self-hosted, Windows, gpu]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: GPU suite
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File ci/gpu_windows.ps1
+
+  linux-gpu:
+    name: GPU gate (X2, Strix Halo)
+    runs-on: [self-hosted, Linux, gpu]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: GPU suite
+        run: bash ci/gpu_linux.sh
