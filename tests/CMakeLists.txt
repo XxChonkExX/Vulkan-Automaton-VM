@@ -127,14 +127,17 @@ add_test(NAME tensor_collective_test COMMAND tensor_collective_test)
 endif()
 add_test(NAME tensor_collective_test COMMAND tensor_collective_test)
 
-# Dtype conversion tests (CPU-only, no Vulkan device required)
+# Dtype conversion tests (CPU-only, but uses tensor-layer utilities from the
+# Compute module - TensorShape/readElem/writeElem)
+if(VVM_BUILD_TENSOR_TRANSPORT AND VVM_BUILD_NETWORK)
 add_executable(dtype_conversion_test dtype_conversion_test.cpp)
-target_link_libraries(dtype_conversion_test PRIVATE vulkan_vm)
+target_link_libraries(dtype_conversion_test PRIVATE vulkan_vm vulkan_vm_tensor)
 target_include_directories(dtype_conversion_test PRIVATE
     ${CMAKE_SOURCE_DIR}/include
     ${TEST_EXTRA_INCLUDES}
 )
 add_test(NAME dtype_conversion_test COMMAND dtype_conversion_test)
+endif()
 
 # Windows-only NDK persistent pin ref-count test (requires network layer)
 if(WIN32 AND VVM_BUILD_NETWORK)
