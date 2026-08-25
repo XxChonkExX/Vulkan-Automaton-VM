@@ -18,6 +18,7 @@
 #include <vector>
 
 namespace vvm_torch {
+using slab::Block;  // provider callbacks use the slab block type unqualified
 namespace {
 
 size_t envSizeGB(const char* name, size_t defGB) {

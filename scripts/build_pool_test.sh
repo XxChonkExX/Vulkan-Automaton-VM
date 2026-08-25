@@ -43,6 +43,7 @@ g++ -O3 -std=c++20 -fPIC -shared \
     -I"$PYTHON_INC" \
     "$REPO/python/vulkanvm_torch/bindings/pool_bindings.cpp" \
     "$REPO/python/vulkanvm_torch/device/pool_device.cpp" \
+    "$REPO/python/vulkanvm_torch/allocator/chonk_slab.cpp" \
     "$REPO/python/vulkanvm_torch/allocator/chonk_allocator.cpp" \
     "$REPO/python/vulkanvm_torch/interop/hip_external_memory.cpp" \
     "$LIB_BUILD_DIR/libvulkan_vm.a" \
