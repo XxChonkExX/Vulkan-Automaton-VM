@@ -485,6 +485,8 @@ private:
     // Offload manager for host swap (created lazily by initializeOffload)
     std::unique_ptr<OffloadManager, OffloadManagerDeleter> offloadManager_;
     
+    // VRAM high-water warning fired? (see VRAM_OVERFLOW_FINDINGS.md)
+    bool warnedHighWater_ = false;
     // Generation counter for handle validation (prevents stale handle use)
     uint64_t generationCounter_ = 0;
     // Live (not-yet-freed) generations. An allocation's generation is valid
