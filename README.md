@@ -133,6 +133,7 @@ Full evidence-linked matrix: [docs/HARDWARE_SUPPORT.md](docs/HARDWARE_SUPPORT.md
 | [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md) | Research history: 131K/196K long-context training stabilization |
 | [explainfordummyuser.md](explainfordummyuser.md) | The relay-race tour of everything above, for humans |
 | [docs/AUDIT_NOTES_2026-08-15.md](docs/AUDIT_NOTES_2026-08-15.md) | External audit response + sync notes |
+| [docs/LINUX_TEST_RESULTS_2026-08-25.md](docs/LINUX_TEST_RESULTS_2026-08-25.md) | Native Linux campaign: cross-vendor DMA-BUF P2P verified, verbs/RDMA fixes, full evidence |
 
 ---
 
@@ -152,7 +153,10 @@ python -m pytest python/vulkanvm_torch/test_autograd_numerics.py -v
 
 CI runs the compile matrix (Linux GCC/Clang, Windows MSVC, Android NDK) plus
 the CPU-only suites on every push —
-[.github/workflows/ci.yml](.github/workflows/ci.yml).
+[.github/workflows/ci.yml](.github/workflows/ci.yml). Hardware-run evidence and
+per-suite tiers live in [docs/HARDWARE_SUPPORT.md](docs/HARDWARE_SUPPORT.md);
+the latest native-Linux campaign is documented in
+[docs/LINUX_TEST_RESULTS_2026-08-25.md](docs/LINUX_TEST_RESULTS_2026-08-25.md).
 
 ---
 
