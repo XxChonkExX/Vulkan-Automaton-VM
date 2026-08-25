@@ -125,10 +125,6 @@ target_link_libraries(tensor_collective_test PRIVATE vulkan_vm vulkan_vm_tensor)
 target_include_directories(tensor_collective_test PRIVATE ${CMAKE_SOURCE_DIR}/include ${TEST_EXTRA_INCLUDES})
 add_test(NAME tensor_collective_test COMMAND tensor_collective_test)
 endif()
-target_include_directories(tensor_collective_test PRIVATE
-    ${CMAKE_SOURCE_DIR}/include
-    ${TEST_EXTRA_INCLUDES}
-)
 add_test(NAME tensor_collective_test COMMAND tensor_collective_test)
 
 # Dtype conversion tests (CPU-only, no Vulkan device required)
