@@ -91,7 +91,7 @@ enum class MemoryLayout {
 // Tensor Shape
 // ============================================================================
 
-struct TensorShape {
+struct VVM_API TensorShape {
     std::vector<int64_t> dims;
     std::vector<int64_t> strides;  // optional, empty = contiguous
 
@@ -208,7 +208,7 @@ using AsyncOperation = std::function<void()>;
 //                  initialize()/shutdown() must not be called concurrently with operations.
 //                  allocateTensor/collectives are thread-safe.
 //                  sendTensor/recvTensor must not be called concurrently for the same tensor.
-class Transport {
+class VVM_API Transport {
 public:
     virtual ~Transport() = default;
     

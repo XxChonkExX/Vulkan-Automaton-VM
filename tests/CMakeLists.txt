@@ -99,6 +99,7 @@ target_include_directories(multi_gpu_test PRIVATE
 # target_link_libraries(stress_test PRIVATE vulkan_vm)
 
 # CPU-only wire-format regression tests (no Vulkan device required)
+if(VVM_BUILD_NETWORK)
 add_executable(serialization_test serialization_test.cpp)
 target_link_libraries(serialization_test PRIVATE vulkan_vm_network)
 target_include_directories(serialization_test PRIVATE
@@ -106,6 +107,7 @@ target_include_directories(serialization_test PRIVATE
     ${TEST_EXTRA_INCLUDES}
 )
 add_test(NAME serialization_test COMMAND serialization_test)
+endif()
 
 # Placement API tests (pure logic, no Vulkan device required)
 add_executable(placement_test placement_test.cpp)
@@ -117,8 +119,12 @@ target_include_directories(placement_test PRIVATE
 add_test(NAME placement_test COMMAND placement_test)
 
 # Tensor collective operations (requires a Vulkan device; single GPU is enough)
+if(VVM_BUILD_TENSOR_TRANSPORT AND VVM_BUILD_NETWORK)
 add_executable(tensor_collective_test tensor_collective_test.cpp)
-target_link_libraries(tensor_collective_test PRIVATE vulkan_vm)
+target_link_libraries(tensor_collective_test PRIVATE vulkan_vm vulkan_vm_tensor)
+target_include_directories(tensor_collective_test PRIVATE ${CMAKE_SOURCE_DIR}/include ${TEST_EXTRA_INCLUDES})
+add_test(NAME tensor_collective_test COMMAND tensor_collective_test)
+endif()
 target_include_directories(tensor_collective_test PRIVATE
     ${CMAKE_SOURCE_DIR}/include
     ${TEST_EXTRA_INCLUDES}
@@ -134,8 +140,8 @@ target_include_directories(dtype_conversion_test PRIVATE
 )
 add_test(NAME dtype_conversion_test COMMAND dtype_conversion_test)
 
-# Windows-only NDK persistent pin ref-count test
-if(WIN32)
+# Windows-only NDK persistent pin ref-count test (requires network layer)
+if(WIN32 AND VVM_BUILD_NETWORK)
     add_executable(persistent_pin_test persistent_pin_test.cpp)
     target_link_libraries(persistent_pin_test PRIVATE
         vulkan_vm_network
@@ -154,8 +160,8 @@ if(WIN32)
     add_test(NAME persistent_pin_test COMMAND persistent_pin_test)
 endif()
 
-# Windows-only ND fake provider + loopback test
-if(WIN32)
+# Windows-only ND fake provider + loopback test (requires network layer)
+if(WIN32 AND VVM_BUILD_NETWORK)
     # Fake ND provider DLL (implements IND2 SPI on host RAM)
     add_library(ndfake_provider SHARED
         ndfake/ndfake_provider.cpp
@@ -211,7 +217,7 @@ if(IBVERBS_FOUND AND RDMA_CM_FOUND)
         ${TEST_EXTRA_INCLUDES}
     )
     add_test(NAME multi_vendor_rdma_test COMMAND multi_vendor_rdma_test)
-elseif(WIN32)
+elseif(WIN32 AND VVM_BUILD_NETWORK)
     message(STATUS "Adding multi-vendor RDMA test (Windows/ND)")
     add_executable(multi_vendor_rdma_test multi_vendor_rdma_test.cpp)
     target_link_libraries(multi_vendor_rdma_test PRIVATE

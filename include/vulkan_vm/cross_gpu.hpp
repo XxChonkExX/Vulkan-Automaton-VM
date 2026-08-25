@@ -42,7 +42,7 @@ struct PeerAccessInfo {
 // Multi-GPU Pool Manager
 // ============================================================================
 
-class MultiGPUPoolManager {
+class VVM_API MultiGPUPoolManager {
 public:
     static std::optional<MultiGPUPoolManager> create(
         const std::vector<DeviceConfig>& devices,
