@@ -1294,12 +1294,22 @@ std::optional<ExternalMemoryInfo> UnifiedMemoryPool::exportMemory(
                 return std::nullopt;
         }
         
-        PFN_vkGetMemoryFdKHR vkGetMemoryFdKHR = 
+        PFN_vkGetMemoryFdKHR vkGetMemoryFdKHR =
             (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(device_, "vkGetMemoryFdKHR");
-        if (!vkGetMemoryFdKHR) return std::nullopt;
-        
+        if (!vkGetMemoryFdKHR) {
+            VVM_LOG_ERROR("exportMemory: vkGetMemoryFdKHR unavailable - was VK_KHR_external_memory_fd "
+                          "enabled at device creation? For DmaBuf also VK_EXT_external_memory_dma_buf.");
+            return std::nullopt;
+        }
+
         int fd = -1;
-        if (vkGetMemoryFdKHR(device_, &fdInfo, &fd) != VK_SUCCESS) return std::nullopt;
+        if (vkGetMemoryFdKHR(device_, &fdInfo, &fd) != VK_SUCCESS) {
+            VVM_LOG_ERROR("exportMemory: vkGetMemoryFdKHR failed (handleType={}) - verify the allocation "
+                          "was created with VkExportMemoryAllocateInfo and, for DMA-BUF, that "
+                          "VK_EXT_external_memory_dma_buf was enabled at device creation",
+                          fdInfo.handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT ? "DMA_BUF" : "OPAQUE_FD");
+            return std::nullopt;
+        }
         info.handle = ExternalHandle(fd);  // RAII wrapper takes ownership
         return info;
     }

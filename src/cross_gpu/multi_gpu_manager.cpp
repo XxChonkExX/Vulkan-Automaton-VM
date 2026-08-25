@@ -19,6 +19,22 @@ struct VendorP2PCaps {
     std::string notes;
 };
 
+// Map a Vulkan handle-type bit to the library enum. NOTE: ExternalHandleType
+// is a sequential enum whose values DO NOT match the VkExternalMemoryHandle-
+// TypeFlagBits bitmask values (e.g. DMA_BUF_BIT_EXT == 0x200, DmaBuf == 4).
+// A static_cast between them silently produces an out-of-range enum on Linux
+// (DMA-BUF) and only works by numeric coincidence for OpaqueWin32.
+static ExternalHandleType toExternalHandleType(VkExternalMemoryHandleTypeFlagBits bit) {
+    switch (bit) {
+        case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT:          return ExternalHandleType::OpaqueFd;
+        case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT:       return ExternalHandleType::OpaqueWin32;
+        case VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT:         return ExternalHandleType::D3D12Heap;
+        case VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT:        return ExternalHandleType::DmaBuf;
+        case VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID: return ExternalHandleType::AndroidHardwareBuffer;
+        default:                                                    return ExternalHandleType::None;
+    }
+}
+
 static VendorP2PCaps getVendorP2PCaps(uint32_t srcVendorId, uint32_t dstVendorId) {
     VendorP2PCaps caps;
     
@@ -325,8 +341,8 @@ bool MultiGPUPoolManager::copyDeviceToDevice(
     VVM_LOG_INFO("copyDeviceToDevice: using vendor P2P path: {}", p2pCaps.notes);
 
     // 1. Export source memory from src device using vendor-optimal handle type.
-    auto exportInfo = srcPool.exportMemory(src, 
-        static_cast<ExternalHandleType>(p2pCaps.optimalExportHandleType));
+    auto exportInfo = srcPool.exportMemory(src,
+        toExternalHandleType(p2pCaps.optimalExportHandleType));
     if (!exportInfo) {
         VVM_LOG_WARN("copyDeviceToDevice: exportMemory failed, "
                      "falling back to host-staged peer copy");
@@ -336,7 +352,7 @@ bool MultiGPUPoolManager::copyDeviceToDevice(
 
     // 2. Import (alias) on the dst device using vendor-optimal import handle type.
     auto importInfo = duplicateForImport(*exportInfo);
-    importInfo.type = static_cast<ExternalHandleType>(p2pCaps.optimalImportHandleType);
+    importInfo.type = toExternalHandleType(p2pCaps.optimalImportHandleType);
     auto remote = dstPool.importMemory(std::move(importInfo),
                                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                        VK_BUFFER_USAGE_TRANSFER_DST_BIT);
