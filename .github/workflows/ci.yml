@@ -32,16 +32,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify Vulkan SDK present
+      - name: Install Vulkan headers + loader (Ubuntu repos)
         run: |
-          echo "VULKAN_SDK=$VULKAN_SDK"
-          test -d "$VULKAN_SDK/include/vulkan" || {
-            # fallback: modern keyring install (apt-key is gone on 24.04)
-            wget -qO- https://packages.lunarg.com/vulkan/lunarg-vulkan-signing-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg-vulkan.asc >/dev/null
-            sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-noble.list https://packages.lunarg.com/vulkan/lunarg-vulkan-noble.list
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq vulkan-sdk
-          }
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libvulkan-dev glslc
+          test -f /usr/include/vulkan/vulkan.h
+          command -v glslc
 
       - name: Configure (core-only)
         if: matrix.mode == 'core'
@@ -77,6 +73,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Diagnostics (Windows SDK + tools)
+        shell: pwsh
+        run: |
+          echo "SDK Include dirs:"
+          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Include" -Directory -ErrorAction SilentlyContinue | ForEach-Object { "  $($_.Name)" }
+          echo "ninja: $(Get-Command ninja -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)"
+          echo "VULKAN_SDK=$env:VULKAN_SDK"
+          if (Test-Path "$env:VULKAN_SDK\Include\vulkan") { echo "SDK headers OK" } else { echo "SDK headers MISSING - will install" ; Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe" -OutFile vulkan-sdk.exe; .\vulkan-sdk.exe --silent --accept-licenses --default-answer --confirm-command install }
       - name: Verify Vulkan SDK present
         shell: pwsh
         run: |
@@ -145,3 +149,4 @@ jobs:
             -DVVM_BUILD_TESTS=OFF -DVVM_BUILD_EXAMPLES=OFF
           cmake --build build-android -j"$(nproc)"
         shell: bash
+
