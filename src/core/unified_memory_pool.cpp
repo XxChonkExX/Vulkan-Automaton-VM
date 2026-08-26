@@ -737,8 +737,8 @@ std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
 // Vendor-aware export handle type selection.
 // Some drivers reject bitmask union of handle types that they don't
 // actually support, even though the spec says they should be fine.
-// We restrict the mask to a single known-good type per vendor.
-// ---------------------------------------------------------------------------
+// The candidate mask below is vendor-heuristic; filterExportableBits() then
+// keeps only the bits the driver actually reports EXPORTABLE for this usage.
 static VkExternalMemoryHandleTypeFlags getExportHandleTypes(VkPhysicalDevice phys) {
     VkPhysicalDeviceProperties props{};
     vkGetPhysicalDeviceProperties(phys, &props);
@@ -752,6 +752,36 @@ static VkExternalMemoryHandleTypeFlags getExportHandleTypes(VkPhysicalDevice phy
     return VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
            VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
     #endif
+}
+
+// Capability-driven selection (external audit P0): never advertise a handle
+// type the driver does not report EXPORTABLE for this buffer usage. Each
+// candidate bit is queried individually via
+// vkGetPhysicalDeviceExternalBufferProperties.
+static VkExternalMemoryHandleTypeFlags filterExportableBits(
+    VkPhysicalDevice phys, VkBufferUsageFlags usage,
+    VkExternalMemoryHandleTypeFlags candidates) {
+    VkExternalMemoryHandleTypeFlags out = 0;
+    uint32_t bit = 0;
+    while (candidates >> bit) {
+        auto ht = static_cast<VkExternalMemoryHandleTypeFlagBits>(1u << bit);
+        if (candidates & (1u << bit)) {
+            VkPhysicalDeviceExternalBufferInfo info{};
+            info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO;
+            info.usage = usage;
+            info.handleType = ht;
+            VkExternalBufferProperties props{};
+            props.sType = VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES;
+            vkGetPhysicalDeviceExternalBufferProperties(phys, &info, &props);
+            if (props.externalMemoryProperties.externalMemoryFeatures &
+                VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) {
+                out |= (1u << bit);
+            }
+        }
+        ++bit;
+        if (bit >= 31) break;
+    }
+    return out;
 }
 
 // Allocate a dedicated VkDeviceMemory for a single exportable buffer.
@@ -769,7 +799,15 @@ static VkExternalMemoryHandleTypeFlags getExportHandleTypes(VkPhysicalDevice phy
 // Step 1: Create buffer with VkExternalMemoryBufferCreateInfo
         VkExternalMemoryBufferCreateInfo extBufferInfo{};
         extBufferInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
-        VkExternalMemoryHandleTypeFlags ht = getExportHandleTypes(deviceConfig_.physicalDevice);
+        VkExternalMemoryHandleTypeFlags ht = filterExportableBits(
+            deviceConfig_.physicalDevice, usage,
+            getExportHandleTypes(deviceConfig_.physicalDevice));
+        if (!ht) {
+            VVM_LOG_ERROR("allocateDedicatedExportable: no EXPORTABLE external "
+                          "handle type for usage={} on this device",
+                          static_cast<unsigned>(usage));
+            return std::nullopt;
+        }
         extBufferInfo.handleTypes = ht;
         
         VkBufferCreateInfo bufferInfo{};

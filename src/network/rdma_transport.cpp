@@ -13,6 +13,7 @@
 #include <sys/mman.h>
 
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -172,6 +173,9 @@ public:
             for (const auto& [key, info] : connections_) conns.push_back(info);
         }
         for (const auto& info : conns) {
+            // id may be torn down concurrently by the connection's own event
+            // thread; serialize like every other id touchpoint.
+            std::lock_guard<std::mutex> lock(info->mutex);
             if (info->id) rdma_disconnect(info->id);
         }
 
@@ -741,7 +745,7 @@ public:
             VVM_LOG_WARN("rdmaWrite: no CPU VA for local region (GPU-direct SGE needs an exported BAR mapping)");
             return false;
         }
-        return postRdma(info, IBV_WR_RDMA_WRITE, localRegion, remoteAddr, remoteRkey, size, timeoutNs);
+        return postRdmaChunked(info, IBV_WR_RDMA_WRITE, localRegion, remoteAddr, remoteRkey, size, timeoutNs);
     }
 
     bool rdmaRead(
@@ -762,7 +766,7 @@ public:
             VVM_LOG_WARN("rdmaRead: no SGE address for local region (GPU-direct accepted only with BAR mapping)");
             return false;
         }
-        return postRdma(info, IBV_WR_RDMA_READ, localRegion, remoteAddr, remoteRkey, size, timeoutNs);
+        return postRdmaChunked(info, IBV_WR_RDMA_READ, localRegion, remoteAddr, remoteRkey, size, timeoutNs);
     }
 
     bool rdmaWriteAsync(
@@ -834,9 +838,14 @@ private:
         bool connected = false;
         bool failed = false;
         bool gpuDirect = false;
+        // Set when an operation times out: the WR is still in flight (RDMA
+        // work cannot be cancelled), so the connection is drained to
+        // completion and no new operations are accepted on it.
+        std::atomic<bool> unhealthy{false};
         std::string remoteHost;
         uint32_t remotePort = 0;
         uint32_t nodeIndex = 0;
+        // Guards qp/cq/id lifetime against postRdma/waitForCompletion.
         std::mutex mutex;
         std::condition_variable cv;
     };
@@ -855,6 +864,11 @@ private:
 
     static void destroyConnection(const std::shared_ptr<ConnectionInfo>& info) {
         if (!info) return;
+        // Serialize against postRdma/waitForCompletion: never destroy qp/cq/id
+        // while an operation may still be posted or being reaped. Bounded by
+        // the operation's timeout (the waiter holds this mutex until the WR is
+        // reaped).
+        std::lock_guard<std::mutex> lock(info->mutex);
         if (info->qp) rdma_destroy_qp(info->id);
         if (info->cq) ibv_destroy_cq(info->cq);
         if (info->id) rdma_destroy_id(info->id);
@@ -1075,6 +1089,38 @@ private:
         }
     }
 
+    // verbs SGE length is 32-bit; a silent VkDeviceSize->uint32_t truncation
+    // turns a >4 GiB transfer into a smaller (wrong) one. Transfer in bounded
+    // chunks instead - each chunk is a separate signaled WR, waited in order.
+    bool postRdmaChunked(const std::shared_ptr<ConnectionInfo>& info,
+                         enum ibv_wr_opcode opcode,
+                         const RdmaMemoryRegion& localRegion,
+                         uint64_t remoteAddr,
+                         uint32_t remoteRkey,
+                         VkDeviceSize size,
+                         uint64_t timeoutNs) {
+        constexpr VkDeviceSize kMaxSge = static_cast<VkDeviceSize>(
+            std::numeric_limits<uint32_t>::max());
+        VkDeviceSize remaining = size;
+        uint64_t addrOffset = 0, remoteOffset = 0;
+        while (remaining > 0) {
+            const VkDeviceSize chunk = std::min(remaining, kMaxSge);
+            RdmaMemoryRegion part = localRegion;
+            part.addr = reinterpret_cast<void*>(
+                reinterpret_cast<uintptr_t>(localRegion.addr) + addrOffset);
+            if (!postRdma(info, opcode, part,
+                          remoteAddr + remoteOffset, remoteRkey, chunk, timeoutNs)) {
+                VVM_LOG_ERROR("{}: chunked transfer failed at offset {} of {} bytes",
+                              opcodeToString(opcode), remoteOffset, size);
+                return false;
+            }
+            remaining -= chunk;
+            addrOffset += chunk;
+            remoteOffset += chunk;
+        }
+        return true;
+    }
+
     bool postRdma(const std::shared_ptr<ConnectionInfo>& info,
                   enum ibv_wr_opcode opcode,
                   const RdmaMemoryRegion& localRegion,
@@ -1082,6 +1128,30 @@ private:
                   uint32_t remoteRkey,
                   VkDeviceSize size,
                   uint64_t timeoutNs) {
+
+        // Belt-and-braces: postRdmaChunked is the entry point; a direct call
+        // with size > UINT32_MAX would silently truncate the SGE length.
+        if (size > static_cast<VkDeviceSize>(std::numeric_limits<uint32_t>::max())) {
+            VVM_LOG_ERROR("postRdma: {} bytes exceeds verbs SGE maximum ({})",
+                          static_cast<unsigned long long>(size),
+                          std::numeric_limits<uint32_t>::max());
+            return false;
+        }
+
+        // Hold the connection mutex across post AND wait: qp/cq must not be
+        // destroyed while a WR is outstanding, and a posted RDMA operation
+        // cannot be cancelled - the completion MUST be reaped before the CQ
+        // (or the memory it reads/writes) goes away. destroyConnection()
+        // takes this same mutex, so teardown waits for in-flight operations.
+        std::lock_guard<std::mutex> lock(info->mutex);
+        if (info->unhealthy.load(std::memory_order_acquire)) {
+            VVM_LOG_WARN("postRdma: connection to {}:{} is unhealthy, failing fast",
+                         info->remoteHost, info->remotePort);
+            return false;
+        }
+        if (!info->qp || !info->cq) {
+            return false;
+        }
 
         struct ibv_sge sge{};
         sge.addr = reinterpret_cast<uintptr_t>(localRegion.addr);
@@ -1101,28 +1171,56 @@ private:
             VVM_LOG_ERROR("Failed to post {}: {}", opcodeToString(opcode), strerror(errno));
             return false;
         }
-        return waitForCompletion(info->cq, timeoutNs);
+        return waitForCompletion(info, info->cq, timeoutNs);
     }
 
-    bool waitForCompletion(struct ibv_cq* cq, uint64_t timeoutNs) {
+    // Wait for the posted WR's completion. Timeout semantics: a timeout means
+    // "the caller stopped waiting", NOT "the operation is gone" - RDMA work
+    // requests cannot be cancelled, and freeing the backing memory region
+    // while the NIC still owns a WR is DMA-level use-after-free. So on
+    // deadline we mark the connection unhealthy (no new ops) and KEEP polling
+    // until the completion is reaped. Teardown flushes outstanding WRs with
+    // IBV_WC_WR_FLUSH_ERR, which this loop reaps as a failure - so the wait
+    // always terminates. Callers must therefore treat `false` after a timeout
+    // as "connection drained & unusable", not "retry on same connection".
+    bool waitForCompletion(const std::shared_ptr<ConnectionInfo>& info,
+                           struct ibv_cq* cq, uint64_t timeoutNs) {
         struct ibv_wc wc{};
         auto start = std::chrono::steady_clock::now();
         bool useDeadline = (timeoutNs != UINT64_MAX);
         auto deadline = start + std::chrono::nanoseconds(timeoutNs);
+        bool timedOut = false;
 
         for (;;) {
             int num = ibv_poll_cq(cq, 1, &wc);
             if (num < 0) return false;
             if (num == 1) {
                 if (wc.status != IBV_WC_SUCCESS) {
-                    VVM_LOG_WARN("RDMA completion error: {}", ibv_wc_status_str(wc.status));
+                    if (timedOut) {
+                        VVM_LOG_WARN("RDMA op timed out; reaped flushed completion "
+                                     "({}) - connection drained",
+                                     ibv_wc_status_str(wc.status));
+                    } else {
+                        VVM_LOG_WARN("RDMA completion error: {}",
+                                     ibv_wc_status_str(wc.status));
+                    }
                     return false;
                 }
-                return true;
+                if (timedOut) {
+                    // Operation actually completed after the deadline: report
+                    // success but the caller's timeout expectation was broken.
+                    VVM_LOG_WARN("RDMA op completed after deadline - reporting "
+                                 "success, connection marked unhealthy");
+                }
+                return !timedOut;
             }
-            if (useDeadline && std::chrono::steady_clock::now() >= deadline) {
-                VVM_LOG_WARN("RDMA operation timed out");
-                return false;
+            if (!timedOut && useDeadline &&
+                std::chrono::steady_clock::now() >= deadline) {
+                timedOut = true;
+                info->unhealthy.store(true, std::memory_order_release);
+                VVM_LOG_WARN("RDMA operation timed out after {} ns - draining "
+                             "until completion is reaped (WRs cannot be cancelled)",
+                             static_cast<unsigned long long>(timeoutNs));
             }
             std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
