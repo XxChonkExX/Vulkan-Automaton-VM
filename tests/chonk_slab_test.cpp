@@ -35,6 +35,31 @@ static int failures = 0;
     } while (0)
 
 // ---------------------------------------------------------------------------
+// Aligned host allocation shims.
+//   - Windows/MSVC has no posix_memalign -> use _aligned_malloc/_aligned_free
+//   - POSIX path keeps posix_memalign because std::aligned_alloc is
+//     unavailable on bionic (Android libc) at older API levels.
+// ---------------------------------------------------------------------------
+#if defined(_WIN32)
+#include <malloc.h>
+static void* alignedAlloc(size_t align, size_t size) {
+    return _aligned_malloc(size, align);
+}
+static void alignedFree(void* p) {
+    _aligned_free(p);
+}
+#else
+static void* alignedAlloc(size_t align, size_t size) {
+    void* p = nullptr;
+    if (posix_memalign(&p, align, size) != 0) return nullptr;
+    return p;
+}
+static void alignedFree(void* p) {
+    std::free(p);
+}
+#endif
+
+// ---------------------------------------------------------------------------
 // Fake provider: blocks backed by host malloc. No GPU anywhere.
 // ---------------------------------------------------------------------------
 
@@ -59,10 +84,8 @@ struct FakeProvider : Core::IProvider {
         // bases; Core requires kAlign(512)-aligned bases. Honor the contract.
         sz = ((sz + 511) / 512) * 512;
         Block* b = new Block();
-        // posix_memalign: std::aligned_alloc is unavailable on bionic
-        // (Android libc) at older API levels.
-        void* base = nullptr;
-        if (posix_memalign(&base, 512, sz) != 0) {
+        void* base = alignedAlloc(512, sz);
+        if (!base) {
             delete b;
             return nullptr;
         }
@@ -87,7 +110,7 @@ struct FakeProvider : Core::IProvider {
                 break;
             }
         }
-        std::free(b->base);
+        alignedFree(b->base);
         delete b;
     }
 };
