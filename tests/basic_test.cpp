@@ -127,19 +127,29 @@ int main() {
     std::cout << "\nSelected: " << bestDevice->props.deviceName << "\n";
     
     // Check required extensions
+    // Critical for correctness; VK_EXT_memory_budget is OPTIONAL - the pool
+    // probes it at runtime and degrades gracefully (Android 16 Adreno drivers
+    // often omit it).
     std::vector<const char*> requiredExts = {
         VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
-#ifdef VVM_PLATFORM_LINUX
+#if defined(__ANDROID__)
+        VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME,
+#elif defined(VVM_PLATFORM_LINUX)
         VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,  // Linux
 #elif defined(VVM_PLATFORM_WINDOWS)
         VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,  // Windows
 #endif
         VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
         VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
+    };
+    std::vector<const char*> optionalExts = {
         VK_EXT_MEMORY_BUDGET_EXTENSION_NAME
     };
-    
-    bool extsSupported = checkDeviceExtensionSupport(bestDevice->device, requiredExts);
+
+    bool extsSupported =
+        checkDeviceExtensionSupport(bestDevice->device, requiredExts);
+    const bool budgetAvailable =
+        checkDeviceExtensionSupport(bestDevice->device, optionalExts);
 
     // Capability gate (see minimal_test): Adreno 610-class drivers lack the
     // required extensions/features; a Release assert() would let a null device
@@ -208,8 +218,11 @@ int main() {
     deviceInfo.queueCreateInfoCount = static_cast<uint32_t>(queueInfos.size());
     deviceInfo.pQueueCreateInfos = queueInfos.data();
     deviceInfo.pNext = &features2;
-    deviceInfo.enabledExtensionCount = static_cast<uint32_t>(requiredExts.size());
-    deviceInfo.ppEnabledExtensionNames = requiredExts.data();
+    std::vector<const char*> enableExts(requiredExts);
+    if (budgetAvailable)
+        enableExts.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    deviceInfo.enabledExtensionCount = static_cast<uint32_t>(enableExts.size());
+    deviceInfo.ppEnabledExtensionNames = enableExts.data();
     
     VkDevice device;
     result = vkCreateDevice(bestDevice->device, &deviceInfo, nullptr, &device);
