@@ -40,15 +40,18 @@ enum class MsgType : uint8_t {
     Register = 3,
     Unregister = 4,
     ReadReq = 5,
+    Resend = 6,   // requester asks ONE missing DATA packet be re-sent
 };
 
-// Total datagram budget (safe under IPv4 UDP limits).
-constexpr size_t kDatagramMax = 60000;
+// Datagram sizing: stay within ONE MTU (~1500B Ethernet/Wi-Fi). Oversized
+// datagrams shatter into dozens of IP fragments; any lost fragment destroys
+// the whole packet and GBN resend-amplifies the loss into collapse.
+constexpr size_t kDatagramMax = 1472;   // 1500 - 20 IPv4 - 8 UDP
 // 36-byte fixed header (see docs/udp_mini_verbs.md).
 constexpr size_t kHeaderSize = 36;
 constexpr size_t kChunkPayload = kDatagramMax - kHeaderSize;
-// Go-Back-N window in packets (~15 MB in flight at max chunk).
-constexpr uint32_t kWindowPkts = 256;
+// Go-Back-N window in packets (~1.4 MB in flight at 1.4K chunks).
+constexpr uint32_t kWindowPkts = 1024;
 constexpr int kAckWaitMs = 20;      // per-round wait before resending window
 
 #pragma pack(push, 1)
@@ -98,6 +101,13 @@ struct UdpVerbTransport::Xfer {
     // Receive side (READ responses land here; WRITEs go straight into regions)
     bool expectData = false;     // true: we are collecting DATA packets
     uint8_t* dst = nullptr;      // read-resp destination buffer
+    uint64_t dstOff = 0;         // base offset within dst (slice support)
+    // Selective-repeat state for read responses:
+    uint32_t contig = 0;                 // highest in-order seq + 1
+    std::vector<bool> have;
+    uint64_t remoteBase = 0;             // peer region offset of seq 0
+    uint64_t reqBytes = 0;
+    uint32_t lastProgressMs = 0;
     const uint8_t* src = nullptr;  // send side source buffer (WRITE)
 };
 
@@ -248,7 +258,7 @@ struct UdpVerbTransport::Impl {
 
                     uint8_t* dst = nullptr;
                     if (xf && xf->expectData && xf->dst) {
-                        dst = xf->dst +
+                        dst = xf->dst + xf->dstOff +
                               static_cast<uint64_t>(h.seq) * kChunkPayload;
                     } else {
                         auto rit = regions_.find(h.regionId);
@@ -278,18 +288,23 @@ struct UdpVerbTransport::Impl {
                         break;
                     }
                     std::memcpy(dst, payload, h.payloadLen);
+                    if (xf && xf->expectData && h.seq < 3)
+                        VVM_LOG_INFO("udp-verb[{}] RX s={} plen={} d0..3={:02x} {:02x} {:02x} {:02x}",
+                                     boundPort_, h.seq, h.payloadLen,
+                                     h.payloadLen>0?dst[0]:0, h.payloadLen>1?dst[1]:0,
+                                     h.payloadLen>2?dst[2]:0, h.payloadLen>3?dst[3]:0);
 
-                    if (xf && xf->totalPkts == h.totalPkts) {
-                        // Read-response path: track contiguity, ACK, finish.
-                        if (xf->acked <= h.seq) {
-                            // simple bitmap-free tracking assumes in-order-ish
-                            // delivery over loopback/LAN with GBN resend.
-                            xf->acked = h.seq + 1;
+                    if (xf && xf->expectData && xf->totalPkts == h.totalPkts) {
+                        // Read-response path: bitmap + contiguous ACK.
+                        if (h.seq < xf->totalPkts && !xf->have[h.seq]) {
+                            xf->have[h.seq] = true;
+                            while (xf->contig < xf->totalPkts &&
+                                   xf->have[xf->contig])
+                                ++xf->contig;
+                            xf->lastProgressMs = nowMs();
                         }
-                        if (xf->acked >= xf->totalPkts) {
-                            finish(h.xid, true);
-                        }
-                        Header ack = makeHdr(MsgType::Ack, h.xid, xf->acked,
+                        if (xf->contig >= xf->totalPkts) finish(h.xid, true);
+                        Header ack = makeHdr(MsgType::Ack, h.xid, xf->contig,
                                              xf->totalPkts, 0, h.regionId, 0);
                         sendTo(from, &ack, sizeof(ack));
                     } else {
@@ -331,6 +346,26 @@ struct UdpVerbTransport::Impl {
                     break;
                 }
 
+                case MsgType::Resend: {
+                    auto rit2 = regions_.find(h.regionId);
+                    if (rit2 == regions_.end()) break;
+                    const uint64_t off = h.offset;
+                    if (off >= rit2->second.size) break;
+                    size_t len = static_cast<size_t>(
+                        std::min<uint64_t>(kChunkPayload,
+                                           rit2->second.size - off));
+                    Header dh = makeHdr(MsgType::Data, h.xid, h.seq, h.totalPkts,
+                                        static_cast<uint16_t>(len),
+                                        h.regionId, off);
+                    std::vector<uint8_t> pkt(sizeof(dh) + len);
+                    std::memcpy(pkt.data(), &dh, sizeof(dh));
+                    std::memcpy(pkt.data() + sizeof(dh),
+                                static_cast<const uint8_t*>(rit2->second.ptr) +
+                                    off,
+                                len);
+                    sendTo(from, pkt.data(), pkt.size());
+                    break;
+                }
                 case MsgType::ReadReq: {
                     VVM_LOG_INFO("udp-verb[{}] READREQ recv xid={} region={}",
                                  boundPort_, h.xid,
@@ -366,6 +401,11 @@ struct UdpVerbTransport::Impl {
                         std::vector<uint8_t> pkt(sizeof(dh) + len);
                         std::memcpy(pkt.data(), &dh, sizeof(dh));
                         if (len) std::memcpy(pkt.data() + sizeof(dh), src + off, len);
+                        if (s < 3)
+                            VVM_LOG_INFO("udp-verb[{}] TX s={} len={} b0..3={:02x} {:02x} {:02x} {:02x}",
+                                         boundPort_, s, len,
+                                         len>0?src[off]:0, len>1?src[off+1]:0,
+                                         len>2?src[off+2]:0, len>3?src[off+3]:0);
                         sendTo(from, pkt.data(), pkt.size());
                         if ((s % kWindowPkts) == (kWindowPkts - 1))
                             std::this_thread::sleep_for(
@@ -629,6 +669,11 @@ bool UdpVerbTransport::rdmaRead(const RdmaConnection& conn,
     xf->totalPkts = total;
     xf->expectData = true;
     xf->dst = static_cast<uint8_t*>(localRegion.addr);
+    xf->dstOff = remoteAddr;  // slice base: packets land at dst+doff+seq*chunk
+    xf->have.assign(total, false);
+    xf->remoteBase = remoteAddr;
+    xf->reqBytes = static_cast<uint64_t>(size);
+    xf->lastProgressMs = nowMs();
 
     const uint32_t xid = static_cast<uint32_t>(impl_->nextXid_++);
     {
@@ -648,6 +693,10 @@ bool UdpVerbTransport::rdmaRead(const RdmaConnection& conn,
 
     const uint64_t deadlineNs =
         timeoutNs == UINT64_MAX ? UINT64_MAX : nowNs() + timeoutNs;
+
+    // Selective-repeat driver: when progress stalls, explicitly request the
+    // missing packets (READ responses are fire-and-forget on the wire; this
+    // is what makes them reliable).
     bool ok = false;
     {
         std::unique_lock<std::mutex> lk(xf->m);
@@ -655,12 +704,31 @@ bool UdpVerbTransport::rdmaRead(const RdmaConnection& conn,
             if (nowNs() >= deadlineNs) {
                 xf->finished = true;
                 ok = false;
-                VVM_LOG_ERROR("udp-verb: READ timed out ({} bytes from region {})",
-                              static_cast<unsigned long long>(size),
+                VVM_LOG_ERROR("udp-verb: READ timed out ({}/{} packets from "
+                              "region {})",
+                              xf->contig, xf->totalPkts,
                               static_cast<unsigned long long>(remoteRkey));
                 break;
             }
-            xf->cv.wait_for(lk, std::chrono::milliseconds(kAckWaitMs));
+            if (xf->cv.wait_for(lk, std::chrono::milliseconds(kAckWaitMs)) ==
+                std::cv_status::timeout) {
+                // No fresh progress this tick: request up to 64 missing
+                // packets, oldest-first.
+                uint32_t requested = 0;
+                for (uint32_t sq = xf->contig;
+                     sq < xf->totalPkts && requested < 64; ++sq) {
+                    if (!xf->have[sq]) {
+                        uint64_t off = remoteAddr +
+                                       static_cast<uint64_t>(sq) *
+                                           kChunkPayload;
+                        Header rr =
+                            Impl::makeHdr(MsgType::Resend, xid, sq, total, 0,
+                                          remoteRkey, off);
+                        impl_->sendTo(to, &rr, sizeof(rr));
+                        ++requested;
+                    }
+                }
+            }
         }
         ok = xf->finished && xf->ok;
     }

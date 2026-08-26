@@ -13,6 +13,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <fstream>
+#include <sys/stat.h>
 #include <map>
 #include <string>
 #include <thread>
@@ -27,7 +31,14 @@ namespace {
 
 struct Region {
     std::vector<uint8_t> mem;
-    uint32_t rkey = 0;  // 0 = not registered with fabric
+    uint32_t rkey = 0;   // 0 = not registered with fabric
+    // File-backed variant: mem points at an mmap of filePath.
+    bool fileBacked = false;
+    void* mapAddr = nullptr;
+    size_t mapLen = 0;
+    std::string filePath;
+    uint8_t* filePtr = nullptr;
+    uint64_t fileSize = 0;
 };
 
 std::mutex g_mutex;
@@ -80,6 +91,11 @@ std::string parseLine(const std::string& line, std::map<std::string, std::string
         start = i;
         while (i < line.size() && line[i] != ' ') ++i;
         std::string tok = line.substr(start, i - start);
+        // path= values may contain spaces: consume the rest of the line.
+        if (tok.rfind("path=", 0) == 0) {
+            kv["path"] = line.substr(start + 5);
+            break;
+        }
         auto eq = tok.find('=');
         if (eq != std::string::npos)
             kv[tok.substr(0, eq)] = tok.substr(eq + 1);
@@ -125,9 +141,78 @@ std::string handleClient(int fd) {
                        (g_transport ? g_transport->getBackendName() : "none") +
                        " regions=" + std::to_string(g_regions.size()) +
                        " conns=" + std::to_string(g_conns.size());
+            } else if (verb == "REGION" && kv.count("sub") && kv["sub"]=="file") {
+                auto pit = kv.find("path");
+                if (pit == kv.end()) { resp = "ERR code=2 msg=missing-path"; }
+                else {
+                    int fd = ::open(pit->second.c_str(), O_RDONLY);
+                    struct stat st{};
+                    if (fd < 0 || ::fstat(fd, &st) != 0 || st.st_size <= 0) {
+                        if (fd >= 0) ::close(fd);
+                        resp = "ERR code=4 msg=cannot-open-file";
+                    } else {
+                        void* m = ::mmap(nullptr, st.st_size, PROT_READ,
+                                         MAP_PRIVATE, fd, 0);
+                        ::close(fd);
+                        if (m == MAP_FAILED) {
+                            resp = "ERR code=6 msg=mmap-failed";
+                        } else {
+                            std::lock_guard<std::mutex> lk(g_mutex);
+                            Region r;
+                            r.fileBacked = true;
+                            r.mapAddr = m; r.mapLen = st.st_size;
+                            r.mem = {};  // unused for file-backed
+                            // Point mem at the mapping so READ/PULL see it.
+                            uint8_t* p8 = static_cast<uint8_t*>(m);
+                            r.mem.assign(0, 0);
+                            r.filePath = pit->second;
+                            // emulate vector view without copying:
+                            r.filePtr = p8; r.fileSize = st.st_size;
+                            uint32_t id = g_nextRegion++;
+                            if (g_transport) {
+                                if (auto reg = g_transport->registerHostMemory(
+                                        p8, st.st_size)) r.rkey = reg->rkey;
+                            }
+                            g_regions[id] = std::move(r);
+                            resp = "OK id=" + std::to_string(id) +
+                                   " rkey=" + std::to_string(g_regions[id].rkey) +
+                                   " bytes=" + std::to_string(st.st_size);
+                        }
+                    }
+                }
+            } else if (verb == "SAVE") {
+                bool ok = true;
+                uint32_t id = needU32(kv, "id", ok);
+                uint32_t off = needU32(kv, "off", ok);
+                uint64_t len = strtoull(kv.count("len") ? kv["len"].c_str() : "0",
+                                        nullptr, 10);
+                auto fit = kv.find("file");
+                std::lock_guard<std::mutex> lk(g_mutex);
+                auto it = g_regions.find(id);
+                const uint8_t* srcp =
+                    it != g_regions.end()
+                        ? (it->second.fileBacked ? it->second.filePtr
+                                                 : it->second.mem.data())
+                        : nullptr;
+                const uint64_t totalsz =
+                    it != g_regions.end()
+                        ? (it->second.fileBacked ? it->second.fileSize
+                                                 : it->second.mem.size())
+                        : 0;
+                if (!ok || fit == kv.end() || !srcp ||
+                    off + len > totalsz) {
+                    resp = "ERR code=4 msg=no-such-region-or-oob";
+                } else {
+                    std::ofstream f(fit->second, std::ios::binary | std::ios::trunc);
+                    f.write(reinterpret_cast<const char*>(srcp) + off,
+                            static_cast<std::streamsize>(len));
+                    f.close();
+                    resp = f ? "OK bytes=" + std::to_string(len)
+                             : "ERR code=6 msg=file-write-failed";
+                }
             } else if (verb == "REGION" && kv.count("sub") && kv["sub"]=="new") {
                 size_t sz = std::strtoul(kv.count("size") ? kv["size"].c_str() : "0", nullptr, 10);
-                if (!sz || sz > (512ull << 20)) {
+                if (!sz || sz > (8ull << 30)) {
                     resp = "ERR code=2 msg=bad-size";
                 } else {
                     std::lock_guard<std::mutex> lk(g_mutex);
@@ -184,11 +269,15 @@ std::string handleClient(int fd) {
                 uint32_t len = needU32(kv, "len", ok);
                 std::lock_guard<std::mutex> lk(g_mutex);
                 auto it = g_regions.find(id);
-                if (!ok || it == g_regions.end() ||
-                    off + len > it->second.mem.size()) {
+                const uint8_t* base = nullptr; uint64_t cap = 0;
+                if (it != g_regions.end()) {
+                    if (it->second.fileBacked) { base = it->second.filePtr; cap = it->second.fileSize; }
+                    else { base = it->second.mem.data(); cap = it->second.mem.size(); }
+                }
+                if (!ok || !base || off + len > cap) {
                     resp = "ERR code=4 msg=no-such-region-or-oob";
                 } else {
-                    resp = "OK hex=" + toHex(it->second.mem.data() + off,
+                    resp = "OK hex=" + toHex(base + off,
                                              std::min<size_t>(len, 1024));
                 }
             } else if (verb == "CONN" && kv.count("sub") && kv["sub"]=="add") {
@@ -229,19 +318,24 @@ std::string handleClient(int fd) {
                 }
                 std::lock_guard<std::mutex> lk(g_mutex);
                 auto rit = g_regions.find(reg);
-                if (!ok || !c.connected || rit == g_regions.end() ||
-                    soff + len > rit->second.mem.size()) {
-                    resp = "ERR code=4 msg=bad-args conn=" + std::to_string(connId) + " ok=" + std::to_string((int)ok) + " reg=" + std::to_string(reg) + " len=" + std::to_string(len);
+                uint8_t* rbase = nullptr; uint64_t rcap = 0;
+                if (rit != g_regions.end()) {
+                    if (rit->second.fileBacked) { rbase = rit->second.filePtr; rcap = rit->second.fileSize; }
+                    else { rbase = rit->second.mem.data(); rcap = rit->second.mem.size(); }
+                }
+                uint64_t tmoNs = 30ull*1000*1000*1000;
+                if (kv.count("tmo")) tmoNs = strtoull(kv["tmo"].c_str(), nullptr, 10)*1000000ull*1000ull;
+                if (!ok || !c.connected || rit == g_regions.end() || !rbase ||
+                    soff + len > rcap) {
+                    resp = "ERR code=4 msg=bad-args";
                 } else {
                     RdmaMemoryRegion rr;
-                    rr.addr = rit->second.mem.data() + soff;
+                    rr.addr = rbase + soff;
                     rr.length = len;
                     bool okXfer =
                         verb == "PUSH"
-                            ? g_transport->rdmaWrite(c, rr, doff, rkey, len,
-                                                     30ull * 1000 * 1000 * 1000)
-                            : g_transport->rdmaRead(c, rr, doff, rkey, len,
-                                                    30ull * 1000 * 1000 * 1000);
+                            ? g_transport->rdmaWrite(c, rr, doff, rkey, len, tmoNs)
+                            : g_transport->rdmaRead(c, rr, doff, rkey, len, tmoNs);
                     resp = okXfer ? "OK bytes=" + std::to_string(len)
                                   : "ERR code=6 msg=fabric-xfer-failed";
                 }

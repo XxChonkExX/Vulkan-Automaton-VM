@@ -162,8 +162,8 @@ int main(int argc, char** argv) {
                                 regionB->rkey, readLen,
                                 /*timeoutNs=*/30ull * 1000 * 1000 * 1000);
         CHECK(okR);
-        // rdmaRead fills the sink region starting at ITS offset 0.
-        CHECK(std::memcmp(sink.data(), mirror.data() + 8192,
+        // rdmaRead mirrors the requested remote offset locally.
+        CHECK(std::memcmp(sink.data() + 8192, mirror.data() + 8192,
                           readLen) == 0);
 
         tb->unregisterMemory(*regionB);
