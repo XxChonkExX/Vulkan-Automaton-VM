@@ -332,6 +332,9 @@ struct UdpVerbTransport::Impl {
                 }
 
                 case MsgType::ReadReq: {
+                    VVM_LOG_INFO("udp-verb[{}] READREQ recv xid={} region={}",
+                                 boundPort_, h.xid,
+                                 static_cast<unsigned long long>(h.regionId));
                     // We own the region: stream requested bytes to requester.
                     // Body carries the REQUESTED total length (u64 LE): the
                     // requester sizes its sink by this, not by our region.
@@ -637,7 +640,9 @@ bool UdpVerbTransport::rdmaRead(const RdmaConnection& conn,
     std::memcpy(reqPkt.data(), &req, sizeof(req));
     uint64_t reqBytes = static_cast<uint64_t>(size);
     std::memcpy(reqPkt.data() + sizeof(req), &reqBytes, sizeof(reqBytes));
-    impl_->sendTo(to, reqPkt.data(), reqPkt.size());
+    const bool sent = impl_->sendTo(to, reqPkt.data(), reqPkt.size());
+    VVM_LOG_INFO("udp-verb[{}] READREQ xid={} sent={} -> udp/{}",
+                 localPort_, xid, sent ? "yes" : "NO", ntohs(to.sin_port));
 
     const uint64_t deadlineNs =
         timeoutNs == UINT64_MAX ? UINT64_MAX : nowNs() + timeoutNs;

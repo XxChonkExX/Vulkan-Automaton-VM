@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <thread>
+#include <chrono>
 #include <vector>
 
 static int failures = 0;
@@ -31,10 +33,73 @@ static NetworkConfig makeCfg(uint16_t port) {
     return cfg;
 }
 
-int main() {
+int main(int argc, char** argv) {
     // This suite exercises the software fabric specifically; never let the
     // factory pick a hardware backend even where one is compiled in.
     setenv("VVM_RDMA_BACKEND", "udp", 1);
+
+    // ---- Two-device mode: udp_verb_test server <port> | client <ip> <port>
+    // Server registers an 8 MiB pattern buffer, advertises its rkey on
+    // stdout, then waits. Client writes 4 MiB of 0xCD into [0,4MiB) and
+    // READS [4MiB,8MiB) back, verifying the server's 0xAB pattern.
+    if (argc >= 2 && std::strcmp(argv[1], "server") == 0) {
+        const uint16_t ctrlPort = static_cast<uint16_t>(std::atoi(argv[2]));
+        auto t = RdmaTransport::create(makeCfg(ctrlPort), nullptr, nullptr);
+        if (!t || !t->initialize()) { std::printf("server init FAIL\n"); return 1; }
+        constexpr size_t kSz = 8 * 1024 * 1024;
+        std::vector<uint8_t> buf(kSz, 0xAB);
+        auto reg = t->registerHostMemory(buf.data(), buf.size());
+        if (!reg) { std::printf("server register FAIL\n"); return 1; }
+        std::printf("REGION rkey=%u size=%zu\n", reg->rkey, buf.size());
+        std::fflush(stdout);
+        // Hold the region alive while the client works.
+        for (int i = 0; i < 60; ++i) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (i >= 5 && buf[0] == 0xCD && buf[kSz / 2 - 1] == 0xCD &&
+                buf[4 * 1024 * 1024] == 0xAB) {
+                // Client's write landed and our pattern half is intact.
+                std::printf("SERVER VERIFY OK\n");
+                std::fflush(stdout);
+                break;
+            }
+        }
+        t->shutdown();
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc >= 4 && std::strcmp(argv[1], "client") == 0) {
+        const char* ip = argv[2];
+        const uint16_t ctrlPort = static_cast<uint16_t>(std::atoi(argv[3]));
+        auto t = RdmaTransport::create(makeCfg(50050), nullptr, nullptr);
+        if (!t || !t->initialize()) { std::printf("client init FAIL\n"); return 1; }
+        auto conn = t->connect(ip, ctrlPort);
+        if (!conn) { std::printf("client connect FAIL\n"); return 1; }
+
+        constexpr size_t kHalf = 4 * 1024 * 1024;
+        uint32_t rkey = 0;
+        if (argc >= 5) rkey = static_cast<uint32_t>(std::atoi(argv[4]));
+        else { std::printf("usage: client <ip> <ctrlport> <rkey>\n"); return 1; }
+
+        std::vector<uint8_t> payload(kHalf, 0xCD);
+        auto scratch = t->registerHostMemory(payload.data(), payload.size());
+        CHECK(scratch.has_value());
+        bool w = t->rdmaWrite(*conn, *scratch, /*remoteAddr=*/0, rkey, kHalf,
+                              30ull * 1000 * 1000 * 1000);
+        std::printf("CLIENT WRITE %s\n", w ? "OK" : "FAIL");
+
+        std::vector<uint8_t> sink(kHalf, 0x00);
+        auto sinkReg = t->registerHostMemory(sink.data(), sink.size());
+        CHECK(sinkReg.has_value());
+        bool r = t->rdmaRead(*conn, *sinkReg, /*remoteAddr=*/kHalf, rkey, kHalf,
+                             30ull * 1000 * 1000 * 1000);
+        bool pattern = r && sink[0] == 0xAB && sink[kHalf - 1] == 0xAB;
+        std::printf("CLIENT READ %s (%s pattern)\n", r ? "OK" : "FAIL",
+                    pattern ? "valid" : "INVALID");
+        std::printf("CLIENT %s\n", (w && r && pattern) ? "DONE-OK" : "DONE-FAIL");
+        t->shutdown();
+        return failures == 0 ? 0 : 1;
+    }
+
+    // ---- Loopback regression mode (no args) -------------------------------
     constexpr uint16_t kPortA = 53201;
     constexpr uint16_t kPortB = 53202;
 
