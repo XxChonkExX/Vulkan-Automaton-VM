@@ -293,6 +293,11 @@ if(VVM_BUILD_EXAMPLES)
     add_subdirectory(examples)
 endif()
 
+# Local control daemon (docs/vvm_daemon_spec.md)
+if(VVM_BUILD_NETWORK)
+    add_subdirectory(tools)
+endif()
+
 # Python bindings
 if(VVM_BUILD_PYTORCH)
     add_subdirectory(python/vulkanvm_torch)

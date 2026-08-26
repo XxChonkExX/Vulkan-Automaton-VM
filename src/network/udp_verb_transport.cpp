@@ -501,7 +501,9 @@ std::optional<RdmaConnection> UdpVerbTransport::connect(
     const std::string& host, uint32_t port, uint32_t nodeIndex) {
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(static_cast<uint16_t>(port + kRdmaPortOffset));
+    // NOTE: `port` IS the peer's fabric data port (exact) - matching the
+    // verbs backend where callers advertise concrete RDMA listener ports.
+    addr.sin_port = htons(static_cast<uint16_t>(port));
     if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
         VVM_LOG_ERROR("udp-verb: invalid host {}", host);
         return std::nullopt;
