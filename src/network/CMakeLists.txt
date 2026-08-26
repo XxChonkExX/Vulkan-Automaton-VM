@@ -122,6 +122,10 @@ if(OPENSSL_FOUND)
     message(STATUS "VulkanVM network: TLS support enabled via OpenSSL")
     list(APPEND NETWORK_ABI_DEFS VVM_NETWORK_HAS_TLS=1)
     set(VVM_NETWORK_TLS_LIBS ${OPENSSL_LIBRARIES})
+    # Headers are not on the default search path everywhere (MSVC has no
+    # /usr/include): without this, tcp_transport.cpp's <openssl/ssl.h> fails
+    # with C1083 on Windows even though find_package(OpenSSL) succeeded.
+    set(VVM_NETWORK_TLS_INCS ${OPENSSL_INCLUDE_DIR})
 else()
     message(STATUS "VulkanVM network: TLS support disabled (OpenSSL not found)")
 endif()
@@ -142,6 +146,7 @@ target_include_directories(vulkan_vm_network PRIVATE
     ${VVM_NETWORK_L0_INCS}
     ${VVM_NETWORK_UCX_INCS}
     ${VVM_NETWORK_NDK_INCS}
+    ${VVM_NETWORK_TLS_INCS}
 )
 
 target_link_libraries(vulkan_vm_network PUBLIC vulkan_vm)
