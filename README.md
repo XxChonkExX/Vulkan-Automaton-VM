@@ -265,3 +265,16 @@ campaign (2026-08-25): cross-vendor P2P + verbs/RDMA verification, RDMA
 teardown hang root-caused and fixed, ANV 26.0.3 import crash characterized,
 validation-layer VUID cleanup — full evidence in
 [docs/LINUX_TEST_RESULTS_2026-08-25.md](docs/LINUX_TEST_RESULTS_2026-08-25.md).
+
+**Recent fixes (2026-08-25, Windows CI + lifecycle):**
+- Windows MSVC full matrix builds & links end-to-end: OpenSSL include-dir
+  propagation, `VVM_API` export annotations across the network public API,
+  pimpl-safe (out-of-line) move operations.
+- Same-process zero-copy imports are now policy-gated in the library
+  (cross-vendor refused on Linux by default; `VVM_ALLOW_CROSSVENDOR_ZC=1`
+  overrides) instead of ad-hoc env vars in tests.
+- Teardown correctness: pools always die before their VkDevices; stale/double
+  frees zero their handles; migration stagings RAII-released; tensor handles
+  gained opt-in auto-free (`attachReleaser`) and leak tripwire
+  (`VVM_TENSOR_LEAK_ABORT=1`).
+- `VVM_DEVICE_INDEX=<n>` selects a specific device for reproducible runs.
