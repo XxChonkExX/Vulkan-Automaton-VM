@@ -460,3 +460,32 @@ back to score selection.
 | network_test | 0 | 2 residual buffers |
 | tensor_collective_test | 0 | 2 residual buffers |
 | full ctest | 11/11 | - |
+
+---
+
+# Phase 7 — External-audit hardening (RDMA lifetime, SIGPIPE, export capabilities)
+
+Response to an independent code audit (2026-08-25). All P0/P1 findings
+verified against source, then fixed:
+
+1. **QP/CQ destruction race (P0):** `postRdma` now holds `ConnectionInfo::mutex`
+   across post AND completion-wait; `destroyConnection()` and shutdown's
+   `rdma_disconnect()` take the same mutex - qp/cq/id can never be destroyed
+   while a WR is outstanding or being reaped.
+2. **Timeout semantics (P0):** an RDMA timeout no longer returns while the WR
+   is unreaped (posted RDMA cannot be cancelled; freeing backing memory then
+   would be DMA-level use-after-free). On deadline the connection is marked
+   unhealthy and polling continues until the completion arrives (teardown
+   flushes it as `IBV_WC_WR_FLUSH_ERR`). Callers see: fail = connection drained.
+3. **32-bit SGE truncation (P1):** transfers > 4 GiB are chunked
+   (`postRdmaChunked`, per-chunk signaled WRs waited in order); `postRdma`
+   additionally rejects oversized direct calls instead of silently truncating.
+4. **TCP SIGPIPE (P1):** POSIX `socketSend` uses `MSG_NOSIGNAL`.
+5. **Capability-driven export handles (P0/P1):** candidate handle types are
+   filtered through `vkGetPhysicalDeviceExternalBufferProperties`
+   (`EXPORTABLE`) per buffer usage before buffer creation; vendor heuristics
+   only seed the candidate set.
+
+Validation: full ctest green on both build trees; verbs RDMA test passes over
+rxe0 with the new lock/drain discipline (no teardown regression); multi_gpu_test
+exercises the capability filter cross-vendor.

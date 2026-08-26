@@ -48,7 +48,15 @@ static constexpr int kSocketError = -1;
 inline void closeSocket(SocketType s) { close(s); }
 inline void socketShutdown(SocketType s) { shutdown(s, SHUT_RDWR); }
 inline int socketRecv(SocketType s, char* buf, int len) { return static_cast<int>(recv(s, buf, len, 0)); }
-inline int socketSend(SocketType s, const char* buf, int len) { return static_cast<int>(send(s, buf, len, 0)); }
+// MSG_NOSIGNAL: a vanished peer must raise EPIPE, not SIGPIPE (which would
+// kill the whole process - cluster nodes are long-lived).
+inline int socketSend(SocketType s, const char* buf, int len) {
+#ifdef MSG_NOSIGNAL
+    return static_cast<int>(send(s, buf, len, MSG_NOSIGNAL));
+#else
+    return static_cast<int>(send(s, buf, len, 0));
+#endif
+}
 using SockLenType = socklen_t;
 #else
 #include <arpa/inet.h>
@@ -65,7 +73,15 @@ static constexpr int kSocketError = -1;
 inline void closeSocket(SocketType s) { close(s); }
 inline void socketShutdown(SocketType s) { shutdown(s, SHUT_RDWR); }
 inline int socketRecv(SocketType s, char* buf, int len) { return static_cast<int>(recv(s, buf, len, 0)); }
-inline int socketSend(SocketType s, const char* buf, int len) { return static_cast<int>(send(s, buf, len, 0)); }
+// MSG_NOSIGNAL: a vanished peer must raise EPIPE, not SIGPIPE (which would
+// kill the whole process - cluster nodes are long-lived).
+inline int socketSend(SocketType s, const char* buf, int len) {
+#ifdef MSG_NOSIGNAL
+    return static_cast<int>(send(s, buf, len, MSG_NOSIGNAL));
+#else
+    return static_cast<int>(send(s, buf, len, 0));
+#endif
+}
 using SockLenType = socklen_t;
 #endif
 
