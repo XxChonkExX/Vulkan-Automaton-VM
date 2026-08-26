@@ -206,6 +206,9 @@ struct VVM_API TensorAllocation {
     // Opt-in auto-free: `fn` receives the Allocation and must return it to
     // its owning pool. Cleared automatically once invoked.
     void attachReleaser(std::function<void(Allocation&&)> fn) { releaser_ = std::move(fn); }
+    // Remove the auto-free hook (owner teardown safety): destructor then
+    // treats any remaining buffer as explicitly managed.
+    void detachReleaser() { releaser_ = nullptr; }
 
 private:
     std::function<void(Allocation&&)> releaser_;

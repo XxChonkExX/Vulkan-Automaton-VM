@@ -468,6 +468,15 @@ public:
             if (h) h->attachReleaser(nullptr);  // pools may not outlive caches
         }
         distributedTensors_.clear();
+        // Detach auto-free from EVERY issued handle: none may fire after the
+        // pools die (bionic FORTIFY aborts on the resulting destroyed-mutex
+        // lock; desktop glibc merely corrupted silently).
+        {
+            std::lock_guard<std::mutex> lk(issuedMutex_);
+            for (auto* h : issued_)
+                if (h) h->detachReleaser();
+            issued_.clear();
+        }
         shutdown();
     }
     
@@ -607,11 +616,20 @@ public:
         // joins workers first). deallocate() nulls allocation.buffer, so a
         // manual pool.deallocate followed by handle destruction is safe.
         UnifiedMemoryPool* owningPool = &pool;
-        handle->attachReleaser([owningPool](Allocation&& a) {
+        auto* rawHandle = handle.get();
+        // `this` capture is safe: the destructor detaches every issued
+        // releaser BEFORE its members/pools disappear.
+        rawHandle->attachReleaser([this, owningPool, rawHandle](Allocation&& a) {
             if (owningPool && a.buffer != VK_NULL_HANDLE) {
                 owningPool->deallocate(std::move(a));
             }
+            std::lock_guard<std::mutex> lk(issuedMutex_);
+            issued_.erase(rawHandle);
         });
+        {
+            std::lock_guard<std::mutex> lk(issuedMutex_);
+            issued_.insert(rawHandle);
+        }
         return handle;
     }
     
@@ -2087,6 +2105,11 @@ private:
     // Broadcast targets: device index -> nearest handle (populated by
     // allocateDistributed).
     std::unordered_map<uint32_t, TensorHandle> distributedTensors_;
+
+    // Every factory-issued live handle, so destruction can strip their
+    // pool-releasing hooks before the pools themselves disappear.
+    std::mutex issuedMutex_;
+    std::set<TensorAllocation*> issued_;
     
     // Async processing
     std::thread asyncThread_;
