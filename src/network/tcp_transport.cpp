@@ -1172,6 +1172,10 @@ struct TcpTransport::Impl {
 
 TcpTransport::TcpTransport() : impl_(std::make_unique<Impl>()) {}
 
+// Defined here (Impl complete) - see header note on the move declarations.
+TcpTransport::TcpTransport(TcpTransport&&) noexcept = default;
+TcpTransport& TcpTransport::operator=(TcpTransport&&) noexcept = default;
+
 TcpTransport::~TcpTransport() {
     if (impl_) impl_->stop();
 }
