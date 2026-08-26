@@ -179,7 +179,7 @@ framework. The honest list:
 
 What we claim, we test. What we haven't tested, we say.
 
-Built homebrew with love — local power. — Mike/ChonkE
+Built and homebrewed with love — local power. — Mike/ChonkE
 
 ---
 
