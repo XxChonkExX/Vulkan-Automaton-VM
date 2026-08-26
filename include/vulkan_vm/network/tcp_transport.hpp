@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vulkan_vm/network/network_config.hpp"
+#include "vulkan_vm/utils.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -118,7 +119,7 @@ struct TlsConfig {
 // Thread Safety: All public methods are thread-safe.
 //                  start()/stop() must not be called concurrently with request().
 //                  Request handler must be thread-safe if called concurrently.
-class TcpTransport {
+class VVM_API TcpTransport {
 public:
     using ConnId = uint64_t;
     using RequestHandler = std::function<void(TcpMessage& request, TcpMessage& response)>;

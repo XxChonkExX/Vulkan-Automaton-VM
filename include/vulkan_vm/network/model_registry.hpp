@@ -41,7 +41,7 @@ namespace network {
 //     config.json
 //     .vvm_complete
 
-class ModelHub {
+class VVM_API ModelHub {
 public:
     // Server construction.  cacheDir is the root for model file storage.
     ModelHub(const std::string& cacheDir);
