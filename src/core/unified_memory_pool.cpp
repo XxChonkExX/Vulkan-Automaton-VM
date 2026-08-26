@@ -1213,18 +1213,25 @@ std::optional<Allocation> UnifiedMemoryPool::allocateTensor(VkDeviceSize size,
 
 void UnifiedMemoryPool::deallocate(Allocation&& alloc) {
     std::lock_guard<std::mutex> lock(mutex_);
-    
+
     // Validate generation counter to prevent stale handle use
     if (!isValidGeneration(alloc.generation)) {
         VVM_LOG_WARN("deallocate: stale allocation handle (generation {}) rejected", alloc.generation);
+        // Zero the stale copy so it can never be re-freed (a second pass with
+        // dead handles surfaces later as vkUnmapMemory/vkFreeMemory parameter
+        // errors or double-free corruption).
+        alloc.buffer = VK_NULL_HANDLE;
+        alloc.memory = VK_NULL_HANDLE;
+        alloc.hostPtr = nullptr;
+        alloc.deviceAddress = 0;
         return;
     }
-    
+
     // Retire the generation BEFORE freeing. subDeallocate must not re-validate:
     // the generation has already been checked here exactly once.
     retireGeneration(alloc.generation);
     alloc.generation = 0;
-    
+
     if (alloc.blockIndex == UINT32_MAX) {
         // Dedicated allocation - destroy directly
         subDeallocate(std::move(alloc));
@@ -1866,6 +1873,24 @@ void UnifiedMemoryPool::subDeallocate(Allocation&& alloc) {
     // Dedicated allocations (blockIndex == UINT32_MAX) have their own VkDeviceMemory
     // and VkBuffer - destroy both directly and remove from tracking
     if (alloc.blockIndex == UINT32_MAX) {
+        // Only free if WE are still tracking it. An untracked dedicated handle
+        // was already freed (double-deallocate of a stale copy) or came from a
+        // foreign pool/device; destroying it here produces loader parameter
+        // errors ("vkUnmapMemory: Invalid device") and worse.
+        const bool tracked = std::any_of(
+            dedicatedAllocations_.begin(), dedicatedAllocations_.end(),
+            [&alloc](const Allocation& a) {
+                return a.buffer == alloc.buffer && a.memory == alloc.memory;
+            });
+        if (!tracked) {
+            VVM_LOG_WARN("subDeallocate: untracked dedicated allocation "
+                         "(buffer={:#x}) - already freed or foreign, skipping",
+                         reinterpret_cast<uintptr_t>(alloc.buffer));
+            alloc.buffer = VK_NULL_HANDLE;
+            alloc.memory = VK_NULL_HANDLE;
+            alloc.hostPtr = nullptr;
+            return;
+        }
         if (alloc.buffer) vkDestroyBuffer(device_, alloc.buffer, nullptr);
         if (alloc.memory) {
             if (alloc.hostPtr) vkUnmapMemory(device_, alloc.memory);
@@ -1878,12 +1903,16 @@ void UnifiedMemoryPool::subDeallocate(Allocation&& alloc) {
                     return a.buffer == alloc.buffer && a.memory == alloc.memory;
                 }),
             dedicatedAllocations_.end());
+        alloc.buffer = VK_NULL_HANDLE;
+        alloc.memory = VK_NULL_HANDLE;
+        alloc.hostPtr = nullptr;
         return;
     }
 
     if (alloc.blockIndex >= blocks_.size()) return;
 
     vkDestroyBuffer(device_, alloc.buffer, nullptr);
+    alloc.buffer = VK_NULL_HANDLE;
 
     auto& block = blocks_[alloc.blockIndex];
     if (block.buddy) {
@@ -1893,6 +1922,8 @@ void UnifiedMemoryPool::subDeallocate(Allocation&& alloc) {
         block.buddy->deallocate(alloc.offset, 0);
     }
     block.used -= alloc.size;
+    alloc.memory = VK_NULL_HANDLE;
+    alloc.hostPtr = nullptr;
 }
 
 VkDeviceSize UnifiedMemoryPool::alignUp(VkDeviceSize value, VkDeviceSize alignment) {

@@ -9,6 +9,7 @@
 #endif
 
 #include <algorithm>
+#include <cstdlib>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -458,6 +459,15 @@ public:
     ) : config_(config), devices_(devices), poolConfig_(poolConfig) {}
     
     ~TensorTransportImpl() override {
+        // Drop cached tensor handles BEFORE pools go away. Their opt-in
+        // auto-free releasers call into poolManager_'s pools; running that
+        // during member destruction (after the manager is gone) deadlocks on
+        // a destroyed mutex. Pools are alive here and workers are joined by
+        // shutdown(), so deallocation is safe at this point.
+        for (auto& [idx, h] : distributedTensors_) {
+            if (h) h->attachReleaser(nullptr);  // pools may not outlive caches
+        }
+        distributedTensors_.clear();
         shutdown();
     }
     
@@ -591,6 +601,17 @@ public:
         handle->allocation = std::move(*alloc);
         handle->metadata = meta;
         handle->deviceIndex = deviceIndex;
+        // Opt-in auto-free safety net: the releaser returns the buffer to its
+        // owning pool when the last handle reference drops. The pool outlives
+        // handles in every supported flow (manager owns pools; shutdown()
+        // joins workers first). deallocate() nulls allocation.buffer, so a
+        // manual pool.deallocate followed by handle destruction is safe.
+        UnifiedMemoryPool* owningPool = &pool;
+        handle->attachReleaser([owningPool](Allocation&& a) {
+            if (owningPool && a.buffer != VK_NULL_HANDLE) {
+                owningPool->deallocate(std::move(a));
+            }
+        });
         return handle;
     }
     
@@ -2090,3 +2111,28 @@ std::unique_ptr<Transport> Transport::create(
 
 } // namespace tensor
 } // namespace vvm
+
+// ============================================================================
+// TensorAllocation lifetime hooks (declared in tensor_transport.hpp)
+// ============================================================================
+
+vvm::tensor::TensorAllocation::~TensorAllocation() {
+    if (allocation.buffer == VK_NULL_HANDLE) return;  // already returned to pool
+
+    if (releaser_) {
+        releaser_(std::move(allocation));
+        allocation.buffer = VK_NULL_HANDLE;
+        return;
+    }
+
+    static const bool abortOnLeak = std::getenv("VVM_TENSOR_LEAK_ABORT") != nullptr;
+    if (abortOnLeak) {
+        VVM_LOG_ERROR("TensorHandle '{}' leaked (buffer alive at destruction) - "
+                      "VVM_TENSOR_LEAK_ABORT=1, aborting",
+                      metadata.name);
+        std::abort();
+    }
+    VVM_LOG_WARN("TensorHandle '{}' destroyed with a live buffer - leaked "
+                 "(return it via pool.deallocate or attachReleaser)",
+                 metadata.name);
+}

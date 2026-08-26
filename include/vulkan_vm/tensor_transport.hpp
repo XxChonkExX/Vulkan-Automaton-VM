@@ -4,6 +4,7 @@
 // Includes: TensorMetadata, TensorShape, DataType, MemoryLayout, TransportConfig,
 //           Transport interface, collective operations
 
+#include <functional>
 #include "vulkan_vm/core.hpp"
 #include "vulkan_vm/cross_gpu.hpp"
 #include "vulkan_vm/network.hpp"
@@ -188,10 +189,26 @@ struct TransportConfig {
 // Tensor Transport Interface
 // ============================================================================
 
-struct TensorAllocation {
+// Tensor lifetime (see docs/LIFETIME_CONTRACT.md): a TensorHandle owns its
+// VkBuffer. By default the buffer is NOT freed automatically - callers must
+// return it to the pool explicitly (pool.deallocate(std::move(h->allocation)),
+// which nulls allocation.buffer). As a safety net, attachReleaser() enables
+// opt-in auto-free on last handle drop; without a releaser, destroying a
+// handle that still holds a live buffer logs a leak warning (and aborts under
+// VVM_TENSOR_LEAK_ABORT=1).
+struct VVM_API TensorAllocation {
     Allocation allocation;
     TensorMetadata metadata;
     uint32_t deviceIndex = 0;  // Which GPU device this tensor is on
+
+    ~TensorAllocation();
+
+    // Opt-in auto-free: `fn` receives the Allocation and must return it to
+    // its owning pool. Cleared automatically once invoked.
+    void attachReleaser(std::function<void(Allocation&&)> fn) { releaser_ = std::move(fn); }
+
+private:
+    std::function<void(Allocation&&)> releaser_;
 };
 
 using TensorHandle = std::shared_ptr<TensorAllocation>;

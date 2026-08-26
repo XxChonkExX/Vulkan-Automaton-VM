@@ -135,3 +135,25 @@ Before merging anything that touches allocation, export/import, or teardown:
 - [ ] Can any alias outlive its source under your new code path?
 - [ ] Vulkan validation layers clean (`VVM_ENABLE_VALIDATION=ON` builds)
 - [ ] Python integration: torch version recorded, allocator ABI re-validated
+
+## 7. Tensor handle lifetime (Compute layer)
+
+- A `TensorHandle` (`TensorAllocation`) owns its `VkBuffer` for as long as
+  `allocation.buffer != VK_NULL_HANDLE`.
+- **Default rule: explicit return.** Callers return tensors to their pool with
+  `pool.deallocate(std::move(handle->allocation))`. `deallocate` zeroes the
+  handles, so a later destruction of the same handle is a no-op.
+- **Opt-in auto-free:** engine-created tensors (via
+  `Transport::allocateTensor` / `allocateDistributed`) carry a releaser bound
+  to their owning pool; if the last reference drops without an explicit
+  return, the destructor releases the buffer automatically.
+  Hand-built handles (tests/tools) have no releaser - they leak-warn on
+  destruction while a buffer is still attached.
+- **Leak tripwire:** set `VVM_TENSOR_LEAK_ABORT=1` to turn the warning into an
+  abort in CI/debug runs.
+- Handles must not outlive their transport/pool owner. The transport detaches
+  cached replicas during its own destruction; user-held handles past that
+  point are use-after-free by contract, not a supported state.
+- Pool blocks and staging buffers follow the same explicit-return rule;
+  internal migration stagings are RAII-released (`StagingReleaser` /
+  freeing-deleter) and must never escape as raw `Allocation` copies.

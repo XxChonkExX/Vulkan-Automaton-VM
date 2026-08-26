@@ -450,22 +450,19 @@ int main() {
 
     int failures = 0;
 
-    // Same-process zero-copy import across VENDOR-different devices segfaults
-    // inside ANV (Mesa 26.0.3) vkAllocateMemory - RADV->RADV is fine. Disable
-    // ZC for cross-vendor pairs unless explicitly overridden, so the cluster
-    // flow exercises host-staged migration instead of dying in the driver.
-    // See docs/LINUX_TEST_RESULTS_2026-08-25.md.
+    // Same-process zero-copy policy lives in the library now
+    // (vvm::network::sameProcessZcAllowed): cross-vendor pairs refuse ZC on
+    // Linux by default because Mesa 26.0.3 ANV segfaults on foreign-driver
+    // import; imports fall back to host-staged automatically.
     VkPhysicalDeviceProperties propsA{}, propsB{};
     vkGetPhysicalDeviceProperties(s_dev.physicalDevice, &propsA);
     vkGetPhysicalDeviceProperties(s_devB.physicalDevice, &propsB);
     const bool crossVendor = propsA.vendorID != propsB.vendorID;
-    const bool zcAllowed = !crossVendor ||
-                           std::getenv("VVM_ALLOW_CROSSVENDOR_ZC") != nullptr;
+    const bool zcAllowed = vvm::network::sameProcessZcAllowed(propsA.vendorID, propsB.vendorID);
     if (!zcAllowed) {
-        setenv("VVM_DISABLE_SAME_PROCESS_ZC", "1", 1);
         std::cout << "Cross-vendor pair (" << propsA.deviceName << " / "
-                  << propsB.deviceName << "): same-process ZC disabled "
-                  << "(set VVM_ALLOW_CROSSVENDOR_ZC=1 to force)\n";
+                  << propsB.deviceName << "): same-process ZC refused by vendor "
+                  << "policy (set VVM_ALLOW_CROSSVENDOR_ZC=1 to force)\n";
     }
 
     // ---- Create two "nodes" on loopback ----

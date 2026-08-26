@@ -388,3 +388,75 @@ Validation status after fixes: create/destroy-path VUIDs clean in
 ```
 VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation ctest --test-dir build_rdma --output-on-failure
 ```
+
+---
+
+# Phase 6 — Teardown correctness, ZC policy, lifecycle hardening (same day)
+
+## Fixed: `multi_gpu_test` SIGABRT at exit ("vkUnmapMemory: Invalid device")
+
+Live backtrace: abort inside `vkUnmapMemory` from `~UnifiedMemoryPool`, called
+via `~vector<GPUInstance>` in main. Instrumented dev/mem pairing proved the
+unmap used the **correct** device/memory pair - meaning the VkDevice itself was
+already destroyed. Root cause: test teardown order - `vkDestroyDevice()` ran
+while the manager (and its pools) were still alive; pool destructors then
+touched a dead device, which the current loader escalates to SIGABRT.
+
+Fixes:
+- `tests/multi_gpu_test.cpp`: `manager.reset()` before destroying devices
+  (pools must always die before their VkDevice).
+- `UnifiedMemoryPool::deallocate/subDeallocate`: stale-generation rejections
+  and untracked dedicated handles now zero their handles instead of leaving
+  dangling buffer/memory values that could be re-freed later.
+
+Result: `multi_gpu_test` exits 0 with no loader errors for the first time.
+
+## Fixed: same-process zero-copy policy moved into the library
+
+The env-var guard in `network_test` is replaced by runtime policy in
+`multi_node_manager.cpp`: exported handles are registered with the exporter's
+PCI vendor ID, and `zcAllowedForPair(srcVendor,dstVendor)` refuses
+cross-vendor same-process imports on Linux by default (Mesa 26.0.3 ANV crash,
+Phase 4), parking the handle instead of consuming it. Overrides:
+`VVM_ALLOW_CROSSVENDOR_ZC=1`. `VVM_DISABLE_SAME_PROCESS_ZC` is superseded.
+`network_test` now consults the exposed
+`vvm::network::sameProcessZcAllowed()` for its SKIP reporting.
+
+## Fixed: migration staging + broadcast replica leaks
+
+- All four host-staged migration staging sites now release via RAII
+  (`StagingReleaser`) or freeing-deleter shared ownership
+  (`StagingFreeDeleter`) - previously the response cleanups were `(void)x`
+  no-ops and client stagings simply went out of scope. `network_test`
+  leaked-buffer count under validation: 8 -> 4 hits (2 buffers).
+- `~TensorTransportImpl` detaches cached distributed-tensor releasers and
+  clears its handle cache before pools can go away (a use-after-teardown
+  deadlock discovered by the new auto-free path). `tensor_collective_test`
+  leaked-buffer count: 20 -> 4 hits (2 buffers).
+
+## Added: tensor handle lifetime hooks
+
+`TensorAllocation` gained `attachReleaser()` (opt-in auto-free bound to the
+owning pool) plus leak warning / `VVM_TENSOR_LEAK_ABORT=1` abort semantics;
+engine factories attach releasers automatically. Contract documented as
+section 7 of docs/LIFETIME_CONTRACT.md.
+
+## Added: deterministic device selection
+
+`vvm::selectBestDevice` honors `VVM_DEVICE_INDEX=<n>` (index into
+`enumerateDevices` order) before any scoring; invalid indices warn and fall
+back to score selection.
+
+## Upstream report drafts
+
+- docs/upstream/mesa-anv-crossvendor-import-segfault.md
+- docs/upstream/kernel-rxe-rstream-corruption.md
+
+## Status after Phase 6
+
+| Suite | Exit | Validation leaks |
+|---|---|---|
+| multi_gpu_test | 0 | (teardown clean) |
+| network_test | 0 | 2 residual buffers |
+| tensor_collective_test | 0 | 2 residual buffers |
+| full ctest | 11/11 | - |
