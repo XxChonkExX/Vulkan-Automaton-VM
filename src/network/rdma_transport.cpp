@@ -1293,7 +1293,7 @@ private:
 // Factory
 // ============================================================================
 
-std::unique_ptr<RdmaTransport> RdmaTransport::create(
+std::unique_ptr<RdmaTransport> createVerbsRdmaTransport(
     const NetworkConfig& config,
     VkPhysicalDevice physicalDevice,
     VkDevice device) {
