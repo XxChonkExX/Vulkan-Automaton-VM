@@ -345,3 +345,46 @@ VVM_RDMA_CONNECT_HOST=<lan-ip> ./build_rdma/tests/multi_vendor_rdma_test
 ./build_rdma/examples/network_test                                 # exit 0
 VVM_ALLOW_CROSSVENDOR_ZC=1 ./build_rdma/examples/network_test     # will hit the ANV bug
 ```
+
+---
+
+# Phase 5 — Validation-layer VUID cleanup (same day)
+
+With `VK_LAYER_KHRONOS_validation` enabled across the suites, five violation
+classes surfaced. Fixed in this phase:
+
+| VUID | Cause | Fix |
+|---|---|---|
+| `VkBufferDeviceAddressInfo-buffer-02601` | `vkGetBufferDeviceAddress` queried on buffers created without `VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT` (`allocateDedicatedExportable`, `importMemory`; tolerated by RADV, flagged by validation) | usage bit added when `config_.enableDeviceAddress` (unified_memory_pool.cpp) |
+| `VkMemoryGetFdInfoKHR-handleType-00671` | verbs GPUDirect path requested DMA-BUF fds for pool-block memories that never had export capability | `registerMemoryForRdma` gates on `Allocation::isExternal` up front |
+| `VkDeviceCreateInfo-pNext-02830` | network_test chained `Vulkan12Features` AND individual BDA/Timeline feature structs | single `Vulkan12Features` struct |
+| `VkDeviceCreateInfo-queueFamilyIndex-02802/-06755` | duplicate queue-family entries when graphics/compute/transfer roles share a family; counts could exceed the family's queueCount | dedup + clamp against `vkGetPhysicalDeviceQueueFamilyProperties` |
+| `vkCreateInstance-ppEnabledExtensionNames-01388` | unused surface extension requested | dropped |
+
+**Leak fixes (object-lifetime):**
+
+- `network_test`: push/pull source allocations (`srcB*`) were never returned
+  to B's pool - only their promoted copies were. Explicit deallocates added.
+- `tensor_collective_test`: `TensorAllocation` holds its `Allocation` by value
+  and does NOT auto-free (per docs/LIFETIME_CONTRACT.md tensors are explicitly
+  managed); the test dropped every handle without deallocating (20 leaked
+  buffers). Handles are now tracked and returned to their pools before
+  transport shutdown / device destroy (20 -> 2).
+
+**Remaining known leaks (documented, not fixed):**
+
+- `tensor_collective_test`: 2 buffers from transport-internal broadcast
+  replication on remote devices - engine-side lifecycle work.
+- `network_test`: 6 buffers of engine-internal temporaries (migration staging).
+- `multi_gpu_test`: teardown `vkUnmapMemory: Invalid device` escalates to
+  SIGABRT under the current loader/validation; stale-generation deallocate
+  warning in the same path.
+
+Validation status after fixes: create/destroy-path VUIDs clean in
+`tensor_collective_test`; remaining hits are only the leak classes above.
+
+## Repro
+
+```
+VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation ctest --test-dir build_rdma --output-on-failure
+```

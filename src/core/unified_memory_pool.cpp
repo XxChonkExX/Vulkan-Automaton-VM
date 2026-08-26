@@ -776,9 +776,12 @@ static VkExternalMemoryHandleTypeFlags getExportHandleTypes(VkPhysicalDevice phy
         bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         bufferInfo.size = size;
         bufferInfo.usage = usage;
+        if (config_.enableDeviceAddress) {
+            bufferInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        }
         bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         bufferInfo.pNext = &extBufferInfo;
-        
+
         VkBuffer buffer;
         VkResult result = vkCreateBuffer(device_, &bufferInfo, nullptr, &buffer);
         if (result != VK_SUCCESS) {
@@ -1406,6 +1409,11 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bufferInfo.size = info.size;
     bufferInfo.usage = usage;
+    if (config_.enableDeviceAddress) {
+        // Step 6 queries vkGetBufferDeviceAddress on this buffer; without this
+        // usage bit that query is invalid (VUID-VkBufferDeviceAddressInfo-buffer-02601).
+        bufferInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    }
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     bufferInfo.pNext = &extBufferInfo;
     
