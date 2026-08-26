@@ -76,15 +76,25 @@ static bool initTestDevice() {
     appInfo.pApplicationName = "VulkanVM Tensor Server";
     appInfo.apiVersion = VK_API_VERSION_1_3;
 
-    std::vector<const char*> instanceExts = {
+    // Filter against loader availability - Android loaders often lack
+    // VK_EXT_debug_utils (VK_ERROR_EXTENSION_NOT_PRESENT otherwise).
+    std::vector<const char*> wantedExts = {
         VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
         VK_EXT_DEBUG_UTILS_EXTENSION_NAME
     };
+    uint32_t availN = 0;
+    vkEnumerateInstanceExtensionProperties(nullptr, &availN, nullptr);
+    std::vector<VkExtensionProperties> avail(availN);
+    vkEnumerateInstanceExtensionProperties(nullptr, &availN, avail.data());
+    std::vector<const char*> instanceExts;
+    for (const char* w : wantedExts)
+        for (const auto& e : avail)
+            if (!std::strcmp(e.extensionName, w)) { instanceExts.push_back(w); break; }
     VkInstanceCreateInfo instanceInfo{};
     instanceInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     instanceInfo.pApplicationInfo = &appInfo;
     instanceInfo.enabledExtensionCount = static_cast<uint32_t>(instanceExts.size());
-    instanceInfo.ppEnabledExtensionNames = instanceExts.data();
+    instanceInfo.ppEnabledExtensionNames = instanceExts.empty() ? nullptr : instanceExts.data();
 
     if (vkCreateInstance(&instanceInfo, nullptr, &s_dev.instance) != VK_SUCCESS) {
         LOG_ERROR("create instance");

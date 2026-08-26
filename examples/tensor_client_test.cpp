@@ -51,15 +51,25 @@ static bool initTestDevice() {
     appInfo.pApplicationName = "VulkanVM Tensor Client";
     appInfo.apiVersion = VK_API_VERSION_1_3;
 
-    std::vector<const char*> instanceExts = {
+    // Filter against loader availability - Android loaders often lack
+    // VK_EXT_debug_utils (VK_ERROR_EXTENSION_NOT_PRESENT otherwise).
+    std::vector<const char*> wantedExts = {
         VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
         VK_EXT_DEBUG_UTILS_EXTENSION_NAME
     };
+    uint32_t availN = 0;
+    vkEnumerateInstanceExtensionProperties(nullptr, &availN, nullptr);
+    std::vector<VkExtensionProperties> avail(availN);
+    vkEnumerateInstanceExtensionProperties(nullptr, &availN, avail.data());
+    std::vector<const char*> instanceExts;
+    for (const char* w : wantedExts)
+        for (const auto& e : avail)
+            if (!std::strcmp(e.extensionName, w)) { instanceExts.push_back(w); break; }
     VkInstanceCreateInfo instanceInfo{};
     instanceInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     instanceInfo.pApplicationInfo = &appInfo;
     instanceInfo.enabledExtensionCount = static_cast<uint32_t>(instanceExts.size());
-    instanceInfo.ppEnabledExtensionNames = instanceExts.data();
+    instanceInfo.ppEnabledExtensionNames = instanceExts.empty() ? nullptr : instanceExts.data();
 
     if (vkCreateInstance(&instanceInfo, nullptr, &s_dev.instance) != VK_SUCCESS) {
         std::cerr << "FAIL: create instance\n"; return false;
@@ -427,6 +437,22 @@ int main(int argc, char** argv) {
                 } else {
                     // Server should send a tensor with a different pattern (e.g., 0xA5)
                     bool ok = verifyPattern(readback->hostPtr, kBytes, 0xA5);
+                    if (!ok) {
+                        const auto* bytes = static_cast<const uint8_t*>(readback->hostPtr);
+                        size_t firstDiff = kBytes;
+                        size_t nonzero = 0, a5 = 0;
+                        for (size_t i = 0; i < kBytes; ++i) {
+                            if (bytes[i] != 0xA5) { if (firstDiff == kBytes) firstDiff = i; }
+                            if (bytes[i] == 0xA5) ++a5;
+                            if (bytes[i] != 0) ++nonzero;
+                        }
+                        std::cerr << "  verify diag: firstDiff=" << firstDiff
+                                  << " a5bytes=" << a5 << "/" << kBytes
+                                  << " nonzero=" << nonzero
+                                  << " byte@diff=0x" << std::hex
+                                  << (int)bytes[firstDiff == kBytes ? 0 : firstDiff]
+                                  << std::dec << "\n";
+                    }
                     std::cout << "  VRAM content verify (expecting 0xA5 from server): " << (ok ? "PASS" : "FAIL") << "\n";
                     if (!ok) ++failures;
                 }
