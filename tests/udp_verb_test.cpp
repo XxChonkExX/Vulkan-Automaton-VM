@@ -110,9 +110,8 @@ int main(int argc, char** argv) {
     CHECK(ta->initialize());
     CHECK(tb->initialize());
 
-    // connect() derives the peer's data port by adding kRdmaPortOffset
-    // itself - pass the CONTROL port, same as the cluster manager does.
-    auto connAB = ta->connect("127.0.0.1", kPortB);
+    // connect() takes the peer's FABRIC DATA port exactly.
+    auto connAB = ta->connect("127.0.0.1", kPortB + vvm::network::kRdmaPortOffset);
     CHECK(connAB.has_value());
     if (!connAB) return 1;
 
