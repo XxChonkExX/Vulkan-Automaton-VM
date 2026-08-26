@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vulkan_vm/network/network_types.hpp"
+#include "vulkan_vm/utils.hpp"
 #include "vulkan_vm/network/gpu_direct_registration.hpp"
 #include <memory>
 #include <vector>
@@ -62,7 +63,7 @@ struct RdmaConnection {
 //                  initialize()/shutdown() must not be called concurrently with operations.
 //                  registerGpuMemory/unregisterMemory are thread-safe.
 //                  rdmaWrite/rdmaRead are thread-safe per connection.
-class RdmaTransport {
+class VVM_API RdmaTransport {
 public:
     // Factory
     static std::unique_ptr<RdmaTransport> create(
