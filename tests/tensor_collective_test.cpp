@@ -94,6 +94,15 @@ Allocation allocGpu(MultiGPUPoolManager& mg, uint32_t deviceIdx, size_t bytes) {
     return std::move(*a);
 }
 
+// Every live tensor handle, so we can return their allocations to the pools
+// before device teardown. TensorAllocation does NOT free its VkBuffer by
+// itself (see docs/LIFETIME_CONTRACT.md) - dropping a handle without an
+// explicit deallocate leaks the buffer.
+std::vector<TensorHandle>& liveHandles() {
+    static std::vector<TensorHandle> handles;
+    return handles;
+}
+
 TensorHandle makeHandle(const Allocation& alloc, DataType dt, size_t bytes,
                         std::string name) {
     auto h = std::make_shared<TensorAllocation>();
@@ -103,6 +112,7 @@ TensorHandle makeHandle(const Allocation& alloc, DataType dt, size_t bytes,
     h->metadata.shape = TensorShape::makeContiguous({static_cast<int64_t>(bytes / dataTypeSize(dt))});
     h->metadata.name = std::move(name);
     h->deviceIndex = 0;
+    liveHandles().push_back(h);
     return h;
 }
 
@@ -428,6 +438,15 @@ int main() {
     }
 
 done:
+    // Return every tensor allocation to its pool BEFORE shutting the
+    // transport / destroying the device; otherwise validation reports leaked
+    // VkBuffers (VUID-vkDestroyDevice-device-05137). Deallocating ahead of
+    // shutdown() also avoids racing pool teardown against live worker threads.
+    for (auto& h : liveHandles()) {
+        if (!h) continue;
+        poolMgr->getPool(h->deviceIndex).deallocate(std::move(h->allocation));
+    }
+    liveHandles().clear();
     transport->shutdown();
     if (env.device) vkDestroyDevice(env.device, nullptr);
     if (env.instance) vkDestroyInstance(env.instance, nullptr);

@@ -1600,6 +1600,11 @@ std::optional<Allocation> MultiNodePoolManager::createLocalAllocationForImport(
 #if defined(VVM_NETWORK_HAS_VERBS)
 bool MultiNodePoolManager::registerMemoryForRdma(const Allocation& alloc, uint64_t& outRdmaAddr, uint32_t& outRkey) {
     if (!rdmaTransport_) return false;
+    // Only export-capable (dedicated external) allocations can hand out a
+    // DMA-BUF fd for ibv_reg_dmabuf_mr. Asking vkGetMemoryFdKHR for a pool
+    // block's memory is a spec violation (VUID-VkMemoryGetFdInfoKHR-handleType-00671)
+    // and just fails non-fatally; skip it up front.
+    if (!alloc.isExternal) return false;
 
     auto region = rdmaTransport_->registerGpuMemory(alloc.memory, alloc.offset, alloc.size, alloc.buffer);
     if (!region) return false;

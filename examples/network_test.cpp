@@ -21,6 +21,7 @@
 #include <chrono>
 #include <atomic>
 #include <vector>
+#include <unordered_map>
 
 // ---------------------------------------------------------------------------
 // Minimal device setup (single GPU, graphics + compute + transfer queues)
@@ -50,8 +51,8 @@ static bool initVulkanInstance() {
 
     std::vector<const char*> instExts = {
         VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
-        VK_EXT_DEBUG_UTILS_EXTENSION_NAME,
-        "VK_KHR_get_surface_capabilities2"
+        VK_EXT_DEBUG_UTILS_EXTENSION_NAME
+        // NOTE: no surface extensions - this test never presents.
     };
     std::vector<const char*> instExtsAvailable;
     for (const char* e : instExts) {
@@ -90,20 +91,36 @@ static bool initLogicalDevice(TestDevice& dev, VkPhysicalDevice phys) {
     }
 
     const float prio = 1.0f;
+    // Roles may share a family (llvmpipe: one family for everything; Raphael:
+    // graphics==compute). Deduplicate and clamp to the family's real queue
+    // count (VUID-VkDeviceCreateInfo-queueFamilyIndex-02802 / -06755).
+    std::vector<VkQueueFamilyProperties> famProps;
+    {
+        uint32_t n = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(dev.physicalDevice, &n, nullptr);
+        famProps.resize(n);
+        vkGetPhysicalDeviceQueueFamilyProperties(dev.physicalDevice, &n, famProps.data());
+    }
     std::vector<VkDeviceQueueCreateInfo> qcis;
-    auto addQueue = [&](std::optional<uint32_t> family, const char* name) {
+    std::unordered_map<uint32_t, uint32_t> requested;  // family -> queues wanted
+    auto addQueue = [&](std::optional<uint32_t> family) {
         if (!family) return;
+        ++requested[*family];
+    };
+    addQueue(queues.graphics);
+    addQueue(queues.compute);
+    addQueue(queues.transfer);
+    for (auto& [family, want] : requested) {
+        const uint32_t available =
+            family < famProps.size() ? famProps[family].queueCount : 1;
         VkDeviceQueueCreateInfo q{};
         q.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-        q.queueFamilyIndex = *family;
-        q.queueCount = 1;
+        q.queueFamilyIndex = family;
+        q.queueCount = std::max(1u, std::min(want, available));
         q.pQueuePriorities = &prio;
         qcis.push_back(q);
-        std::cout << "  Queue " << name << ": family " << *family << "\n" << std::flush;
-    };
-    addQueue(queues.graphics, "graphics");
-    addQueue(queues.compute, "compute");
-    addQueue(queues.transfer, "transfer");
+        std::cout << "  Queue family " << family << ": " << q.queueCount << " queue(s)\n" << std::flush;
+    }
 
     // Query which extensions this physical device actually supports.
     uint32_t devExtCount = 0;
@@ -151,24 +168,15 @@ static bool initLogicalDevice(TestDevice& dev, VkPhysicalDevice phys) {
     VkPhysicalDeviceFeatures2 physFeats{};
     physFeats.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
 
-    VkPhysicalDeviceBufferDeviceAddressFeatures bdaFeat{};
-    bdaFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
-    bdaFeat.bufferDeviceAddress = VK_TRUE;
-
-    VkPhysicalDeviceTimelineSemaphoreFeatures tsFeat{};
-    tsFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
-    tsFeat.timelineSemaphore = VK_TRUE;
-
+    // Vulkan12Features already covers bufferDeviceAddress + timelineSemaphore;
+    // chaining the individual VkPhysicalDeviceBufferDeviceAddressFeatures /
+    // VkPhysicalDeviceTimelineSemaphoreFeatures structs alongside it is
+    // illegal (VUID-VkDeviceCreateInfo-pNext-02830).
     VkPhysicalDeviceVulkan12Features v12Feat{};
     v12Feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     v12Feat.bufferDeviceAddress = VK_TRUE;
     v12Feat.timelineSemaphore = VK_TRUE;
 
-    bdaFeat.pNext = physFeats.pNext;
-    physFeats.pNext = &bdaFeat;
-    tsFeat.pNext = physFeats.pNext;
-    physFeats.pNext = &tsFeat;
-    v12Feat.pNext = physFeats.pNext;
     physFeats.pNext = &v12Feat;
     dci.pNext = &physFeats;
 
@@ -572,6 +580,7 @@ int main() {
             }
             mgrA->deallocateRemote(*dstOnA);
         }
+        mgrB->getLocalPool().deallocate(std::move(*srcB));
     }
 
     // ---- Pull migration: A pulls from B ----
@@ -612,6 +621,7 @@ int main() {
             }
             mgrB->deallocateRemote(*exportedB2);
         }
+        mgrB->getLocalPool().deallocate(std::move(*srcB2));
     }
 
     // ---- Zero-copy handle import: B exports, A imports on the SAME device ----
@@ -672,6 +682,7 @@ int main() {
             }
             mgrB->deallocateRemote(*exportedB3);
         }
+        mgrB->getLocalPool().deallocate(std::move(*srcB3));
     }
     }  // zcAllowed
 

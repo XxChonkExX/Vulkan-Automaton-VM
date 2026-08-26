@@ -7,6 +7,10 @@ AMD, Intel, (NVIDIA path designed), Tenstorrent-ICD, Android.
 
 **Version**: 0.3.0-dev
 
+> **New here?** Start with [explainfordummyuser.md](explainfordummyuser.md) —
+> *"the relay race tour"*: what problem this solves and how it all fits
+> together, written for humans first. Then come back for the details below.
+
 ---
 
 ## Architecture
@@ -175,9 +179,6 @@ framework. The honest list:
 
 What we claim, we test. What we haven't tested, we say.
 
-## License & credits
-
-See [LICENSE](LICENSE) and [README section on third-party licenses](#third-party-licenses--credits).
 Built homebrew with love — local power. — Mike/ChonkE
 
 ---
@@ -200,6 +201,52 @@ cmake --build build
 Requirements: CMake >= 3.19, C++20, Vulkan SDK. Network layer adds
 OpenSSL (optional TLS), libibverbs (optional RDMA), UCX (optional).
 
+## Licenses & credits
+
+VulkanVM stands on a lot of shoulders. This project is an independent
+implementation that borrows ideas, specifications, drivers, tools and
+infrastructure from many people and organizations — all used under their own
+licenses; nothing here is affiliated with or endorsed by them.
+
+### Foundations we build on
+
+| Project / Organization | What we use it for |
+|---|---|
+| **Khronos Group** — Vulkan | The entire foundation: external memory, sparse residency, device addresses, SPIR-V compute. Vulkan headers + loader power every line of this repo. |
+| **Mesa3D** — RADV (AMD), ANV (Intel), lavapipe | Our primary Linux test drivers. Every Tier-1 verification row in [docs/HARDWARE_SUPPORT.md](docs/HARDWARE_SUPPORT.md) exists because Mesa's open-source Vulkan drivers let us exercise cross-vendor paths on commodity hardware. |
+| **Linux kernel** — DMA-BUF, RDMA/rxe, drm | Cross-device memory sharing (DMA-BUF), SoftRoCE RDMA transport (`rdma_rxe`), and the platform substrate. Kernel-side bugs we hit are documented upstream-first in our test docs. |
+| **rdma-core** (libibverbs, librdmacm) | The verbs/RDMA transport layer — connection management, memory regions, `ibv_reg_dmabuf_mr`. |
+| **glslang / spirv-tools** (Khronos) | Layout-conversion compute shaders compiled at build time. |
+
+### Integrations & optional dependencies
+
+| Project | Role |
+|---|---|
+| **PyTorch** | Pluggable allocator integration + autograd ops ([train_qwen_chonk.py](train_qwen_chonk.py)) |
+| **ONNX Runtime** | Execution-provider integration |
+| **llama.cpp** | Inference-consumption verification ([docs/inference_benchmarks.md](docs/inference_benchmarks.md)) |
+| **pybind11** | Python bindings glue |
+| **OpenSSL** | Optional TLS for the network layer |
+| **UCX** (optional) | Alternative transport backend |
+| **Android NDK / AHardwareBuffer** | Android platform path (verified on Adreno) |
+
+### Hardware that made the honest tiers possible
+
+- **AMD** — Radeon RX 7900 XTX (RDNA3) and Strix Halo unified-memory APUs:
+  primary verification platforms for Vulkan, HIP/DMA-BUF interop.
+- **Intel** — Battlemage G31: second vendor for cross-vendor P2P evidence;
+  Battlemage's open driver work makes multi-vendor rigs affordable.
+- **Google/Qualcomm** (Android S24+, Adreno): AHardwareBuffer verification.
+
+These companies' driver teams (especially Mesa's RADV/ANV contributors and
+AMD's ROCm/PAL folks) do the unglamorous work that lets a homebrew project
+like this one exist at all. Bugs we find in their layers get documented with
+repros so they can fix them — see the Phase sections of
+[docs/LINUX_TEST_RESULTS_2026-08-25.md](docs/LINUX_TEST_RESULTS_2026-08-25.md)
+for current examples.
+
+See [LICENSE](LICENSE) for this project's license.
+
 ## Why "Chonk Buffer"?
 
 The core memory pool is affectionately nicknamed the **Chonk Buffer**
@@ -207,16 +254,14 @@ The core memory pool is affectionately nicknamed the **Chonk Buffer**
 fragmentation, every framework welcome. The name stuck; the architecture
 earned it. The keeper of this library is also known as ChonkE.
 
-## Licenses
-
-See [LICENSE](LICENSE). Third-party credits: Vulkan SDK (Khronos),
-pybind11, OpenSSL, libibverbs/rdma-core, UCX - all used under their own
-licenses; this project is an independent implementation.
-
 ## Changelog
 
 Version history and the (extensive) experimental changelog live in
 [OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md) and the git history. v0.3.0-dev:
 layer separation (Core/Transport/Compute/Integrations), Chonk allocator
 exact-fit + Chonk Chunks, llama.cpp integration at parity, Android
-AHardwareBuffer verified, audit-driven correctness pass.
+AHardwareBuffer verified, audit-driven correctness pass. Native-Linux
+campaign (2026-08-25): cross-vendor P2P + verbs/RDMA verification, RDMA
+teardown hang root-caused and fixed, ANV 26.0.3 import crash characterized,
+validation-layer VUID cleanup — full evidence in
+[docs/LINUX_TEST_RESULTS_2026-08-25.md](docs/LINUX_TEST_RESULTS_2026-08-25.md).
