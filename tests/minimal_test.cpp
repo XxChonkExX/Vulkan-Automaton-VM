@@ -27,14 +27,25 @@ int main() {
     
     VkInstance instance;
     VkResult result = vkCreateInstance(&instanceInfo, nullptr, &instance);
-    assert(result == VK_SUCCESS);
-    
+    if (result != VK_SUCCESS) {
+        std::cerr << "vkCreateInstance failed: VkResult=" << result << "\n";
+        return 1;
+    }
+
     // Enumerate devices
     auto devices = enumerateDevices(instance);
-    assert(!devices.empty());
-    
+    if (devices.empty()) {
+        std::cerr << "No Vulkan devices found\n";
+        vkDestroyInstance(instance, nullptr);
+        return 0;
+    }
+
     auto bestDevice = selectBestDevice(devices, true, 1024);
-    assert(bestDevice.has_value());
+    if (!bestDevice) {
+        std::cout << "SKIP: no device meets the minimum heap requirement\n";
+        vkDestroyInstance(instance, nullptr);
+        return 0;
+    }
     
     // Check required extensions
     std::vector<const char*> requiredExts = {
@@ -50,6 +61,29 @@ int main() {
     
     bool extsSupported = checkDeviceExtensionSupport(bestDevice->device, requiredExts);
     std::cout << "Required extensions supported: " << (extsSupported ? "YES" : "NO") << "\n";
+
+    // Capability gate: query what THIS device supports before requesting.
+    // Adreno 610-class drivers lack Vulkan 1.2 bufferDeviceAddress - creating
+    // a device that requests unsupported features fails, and a Release-build
+    // assert() would let the null device sail into vkGetDeviceQueue (SEGV).
+    {
+        VkPhysicalDeviceVulkan12Features supported12{};
+        supported12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+        VkPhysicalDeviceFeatures2 suppFeat{};
+        suppFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        suppFeat.pNext = &supported12;
+        vkGetPhysicalDeviceFeatures2(bestDevice->device, &suppFeat);
+
+        if (!extsSupported || !supported12.bufferDeviceAddress ||
+            !supported12.timelineSemaphore) {
+            std::cout << "SKIP: " << bestDevice->props.deviceName
+                      << " does not meet requirements (exts=" << extsSupported
+                      << " BDA=" << supported12.bufferDeviceAddress
+                      << " TS=" << supported12.timelineSemaphore << ")\n";
+            vkDestroyInstance(instance, nullptr);
+            return 0;
+        }
+    }
     
     // Create logical device
     auto queues = findQueueFamilies(bestDevice->device);
@@ -75,23 +109,13 @@ int main() {
     VkPhysicalDeviceFeatures2 features2{};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     
-    VkPhysicalDeviceBufferDeviceAddressFeatures addrFeatures{};
-    addrFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
-    addrFeatures.bufferDeviceAddress = VK_TRUE;
-    addrFeatures.pNext = features2.pNext;
-    features2.pNext = &addrFeatures;
-    
-    VkPhysicalDeviceTimelineSemaphoreFeatures tsFeatures{};
-    tsFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
-    tsFeatures.timelineSemaphore = VK_TRUE;
-    tsFeatures.pNext = features2.pNext;
-    features2.pNext = &tsFeatures;
-    
+    // Request only via the aggregate Vulkan12 struct: chaining the individual
+    // BufferDeviceAddress/TimelineSemaphore structs alongside it is illegal
+    // (VUID-VkDeviceCreateInfo-pNext-02830).
     VkPhysicalDeviceVulkan12Features v12Features{};
     v12Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     v12Features.bufferDeviceAddress = VK_TRUE;
     v12Features.timelineSemaphore = VK_TRUE;
-    v12Features.pNext = features2.pNext;
     features2.pNext = &v12Features;
     
     VkDeviceCreateInfo deviceInfo{};
@@ -104,7 +128,11 @@ int main() {
     
     VkDevice device;
     result = vkCreateDevice(bestDevice->device, &deviceInfo, nullptr, &device);
-    assert(result == VK_SUCCESS);
+    if (result != VK_SUCCESS) {
+        std::cerr << "vkCreateDevice failed: VkResult=" << result << "\n";
+        vkDestroyInstance(instance, nullptr);
+        return 1;
+    }
     
     // Get queues
     VkQueue graphicsQueue, computeQueue, transferQueue;

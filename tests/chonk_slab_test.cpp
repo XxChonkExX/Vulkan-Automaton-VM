@@ -59,7 +59,14 @@ struct FakeProvider : Core::IProvider {
         // bases; Core requires kAlign(512)-aligned bases. Honor the contract.
         sz = ((sz + 511) / 512) * 512;
         Block* b = new Block();
-        b->base = std::aligned_alloc(512, sz);
+        // posix_memalign: std::aligned_alloc is unavailable on bionic
+        // (Android libc) at older API levels.
+        void* base = nullptr;
+        if (posix_memalign(&base, 512, sz) != 0) {
+            delete b;
+            return nullptr;
+        }
+        b->base = base;
         if (!b->base) {
             delete b;
             return nullptr;
