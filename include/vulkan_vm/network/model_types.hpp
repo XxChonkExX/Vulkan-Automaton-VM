@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+
+#include "vulkan_vm/utils.hpp"
 #include <string>
 #include <vector>
 
@@ -21,7 +23,7 @@ struct ModelFileEntry {
 // Model manifest — the content-addressable "index" for a model version
 // ============================================================================
 
-struct ModelManifest {
+struct VVM_API ModelManifest {
     std::string modelId;    // e.g. "chonk/llama-3b-q4"
     std::string version;    // e.g. "1" or a git hash
     uint32_t chunkSize = 4u * 1024u * 1024u;  // chunk size (default 4 MiB)

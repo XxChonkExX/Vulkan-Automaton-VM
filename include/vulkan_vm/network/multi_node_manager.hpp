@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vulkan_vm/vulkan_vm.hpp"
+#include "vulkan_vm/utils.hpp"
 #include "vulkan_vm/network/network_types.hpp"
 #include "vulkan_vm/network/tcp_transport.hpp"
 #include "vulkan_vm/network/cluster_client.hpp"
@@ -35,7 +36,7 @@ class UcxTransport;
 // MultiNodePoolManager
 // ============================================================================
 
-class MultiNodePoolManager {
+class VVM_API MultiNodePoolManager {
 public:
     // Factory
     static std::optional<MultiNodePoolManager> create(
@@ -414,7 +415,7 @@ private:
 // PCI vendor pair. Cross-vendor pairs are refused on Linux by default
 // (VVM_ALLOW_CROSSVENDOR_ZC=1 overrides) - see zcAllowedForPair() in
 // multi_node_manager.cpp for rationale.
-bool sameProcessZcAllowed(uint32_t srcVendorId, uint32_t dstVendorId);
+VVM_API bool sameProcessZcAllowed(uint32_t srcVendorId, uint32_t dstVendorId);
 
 } // namespace network
 } // namespace vvm

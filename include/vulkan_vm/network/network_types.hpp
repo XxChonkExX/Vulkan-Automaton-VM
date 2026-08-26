@@ -200,14 +200,14 @@ struct NetworkMigrationOperation {
 // Serialization helpers
 // ============================================================================
 
-std::vector<uint8_t> serializeNodeId(const NodeId& id);
+VVM_API std::vector<uint8_t> serializeNodeId(const NodeId& id);
 bool deserializeNodeId(const uint8_t*& p, const uint8_t* end, NodeId& out);
 
-std::vector<uint8_t> serializeNodeInfo(const NodeInfo& info);
-bool deserializeNodeInfo(const uint8_t*& p, const uint8_t* end, NodeInfo& out);
+VVM_API std::vector<uint8_t> serializeNodeInfo(const NodeInfo& info);
+VVM_API bool deserializeNodeInfo(const uint8_t*& p, const uint8_t* end, NodeInfo& out);
 
-std::vector<uint8_t> serializeNodeList(const std::vector<NodeInfo>& list);
-bool deserializeNodeList(const std::vector<uint8_t>& data, std::vector<NodeInfo>& out);
+VVM_API std::vector<uint8_t> serializeNodeList(const std::vector<NodeInfo>& list);
+VVM_API bool deserializeNodeList(const std::vector<uint8_t>& data, std::vector<NodeInfo>& out);
 
 std::vector<uint8_t> serializeAllocationDesc(const RemoteAllocationDesc& desc);
 bool deserializeAllocationDesc(const uint8_t*& p, const uint8_t* end, RemoteAllocationDesc& out);
