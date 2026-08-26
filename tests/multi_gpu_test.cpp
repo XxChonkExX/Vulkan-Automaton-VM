@@ -280,6 +280,10 @@ int main() {
     std::cout << "\n=== " << (failures == 0 ? "ALL P2P TESTS PASSED" : "P2P TESTS FAILED")
               << " (" << failures << " failures) ===\n" << std::flush;
 
+    // Destroy pools BEFORE their VkDevices: letting `manager` outlive device
+    // destruction made every pool teardown call vkUnmapMemory/vkFreeMemory on
+    // a dead device ("vkUnmapMemory: Invalid device" -> loader SIGABRT).
+    manager.reset();
     vkDestroyDevice(dev1.device, nullptr);
     vkDestroyDevice(dev0.device, nullptr);
     vkDestroyInstance(instance, nullptr);

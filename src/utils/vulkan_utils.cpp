@@ -4,8 +4,10 @@
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 
 namespace vvm {
 
@@ -184,6 +186,22 @@ std::vector<DeviceScore> enumerateDevices(VkInstance instance) {
 std::optional<DeviceScore> selectBestDevice(const std::vector<DeviceScore>& devices,
                                              bool preferDiscrete,
                                              uint32_t minHeapSizeMB) {
+    // Deterministic override for benchmarking/repro: VVM_DEVICE_INDEX=<n>
+    // selects devices[n] directly, skipping score-based selection entirely.
+    if (const char* idxEnv = std::getenv("VVM_DEVICE_INDEX")) {
+        try {
+            size_t idx = static_cast<size_t>(std::stoul(idxEnv));
+            if (idx < devices.size()) {
+                return devices[idx];
+            }
+            VVM_LOG_ERROR("VVM_DEVICE_INDEX={} out of range ({} devices enumerated); "
+                          "falling back to score-based selection", idx, devices.size());
+        } catch (const std::exception&) {
+            VVM_LOG_ERROR("VVM_DEVICE_INDEX='{}' is not a number; falling back to "
+                          "score-based selection", idxEnv);
+        }
+    }
+
     auto fitsHeap = [&](const DeviceScore& dev) {
         bool hasHeap = false;
         for (uint32_t i = 0; i < dev.memProps.memoryHeapCount; ++i) {

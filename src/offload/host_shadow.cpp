@@ -143,6 +143,7 @@ void HostShadowManager::destroyShadowBuffer() {
         }
         vkFreeMemory(device_, shadowBuffer_.memory, nullptr);
         shadowBuffer_.memory = VK_NULL_HANDLE;
+        VVM_LOG_INFO("Shadow buffer destroyed");
     }
     if (shadowBuffer_.buffer) {
         vkDestroyBuffer(device_, shadowBuffer_.buffer, nullptr);

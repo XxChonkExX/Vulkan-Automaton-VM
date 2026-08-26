@@ -105,8 +105,32 @@ constexpr VkDeviceSize kTransferChunk = 4ull * 1024 * 1024;  // 4MB chunks over 
 // alive. OS handles (FDs/HANDLEs) are process-relative and CANNOT be shipped
 // over TCP, so a same-process peer import consumes the live handle from here,
 // while cross-process/machine peers fall back to host-staged copies.
-std::unordered_map<std::string, vvm::ExternalMemoryInfo> g_pendingExports;
+struct PendingExport {
+    vvm::ExternalMemoryInfo info;
+    uint32_t vendorId = 0;  // exporter's PCI vendor (policy input, see zcAllowedForPair)
+};
+std::unordered_map<std::string, PendingExport> g_pendingExports;
 std::mutex g_pendingExportsMutex;
+
+// Same-process zero-copy policy. Cross-vendor ZC is disabled by default on
+// Linux: Mesa 26.0.3 ANV segfaults inside vkAllocateMemory when importing
+// another driver's external heap (RADV->RADV is fine) - see
+// docs/LINUX_TEST_RESULTS_2026-08-25.md Phase 4. A segfault cannot be caught,
+// so the policy must refuse BEFORE the driver call. Set
+// VVM_ALLOW_CROSSVENDOR_ZC=1 to override (e.g. to re-test after a Mesa fix).
+bool zcAllowedForPair(uint32_t srcVendorId, uint32_t dstVendorId) {
+#if defined(VVM_PLATFORM_LINUX)
+    if (srcVendorId == dstVendorId) return true;
+    static const bool force = std::getenv("VVM_ALLOW_CROSSVENDOR_ZC") != nullptr;
+    return force;
+#else
+    (void)srcVendorId;
+    (void)dstVendorId;
+    return true;
+#endif
+}
+
+}  // namespace
 
 std::string pendingKey(const NodeId& owner, uint64_t allocId) {
     return owner.host + ":" + std::to_string(owner.port) + ":" + std::to_string(allocId);
@@ -120,6 +144,42 @@ TcpMessage makeResponse(uint32_t type, uint32_t flags) {
     return resp;
 }
 
+bool sameProcessZcAllowed(uint32_t srcVendorId, uint32_t dstVendorId) {
+    return zcAllowedForPair(srcVendorId, dstVendorId);
+}
+
+// RAII: return a staging allocation to its pool on scope exit. Without this,
+// every host-staged migration leaked its staging VkBuffer (validation
+// object-lifetime evidence, docs/LINUX_TEST_RESULTS_2026-08-25.md Phase 6).
+namespace {
+struct StagingReleaser {
+    UnifiedMemoryPool* pool = nullptr;
+    std::optional<Allocation> alloc;
+
+    Allocation* get() { return alloc ? &*alloc : nullptr; }
+    const Allocation* get() const { return alloc ? &*alloc : nullptr; }
+    explicit operator bool() const { return alloc.has_value(); }
+    ~StagingReleaser() {
+        if (pool && alloc && (*alloc).buffer != VK_NULL_HANDLE) {
+            pool->deallocate(std::move(*alloc));
+        }
+    }
+};
+
+// shared_ptr deleter: frees the staging exactly once whenever the last
+// reference dies - safe for response/stream cleanup lambdas that may run in
+// any order or not at all.
+struct StagingFreeDeleter {
+    UnifiedMemoryPool* pool;
+    void operator()(Allocation* a) const {
+        if (a) {
+            if (a->buffer != VK_NULL_HANDLE && pool) {
+                pool->deallocate(std::move(*a));
+            }
+            delete a;
+        }
+    }
+};
 }  // namespace
 
 // ============================================================================
@@ -687,7 +747,10 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
     // export is deallocated / the manager stops).
     if (exportInfo) {
         std::lock_guard<std::mutex> lock(g_pendingExportsMutex);
-        g_pendingExports[pendingKey(localNodeId_, allocId)] = std::move(*exportInfo);
+        VkPhysicalDeviceProperties expProps{};
+        vkGetPhysicalDeviceProperties(localPools_[0].getPhysicalDevice(), &expProps);
+        g_pendingExports[pendingKey(localNodeId_, allocId)] =
+            PendingExport{std::move(*exportInfo), expProps.vendorID};
     }
 
     return netDesc;
@@ -745,7 +808,8 @@ std::optional<NetworkMigrationOperation> MultiNodePoolManager::migrateFromRemote
     }
 
     // Stage received bytes into a host-visible buffer, then copy to device
-    auto staging = createStaging(source.size);
+    StagingReleaser staging{localPools_.empty() ? nullptr : &localPools_[0],
+                            createStaging(source.size)};
     if (!staging) {
         VVM_LOG_ERROR("migrateFromRemote: failed to allocate staging buffer");
         return std::nullopt;
@@ -763,7 +827,7 @@ std::optional<NetworkMigrationOperation> MultiNodePoolManager::migrateFromRemote
 
     // Slice mode: stream the pulled data straight into the staging buffer.
     StreamIO streamIO;
-    streamIO.readBuffer = staging->hostPtr;
+    streamIO.readBuffer = staging.get()->hostPtr;
     streamIO.readLen = source.size;
 
     auto resp = tcpTransport_->request(conn, req, &streamIO);
@@ -778,7 +842,7 @@ std::optional<NetworkMigrationOperation> MultiNodePoolManager::migrateFromRemote
         return std::nullopt;
     }
 
-    if (!copyHostToDevice(*staging, destination, 0, source.size)) {
+    if (!copyHostToDevice(*staging.get(), destination, 0, source.size)) {
         VVM_LOG_ERROR("migrateFromRemote: staging -> device copy failed");
         return std::nullopt;
     }
@@ -822,13 +886,14 @@ std::optional<NetworkMigrationOperation> MultiNodePoolManager::migrateToRemote(
     }
 
     // Stage device memory into a host-visible buffer
-    auto staging = createStaging(source.size);
+    StagingReleaser staging{localPools_.empty() ? nullptr : &localPools_[0],
+                            createStaging(source.size)};
     if (!staging) {
         VVM_LOG_ERROR("migrateToRemote: failed to allocate staging buffer");
         return std::nullopt;
     }
 
-    if (!copyDeviceToHost(source, 0, *staging, source.size)) {
+    if (!copyDeviceToHost(source, 0, *staging.get(), source.size)) {
         VVM_LOG_ERROR("migrateToRemote: device -> staging copy failed");
         return std::nullopt;
     }
@@ -844,7 +909,7 @@ std::optional<NetworkMigrationOperation> MultiNodePoolManager::migrateToRemote(
 
     // Slice mode: stream the staged data out of the staging buffer directly.
     StreamIO streamIO;
-    streamIO.writeBuffer = staging->hostPtr;
+    streamIO.writeBuffer = staging.get()->hostPtr;
     streamIO.writeLen = source.size;
 
     auto conn = getPeerConnection(destination.owner.host, destination.owner.port);
@@ -1412,22 +1477,32 @@ void MultiNodePoolManager::onTcpRequest(TcpMessage& request, TcpMessage& respons
                 return;
             }
 
-            auto staging = createStaging(size);
-            if (!staging) {
+            auto rawStaging = createStaging(size);
+            if (!rawStaging) {
+                response = makeResponse(request.type, TcpFlagsError);
+                return;
+            }
+            // Freeing deleter: whenever the last reference dies (response
+            // sent / stream done), the staging returns to the pool instead of
+            // leaking its VkBuffer.
+            auto stage = std::shared_ptr<Allocation>(
+                new Allocation(std::move(*rawStaging)),
+                StagingFreeDeleter{localPools_.empty() ? nullptr : &localPools_[0]});
+            if (!stage || !stage->hostPtr) {
                 response = makeResponse(request.type, TcpFlagsError);
                 return;
             }
 
-            if (!copyDeviceToHost(*alloc, srcOffset, *staging, size)) {
+            if (!copyDeviceToHost(*alloc, srcOffset, *stage, size)) {
                 VVM_LOG_ERROR("MigratePull: device -> host copy failed");
                 response = makeResponse(request.type, TcpFlagsError);
                 return;
             }
 
             response = makeResponse(request.type, TcpFlagsResponse);
-            response.streamSource = staging->hostPtr;
+            response.streamSource = stage->hostPtr;
             response.streamLen = size;
-            response.streamCleanup = [staging = std::move(staging)]() mutable { (void)staging; };
+            response.streamCleanup = [stage]() mutable { (void)stage; };
             VVM_LOG_INFO("MigratePull: serving {} bytes for allocation {}", size, localAllocId);
             break;
         }
@@ -1452,10 +1527,12 @@ void MultiNodePoolManager::onTcpRequest(TcpMessage& request, TcpMessage& respons
                     response = makeResponse(request.type, TcpFlagsError);
                     return;
                 }
-                // Shared ownership keeps the staging alive across both handler
-                // phases; the raw Allocation* is stable because shared_ptr
-                // never moves the pointee.
-                auto staging = std::make_shared<Allocation>(std::move(*rawStaging));
+                // Shared ownership with a freeing deleter keeps the staging
+                // alive across both handler phases and releases it to the
+                // pool exactly once, no matter which cleanup runs last.
+                auto staging = std::shared_ptr<Allocation>(
+                    new Allocation(std::move(*rawStaging)),
+                    StagingFreeDeleter{localPools_.empty() ? nullptr : &localPools_[0]});
                 request.streamContext = staging.get();
                 request.streamSink = staging->hostPtr;
                 request.streamSinkCleanup = [staging]() mutable { (void)staging; };
@@ -1551,28 +1628,37 @@ std::optional<Allocation> MultiNodePoolManager::createLocalAllocationForImport(
     // Same-process zero-copy path: if THIS process still owns the exported
     // handle (registry keyed by owner node + allocId), import it directly.
     // Consuming moves the handle into the driver (or closes it on failure).
-    // VVM_DISABLE_SAME_PROCESS_ZC=1 forces the host-staged path; useful when
-    // a driver crashes on same-device DMA-BUF re-import (observed: ANV /
-    // Battlemage G31 segfaults inside libvulkan_intel.so when a dma-buf
-    // exported from one VkDevice is imported on a second VkDevice over the
-    // SAME physical device; cross-vendor RADV->ANV import is unaffected).
-    static const bool zcDisabled = std::getenv("VVM_DISABLE_SAME_PROCESS_ZC") != nullptr;
-    if (!zcDisabled) {
+    // Cross-vendor pairs are policy-gated: see zcAllowedForPair() above.
+    {
         std::lock_guard<std::mutex> lock(g_pendingExportsMutex);
         auto it = g_pendingExports.find(pendingKey(desc.owner, desc.localAllocId));
         if (it != g_pendingExports.end()) {
-            ExternalMemoryInfo ext = std::move(it->second);
+            PendingExport pending = std::move(it->second);
             g_pendingExports.erase(it);
-            ext.type = static_cast<vvm::ExternalHandleType>(desc.handleType);
-            ext.size = desc.size;
-            auto imported = localPools_[0].importMemory(std::move(ext), usage);
-            if (imported) {
-                VVM_LOG_INFO("importRemote: zero-copy handle import for allocId=%llu succeeded",
-                             desc.localAllocId);
-                return imported;
+
+            VkPhysicalDeviceProperties localProps{};
+            vkGetPhysicalDeviceProperties(localPools_[0].getPhysicalDevice(), &localProps);
+            if (!zcAllowedForPair(pending.vendorId, localProps.vendorID)) {
+                VVM_LOG_INFO("importRemote: same-process ZC refused by vendor policy "
+                             "(src={} dst={}); host-staged fallback",
+                             static_cast<unsigned long>(pending.vendorId),
+                             static_cast<unsigned long>(localProps.vendorID));
+                // Park the handle back so a later same-vendor pool can still
+                // consume it zero-copy.
+                g_pendingExports[pendingKey(desc.owner, desc.localAllocId)] = std::move(pending);
+            } else {
+                vvm::ExternalMemoryInfo ext = std::move(pending.info);
+                ext.type = static_cast<vvm::ExternalHandleType>(desc.handleType);
+                ext.size = desc.size;
+                auto imported = localPools_[0].importMemory(std::move(ext), usage);
+                if (imported) {
+                    VVM_LOG_INFO("importRemote: zero-copy handle import for allocId=%llu succeeded",
+                                 desc.localAllocId);
+                    return imported;
+                }
+                VVM_LOG_WARN("importRemote: same-process handle import failed; "
+                             "falling back to host-staged copy");
             }
-            VVM_LOG_WARN("importRemote: same-process handle import failed; "
-                         "falling back to host-staged copy");
         }
     }
 

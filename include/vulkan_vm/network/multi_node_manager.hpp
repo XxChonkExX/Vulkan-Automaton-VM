@@ -410,5 +410,11 @@ private:
     static bool parseEndpoint(const std::string& endpoint, std::string& outHost, uint16_t& outPort);
 };
 
+// Whether same-process zero-copy import is allowed for a (srcVendor, dstVendor)
+// PCI vendor pair. Cross-vendor pairs are refused on Linux by default
+// (VVM_ALLOW_CROSSVENDOR_ZC=1 overrides) - see zcAllowedForPair() in
+// multi_node_manager.cpp for rationale.
+bool sameProcessZcAllowed(uint32_t srcVendorId, uint32_t dstVendorId);
+
 } // namespace network
 } // namespace vvm
