@@ -3,6 +3,7 @@
 #include "chonk_slab.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -52,6 +53,17 @@ void* Core::alloc(size_t size, size_t* grantedSize) {
     if (!provider_) return nullptr;
     Block* blk = provider_->createBlock(*this, aligned);
     if (blk == nullptr) return nullptr;
+    // Block bases MUST be kAlign-aligned: all intra-block offsets are aligned
+    // relative to base, so an unaligned base silently misaligns every
+    // allocation in the block. Reject loudly instead of corrupting alignment.
+    if (reinterpret_cast<uintptr_t>(blk->base) % kAlign != 0) {
+        std::fprintf(stderr,
+                     "chonk_slab: createBlock rejected - provider base %p is not "
+                     "%zu-byte aligned\n",
+                     blk->base, kAlign);
+        provider_->destroyBlock(blk);
+        return nullptr;
+    }
     blocks_.push_back(blk);
     auto& fc = blk->freeChunks;
     if (fc.empty() || fc.front().second < aligned) {

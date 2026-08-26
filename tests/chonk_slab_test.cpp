@@ -16,6 +16,7 @@
 #include <cstring>
 #include <map>
 #include <random>
+#include <cstdlib>
 #include <set>
 #include <string>
 #include <vector>
@@ -54,8 +55,11 @@ struct FakeProvider : Core::IProvider {
             return nullptr;
         }
         size_t sz = need > minBlockSize ? need : minBlockSize;
+        // Real providers (hipMalloc/hipHostMalloc) return >=256-byte aligned
+        // bases; Core requires kAlign(512)-aligned bases. Honor the contract.
+        sz = ((sz + 511) / 512) * 512;
         Block* b = new Block();
-        b->base = std::malloc(sz);
+        b->base = std::aligned_alloc(512, sz);
         if (!b->base) {
             delete b;
             return nullptr;
@@ -298,6 +302,131 @@ static void test_fuzz(size_t iterations, unsigned seed) {
 }
 
 // ---------------------------------------------------------------------------
+// 4b. Differential fuzz (external-audit #16): maintain a REFERENCE model of
+// live allocations and cross-check it against the allocator's own accounting
+// after every operation - not just the allocator's internal invariants.
+//   reference: no two live intervals overlap (LiveTracker)
+//              allocation COUNT matches stats()
+//              live BYTE totals match stats()
+//              every returned pointer honors kAlign
+//              grantedSize >= requestedSize
+// ---------------------------------------------------------------------------
+
+static void test_differential_fuzz(size_t iterations, unsigned seed) {
+    FakeProvider prov;
+    prov.minBlockSize = 1 << 20;
+    Core core(&prov, /*warm=*/4, /*max=*/0, /*minOOM=*/2);
+
+    std::mt19937 rng(seed);
+    LiveTracker tracker;
+
+    struct RefAlloc { void* ptr; size_t size; };
+    std::vector<RefAlloc> ref;
+    size_t refLiveBytes = 0;
+
+    auto randomSize = [&rng]() -> size_t {
+        const size_t edge[] = {
+            0, 1, 511, 512, 513, 4095, 4096, 65535, 65536,
+            (1u << 20) - 512, (1u << 20) - 1, (1u << 20), (1u << 20) + 1,
+        };
+        switch (rng() % 4) {
+            case 0: return edge[rng() % (sizeof(edge) / sizeof(edge[0]))];
+            case 1: return 1 + (rng() % 1024);
+            case 2: return 1 + (rng() % 65536);
+            default: return 1 + (rng() % (3u << 20));
+        }
+    };
+
+    auto crossCheck = [&](size_t iter) {
+        auto st = core.stats();
+        if (st.allocations != ref.size()) {
+            std::printf("DIFF FAIL @%zu: stats().allocations=%zu ref=%zu\n",
+                        iter, st.allocations, ref.size());
+            ++failures;
+        }
+        if (st.liveBytes != refLiveBytes) {
+            std::printf("DIFF FAIL @%zu: stats().liveBytes=%zu ref=%zu\n",
+                        iter, st.liveBytes, refLiveBytes);
+            ++failures;
+        }
+        if (st.liveBytes + st.freeBytes > st.capacityBytes) {
+            std::printf("DIFF FAIL @%zu: live(%zu)+free(%zu) > capacity(%zu)\n",
+                        iter, st.liveBytes, st.freeBytes, st.capacityBytes);
+            ++failures;
+        }
+    };
+
+    for (size_t i = 0; i < iterations; ++i) {
+        if (!ref.empty() && (rng() % 100) < 45) {
+            // Free a random LIVE allocation; reference must contain it.
+            size_t idx = rng() % ref.size();
+            core.free(ref[idx].ptr, ref[idx].size);
+            tracker.remove(ref[idx].ptr);
+            refLiveBytes -= ref[idx].size;
+            ref[idx] = ref.back();
+            ref.pop_back();
+        } else {
+            size_t sz = randomSize();
+            size_t granted = 0;
+            void* p = core.alloc(sz, &granted);
+            if (p) {
+                const size_t aligned =
+                    ((sz + Core::kAlign - 1) / Core::kAlign) * Core::kAlign;
+                if (granted < aligned && !(sz == 0)) {
+                    std::printf("DIFF FAIL @%zu: granted %zu < requested-aligned %zu\n",
+                                i, granted, aligned);
+                    ++failures;
+                }
+                if (reinterpret_cast<uintptr_t>(p) % Core::kAlign != 0) {
+                    std::printf("DIFF FAIL @%zu: pointer %p violates alignment\n",
+                                i, p);
+                    ++failures;
+                }
+                tracker.add(p, granted);
+                touchAndVerify(p, granted > 4096 ? 4096 : granted);
+                refLiveBytes += granted;
+                ref.push_back({p, granted});
+            }
+        }
+        crossCheck(i);
+        if (failures > 0) break;
+    }
+
+    // Drain: everything coalesces; provider reclaims every block.
+    for (auto& a : ref) {
+        core.free(a.ptr, a.size);
+        tracker.remove(a.ptr);
+    }
+    ref.clear();
+    refLiveBytes = 0;
+    crossCheck(iterations);
+    CHECK(core.stats().allocations == 0);
+    CHECK(core.checkInvariants());
+    core.reset();
+    CHECK(prov.live.empty());
+}
+
+// Negative probe: freeing an unknown/double pointer must be rejected
+// gracefully (no crash, no corruption), not silently accepted.
+static void test_unknown_free() {
+    FakeProvider prov;
+    prov.minBlockSize = 1 << 20;
+    Core core(&prov, 2, 0, 2);
+
+    void* p = core.alloc(1024);
+    CHECK(p != nullptr);
+    core.free(p, 1024);          // legitimate
+    auto before = core.stats();
+    core.free(p, 1024);          // DOUBLE free of the same pointer
+    core.free(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(p) + 512),
+              512);              // interior pointer, never allocated
+    auto after = core.stats();
+    CHECK(after.allocations == before.allocations);
+    CHECK(after.liveBytes == before.liveBytes);
+    CHECK(core.checkInvariants());
+}
+
+// ---------------------------------------------------------------------------
 // 5. Provider failure path
 // ---------------------------------------------------------------------------
 static void test_provider_failure() {
@@ -323,6 +452,9 @@ int main(int argc, char** argv) {
     test_release_policy();
     test_fuzz(fuzzIters, 12345);
     test_fuzz(fuzzIters, 987654321);
+    test_differential_fuzz(fuzzIters, 24681357);
+    test_differential_fuzz(fuzzIters, 555555);
+    test_unknown_free();
     test_provider_failure();
 
     if (failures == 0) {
