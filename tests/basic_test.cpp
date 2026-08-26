@@ -74,10 +74,23 @@ int main() {
     appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.apiVersion = VK_API_VERSION_1_3;
     
-    std::vector<const char*> extensions = {
+    // Filter against what the platform loader actually provides - Android
+    // loaders may lack VK_EXT_debug_utils (VK_ERROR_EXTENSION_NOT_PRESENT
+    // otherwise kills instance creation).
+    std::vector<const char*> wanted = {
         VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
         VK_EXT_DEBUG_UTILS_EXTENSION_NAME
     };
+    uint32_t availCount = 0;
+    vkEnumerateInstanceExtensionProperties(nullptr, &availCount, nullptr);
+    std::vector<VkExtensionProperties> avail(availCount);
+    vkEnumerateInstanceExtensionProperties(nullptr, &availCount, avail.data());
+    std::vector<const char*> extensions;
+    for (const char* w : wanted) {
+        for (const auto& e : avail) {
+            if (!std::strcmp(e.extensionName, w)) { extensions.push_back(w); break; }
+        }
+    }
     
     VkInstanceCreateInfo instanceInfo{};
     instanceInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -87,7 +100,10 @@ int main() {
     
     VkInstance instance;
     VkResult result = vkCreateInstance(&instanceInfo, nullptr, &instance);
-    assert(result == VK_SUCCESS);
+    if (result != VK_SUCCESS) {
+        std::cerr << "vkCreateInstance failed: VkResult=" << result << "\n";
+        return 1;
+    }
     
     // Enumerate devices
     auto devices = enumerateDevices(instance);
@@ -124,8 +140,31 @@ int main() {
     };
     
     bool extsSupported = checkDeviceExtensionSupport(bestDevice->device, requiredExts);
-    std::cout << "Required extensions supported: " << (extsSupported ? "YES" : "NO") << "\n";
-    
+
+    // Capability gate (see minimal_test): Adreno 610-class drivers lack the
+    // required extensions/features; a Release assert() would let a null device
+    // sail into vkGetDeviceQueue (SEGV) instead of skipping cleanly.
+    {
+        VkPhysicalDeviceVulkan12Features supported12{};
+        supported12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+        VkPhysicalDeviceFeatures2 suppFeat{};
+        suppFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        suppFeat.pNext = &supported12;
+        vkGetPhysicalDeviceFeatures2(bestDevice->device, &suppFeat);
+
+        if (!extsSupported || !supported12.bufferDeviceAddress ||
+            !supported12.timelineSemaphore) {
+            std::cout << "SKIP: " << bestDevice->props.deviceName
+                      << " does not meet requirements (exts=" << extsSupported
+                      << " BDA=" << supported12.bufferDeviceAddress
+                      << " TS=" << supported12.timelineSemaphore << ")\n";
+            vkDestroyInstance(instance, nullptr);
+            return 0;
+        }
+    }
+
+    std::cout << "Required extensions supported: YES\n";
+
     // Create logical device
     auto queues = findQueueFamilies(bestDevice->device);
     
@@ -157,17 +196,11 @@ int main() {
     addrFeatures.pNext = features2.pNext;
     features2.pNext = &addrFeatures;
     
-    VkPhysicalDeviceTimelineSemaphoreFeatures tsFeatures{};
-    tsFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
-    tsFeatures.timelineSemaphore = VK_TRUE;
-    tsFeatures.pNext = features2.pNext;
-    features2.pNext = &tsFeatures;
-    
+    // Request only via the aggregate Vulkan12 struct (VUID-pNext-02830).
     VkPhysicalDeviceVulkan12Features v12Features{};
     v12Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     v12Features.bufferDeviceAddress = VK_TRUE;
     v12Features.timelineSemaphore = VK_TRUE;
-    v12Features.pNext = features2.pNext;
     features2.pNext = &v12Features;
     
     VkDeviceCreateInfo deviceInfo{};
@@ -180,7 +213,11 @@ int main() {
     
     VkDevice device;
     result = vkCreateDevice(bestDevice->device, &deviceInfo, nullptr, &device);
-    assert(result == VK_SUCCESS);
+    if (result != VK_SUCCESS) {
+        std::cerr << "vkCreateDevice failed: VkResult=" << result << "\n";
+        vkDestroyInstance(instance, nullptr);
+        return 1;
+    }
     
     // Get queues
     VkQueue graphicsQueue, computeQueue, transferQueue;
