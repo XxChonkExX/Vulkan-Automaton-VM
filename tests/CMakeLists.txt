@@ -228,3 +228,15 @@ elseif(WIN32 AND VVM_BUILD_NETWORK)
     )
     add_test(NAME multi_vendor_rdma_test COMMAND multi_vendor_rdma_test)
 endif()
+
+# UDP mini-verb transport test - always available (no optional deps).
+add_executable(udp_verb_test udp_verb_test.cpp)
+target_link_libraries(udp_verb_test PRIVATE
+    vulkan_vm_network
+    ${CMAKE_DL_LIBS}
+)
+target_include_directories(udp_verb_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
+add_test(NAME udp_verb_test COMMAND udp_verb_test)

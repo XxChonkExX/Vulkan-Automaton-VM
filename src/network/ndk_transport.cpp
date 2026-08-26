@@ -1158,7 +1158,7 @@ private:
 // Factory
 // ============================================================================
 
-std::unique_ptr<RdmaTransport> RdmaTransport::create(
+std::unique_ptr<RdmaTransport> createNdkRdmaTransport(
     const NetworkConfig& config,
     VkPhysicalDevice physicalDevice,
     VkDevice device) {

@@ -44,6 +44,8 @@ endif()
 
 set(NETWORK_CORE_SRCS
     tcp_transport.cpp
+        udp_verb_transport.cpp
+        network_factory.cpp
     multi_node_manager.cpp
     network.cpp
     model_registry.cpp
