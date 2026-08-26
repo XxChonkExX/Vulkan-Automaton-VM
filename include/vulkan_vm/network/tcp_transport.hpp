@@ -129,8 +129,11 @@ public:
 
     TcpTransport(const TcpTransport&) = delete;
     TcpTransport& operator=(const TcpTransport&) = delete;
-    TcpTransport(TcpTransport&&) noexcept = default;
-    TcpTransport& operator=(TcpTransport&&) noexcept = default;
+    // Move ops are declared only: a header-defaulted move would force every
+    // includer to instantiate ~unique_ptr<Impl> with an incomplete Impl
+    // (MSVC C2027/C2338 once the class is dllexport-ed).
+    TcpTransport(TcpTransport&&) noexcept;
+    TcpTransport& operator=(TcpTransport&&) noexcept;
 
     // ========================================================================
     // Server
