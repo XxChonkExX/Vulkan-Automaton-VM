@@ -36,7 +36,11 @@ static NetworkConfig makeCfg(uint16_t port) {
 int main(int argc, char** argv) {
     // This suite exercises the software fabric specifically; never let the
     // factory pick a hardware backend even where one is compiled in.
+#if defined(_WIN32)
+    _putenv_s("VVM_RDMA_BACKEND", "udp");
+#else
     setenv("VVM_RDMA_BACKEND", "udp", 1);
+#endif
 
     // ---- Two-device mode: udp_verb_test server <port> | client <ip> <port>
     // Server registers an 8 MiB pattern buffer, advertises its rkey on

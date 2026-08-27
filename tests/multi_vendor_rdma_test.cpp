@@ -132,7 +132,7 @@ static bool tryCreateVulkan(VkInstance* outInstance, VkPhysicalDevice* outPhysDe
     // is enabled; on Linux request the fd variant instead.
 #if defined(VK_USE_PLATFORM_WIN32_KHR) || defined(_WIN32)
     const char* wantDevExts[] = {
-        VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
+        "VK_KHR_external_memory_win32",
         VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
         VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
     };
@@ -144,13 +144,15 @@ static bool tryCreateVulkan(VkInstance* outInstance, VkPhysicalDevice* outPhysDe
         VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
     };
 #endif
+    size_t wantDevExtsCount = sizeof(wantDevExts) / sizeof(wantDevExts[0]);
     auto createDevice = [&](VkPhysicalDevice pd, VkDevice* outDev) -> bool {
         uint32_t devAvailCount = 0;
         vkEnumerateDeviceExtensionProperties(pd, nullptr, &devAvailCount, nullptr);
         std::vector<VkExtensionProperties> devAvail(devAvailCount);
         vkEnumerateDeviceExtensionProperties(pd, nullptr, &devAvailCount, devAvail.data());
         std::vector<const char*> devExts;
-        for (const char* e : wantDevExts) {
+        for (size_t i = 0; i < wantDevExtsCount; ++i) {
+            const char* e = wantDevExts[i];
             bool found = false;
             for (auto& p : devAvail) {
                 if (std::strcmp(p.extensionName, e) == 0) { found = true; break; }
