@@ -89,7 +89,7 @@ private:
 };
 
 // Factory hooks used by the shared backend dispatcher (rdma_transport factory).
-std::unique_ptr<RdmaTransport> createUdpVerbRdmaTransport(
+VVM_API std::unique_ptr<RdmaTransport> createUdpVerbRdmaTransport(
     const NetworkConfig& config, VkPhysicalDevice physicalDevice, VkDevice device);
 
 }  // namespace network

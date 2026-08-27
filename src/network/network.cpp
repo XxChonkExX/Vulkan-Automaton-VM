@@ -2,7 +2,7 @@
 
 #include "vulkan_vm/network.hpp"
 #include "vulkan_vm/vulkan_vm.hpp"
-#include "vulkan_vm/utils.hpp"
+#include "vulkan_vm/logging.hpp"
 
 #if defined(VVM_NETWORK_HAS_VERBS)
 #include "vulkan_vm/network/rdma_transport.hpp"

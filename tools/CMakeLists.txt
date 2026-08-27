@@ -7,4 +7,5 @@ target_link_libraries(vvm_daemon PRIVATE
 )
 target_include_directories(vvm_daemon PRIVATE
     ${CMAKE_SOURCE_DIR}/include
+    ${Vulkan_INCLUDE_DIRS}
 )

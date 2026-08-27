@@ -1,5 +1,5 @@
 #include "vulkan_vm/network/gpu_direct_registration.hpp"
-#include "vulkan_vm/utils.hpp"
+#include "vulkan_vm/logging.hpp"
 
 #include <mutex>
 #include <vector>
