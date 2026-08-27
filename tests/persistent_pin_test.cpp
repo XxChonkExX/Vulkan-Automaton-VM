@@ -147,7 +147,7 @@ static bool tryCreateVulkan(VkInstance* outInstance, VkPhysicalDevice* outPhysDe
     dqci.pQueuePriorities = &queuePriority;
 
     const char* devExts[] = {
-        VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
+        "VK_KHR_external_memory_win32",
         VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
     };
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
