@@ -40,7 +40,7 @@ static bool createDeviceForPool(const DeviceScore& score, const std::string& nam
     const char* exts[] = {
         VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
 #if defined(VVM_PLATFORM_WINDOWS)
-        VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
+        "VK_KHR_external_memory_win32",
 #else
         VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
         VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
