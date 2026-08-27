@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vulkan/vulkan.h>
+#include "vulkan_vm/logging.hpp"
 
 #ifdef VVM_PLATFORM_LINUX
 #include <unistd.h>
@@ -8,6 +9,16 @@
 
 #ifdef VVM_PLATFORM_ANDROID
 #include <android/hardware_buffer.h>
+#endif
+
+#ifdef VVM_PLATFORM_WINDOWS
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #endif
 
 // Export macros for shared library (canonical definition in core.hpp)
@@ -530,69 +541,6 @@ public:
 };
 
 // ============================================================================
-// Logging
-// ============================================================================
-
-enum class LogLevel { Trace, Debug, Info, Warning, Error };
-
-namespace detail {
-
-// Render a single argument for {} substitution.
-inline std::string logArgToString(const std::string& v) { return v; }
-inline std::string logArgToString(const char* v) { return v ? v : "(null)"; }
-inline std::string logArgToString(char* v) { return v ? v : "(null)"; }
-inline std::string logArgToString(bool v) { return v ? "true" : "false"; }
-inline std::string logArgToString(char v) { return std::string(1, v); }
-template <typename T>
-std::string logArgToString(const T& v) {
-    if constexpr (std::is_integral_v<T>) {
-        return std::to_string(v);
-    } else if constexpr (std::is_floating_point_v<T>) {
-        std::ostringstream os;
-        os << v;
-        return os.str();
-    } else if constexpr (std::is_pointer_v<T>) {
-        std::ostringstream os;
-        os << static_cast<const void*>(v);
-        return os.str();
-    } else {
-        std::ostringstream os;
-        os << v;
-        return os.str();
-    }
-}
-
-// Substitute {} placeholders with the rendered arguments.
-// Falls back to the raw format string when argument count mismatches.
-template <typename... Args>
-std::string logFormat(const char* fmt, Args&&... args) {
-    if (fmt == nullptr) return "";
-    std::string_view fv(fmt);
-    std::vector<std::string> rendered;
-    rendered.reserve(sizeof...(Args));
-    (rendered.push_back(logArgToString(std::forward<Args>(args))), ...);
-
-    std::string out;
-    out.reserve(fv.size());
-    size_t argIndex = 0;
-    for (size_t i = 0; i < fv.size(); ++i) {
-        if (i + 1 < fv.size() && fv[i] == '{' && fv[i + 1] == '}') {
-            if (argIndex < rendered.size()) {
-                out += rendered[argIndex++];
-            } else {
-                out += "{}";
-            }
-            ++i;
-        } else {
-            out += fv[i];
-        }
-    }
-    return out;
-}
-
-}  // namespace detail
-
-// ============================================================================
 // Serialization helpers (used by network transport)
 // ============================================================================
 
@@ -671,50 +619,6 @@ inline bool getBytes(const uint8_t*& p, const uint8_t* end, std::vector<uint8_t>
 }
 
 }  // namespace detail
-
-class VVM_API Logger {
-public:
-    static Logger& instance();
-    
-    void setLevel(LogLevel level) { level_ = level; }
-    void setCallback(std::function<void(LogLevel, const std::string&)> cb) { callback_ = std::move(cb); }
-
-    // Supports both printf-style (%d, %s, ...) and {}-style formats.
-    template<typename... Args>
-    void log(LogLevel lvl, const char* fmt, Args&&... args) {
-        if (lvl < level_) return;
-
-        std::string msg;
-        if (fmt != nullptr && std::strstr(fmt, "{}") != nullptr) {
-            msg = detail::logFormat(fmt, std::forward<Args>(args)...);
-        } else {
-            char buffer[1024];
-#if defined(__clang__) || defined(__GNUC__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wformat-security"
-#pragma GCC diagnostic ignored "-Wnon-pod-varargs"
-#endif
-            int len = snprintf(buffer, sizeof(buffer), fmt ? fmt : "", std::forward<Args>(args)...);
-#if defined(__clang__) || defined(__GNUC__)
-#pragma GCC diagnostic pop
-#endif
-            if (len < 0) return;
-            msg.assign(buffer, static_cast<size_t>(len));
-        }
-
-        if (callback_) {
-            callback_(lvl, msg);
-        } else {
-            static const char* levelStr[] = {"TRACE", "DEBUG", "INFO", "WARN", "ERROR"};
-            fprintf(stderr, "[%s] %s\n", levelStr[static_cast<int>(lvl)], msg.c_str());
-        }
-    }
-
-private:
-    Logger() = default;
-    LogLevel level_ = LogLevel::Info;
-    std::function<void(LogLevel, const std::string&)> callback_;
-};
 
 // ============================================================================
 // Vulkan Result Checking
@@ -813,11 +717,5 @@ inline std::string vkErrorToString(VkResult result) {
         default: return "Unknown";
     }
 }
-
-#define VVM_LOG_TRACE(...)  vvm::Logger::instance().log(vvm::LogLevel::Trace, __VA_ARGS__)
-#define VVM_LOG_DEBUG(...)  vvm::Logger::instance().log(vvm::LogLevel::Debug, __VA_ARGS__)
-#define VVM_LOG_INFO(...)   vvm::Logger::instance().log(vvm::LogLevel::Info, __VA_ARGS__)
-#define VVM_LOG_WARN(...)   vvm::Logger::instance().log(vvm::LogLevel::Warning, __VA_ARGS__)
-#define VVM_LOG_ERROR(...)  vvm::Logger::instance().log(vvm::LogLevel::Error, __VA_ARGS__)
 
 } // namespace vvm

@@ -9,6 +9,14 @@
 #include "vulkan_vm/network/udp_verb_transport.hpp"
 
 #include <algorithm>
+#if defined(_WIN32)
+#include <BaseTsd.h>
+using ssize_t = SSIZE_T;
+#else
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -350,10 +358,8 @@ struct UdpVerbTransport::Impl {
                     auto rit2 = regions_.find(h.regionId);
                     if (rit2 == regions_.end()) break;
                     const uint64_t off = h.offset;
-                    if (off >= rit2->second.size) break;
-                    size_t len = static_cast<size_t>(
-                        std::min<uint64_t>(kChunkPayload,
-                                           rit2->second.size - off));
+if (off >= rit2->second.size) break;
+size_t len = static_cast<size_t>((std::min)(kChunkPayload, rit2->second.size - off));
                     Header dh = makeHdr(MsgType::Data, h.xid, h.seq, h.totalPkts,
                                         static_cast<uint16_t>(len),
                                         h.regionId, off);
@@ -391,10 +397,12 @@ struct UdpVerbTransport::Impl {
                             static_cast<uint64_t>(s) * kChunkPayload;
                         if (rel >= reqBytes) break;
                         uint64_t off = h.offset + rel;
-                        if (off >= rit->second.size) break;
-                        size_t len = static_cast<size_t>(std::min<uint64_t>(
-                            {kChunkPayload, reqBytes - rel,
-                             rit->second.size - off}));
+if (off >= rit->second.size) break;
+uint64_t a = kChunkPayload;
+uint64_t b = reqBytes - rel;
+uint64_t c = rit->second.size - off;
+uint64_t min_val = (std::min)((std::min)(a, b), c);
+size_t len = static_cast<size_t>(min_val);
                         Header dh = makeHdr(MsgType::Data, h.xid, s, h.totalPkts,
                                             static_cast<uint16_t>(len),
                                             h.regionId, off);
@@ -612,15 +620,15 @@ bool UdpVerbTransport::rdmaWrite(const RdmaConnection& conn,
     while (true) {
         {
             std::lock_guard<std::mutex> lk(xf->m);
-            sentUpTo = std::min(xf->acked + kWindowPkts, total);
+            sentUpTo = (std::min)(xf->acked + kWindowPkts, total);
         }
         for (uint32_t s = (sentUpTo > kWindowPkts
                                ? sentUpTo - kWindowPkts
                                : 0);
              s < sentUpTo; ++s) {
-            uint64_t off = static_cast<uint64_t>(s) * kChunkPayload;
+uint64_t off = static_cast<uint64_t>(s) * kChunkPayload;
             size_t len = static_cast<size_t>(
-                std::min<uint64_t>(kChunkPayload, size - off));
+                (std::min)(kChunkPayload, size - off));
             Header dh = Impl::makeHdr(MsgType::Data, xid, s, total,
                                       static_cast<uint16_t>(len),
                                       remoteRkey, remoteAddr + off);
@@ -784,3 +792,4 @@ std::unique_ptr<RdmaTransport> createUdpVerbRdmaTransport(
 
 }  // namespace network
 }  // namespace vvm
+

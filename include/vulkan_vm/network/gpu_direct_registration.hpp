@@ -1,9 +1,20 @@
 #pragma once
 
-#ifndef VK_ENABLE_BETA_EXTENSIONS
-#define VK_ENABLE_BETA_EXTENSIONS 1
+// Forward declare Vulkan types to avoid including vulkan.h (which pulls in
+// conflicting Windows SDK headers). Full Vulkan types are defined in vulkan.h
+// when the implementation file includes it.
+#ifndef VK_VERSION_1_0
+typedef uint64_t VkDeviceSize;
+typedef uint32_t VkFlags;
+typedef VkFlags VkMemoryPropertyFlags;
+typedef VkFlags VkBufferUsageFlags;
+typedef uint64_t VkDevice;
+typedef uint64_t VkPhysicalDevice;
+typedef uint64_t VkDeviceMemory;
+typedef uint64_t VkQueue;
+typedef uint64_t VkRemoteAddressNV;
+static constexpr uint64_t VK_NULL_HANDLE = 0;
 #endif
-#include <vulkan/vulkan.h>
 
 #include <optional>
 #include <string>
@@ -23,6 +34,7 @@ struct ibv_mr;
 typedef struct _ze_device_handle_t* ze_device_handle_t;
 typedef struct _ze_context_handle_t* ze_context_handle_t;
 typedef void* ze_ipc_mem_handle_t;
+typedef uint32_t ze_external_memory_type_flags_t;
 #endif
 
 namespace vvm {

@@ -1,7 +1,5 @@
 #pragma once
 
-#include <vulkan/vulkan.h>
-
 #include "vulkan_vm/utils.hpp"
 #include "vulkan_vm/constants.hpp"
 
@@ -11,8 +9,29 @@
 #include <chrono>
 #include <cstdint>
 
+// Forward declare Vulkan types to avoid including vulkan.h in public headers
+// Only define if vulkan.h hasn't been included yet
+#ifndef VK_VERSION_1_0
+using VkFlags = uint32_t;
+using VkBufferUsageFlags = VkFlags;
+using VkFence = uint64_t;
+using VkSemaphore = uint64_t;
+static constexpr VkFence VK_NULL_HANDLE = 0;
+static constexpr VkSemaphore VK_NULL_SEMAPHORE = 0;
+#endif
+
 namespace vvm {
 namespace network {
+
+// Forward declare ExternalHandleType from core (defined without Vulkan dependency)
+enum class ExternalHandleType {
+    None,
+    OpaqueFd,
+    OpaqueWin32,
+    D3D12Heap,
+    DmaBuf,
+    AndroidHardwareBuffer
+};
 
 struct NetworkConfig {
     // gRPC server
@@ -133,7 +152,7 @@ struct RemoteAllocationDesc {
     bool dedicatedAllocation = false;
     
     // External handle type
-    vvm::ExternalHandleType handleType = vvm::ExternalHandleType::OpaqueFd;
+    ExternalHandleType handleType = ExternalHandleType::OpaqueFd;
     
     // Handle data (for staged import when RDMA not available)
     std::vector<uint8_t> externalHandle;  // serialized fd/handle

@@ -2,7 +2,7 @@
 # The core network module (TCP control plane + host-staged migration) builds
 # without any external dependencies. gRPC and RDMA/verbs are optional extras.
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake)
-find_package(Vulkan REQUIRED)
+# Vulkan is found by parent CMakeLists.txt; use inherited variables
 find_package(Protobuf QUIET)
 find_package(gRPC QUIET)
 find_package(ibverbs QUIET)
@@ -79,7 +79,6 @@ if(IBVERBS_FOUND AND RDMA_CM_FOUND)
     message(STATUS "VulkanVM network: RDMA/verbs transport enabled")
     list(APPEND NETWORK_CORE_SRCS
         rdma_transport.cpp
-        gpu_direct_registration.cpp
     )
     list(APPEND NETWORK_ABI_DEFS VVM_NETWORK_HAS_VERBS=1)
     set(VVM_NETWORK_VERBS_LIBS ${IBVERBS_LIBRARIES} ${RDMA_CM_LIBRARIES})
@@ -104,19 +103,30 @@ endif()
 # Windows: Level Zero GPU-direct (Intel)
 if(WIN32 AND LevelZero_FOUND)
     message(STATUS "VulkanVM network: Level Zero GPU-direct enabled for Intel")
-    list(APPEND NETWORK_CORE_SRCS gpu_direct_registration.cpp)
     set(VVM_NETWORK_L0_LIBS ${LevelZero_LIBRARIES})
     set(VVM_NETWORK_L0_INCS ${LevelZero_INCLUDE_DIRS})
 endif()
 
-# Windows: Network Direct (ND) transport. NDKPI is the kernel-mode contract
-# RNIC miniports implement; the user-mode consumer this library talks to is the
-# ND SPI (IND2*, headers vendored under third_party/ndk).
+# Windows: Network Direct (ND) transport
 if(WIN32)
     message(STATUS "VulkanVM network: ND (Network Direct) transport enabled on Windows")
     list(APPEND NETWORK_CORE_SRCS ndk_transport.cpp)
     list(APPEND NETWORK_ABI_DEFS VVM_NETWORK_HAS_NDKPI=1)
     set(VVM_NETWORK_NDK_INCS ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/ndk)
+endif()
+
+# GPU Direct Registration (optional, requires Vulkan)
+# Built as a separate static library to avoid propagating Vulkan includes
+if(Vulkan_FOUND AND (IBVERBS_FOUND OR LevelZero_FOUND))
+    message(STATUS "VulkanVM network: GPU-direct registration enabled")
+    add_library(vulkan_vm_gpu_direct STATIC gpu_direct_registration.cpp)
+    target_include_directories(vulkan_vm_gpu_direct PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${Vulkan_INCLUDE_DIRS}
+    )
+    target_link_libraries(vulkan_vm_gpu_direct PRIVATE ${Vulkan_LIBRARIES})
+    target_compile_definitions(vulkan_vm_gpu_direct PRIVATE VK_USE_PLATFORM_WIN32_KHR=1)
+    set(NETWORK_EXTRA_LIBS ${NETWORK_EXTRA_LIBS} vulkan_vm_gpu_direct)
 endif()
 
 # TLS support via OpenSSL
@@ -137,6 +147,12 @@ if(VVM_BUILD_SHARED)
 else()
     add_library(vulkan_vm_network STATIC ${NETWORK_CORE_SRCS})
 endif()
+# gpu_direct_registration.cpp needs VK_USE_PLATFORM_WIN32_KHR for external memory Win32 extensions
+# (Handled by vulkan_vm_gpu_direct target)
+if(WIN32)
+    set_source_files_properties(gpu_direct_registration.cpp PROPERTIES COMPILE_DEFINITIONS 
+"VK_USE_PLATFORM_WIN32_KHR=1")
+endif()
 
 add_library(VulkanVM::Transport ALIAS vulkan_vm_network)
 
@@ -152,7 +168,6 @@ target_include_directories(vulkan_vm_network PRIVATE
 )
 
 target_link_libraries(vulkan_vm_network PUBLIC vulkan_vm)
-target_link_libraries(vulkan_vm_network PRIVATE Vulkan::Vulkan)
 target_link_libraries(vulkan_vm_network PRIVATE
     Threads::Threads
     ${VVM_NETWORK_GRPC_LIBS}
@@ -160,6 +175,7 @@ target_link_libraries(vulkan_vm_network PRIVATE
     ${VVM_NETWORK_UCX_LIBS}
     ${VVM_NETWORK_L0_LIBS}
     ${VVM_NETWORK_TLS_LIBS}
+    ${NETWORK_EXTRA_LIBS}
 )
 
 # Winsock is required by the TCP transport on Windows. The ND transport also

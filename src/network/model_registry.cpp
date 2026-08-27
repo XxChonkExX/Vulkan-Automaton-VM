@@ -2,7 +2,7 @@
 #include "vulkan_vm/network/sha256.hpp"
 #include "vulkan_vm/network/network_types.hpp"
 #include "vulkan_vm/network/wire_format.hpp"
-#include "vulkan_vm/utils.hpp"
+#include "vulkan_vm/logging.hpp"
 
 #include <algorithm>
 #include <cstddef>

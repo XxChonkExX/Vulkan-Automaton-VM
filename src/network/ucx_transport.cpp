@@ -1,5 +1,5 @@
 #include "vulkan_vm/ucx_transport.hpp"
-#include "vulkan_vm/utils.hpp"
+#include "vulkan_vm/logging.hpp"
 
 #if defined(VVM_HAS_UCX)
 #include <ucp/api/ucp.h>

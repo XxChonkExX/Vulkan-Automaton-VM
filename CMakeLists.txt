@@ -53,10 +53,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Platform detection
-if(WIN32)
-    set(VVM_PLATFORM_WINDOWS 1)
-    add_compile_definitions(VVM_PLATFORM_WINDOWS=1 VK_USE_PLATFORM_WIN32_KHR=1)
-elseif(ANDROID)
+  if(WIN32)
+      set(VVM_PLATFORM_WINDOWS 1)
+      add_compile_definitions(VVM_PLATFORM_WINDOWS=1)
+  elseif(ANDROID)
     # Cross-compiles via the NDK toolchain: Linux-like, but platform headers
     # (vulkan_android.h -> AHardwareBuffer extension macros) need this gate.
     set(VVM_PLATFORM_LINUX 1)
@@ -206,6 +206,7 @@ endif()
 
 target_compile_definitions(vulkan_vm PRIVATE
     VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1
+    VK_USE_PLATFORM_WIN32_KHR=1
 )
 
 if(VVM_BUILD_SHARED)

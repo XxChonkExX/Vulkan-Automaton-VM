@@ -3,7 +3,7 @@
 #include "vulkan_vm/network/network_types.hpp"
 #include "vulkan_vm/cross_gpu/external_memory.hpp"
 #include "vulkan_vm/vulkan_vm.hpp"
-#include "vulkan_vm/utils.hpp"
+#include "vulkan_vm/logging.hpp"
 
 #include <random>
 #include <algorithm>
@@ -714,10 +714,10 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
             }
         }
         exportInfo = localPools_[0].exportMemory(*exportSrc, exportType);
-        netDesc.handleType = exportInfo ? exportType : netDesc.handleType;
+        netDesc.handleType = exportInfo ? static_cast<ExternalHandleType>(exportType) : netDesc.handleType;
         #elif defined(VVM_PLATFORM_WINDOWS)
         exportInfo = localPools_[0].exportMemory(*exportSrc, vvm::ExternalHandleType::OpaqueWin32);
-        netDesc.handleType = exportInfo ? vvm::ExternalHandleType::OpaqueWin32
+        netDesc.handleType = exportInfo ? static_cast<ExternalHandleType>(vvm::ExternalHandleType::OpaqueWin32)
                                         : netDesc.handleType;
         #endif
         if (!exportInfo) {

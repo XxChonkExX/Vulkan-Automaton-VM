@@ -1,6 +1,6 @@
 #include "vulkan_vm/network/rdma_transport.hpp"
 #include "vulkan_vm/vulkan_vm.hpp"
-#include "vulkan_vm/utils.hpp"
+#include "vulkan_vm/logging.hpp"
 #include "vulkan_vm/network/gpu_direct_registration.hpp"
 
 #include <infiniband/verbs.h>

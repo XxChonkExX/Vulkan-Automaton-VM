@@ -15,7 +15,7 @@
 // ============================================================================
 
 #include "vulkan_vm/network/rdma_transport.hpp"
-#include "vulkan_vm/utils.hpp"
+#include "vulkan_vm/logging.hpp"
 
 #include <initguid.h>  // must precede ndspi.h to materialize the IID_* globals
 
