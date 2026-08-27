@@ -51,7 +51,7 @@ int main() {
     std::vector<const char*> requiredExts = {
         VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
 #if defined(VVM_PLATFORM_WINDOWS)
-        VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
+        "VK_KHR_external_memory_win32",
 #elif defined(__ANDROID__)
         VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME,
 #else

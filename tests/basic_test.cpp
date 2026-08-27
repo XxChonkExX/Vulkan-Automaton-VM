@@ -137,7 +137,7 @@ int main() {
 #elif defined(VVM_PLATFORM_LINUX)
         VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,  // Linux
 #elif defined(VVM_PLATFORM_WINDOWS)
-        VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,  // Windows
+        "VK_KHR_external_memory_win32",  // Windows
 #endif
         VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
         VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
