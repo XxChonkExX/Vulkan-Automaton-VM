@@ -206,8 +206,10 @@ endif()
 
 target_compile_definitions(vulkan_vm PRIVATE
     VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1
-    VK_USE_PLATFORM_WIN32_KHR=1
 )
+if(WIN32)
+    target_compile_definitions(vulkan_vm PRIVATE VK_USE_PLATFORM_WIN32_KHR=1)
+endif()
 
 if(VVM_BUILD_SHARED)
     set_target_properties(vulkan_vm PROPERTIES
