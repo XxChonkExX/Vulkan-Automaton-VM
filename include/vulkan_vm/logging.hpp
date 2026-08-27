@@ -53,14 +53,62 @@ enum class LogLevel {
 
 namespace detail {
 
+// Safe argument to string conversion - no variadic snprintf
+template<typename T>
+std::string logArgToString(const T& v) {
+    if constexpr (std::is_same_v<T, std::string>) {
+        return v;
+    } else if constexpr (std::is_same_v<T, const char*>) {
+        return v ? v : "(null)";
+    } else if constexpr (std::is_same_v<T, char*>) {
+        return v ? v : "(null)";
+    } else if constexpr (std::is_same_v<T, bool>) {
+        return v ? "true" : "false";
+    } else if constexpr (std::is_same_v<T, char>) {
+        return std::string(1, v);
+    } else if constexpr (std::is_integral_v<T>) {
+        return std::to_string(v);
+    } else if constexpr (std::is_floating_point_v<T>) {
+        std::ostringstream os;
+        os << v;
+        return os.str();
+    } else if constexpr (std::is_pointer_v<T>) {
+        std::ostringstream os;
+        os << static_cast<const void*>(v);
+        return os.str();
+    } else {
+        std::ostringstream os;
+        os << v;
+        return os.str();
+    }
+}
+
+// Substitute {} placeholders with rendered arguments
+// Safe: no variadic snprintf, no format-security issues
 template<typename... Args>
 std::string logFormat(const char* fmt, Args&&... args) {
-    size_t len = std::snprintf(nullptr, 0, fmt, std::forward<Args>(args)...);
-    if (len <= 0) return "";
-    std::string result(len + 1, '\0');
-    std::snprintf(&result[0], result.size(), fmt, std::forward<Args>(args)...);
-    result.pop_back();
-    return result;
+    if (fmt == nullptr) return "";
+    std::string_view fv(fmt);
+    std::vector<std::string> rendered;
+    rendered.reserve(sizeof...(Args));
+    (rendered.push_back(logArgToString(std::forward<Args>(args))), ...);
+
+    std::string out;
+    out.reserve(fv.size() + rendered.size() * 8);
+    size_t argIndex = 0;
+    for (size_t i = 0; i < fv.size(); ++i) {
+        if (i + 1 < fv.size() && fv[i] == '{' && fv[i + 1] == '}') {
+            if (argIndex < rendered.size()) {
+                out += rendered[argIndex++];
+            } else {
+                out += "{}";
+            }
+            ++i;
+        } else {
+            out += fv[i];
+        }
+    }
+    return out;
 }
 
 } // namespace detail
@@ -72,28 +120,12 @@ public:
     void setLevel(LogLevel level) { level_ = level; }
     void setCallback(std::function<void(LogLevel, const std::string&)> cb) { callback_ = std::move(cb); }
 
-    // Supports both printf-style (%d, %s, ...) and {}-style formats.
+    // Type-safe logging with {} placeholder support
     template<typename... Args>
     void log(LogLevel lvl, const char* fmt, Args&&... args) {
         if (lvl < level_) return;
 
-        std::string msg;
-        if (fmt != nullptr && std::strstr(fmt, "{}") != nullptr) {
-            msg = detail::logFormat(fmt, std::forward<Args>(args)...);
-        } else {
-            char buffer[1024];
-#if defined(__clang__) || defined(__GNUC__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wformat-security"
-#pragma GCC diagnostic ignored "-Wnon-pod-varargs"
-#endif
-            int len = std::snprintf(buffer, sizeof(buffer), fmt ? fmt : "", std::forward<Args>(args)...);
-#if defined(__clang__) || defined(__GNUC__)
-#pragma GCC diagnostic pop
-#endif
-            if (len < 0) return;
-            msg.assign(buffer, static_cast<size_t>(len));
-        }
+        std::string msg = detail::logFormat(fmt, std::forward<Args>(args)...);
 
         if (callback_) {
             callback_(lvl, msg);
