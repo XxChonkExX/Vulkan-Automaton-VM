@@ -137,7 +137,7 @@ static bool initLogicalDevice(TestDevice& dev, VkPhysicalDevice phys) {
         VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
         VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
 #else
-        VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
+        "VK_KHR_external_memory_win32",
 #endif
         // NOTE: VK_EXT_memory_budget deliberately NOT enabled here - under
         // Mesa 26.0.3 ANV, vkAllocateMemory segfaults when importing an

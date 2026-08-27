@@ -26,6 +26,10 @@ if(WIN32)
         set(CMAKE_SYSTEM_VERSION "${_vvm_best_sdk}" CACHE STRING "Windows SDK version")
         set(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION "${_vvm_best_sdk}" CACHE STRING "Windows SDK version")
         message(STATUS "VulkanVM: using Windows SDK ${_vvm_best_sdk}")
+
+        # Ensure RC and MT tools are found (required for MSVC manifests)
+        set(CMAKE_RC_COMPILER "C:/Program Files (x86)/Windows Kits/10/bin/${_vvm_best_sdk}/x64/rc.exe" CACHE PATH "Windows RC compiler")
+        set(CMAKE_MT "C:/Program Files (x86)/Windows Kits/10/bin/${_vvm_best_sdk}/x64/mt.exe" CACHE PATH "Windows Manifest Tool")
     endif()
     # Optional overrides for exotic setups (do not force):
     if(DEFINED ENV{VVM_RC_COMPILER})

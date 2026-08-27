@@ -115,12 +115,14 @@ static bool initTestDevice() {
         VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
         VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
 #ifdef VVM_PLATFORM_WINDOWS
-        VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
+        "VK_KHR_external_memory_win32",
 #endif
         VK_EXT_MEMORY_BUDGET_EXTENSION_NAME
     };
+    constexpr size_t kNumDevExts = sizeof(allDevExts) / sizeof(allDevExts[0]);
     std::vector<const char*> devExts;
-    for (const char* ext : allDevExts) {
+    for (size_t i = 0; i < kNumDevExts; ++i) {
+        const char* ext = allDevExts[i];
         for (const auto& p : devExtProps) {
             if (std::strcmp(p.extensionName, ext) == 0) {
                 devExts.push_back(ext);
