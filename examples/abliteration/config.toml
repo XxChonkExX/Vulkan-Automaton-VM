@@ -1,0 +1,60 @@
+# Heretic config for IBM Granite 4.2 with research plotting enabled
+
+dtypes = ["auto", "float16", "bfloat16", "float32"]
+quantization = "bnb_4bit"
+device_map = "cpu"
+offload_outputs_to_cpu = true
+batch_size = 1
+max_batch_size = 1
+max_response_length = 1
+response_prefix = ""
+export_strategy = "merge"
+
+chain_of_thought_skips = [
+  ["<|channel|>analysis<|message|>", "<|channel|>analysis<|message|><|end|><|start|>assistant<|channel|>final<|message|>"],
+  ["<thought>", "<thought></thought>"],
+  ["[THINK]", "[THINK][/THINK]"],
+]
+
+# Research visualization - PaCMAP projections of residual vectors
+plot_residuals = true
+residual_plot_path = "plots"
+residual_plot_title = 'PaCMAP Projection of Residual Vectors for "Harmless" and "Harmful" Prompts (Granite 4.2)'
+residual_plot_style = "dark_background"
+
+kl_divergence_scale = 1.0
+kl_divergence_target = 0.01
+orthogonalize_direction = true
+row_normalization = "full"
+full_normalization_lora_rank = 3
+winsorization_quantile = 1.0
+
+n_trials = 200
+n_startup_trials = 60
+study_checkpoint_dir = "checkpoints"
+max_shard_size = "5GB"
+system_prompt = "You are a helpful assistant."
+
+[good_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "train[:400]"
+column = "text"
+residual_plot_label = '"Harmless" prompts'
+residual_plot_color = "royalblue"
+
+[bad_prompts]
+dataset = "mlabonne/harmful_behaviors"
+split = "train[:400]"
+column = "text"
+residual_plot_label = '"Harmful" prompts'
+residual_plot_color = "darkorange"
+
+[good_evaluation_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "test[:10]"
+column = "text"
+
+[bad_evaluation_prompts]
+dataset = "mlabonne/harmful_behaviors"
+split = "test[:10]"
+column = "text"
