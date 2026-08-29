@@ -212,14 +212,17 @@ namespace sub {
     // Tier N: floor size in bytes. Requests are routed to the tier whose
     // floor is the largest value still <= 2x the request (i.e., the floor
     // fits the request with <= 2x waste). This matches the user's chunk
-    // sizes (512, 1024, 2048) and closes the 512MB-2GB gap.
-    static constexpr size_t TIER_FLOORS_BYTES[3] = {
-        (size_t)512 * 1024 * 1024,   // tier 0: 512 MB
+    // sizes (256/512/1024/2048) and the main-slab min block, closing the
+    // 0..4GB gap so the main slab isn't asked for 4GB blocks (which would
+    // round up to 16GB under MIN_BLOCK_GB=16 and OOM the driver).
+    static constexpr size_t TIER_FLOORS_BYTES[4] = {
+        (size_t)512  * 1024 * 1024,  // tier 0: 512 MB
         (size_t)1024 * 1024 * 1024,  // tier 1: 1 GB
         (size_t)2048 * 1024 * 1024,  // tier 2: 2 GB
+        (size_t)4096 * 1024 * 1024,  // tier 3: 4 GB
     };
-    static constexpr int N_TIERS = 3;
-    static slab::Core* tiers[N_TIERS] = {nullptr, nullptr, nullptr};
+    static constexpr int N_TIERS = 4;
+    static slab::Core* tiers[N_TIERS] = {nullptr, nullptr, nullptr, nullptr};
 
     // Pick the tier index for a request size, or -1 if the request is
     // larger than the largest tier floor (caller should use main slab).
