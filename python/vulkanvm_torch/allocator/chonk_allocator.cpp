@@ -30,38 +30,66 @@ size_t envSizeGB(const char* name, size_t defGB) {
     return defGB;
 }
 
-// Bucket list (GB) parsed once from CHONK_POOL_BLOCK_SIZES_GB ("auto" gives
-// the graduated 1..128 GB ladder). New blocks are rounded UP to the smallest
-// bucket >= the request so a single block absorbs the monotonic growth of
-// recompute attention temporaries. Falls back to power-of-two rounding.
+// Bucket ladder from 1 MB to 512 GB. New blocks are rounded UP to the
+// smallest bucket >= the request. One unified freelist across all block
+// sizes (slab::Core best-fit) so 1 KB to 131K-context allocations share
+// the same pool, with no tier-routing layer in between. Defaults to
+// "auto" (the full ladder). Override with CHONK_POOL_BLOCK_SIZES_GB.
+//
+// Ladder layout (per user spec, no shortcuts):
+//   MB scale:
+//     1, 1.5, 2, 3, 4 MB                          (fine for activations, gradients)
+//     6, 8, 10, 12, ..., 16382 MB (2 MB steps)   (continuous to 16 GB)
+//   GB scale:
+//     16, 18, 20, ..., 128 GB (2 GB steps)        (KV cache, p/scores)
+//   Standard sizing:
+//     128, 192, 256, 384, 512 GB                 (1.5x; huge contexts)
+//
+// The 1.5 MB rung catches the "odd duck" between 1 and 2 MB. From 4 MB
+// upward, 2-unit MB steps give <= 2 MB of waste. From 16 GB upward,
+// 2-unit GB steps give <= 2 GB of waste. Beyond 128 GB, 1.5x standard
+// sizing (matches the GTT heap's power-of-2 fragment).
 std::vector<size_t> buckets() {
     static std::vector<size_t> b = [] {
         std::vector<size_t> out;
         const char* p = getenv("CHONK_POOL_BLOCK_SIZES_GB");
-        if (p) {
+        if (p && std::string(p) != "auto") {
+            // Custom ladder, in GB, parsed like "1,2,4,8,16".
             std::string str(p);
-            std::string firstToken = str.substr(0, str.find(','));
-            if (firstToken == "auto") {
-                static const size_t kLadderGB[] = {
-                    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-                    20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128,
-                };
-                for (size_t gb : kLadderGB) {
-                    out.push_back(gb * 1024ull * 1024ull * 1024ull);
-                }
-                fprintf(stderr, "[allocator] auto-buckets: graduated %zu-rung ladder, 1..128 GB\n",
-                        sizeof(kLadderGB) / sizeof(kLadderGB[0]));
-            } else {
-                size_t start = 0;
-                for (;;) {
-                    size_t end = str.find(',', start);
-                    std::string token = str.substr(start, end == std::string::npos ? std::string::npos : end - start);
-                    double gb_val = atof(token.c_str());
-                    if (gb_val >= 1.0) out.push_back((size_t)(gb_val * 1024.0 * 1024.0 * 1024.0));
-                    if (end == std::string::npos) break;
-                    start = end + 1;
-                }
+            size_t start = 0;
+            for (;;) {
+                size_t end = str.find(',', start);
+                std::string token = str.substr(start, end == std::string::npos ? std::string::npos : end - start);
+                double gb_val = atof(token.c_str());
+                if (gb_val >= 1.0) out.push_back((size_t)(gb_val * 1024.0 * 1024.0 * 1024.0));
+                if (end == std::string::npos) break;
+                start = end + 1;
             }
+        } else {
+            // Default: the full user-specified ladder.
+            //   1, 1.5, 2, 3, 4 MB  (fine MB rungs)
+            out.push_back(1 * 1024 * 1024);
+            out.push_back(1 * 1024 * 1024 + 512 * 1024);  // 1.5 MB
+            out.push_back(2 * 1024 * 1024);
+            out.push_back(3 * 1024 * 1024);
+            out.push_back(4 * 1024 * 1024);
+            //   6, 8, 10, ..., 16382 MB  (2 MB steps, continuous to 16 GB)
+            for (size_t mb = 6; mb <= 16382; mb += 2) {
+                out.push_back(mb * 1024 * 1024);
+            }
+            //   16, 18, 20, ..., 128 GB  (2 GB steps)
+            for (size_t gb = 16; gb <= 128; gb += 2) {
+                out.push_back((size_t)gb * 1024 * 1024 * 1024);
+            }
+            //   192, 256, 384, 512 GB  (1.5x standard, beyond 128)
+            out.push_back((size_t)192 * 1024 * 1024 * 1024);
+            out.push_back((size_t)256 * 1024 * 1024 * 1024);
+            out.push_back((size_t)384 * 1024 * 1024 * 1024);
+            out.push_back((size_t)512 * 1024 * 1024 * 1024);
+            fprintf(stderr,
+                    "[allocator] auto-buckets: user-spec ladder, %zu rungs, 1 MB .. 512 GB "
+                    "(1,1.5,2,3,4,6,8..16GB step 2MB, 16..128GB step 2GB, 192..512GB 1.5x)\n",
+                    out.size());
         }
         std::sort(out.begin(), out.end());
         out.erase(std::unique(out.begin(), out.end()), out.end());
@@ -70,11 +98,23 @@ std::vector<size_t> buckets() {
     return b;
 }
 
+// Read CHONK_MIN_BLOCK_GB and (override) CHONK_MIN_BLOCK_MB. Default 1 MB.
+static size_t computeMinBlockBytes() {
+    if (const char* mb = getenv("CHONK_MIN_BLOCK_MB")) {
+        double v = atof(mb);
+        if (v >= 0.5) return (size_t)(v * 1024.0 * 1024.0);
+    }
+    return envSizeGB("CHONK_MIN_BLOCK_GB", 0.001) * 1024ull * 1024ull * 1024ull;  // 1 MB
+}
+
+// Round a request size UP to the smallest ladder rung that fits it. Falls
+// back to max(minBlock, need) rounded up to the next power of two if the
+// request exceeds all rungs (defensive; should not happen for our workloads).
 size_t roundToBucket(size_t need) {
     for (size_t b : buckets()) {
         if (b >= need) return b;
     }
-    size_t minBlock = envSizeGB("CHONK_MIN_BLOCK_GB", 2) * 1024ull * 1024ull * 1024ull;
+    size_t minBlock = computeMinBlockBytes();
     size_t b = std::max(minBlock, need);
     size_t p = 1;
     while (p < b) p <<= 1;
@@ -97,9 +137,9 @@ void allocLog(const char* op, void* ptr, size_t sz) {
 // Production provider: Vulkan allocation -> DMA-BUF export -> HIP import.
 // Keeps the vvm::Allocation handle per block (the slab core type-erases it).
 struct PoolBlockProvider : slab::Core::IProvider {
-    size_t minBlockBytes = envSizeGB("CHONK_MIN_BLOCK_GB", 2) * 1024ull * 1024ull * 1024ull;
+    size_t minBlockBytes = computeMinBlockBytes();  // default 1 MB
     size_t escalateSlackGB = envSizeGB("CHONK_ESCALATE_SLACK_GB", 2);
-    size_t minBlocksOnOOM = 1;  // aggressive: keep only 1 block on OOM release (was 4)
+    size_t minBlocksOnOOM = 1;  // aggressive: keep only 1 block on OOM release
     std::unordered_map<void*, vvm::Allocation> blockAllocs_;
 
     size_t warmBlocks() const { return envSizeGB("CHONK_WARM_BLOCKS", 8); }
@@ -108,12 +148,14 @@ struct PoolBlockProvider : slab::Core::IProvider {
     Block* createBlock(slab::Core& core, size_t need) override {
         vvm::UnifiedMemoryPool* p = pool();
         if (!p) return nullptr;
-        // Proven sizing: exact-fit above the min-block floor (the validated
-        // 196K recipe sets CHONK_MIN_BLOCK_GB=16). Bucket rounding is NOT
-        // applied to base allocations (it inflated them by ~10GB); it is the
-        // pressure-relief escalation only.
-        size_t blockSize = std::max(minBlockBytes,
-                                    (need + slab::Core::kAlign - 1) / slab::Core::kAlign * slab::Core::kAlign);
+        // Size the new block to the nearest ladder rung >= max(need, minBlock).
+        // For a 1 KB request with min=1 MB, we get a 1 MB block; for a 700 MB
+        // request, a 1 GB block; for 14 GB, a 16 GB block. The slab's best-fit
+        // then finds the smallest free chunk across all blocks (any size),
+        // so the ladder is just the set of block sizes the pool may grow to.
+        size_t blockSize = roundToBucket(
+            std::max(minBlockBytes,
+                     (need + slab::Core::kAlign - 1) / slab::Core::kAlign * slab::Core::kAlign));
         vvm::AllocDesc desc;
         desc.size = blockSize;
         desc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -203,62 +245,6 @@ PoolBlockProvider& provider() {
 }
 
 
-// Sub-allocator: tiered sub-slabs (512MB, 1024MB, 2048MB floors) for
-// "best fit" coverage of allocations in the 0..2GB range. Each tier routes
-// requests to the smallest sub-slab whose floor >= the request, so a
-// 600MB allocation gets a 1024MB block (not a 2GB main-slab block that
-// wastes 1.4GB). Tier defaults are env-tunable.
-namespace sub {
-    // Tier N: floor size in bytes. Requests are routed to the tier whose
-    // floor is the largest value still <= 2x the request (i.e., the floor
-    // fits the request with <= 2x waste). This matches the user's chunk
-    // sizes (256/512/1024/2048) and the main-slab min block, closing the
-    // 0..4GB gap so the main slab isn't asked for 4GB blocks (which would
-    // round up to 16GB under MIN_BLOCK_GB=16 and OOM the driver).
-    static constexpr size_t TIER_FLOORS_BYTES[4] = {
-        (size_t)512  * 1024 * 1024,  // tier 0: 512 MB
-        (size_t)1024 * 1024 * 1024,  // tier 1: 1 GB
-        (size_t)2048 * 1024 * 1024,  // tier 2: 2 GB
-        (size_t)4096 * 1024 * 1024,  // tier 3: 4 GB
-    };
-    static constexpr int N_TIERS = 4;
-    static slab::Core* tiers[N_TIERS] = {nullptr, nullptr, nullptr, nullptr};
-
-    // Pick the tier index for a request size, or -1 if the request is
-    // larger than the largest tier floor (caller should use main slab).
-    int pick_tier(size_t sz) {
-        for (int i = 0; i < N_TIERS; ++i) {
-            if (sz <= TIER_FLOORS_BYTES[i] * 2) return i;
-        }
-        return -1;
-    }
-
-    slab::Core* get(int tier) {
-        if (tier < 0 || tier >= N_TIERS) return nullptr;
-        if (!tiers[tier]) {
-            // Lazy init: each tier gets its own slab::Core with floor = TIER_FLOORS_BYTES[tier]
-            // (handled in the provider via minBlock per request; here we
-            // just create a Core with a generic provider).
-            size_t warm  = envSizeGB("CHONK_SUB_WARM_BLOCKS", 4);
-            size_t maxb  = envSizeGB("CHONK_SUB_MAX_BLOCKS", 16);
-            size_t minb  = envSizeGB("CHONK_SUB_MIN_BLOCKS", 4);
-            static PoolBlockProvider p;
-            // Note: the per-tier min block floor is enforced in the provider's
-            // createBlock by passing need >= TIER_FLOORS_BYTES[tier]; the slab
-            // itself doesn't know about tier floors. The provider is global,
-            // so this is a soft guarantee (allocator may round up further if
-            // the bucket ladder mandates). For an exact tier floor, a per-tier
-            // provider would be needed; in practice the bucket ladder is
-            // graduated and the difference is small.
-            tiers[tier] = new slab::Core(&p, warm, maxb, minb);
-        }
-        return tiers[tier];
-    }
-
-    // Legacy single-slab init (kept for backward compat; returns tier 0).
-    slab::Core* init() { return get(0); }
-}
-
 slab::Core& core() {
     static slab::Core c(&provider(), provider().warmBlocks(),
                         provider().maxBlocks(), provider().minBlocksOnOOM);
@@ -276,29 +262,12 @@ void* chonk_allocator_alloc(ssize_t size, int device, void* stream) {
     if (size < 0) return nullptr;  // ABI boundary: reject negative sizes explicitly
     if (!pool()) return nullptr;   // pool must be initialized before install
     size_t granted = 0;
-    void* ptr = nullptr;
-    size_t granted_local = 0;
-    // Tiered sub-allocator routing: pick the best-fit sub-slab (512MB / 1GB / 2GB)
-    // for this request. Falls back to the main slab if no sub-slab fits.
-    int tier = sub::pick_tier((size_t)size);
-    if (tier >= 0) {
-        slab::Core* s = sub::get(tier);
-        if (s) {
-            // Aggressive empty-block release: before allocating, free any
-            // fully-empty sub-slab blocks back to the Vulkan pool. With the
-            // 130 GB GTT heap, re-alloc is cheap; holding dead 1-2 GB blocks
-            // just bloats the pool and fragments the driver's exportable heap.
-            s->releaseEmptyBlocks(0);
-            ptr = s->alloc((size_t)size, &granted_local);
-        }
-    }
-    if (!ptr) {
-        // Same aggressive release on the main slab.
-        core().releaseEmptyBlocks(0);
-        ptr = core().alloc((size_t)size, (granted_local == 0 ? &granted : nullptr));
-        if (granted_local == 0) granted_local = granted;
-    }
-    if (ptr && granted == 0) granted = granted_local;
+    // Aggressive empty-block release: before allocating, free any fully-empty
+    // blocks back to the Vulkan pool. With the 130 GB GTT heap, re-alloc is
+    // cheap; holding dead 1 MB - 4 GB blocks just fragments the GTT. The slab
+    // (best-fit) then reuses the released space for the next request.
+    core().releaseEmptyBlocks(0);
+    void* ptr = core().alloc((size_t)size, &granted);
     if (ptr) allocLog("A", ptr, granted);
     return ptr;
 }
