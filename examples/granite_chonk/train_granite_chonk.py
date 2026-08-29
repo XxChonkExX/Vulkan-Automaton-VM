@@ -65,6 +65,8 @@ CHONK_ATTN = os.environ.get("CHONK_ATTN", "eager")
 CHONK_ATTN_RECOMPUTE = os.environ.get("CHONK_ATTN_RECOMPUTE", "1") == "1"
 CHONK_PAUSE = float(os.environ.get("CHONK_PAUSE", "0.05"))          # display driver breath
 CHONK_OPTIMIZER_PAUSE = float(os.environ.get("CHONK_OPTIMIZER_PAUSE", "1.0"))
+CHONK_ACT_GB = float(os.environ.get("CHONK_ACT_GB", "0.25"))            # activation scratch (log optimum)
+CHONK_STAGING_GB = float(os.environ.get("CHONK_STAGING_GB", "0.25"))    # host-visible staging
 CHONK_EMA_UPDATE_EVERY = int(os.environ.get("CHONK_EMA_UPDATE_EVERY", "1"))
 CHONK_SUBSAMPLE = float(os.environ.get("CHONK_SUBSAMPLE", "1.0"))
 CHONK_EPOCHS = int(os.environ.get("CHONK_EPOCHS", "1"))
@@ -233,6 +235,7 @@ def main():
         lora_r=CHONK_LORA_R, lora_alpha=CHONK_LORA_ALPHA, lora_dropout=0.05,
         attn_implementation=CHONK_ATTN,
         quantize=True, quant_group_size=CHONK_QUANT_GROUP, quant_bits=CHONK_QUANT_BITS,
+        act_budget_gb=CHONK_ACT_GB, staging_gb=CHONK_STAGING_GB,
     )
     pool = setup["pool"]
     kv_cache = setup["kv_cache"]

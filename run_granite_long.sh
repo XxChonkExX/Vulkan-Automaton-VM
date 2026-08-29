@@ -6,17 +6,21 @@ LOG="/tmp/train_granite.log"
 export PYTORCH_HIP_ALLOC_CONF="expandable_segments:False,garbage_collection_threshold:0.4"
 export PYTORCH_ALLOC_CONF="expandable_segments:False,garbage_collection_threshold:0.4"
 export CHONK_SEQ_LEN=131072
-export CHONK_CHUNK=512
+export CHONK_CHUNK=1024
 export CHONK_ATTN=eager
 export CHONK_ATTN_RECOMPUTE=1
 export CHONK_QUANT_BITS=4
 export CHONK_QUANT_GROUP=128
+export CHONK_MIN_BLOCK_GB=16
+export CHONK_POOL_BLOCK_SIZES_GB=auto
+export CHONK_ACT_GB=0.25
+export CHONK_STAGING_GB=0.25
+export CHONK_GRAD_ACCUM=16
 export CHONK_PAUSE=0.05
 export CHONK_OPTIMIZER_PAUSE=1.0
 export CHONK_MAX_STEPS=400
 export CHONK_SAVE_INTERVAL=50
 export CHONK_WARMUP=50
-export CHONK_GRAD_ACCUM=4
 export CHONK_SUBSAMPLE=1.0
 export CHONK_EPOCHS=1
 
@@ -30,7 +34,7 @@ fi
 # Launch (loop restarts on crash/resume)
 while true; do
     echo "[$(date)] Starting training (resume=${CHONK_RESUME_DIR:-none})" >> $LOG
-    /home/chonke/venv-ds4/bin/python examples/granite_chonk/train_granite_chonk.py >> $LOG 2>&1
+    cd /home/chonke/Vulkan-Automaton-VM && /home/chonke/venv-ds4/bin/python /home/chonke/Vulkan-Automaton-VM/examples/granite_chonk/train_granite_chonk.py >> $LOG 2>&1
     EXIT_CODE=$?
     echo "[$(date)] Exit code $EXIT_CODE" >> $LOG
     if [ -n "$CHONK_RESUME_DIR" ] && [ -f "$CHONK_RESUME_DIR/training_state.pt" ]; then
