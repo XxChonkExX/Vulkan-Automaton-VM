@@ -437,21 +437,66 @@ def main():
     # ---- Raw corpora -> synthesized RAG + self-check ----
     if args.synthesize:
         raw_chunks = []
-        # PDFs
-        for pdf in glob.glob(os.path.join(ld, "**", "*.pdf"), recursive=True)[:40]:
+        # Blocklist: files to exclude (dice-RNG tools that conflict with
+        # speculative decoding/drafting and hurt logic/math). Pattern match
+        # on basename (case-insensitive).
+        BLOCKLIST_BASENAMES = {
+            "toolsdicesage.html",   # D&D 3.5 DiceSage random number generator tool
+        }
+        BLOCKLIST_PATTERNS = ("dice", "rng", "random", "roll")  # generic dice/RNG files
+        def is_blocked(path):
+            base = os.path.basename(path).lower()
+            if base in BLOCKLIST_BASENAMES:
+                return True
+            return any(p in base for p in BLOCKLIST_PATTERNS)
+        # PDFs: scan ALL recursively, exclude venv/site-packages junk, cap to avoid memory blowup
+        pdf_cap = int(os.environ.get("PDF_CAP", "200"))
+        pdf_paths = []
+        for p in glob.glob(os.path.join(ld, "**", "*.pdf"), recursive=True):
+            pl = p.lower()
+            if any(junk in pl for junk in ("/.venv/", "/site-packages/", "/__pycache__/")):
+                continue
+            if is_blocked(p):
+                continue
+            pdf_paths.append(p)
+        pdf_paths = pdf_paths[:pdf_cap]
+        for pdf in pdf_paths:
             t = extract_pdf_text(pdf)
-            raw_chunks.extend(chunk_text(t))
-        # HTML
-        for html in glob.glob(os.path.join(ld, "pathfinder", "*.html"))[:20]:
+            if t:
+                raw_chunks.extend(chunk_text(t))
+        # HTML: scan ALL under training root, exclude venv/site-packages, cap
+        html_cap = int(os.environ.get("HTML_CAP", "500"))
+        html_paths = []
+        for p in glob.glob(os.path.join(ld, "**", "*.html"), recursive=True):
+            pl = p.lower()
+            if any(junk in pl for junk in ("/.venv/", "/site-packages/", "/__pycache__/")):
+                continue
+            if is_blocked(p):
+                continue
+            html_paths.append(p)
+        html_paths = html_paths[:html_cap]
+        for html in html_paths:
             t = extract_html_text(html)
-            raw_chunks.extend(chunk_text(t))
+            if t:
+                raw_chunks.extend(chunk_text(t))
         random.shuffle(raw_chunks)
+        # Dedup: drop near-duplicate chunks (same content appears in multiple PDFs/HTMLs)
+        seen = set()
+        deduped = []
+        for c in raw_chunks:
+            h = hash(c.strip()[:500])
+            if h in seen:
+                continue
+            seen.add(h)
+            deduped.append(c)
+        raw_chunks = deduped
         rag_n = min(len(raw_chunks), args.cap_per_source // 2)
         for i, c in enumerate(raw_chunks[:rag_n]):
             m = synth_rag_from_chunk(c, i)
             if m:
                 examples.append(m)
-        print(f"[synth] RAG from {len(raw_chunks)} raw chunks -> {rag_n}")
+        blocked_count = 0
+        print(f"[synth] RAG from {len(raw_chunks)} deduped chunks -> {rag_n} (PDFs: {len(pdf_paths)}, HTMLs: {len(html_paths)}, blocked RNG/dice)")
 
     # ---- Tool-call synthesis from HF tool schemas ----
     if args.synthesize:
@@ -490,6 +535,12 @@ def main():
     kept = 0
     for m, tools in examples:
         if not m or len(m) < 2:
+            continue
+        # NaN/loss safety: require at least one assistant turn and at least one
+        # user (or system) turn. Without an assistant target, CrossEntropy can
+        # produce NaN or train on the wrong token.
+        roles = {x.get("role") for x in m}
+        if "assistant" not in roles or ("user" not in roles and "system" not in roles):
             continue
         text = fmt_messages(m, tok, tools)
         if not text.strip():

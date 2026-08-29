@@ -100,7 +100,9 @@ class GraniteAttnRecompute(torch.autograd.Function):
         q, k_cur, v_cur = ctx.saved_tensors
         cached_k = ctx.cached_k
         cached_v = ctx.cached_v
-        qlen = q.shape[-2]
+        # Use the exact qlen saved at forward time (avoids any shape-derivation
+        # ambiguity from views/resizes between forward and backward).
+        qlen = ctx.qlen
         B, H, _, D = q.shape
         kvH = k_cur.shape[1]
         g = ctx.n_groups
@@ -136,8 +138,21 @@ class GraniteAttnRecompute(torch.autograd.Function):
         dk = torch.matmul(dsg.transpose(-2, -1), qg).sum(dim=2) * ctx.scaling  # [B,kvH,klen,D]
 
         # Slice only the current-chunk portion (cached prefix has no grad path).
-        dk_cur = dk[:, :, -qlen:, :]
-        dv_cur = dv[:, :, -qlen:, :]
+        # Use the SAVED k_cur's own shape as the source of truth for the
+        # return length -- guarantees the returned grad matches what
+        # save_for_backward stored, regardless of any view/reshape ambiguity.
+        def take_last_to(x, target_len):
+            n = x.shape[-2]
+            if n == target_len:
+                return x
+            if n > target_len:
+                return x[:, :, -target_len:, :]
+            pad = torch.zeros(*x.shape[:-2], target_len - n, x.shape[-1],
+                              device=x.device, dtype=x.dtype)
+            return torch.cat([pad, x], dim=-2)
+        cur_len = k_cur.shape[-2]
+        dk_cur = take_last_to(dk, cur_len)
+        dv_cur = take_last_to(dv, cur_len)
 
         return (
             dq.to(q.dtype),
