@@ -99,7 +99,7 @@ void allocLog(const char* op, void* ptr, size_t sz) {
 struct PoolBlockProvider : slab::Core::IProvider {
     size_t minBlockBytes = envSizeGB("CHONK_MIN_BLOCK_GB", 2) * 1024ull * 1024ull * 1024ull;
     size_t escalateSlackGB = envSizeGB("CHONK_ESCALATE_SLACK_GB", 2);
-    size_t minBlocksOnOOM = 4;
+    size_t minBlocksOnOOM = 1;  // aggressive: keep only 1 block on OOM release (was 4)
     std::unordered_map<void*, vvm::Allocation> blockAllocs_;
 
     size_t warmBlocks() const { return envSizeGB("CHONK_WARM_BLOCKS", 8); }
@@ -280,11 +280,18 @@ void* chonk_allocator_alloc(ssize_t size, int device, void* stream) {
     int tier = sub::pick_tier((size_t)size);
     if (tier >= 0) {
         slab::Core* s = sub::get(tier);
-        if (s && s->stats().freeBytes > 0) {
+        if (s) {
+            // Aggressive empty-block release: before allocating, free any
+            // fully-empty sub-slab blocks back to the Vulkan pool. With the
+            // 130 GB GTT heap, re-alloc is cheap; holding dead 1-2 GB blocks
+            // just bloats the pool and fragments the driver's exportable heap.
+            s->releaseEmptyBlocks(0);
             ptr = s->alloc((size_t)size, &granted_local);
         }
     }
     if (!ptr) {
+        // Same aggressive release on the main slab.
+        core().releaseEmptyBlocks(0);
         ptr = core().alloc((size_t)size, (granted_local == 0 ? &granted : nullptr));
         if (granted_local == 0) granted_local = granted;
     }
