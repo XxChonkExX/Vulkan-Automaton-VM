@@ -202,6 +202,18 @@ PoolBlockProvider& provider() {
     return p;
 }
 
+
+// Sub-allocator: dedicated 512MB-floor slab for small allocations (<512MB)
+namespace sub {
+    slab::Core* init() {
+        static slab::Core sub_slab(&provider(),
+            envSizeGB("CHONK_SUB_WARM_BLOCKS", 4),
+            envSizeGB("CHONK_SUB_MAX_BLOCKS", 16),
+            envSizeGB("CHONK_SUB_MIN_BLOCKS", 4));
+        return &sub_slab;
+    }
+}
+
 slab::Core& core() {
     static slab::Core c(&provider(), provider().warmBlocks(),
                         provider().maxBlocks(), provider().minBlocksOnOOM);
@@ -219,7 +231,17 @@ void* chonk_allocator_alloc(ssize_t size, int device, void* stream) {
     if (size < 0) return nullptr;  // ABI boundary: reject negative sizes explicitly
     if (!pool()) return nullptr;   // pool must be initialized before install
     size_t granted = 0;
-    void* ptr = core().alloc((size_t)size, &granted);
+        void* ptr = nullptr;
+    size_t granted_local = 0;
+    slab::Core* sub_slab = sub::init();
+    if (sub_slab && (size_t)size < (512ULL*1024*1024*1024) && sub_slab->stats().freeBytes > 0) {
+        ptr = sub_slab->alloc((size_t)size, &granted_local);
+    }
+    if (!ptr) {
+        ptr = core().alloc((size_t)size, (granted_local == 0 ? &granted : nullptr));
+        if (granted_local == 0) granted_local = granted;
+    }
+    if (ptr && granted == 0) granted = granted_local;
     if (ptr) allocLog("A", ptr, granted);
     return ptr;
 }
