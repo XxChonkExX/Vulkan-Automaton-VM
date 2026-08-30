@@ -512,8 +512,6 @@ def build_chonk_cache(config, batch_size, max_cache_len, pool=None):
             # (drivers reject a single contiguous vkAllocateMemory that large;
             # per-layer ~0.5GB blocks fit the bucket ladder and the GTT heap).
             base, host_ptr = pool.alloc_base(per_layer_total, f"chonk_kv_cache_layer_{i}")
-            if pool.host_ptr is None:
-                pool.host_ptr = host_ptr
             layer = ChonkFullLayer(max_cache_len, base, 0, storage_dtype, compute_dtype, device, quantize_kv, num_kv_heads, head_dim)
             layer._prealloc(batch_size, num_kv_heads, head_dim)
         else:
