@@ -1,0 +1,13 @@
+<driconf>
+  <device>
+    <application name="python" executable="python3.12">
+      <option name="radv_enable_unified_heap_on_apu" value="true" />
+    </application>
+    <application name="python3" executable="python3">
+      <option name="radv_enable_unified_heap_on_apu" value="true" />
+    </application>
+    <application name="python" executable="python">
+      <option name="radv_enable_unified_heap_on_apu" value="true" />
+    </application>
+  </device>
+</driconf>
