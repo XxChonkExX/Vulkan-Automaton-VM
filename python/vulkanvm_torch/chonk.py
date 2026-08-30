@@ -153,9 +153,12 @@ class ChunkedPoolBuffer:
                 return b, byte_off - self._starts[i]
         raise IndexError(f"offset {byte_off} out of range")
 
-    def narrow(self, start, length):
-        """start/length in BYTES (the buffer is uint8). Returns a contiguous
-        uint8 tensor of `length` bytes spanning the logical range."""
+    def narrow(self, dim, start, length):
+        """dim must be 0 (byte range). start/length in BYTES (the buffer is
+        uint8). Returns a contiguous uint8 tensor of `length` bytes spanning
+        the logical range."""
+        if dim != 0:
+            raise NotImplementedError("ChunkedPoolBuffer only supports dim=0")
         if length == 0:
             return self.blocks[0].narrow(0, 0, 0)
         # Single-block case (common): zero-copy view.
