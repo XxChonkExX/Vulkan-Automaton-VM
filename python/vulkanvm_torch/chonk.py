@@ -477,8 +477,11 @@ def build_chonk_cache(config, batch_size, max_cache_len, pool=None):
     )
     device = "cuda"
 
-    quantize_threshold = 0  # Force quantization for all cache lengths
-    quantize_kv = True  # Force quantization
+    # Weights are INT4 (via build_lora_chonk_setup quantize=True); the KV cache
+    # stays bf16/fp16 ("weights 4, cache 16"). Quantizing the cache (uint8 packed)
+    # causes explosive forward/backward dequant tensors at long context -- the
+    # exact failure the user hit. Gate behind CHONK_QUANTIZE_KV (default OFF).
+    quantize_kv = os.environ.get("CHONK_QUANTIZE_KV", "0") == "1"
     if quantize_kv:
         storage_dtype = torch.uint8
         compute_dtype = torch.bfloat16
