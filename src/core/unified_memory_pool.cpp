@@ -72,7 +72,15 @@ PoolConfig PoolConfig::forDevice(VkPhysicalDevice physicalDevice) {
             cfg.blockSize = isHighVRAM ? 2048ull * 1024 * 1024 : 1024ull * 1024 * 1024;
             cfg.maxBlocks = isHighVRAM ? 16 : 8;
             cfg.enableHostVisible = true;
-            cfg.maxHeapFraction = isHighVRAM ? 0.8f : 0.7f;
+            // maxHeapFraction caps the pool at a fraction of the reported
+            // DEVICE_LOCAL heap. On Strix Halo (UMA, 129GB physical) the
+            // reported heap under-counts the true unified RAM, so the default
+            // 0.8 can leave a false ~84GB wall. Allow override via
+            // CHONK_MAX_HEAP_FRACTION (e.g. 0.92) to use more physical RAM.
+            {
+                const char* hf = getenv("CHONK_MAX_HEAP_FRACTION");
+                cfg.maxHeapFraction = hf ? (float)atof(hf) : (isHighVRAM ? 0.8f : 0.7f);
+            }
             cfg.hostShadowMultiplier = 0.0f;  // VRAM is already host-visible
             cfg.maxHostShadowBytes = 0;
             cfg.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
