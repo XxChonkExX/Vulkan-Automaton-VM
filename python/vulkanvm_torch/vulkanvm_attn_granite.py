@@ -114,23 +114,28 @@ class GraniteAttnRecompute(torch.autograd.Function):
             k, v = k_cur, v_cur
         klen = k.shape[-2]
 
-        # Recompute probs in fp32 (checkpointing: p was not saved).
-        qf = q.float()
-        kf = k.float()
-        vf = v.float()
+        # Recompute probs in bf16 (checkpointing: p was not saved), NOT fp32.
+        # The position-proportional tensors (p/ds/dp, [B,H,qlen,klen]) at full
+        # 131K context are 32 x qlen x 131072; fp32 makes each ~8.6GB and the
+        # sum ~34GB -> HSA memory fault. bf16 halves it (matches the original
+        # C++ vulkanvm_autograd.hpp mt=bf16 path) so the backward fits.
+        mt = torch.bfloat16 if q.dtype in (torch.bfloat16, torch.float16) else torch.float32
+        qf = q.to(mt)
+        kf = k.to(mt)
+        vf = v.to(mt)
         qg = qf.view(B, kvH, g, qlen, D)
         scores = torch.matmul(qg, kf.unsqueeze(2).transpose(-2, -1))
         scores = scores.reshape(B, H, qlen, klen) * ctx.scaling
         if ctx.causal:
-            scores = scores + _causal_mask(qlen, klen, q.device, torch.float32)
-        p = torch.softmax(scores, dim=-1)  # [B,H,qlen,klen] fp32
+            scores = scores + _causal_mask(qlen, klen, q.device, mt)
+        p = torch.softmax(scores.float(), dim=-1).to(mt)  # [B,H,qlen,klen] bf16
         pg = p.view(B, kvH, g, qlen, klen)
 
-        dout_f = dout.float()
-        dyg = dout_f.view(B, kvH, g, qlen, D)
-        vg = vf.unsqueeze(2)  # [B,kvH,1,klen,D] -> transpose -> [B,kvH,1,D,klen]
+        dout_mt = dout.to(mt)
+        dyg = dout_mt.view(B, kvH, g, qlen, D)
+        vg = vf.unsqueeze(2)  # [B,kvH,1,klen,D]
 
-        dv = torch.matmul(pg.transpose(-2, -1), dyg).sum(dim=2)        # sum over group dim=2
+        dv = torch.matmul(pg.transpose(-2, -1), dyg).sum(dim=2)        # [B,kvH,klen,D]
         dp = torch.matmul(dyg, vg.transpose(-2, -1)).reshape(B, H, qlen, klen)
         ds = p * (dp - (dp * p).sum(dim=-1, keepdim=True))             # [B,H,qlen,klen]
         dsg = ds.view(B, kvH, g, qlen, klen)
