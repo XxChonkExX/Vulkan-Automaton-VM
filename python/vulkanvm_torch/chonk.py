@@ -122,6 +122,72 @@ def install_chonk_allocator():
     change_current_allocator(allocator)
 
 
+class ChunkedPoolBuffer:
+    """A logical contiguous byte region backed by multiple smaller exportable
+    pool blocks. Present narrow(start, len) as a single contiguous tensor so
+    callers (quant buffer writes, model buffer) work unchanged. Within a block
+    it is a zero-copy view; across a block boundary it copies (rare for the
+    per-module quant writes, which fit in one ~1GB block)."""
+
+    def __init__(self, blocks, block_bytes, total_bytes, name):
+        self.blocks = blocks          # list of uint8 CUDA tensors
+        self.block_bytes = block_bytes
+        self.total_bytes = total_bytes
+        self.name = name
+        # Each block's byte-offset base in the logical range.
+        self._starts = []
+        off = 0
+        for b in blocks:
+            self._starts.append(off)
+            off += b.shape[0]
+
+    @classmethod
+    def from_single(cls, base_tensor, total_bytes, name):
+        obj = cls([base_tensor], max(base_tensor.shape[0], 1), total_bytes, name)
+        return obj
+
+    def _locate(self, byte_off, length):
+        """Return (tensor, in_block_off) for the block containing byte_off."""
+        for i, b in enumerate(self.blocks):
+            if byte_off < self._starts[i] + b.shape[0]:
+                return b, byte_off - self._starts[i]
+        raise IndexError(f"offset {byte_off} out of range")
+
+    def narrow(self, start, length):
+        """start/length in BYTES (the buffer is uint8). Returns a contiguous
+        uint8 tensor of `length` bytes spanning the logical range."""
+        if length == 0:
+            return self.blocks[0].narrow(0, 0, 0)
+        # Single-block case (common): zero-copy view.
+        b, off = self._locate(start, length)
+        if off + length <= b.shape[0]:
+            return b.narrow(0, off, length)
+        # Cross-block: copy into a fresh contiguous tensor.
+        parts = []
+        rem = length
+        cur = start
+        while rem > 0:
+            blk, boff = self._locate(cur, rem)
+            take = min(rem, blk.shape[0] - boff)
+            parts.append(blk.narrow(0, boff, take))
+            cur += take
+            rem -= take
+        out = torch.empty(length, dtype=torch.uint8, device=parts[0].device)
+        o = 0
+        for p in parts:
+            out.narrow(0, o, p.shape[0]).copy_(p)
+            o += p.shape[0]
+        return out
+
+    def view(self, dtype):
+        # Not a true contiguous view across blocks; used mainly to get a typed
+        # handle for narrow-based writes. Return self (caller uses narrow).
+        return self
+
+    def __len__(self):
+        return self.total_bytes
+
+
 class ChonkPool:
     """Wraps the pool binding + HIP dma-buf import, exposing a base tensor
     that aliases the pool's unified memory for both GPU and host."""
@@ -186,6 +252,29 @@ class ChonkPool:
         the returned tensor is a valid CUDA tensor)."""
         base, _ = self.alloc_base(nbytes, name)
         return base
+
+    def alloc_chunked(self, nbytes: int, name: str = "chunked", max_block_mb: int = 1024):
+        """Allocate a large region as MULTIPLE smaller exportable blocks (each
+        <= max_block_mb) to avoid a single monolithic vkAllocateMemory that the
+        radv driver rejects at scale (e.g. the 14.43 GB INT4 q buffer). Returns
+        a ChunkedPoolBuffer that presents the region as one logical contiguous
+        byte range but is backed by many small, driver-friendly blocks. This is
+        the "smaller blocks / fine ladder" fix."""
+        nbytes = int(nbytes)
+        if nbytes <= max_block_mb * 1024 * 1024:
+            # Small enough for a single block; behave like alloc_model_weights.
+            base, _ = self.alloc_base(nbytes, name)
+            return ChunkedPoolBuffer.from_single(base, nbytes, name)
+        block_bytes = max_block_mb * 1024 * 1024
+        n_blocks = (nbytes + block_bytes - 1) // block_bytes
+        blocks = []
+        remaining = nbytes
+        for i in range(n_blocks):
+            this = min(block_bytes, remaining)
+            b, _ = self.alloc_base(this, f"{name}_block_{i}")
+            blocks.append(b)
+            remaining -= this
+        return ChunkedPoolBuffer(blocks, block_bytes, nbytes, name)
 
     def alloc_optimizer_states(self, nbytes: int, name: str = "optimizer_states"):
         """Allocate optimizer states in Chonk Buffer."""
@@ -815,10 +904,16 @@ def load_model_directly_to_chonk(model_path, config, pool: ChonkPool, dtype=torc
         quant_bytes["q"] += n_mod * 8
         quant_bytes["s"] += n_mod * 8
         quant_bytes["z"] += n_mod * 8
+        # Allocate ALL quantized weights as chunked flat buffers (qweight/
+        # scales/zeros) split into <=1GB exportable blocks so no single
+        # monolithic vkAllocateMemory (14.43GB q) is needed -- the radv driver
+        # rejects large single exportable blocks under load. This is the
+        # "smaller blocks / fine ladder" fix.
+        max_q_block_mb = int(os.environ.get("CHONK_MAX_EXPORTABLE_MB", "1024"))
         quant_buffers = {
-            "q": pool.alloc_model_weights(quant_bytes["q"], "quant_qweight"),
-            "s": pool.alloc_model_weights(quant_bytes["s"], "quant_scales"),
-            "z": pool.alloc_model_weights(quant_bytes["z"], "quant_zeros"),
+            "q": pool.alloc_chunked(quant_bytes["q"], "quant_qweight", max_q_block_mb),
+            "s": pool.alloc_chunked(quant_bytes["s"], "quant_scales", max_q_block_mb),
+            "z": pool.alloc_chunked(quant_bytes["z"], "quant_zeros", max_q_block_mb),
         }
         quant_offsets = {"q": 0, "s": 0, "z": 0}
         print(f"Quant buffers: q={quant_bytes['q']/1e9:.2f}GB "

@@ -112,3 +112,23 @@ The 2^31 boundary transient `p/scores` at chunk=512 is 1×32×512×131072×2 =
 - The `.so` (`vulkanvm_pool_test.so`) must be rebuilt for the 4th tier and
   `MIN_BLOCK_GB=4` to take effect at runtime. Source is committed; binary
   rebuild is a one-time `bash scripts/build_pool_test.sh`.
+
+## ChunkedPoolBuffer (fine-ladder exportable splitting)
+
+The INT4 `q`/`s`/`z` buffers (q = 14.43 GB) were each ONE monolithic
+`allocateDedicatedExportable` — a single 14.43 GB `vkAllocateMemory` the radv
+driver rejects under load (the recurring `VK_ERROR_OUT_OF_DEVICE_MEMORY`).
+
+`ChunkedPoolBuffer` + `ChonkPool.alloc_chunked()` split a large region into
+many <= 1 GB exportable blocks (`CHONK_MAX_EXPORTABLE_MB`, default 1024). The
+quant-write loop keeps working via `narrow(start, length)` (zero-copy view
+within a block; contiguous copy across a boundary — rare, since each module's
+qweight ~225 MB fits one block).
+
+- 14.43 GB q buffer -> 15 x 1 GB blocks (was 1 monolithic)
+- Model buffer (0.82 GB) stays single
+- KV cache is already per-layer (0.5 GB each)
+- Commit: (this change)
+
+Combined with `CHONK_MIN_BLOCK_GB=8` + `POOL=1,2,4,8`, no single large
+exportable allocation remains; the pool uses a fine, flat, graduated layout.
