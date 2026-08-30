@@ -504,16 +504,18 @@ def build_chonk_cache(config, batch_size, max_cache_len, pool=None):
 
     if pool is None:
         pool = ChonkPool()
-    base, host_ptr = pool.alloc_base(total, "chonk_kv_cache")
-    pool.host_ptr = host_ptr
 
     layers = []
-    byte_off = 0
     for i, lt in enumerate(layer_types):
         if lt in ("full_attention", "attention"):
-            layer = ChonkFullLayer(max_cache_len, base, byte_off, storage_dtype, compute_dtype, device, quantize_kv, num_kv_heads, head_dim)
+            # Per-layer allocation: avoid one monolithic 32GB exportable block
+            # (drivers reject a single contiguous vkAllocateMemory that large;
+            # per-layer ~0.5GB blocks fit the bucket ladder and the GTT heap).
+            base, host_ptr = pool.alloc_base(per_layer_total, f"chonk_kv_cache_layer_{i}")
+            if pool.host_ptr is None:
+                pool.host_ptr = host_ptr
+            layer = ChonkFullLayer(max_cache_len, base, 0, storage_dtype, compute_dtype, device, quantize_kv, num_kv_heads, head_dim)
             layer._prealloc(batch_size, num_kv_heads, head_dim)
-            byte_off += per_layer_total
         else:
             layer = LinearAttentionLayer(**layer_kwargs)
         layers.append(layer)
