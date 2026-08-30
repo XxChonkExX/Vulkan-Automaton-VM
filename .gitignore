@@ -82,3 +82,9 @@ examples/seed_node.cpp
 examples/tensor_seed_node.cpp
 seed_node.cpp
 _build/
+
+# Granite training outputs (large binaries)
+examples/granite_chonk/out/*/chonk_final/
+examples/granite_chonk/out/*/chonk_step_*/
+examples/granite_chonk/data/*/tokens.bin
+*.safetensors

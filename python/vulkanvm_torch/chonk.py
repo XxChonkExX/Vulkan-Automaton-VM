@@ -281,7 +281,8 @@ class ChonkFullLayer(StaticLayer):
 
         self.dtype = self._compute_dtype
         self.device = self._prealloc_device
-        self.cumulative_length = torch.tensor(0, dtype=int, device=self._prealloc_device)
+        # Create on CPU first to avoid ROCm lazy allocation issues
+        self.cumulative_length = torch.tensor(0, dtype=torch.int32, device="cpu").to(self._prealloc_device)
         self.is_initialized = True
 
     @staticmethod
@@ -464,6 +465,7 @@ def build_chonk_cache(config, batch_size, max_cache_len, pool=None):
     block holding every full-attention layer's keys and values, then
     creates views. Linear-attention layers use the standard in-place
     LinearAttentionLayer (small, no seq dimension)."""
+    import os
     layer_types, layer_kwargs = get_layer_types_and_kwargs(config.get_text_config(decoder=True))
     full_layers = [i for i, t in enumerate(layer_types) if t in ("full_attention", "attention")]
     n_full = len(full_layers)
@@ -475,8 +477,8 @@ def build_chonk_cache(config, batch_size, max_cache_len, pool=None):
     )
     device = "cuda"
 
-    quantize_threshold = int(os.environ.get("CHONK_KV_QUANTIZE_THRESHOLD", "131072"))
-    quantize_kv = os.environ.get("CHONK_QUANTIZE_KV", "0") == "1" and max_cache_len > quantize_threshold
+    quantize_threshold = 0  # Force quantization for all cache lengths
+    quantize_kv = True  # Force quantization
     if quantize_kv:
         storage_dtype = torch.uint8
         compute_dtype = torch.bfloat16
@@ -626,9 +628,12 @@ def build_model_from_chonk_buffer(config, model_buffer, dtype=torch.bfloat16,
     typed = model_buffer.view(dtype)
     offset = 0
     for name, param in list(model.named_parameters()):
+        skip = name.startswith(skip_prefixes)
         if name.startswith(skip_prefixes):
             continue  # quantized: module swapped to QuantLinear after PEFT
         numel = param.numel()
+        if offset + numel > typed.numel():
+            raise RuntimeError(f"Offset overflow: offset={offset}, numel={numel}, buffer_size={typed.numel()}, name={name}")
         view = typed.narrow(0, offset, numel).view(param.shape)
         parts = name.split('.')
         parent = model
@@ -742,6 +747,21 @@ def load_model_directly_to_chonk(model_path, config, pool: ChonkPool, dtype=torc
     from transformers import AutoModelForCausalLM
     from vulkanvm_quant_py import quantize_weight
 
+    # Handle "all" special keyword to quantize all linear layers
+    if quantize_modules == "all":
+        print("Creating meta model for quantization module detection...")
+        # Use the SAME config as the actual model (language_model_only=True)
+        # so module names match (no "language_model." prefix)
+        config.language_model_only = True
+        with torch.device('meta'):
+            meta_model = AutoModelForCausalLM.from_config(
+                config, torch_dtype=dtype, trust_remote_code=True)
+        quantize_modules = {
+            name for name, m in meta_model.named_modules()
+            if isinstance(m, torch.nn.Linear)
+        }
+        quantize_modules.discard("lm_head")
+        print(f"Quantizing ALL {len(quantize_modules)} linear modules (lm_head excluded)")
     quantize_modules = set(quantize_modules or [])
     quant_weight_names = {f"{m}.weight" for m in quantize_modules}
     quant_bias_names = {f"{m}.bias" for m in quantize_modules}
@@ -801,7 +821,7 @@ def load_model_directly_to_chonk(model_path, config, pool: ChonkPool, dtype=torc
         print(f"Quant buffers: q={quant_bytes['q']/1e9:.2f}GB "
               f"s={quant_bytes['s']/1e9:.2f}GB z={quant_bytes['z']/1e9:.2f}GB")
 
-    # Load state dict and copy directly to Chonk Buffer
+# Load state dict and copy directly to Chonk Buffer
     from safetensors.torch import load_file
     import glob
 
@@ -812,7 +832,7 @@ def load_model_directly_to_chonk(model_path, config, pool: ChonkPool, dtype=torc
 
     param_map = dict(params_list)
     # Precompute each param's slot offset in the flat buffer (layout follows
-    # named_parameters order, skipping quantized params). Offsets are
+    # named_parameters() order, skipping quantized params). Offsets are
     # computed ONCE, not per file.
     slots = {}
     o = 0
@@ -821,6 +841,7 @@ def load_model_directly_to_chonk(model_path, config, pool: ChonkPool, dtype=torc
             continue
         slots[name] = o
         o += param.numel()
+
 
     bytes_copied = 0
     chunk_bytes = chunk_size_mb * 1024 * 1024
@@ -832,9 +853,7 @@ def load_model_directly_to_chonk(model_path, config, pool: ChonkPool, dtype=torc
     def to_ckpt_name(name):
         if name in ("lm_head.weight", "model.lm_head.weight"):
             return "lm_head.weight"
-        if name.startswith("model."):
-            return "model.language_model." + name[len("model."):]
-        return None
+        return name
 
     for model_file in model_files:
         print(f"  Loading {model_file}...")
@@ -865,7 +884,7 @@ def load_model_directly_to_chonk(model_path, config, pool: ChonkPool, dtype=torc
                 # Quantize into the flat quant buffers (no bf16 copy).
                 module_name = name[: -len(".weight")]
                 if processed % 25 == 0:
-                    print(f"  Quantizing [{processed}/~{len(param_map)}]: {module_name}...")
+                    print(f"  Quantizing [{processed}/~{len(param_map)}]: {module_name}...", flush=True)
                 qweight, scales, zeros = quantize_weight(
                     tensor.to(torch.float32), bits=quant_bits,
                     group_size=quant_group_size)

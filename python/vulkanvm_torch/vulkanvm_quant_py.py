@@ -165,6 +165,10 @@ class QuantLinear(nn.Module):
         else:
             self.register_buffer("bias", None)
 
+    @property
+    def weight(self):
+        return self.dequantized_weight()
+
     def dequantized_weight(self):
         return dequantize_weight(self.qweight, self.scales, self.zeros,
                                  self.bits, self.group_size,
