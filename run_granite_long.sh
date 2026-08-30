@@ -6,7 +6,7 @@ LOG="/home/chonke/Documents/train_granite.log"
 export PYTORCH_HIP_ALLOC_CONF="expandable_segments:False,garbage_collection_threshold:0.4"
 export PYTORCH_ALLOC_CONF="expandable_segments:False,garbage_collection_threshold:0.4"
 export CHONK_SEQ_LEN=131072
-export CHONK_CHUNK=1024
+export CHONK_CHUNK=512
 export CHONK_ATTN=eager
 export CHONK_ATTN_RECOMPUTE=1
 export CHONK_QUANT_BITS=4
@@ -24,7 +24,7 @@ export CHONK_MAX_STEPS=10000
 export CHONK_SAVE_INTERVAL=10
 export CHONK_WARMUP=50
 export CHONK_SUBSAMPLE=1.0
-export CHONK_EPOCHS=10
+export CHONK_EPOCHS=1
 
 # Resume from latest checkpoint if exists
 LATEST=$(ls -1d $OUT_DIR/chonk_step_* 2>/dev/null | sort -V | tail -1)
