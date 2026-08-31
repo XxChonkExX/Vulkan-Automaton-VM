@@ -111,6 +111,14 @@ def quantize_weight(weight: torch.Tensor, bits: int = 8, group_size: int = 128):
 
 def dequantize_weight(qweight, scales, zeros, bits: int = 8, group_size=128,
                       dtype=torch.bfloat16):
+    # The quantized buffers are narrow/view slices into the Chonk pool's
+    # shared uint8 block. Dequant does lots of reshape/index ops on GPU; a
+    # non-contiguous pool view faults there -> hipErrorLaunchFailure at
+    # F.linear. Force contiguous (a copy only happens when needed) so the
+    # dequant kernel always reads a plain contiguous tensor.
+    qweight = qweight.contiguous()
+    scales = scales.contiguous()
+    zeros = zeros.contiguous()
     if bits == 8:
         return dequantize_weight_int8(qweight, scales, zeros, group_size, dtype)
     if bits == 4:
@@ -165,9 +173,9 @@ class QuantLinear(nn.Module):
         self.out_features = out_features
         self.bits = int(bits)
         self.group_size = int(group_size)
-        self.register_buffer("qweight", qweight)
-        self.register_buffer("scales", scales)
-        self.register_buffer("zeros", zeros)
+        self.register_buffer("qweight", qweight.contiguous())
+        self.register_buffer("scales", scales.contiguous())
+        self.register_buffer("zeros", zeros.contiguous())
         if bias is not None:
             self.bias = nn.Parameter(bias, requires_grad=False)
         else:
