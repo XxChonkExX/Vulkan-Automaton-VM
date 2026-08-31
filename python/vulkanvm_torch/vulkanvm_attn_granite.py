@@ -188,18 +188,17 @@ def patch_granite_attention_recompute(model, kv_cache):
 
         qlen = query.shape[-2]
         cur_len = key.shape[-2] - qlen
-        cached_k = cached_v = None
-        if cur_len > 0 and kv_cache is not None:
-            try:
-                layer = kv_cache.layers[module.layer_idx]
-                if hasattr(layer, "get_cached_kv"):
-                    ck, cv = layer.get_cached_kv(cur_len)
-                    cached_k = ck[: key.shape[0], :, :cur_len].detach()
-                    cached_v = cv[: key.shape[0], :, :cur_len].detach()
-            except Exception as e:
-                print(f"[warn] get_cached_kv failed (layer {module.layer_idx}): {e}")
 
-        if cached_k is None or cached_k.numel() == 0:
+        # key/value are ALREADY the full [cached | current] cat (returned by
+        # the Chonk cache layer's update()). So slice the cached prefix directly
+        # instead of calling get_cached_kv — avoids a redundant second dequant
+        # of the cached span (the cache is INT4; update() dequantized it once
+        # to build this cat, re-dequantizing here would double the per-layer
+        # transient cost across 64 layers).
+        if cur_len > 0:
+            cached_k = key[..., :-qlen][: key.shape[0]].detach()
+            cached_v = value[..., :-qlen][: value.shape[0]].detach()
+        else:
             cached_k = torch.empty(0, device=query.device, dtype=query.dtype).view(
                 query.shape[0], key.shape[1], 0, query.shape[-1]
             )

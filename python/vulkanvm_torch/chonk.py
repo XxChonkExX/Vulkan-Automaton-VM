@@ -570,10 +570,12 @@ def build_chonk_cache(config, batch_size, max_cache_len, pool=None):
     device = "cuda"
 
     # Weights are INT4 (via build_lora_chonk_setup quantize=True); the KV cache
-    # stays bf16/fp16 ("weights 4, cache 16"). Quantizing the cache (uint8 packed)
-    # causes explosive forward/backward dequant tensors at long context -- the
-    # exact failure the user hit. Gate behind CHONK_QUANTIZE_KV (default OFF).
-    quantize_kv = os.environ.get("CHONK_QUANTIZE_KV", "0") == "1"
+    # is INT4-quantized too when CHONK_QUANTIZE_KV is on (default ON for the
+    # full-131K run). INT4 KV stores ~8.6GB vs 32GB bf16 — the ~23GB savings
+    # is what lets a full 131072-token sequence actually fit under the ~120GB
+    # wall. Dequant is per-layer and transient (bounded to the current prefix),
+    # so it does not explode the forward/backward graph.
+    quantize_kv = os.environ.get("CHONK_QUANTIZE_KV", "1") == "1"
     if quantize_kv:
         storage_dtype = torch.uint8
         compute_dtype = torch.bfloat16
