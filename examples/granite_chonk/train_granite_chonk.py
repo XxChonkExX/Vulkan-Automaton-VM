@@ -15,6 +15,7 @@ Prereq: run prepare_dataset.py first -> DATA_PATH/tokens.bin + index.bin
 import os
 import sys
 import time
+import random
 import contextlib
 import shutil
 import numpy as np
@@ -255,10 +256,19 @@ def main():
     n_blocks_full = len(np.memmap(os.path.join(DATA_PATH, "tokens.bin"),
                                   dtype=np.uint32, mode="r")) // SEQ_LEN
     n_blocks_per_epoch = max(1, int(n_blocks_full * CHONK_SUBSAMPLE))
-    total_steps = n_blocks_per_epoch * CHONK_EPOCHS
+    # OPTIMIZER-STEP ACCOUNTING (critical): `step` counts OPTIMIZER steps
+    # (one per GRAD_ACCUM_STEPS chunks), NOT chunks. total_steps, MAX_STEPS,
+    # SAVE_INTERVAL, LOG_INTERVAL and the cosine schedule are all in units of
+    # optimizer steps. (Previously step counted chunks, which stopped training
+    # after total_steps CHUNKS — ~0.4% of one epoch — and desynced the
+    # scheduler by GRAD_ACCUM_STEPS x.)
+    chunks_per_block = (SEQ_LEN + CHUNK_SIZE - 1) // CHUNK_SIZE
+    opt_steps_per_block = (chunks_per_block + GRAD_ACCUM_STEPS - 1) // GRAD_ACCUM_STEPS
+    total_steps = n_blocks_per_epoch * opt_steps_per_block * CHONK_EPOCHS
     scheduler = get_cosine_schedule_with_warmup(
         optimizer, num_warmup_steps=WARMUP_STEPS, num_training_steps=total_steps)
-    print(f"  total_steps={total_steps} ({n_blocks_per_epoch}/epoch x {CHONK_EPOCHS})")
+    print(f"  total_steps={total_steps} ({n_blocks_per_epoch} blocks x "
+          f"{chunks_per_block} chunks x {CHONK_EPOCHS} epochs / accum {GRAD_ACCUM_STEPS})")
 
     resume_step = resume_epoch = 0
     if RESUME_DIR:
@@ -282,7 +292,6 @@ def main():
         gen = get_tokenized_dataset(DATA_PATH, SEQ_LEN, CHONK_SUBSAMPLE, epoch)
         t0 = time.time()
         print(f"\n--- Epoch {epoch + 1}/{CHONK_EPOCHS} ---")
-        steps_skipped = 0
         for input_ids in gen:
             if step >= total_steps or step >= MAX_STEPS:
                 break
@@ -308,42 +317,56 @@ def main():
                         del loss, outputs
                 chunks_this_seq += 1
                 torch.cuda.empty_cache()
-                if chunks_this_seq % 8 == 0:
+                if chunks_this_seq % 16 == 0:
                     ps = pool.stats()
-                    print(f"  chunk {chunks_this_seq}/{SEQ_LEN//CHUNK_SIZE} "
+                    print(f"  chunk {chunks_this_seq}/{chunks_per_block} "
                           f"({time.time()-t0:.0f}s loss={last_loss:.4f} "
                           f"pool={ps['totalUsed']/1e9:.2f}GB)", flush=True)
-                if chunks_this_seq % GRAD_ACCUM_STEPS == 0 or chunk_end == SEQ_LEN:
+
+                # One optimizer step per GRAD_ACCUM_STEPS chunks (plus a partial
+                # step at block end for non-divisible configs). step/log/save
+                # are all optimizer-step-scoped.
+                do_opt = (chunks_this_seq % GRAD_ACCUM_STEPS == 0) or (chunk_end == SEQ_LEN)
+                if do_opt:
                     if skip_step:
-                        optimizer.zero_grad(); torch.cuda.empty_cache(); skip_step = False; continue
-                    if GRAD_CLIP_NORM > 0:
-                        gn = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
-                        if gn != gn:
-                            print(f"  [NaN grad] skip step {step}")
-                            optimizer.zero_grad(); torch.cuda.empty_cache(); continue
-                    optimizer.step(); scheduler.step(); optimizer.zero_grad()
-                    if CHONK_EMA_UPDATE_EVERY > 0 and step % CHONK_EMA_UPDATE_EVERY == 0:
-                        ema.update()
-                    if CHONK_OPTIMIZER_PAUSE:
-                        time.sleep(CHONK_OPTIMIZER_PAUSE)
-                if step % SAVE_INTERVAL == 0 and step > 0:
-                    sp = f"{OUT_DIR}/chonk_step_{step}"
-                    os.makedirs(sp, exist_ok=True)
-                    model.save_pretrained(sp)
-                    torch.save({"optimizer": optimizer.state_dict(),
-                                "scheduler": scheduler.state_dict(),
-                                "ema": ema.shadow, "step": step, "epoch": epoch},
-                               f"{sp}/training_state.pt")
-                    with open(f"{sp}/.chonk_loss", "w") as f:
-                        f.write(f"{last_loss * GRAD_ACCUM_STEPS:.6f}")
-                    print(f"Checkpoint -> {sp} (loss={last_loss*GRAD_ACCUM_STEPS:.4f})")
-                    cleanup_checkpoints(OUT_DIR, KEEP_CHECKPOINTS)
-                if step % LOG_INTERVAL == 0:
-                    print(f"Step {step}: loss={last_loss*GRAD_ACCUM_STEPS:.4f} "
-                          f"lr={scheduler.get_last_lr()[0]:.2e}")
-                step += 1
+                        print(f"  [skip opt step {step} — NaN chunk in window]", flush=True)
+                        optimizer.zero_grad(); torch.cuda.empty_cache()
+                        skip_step = False
+                    else:
+                        if GRAD_CLIP_NORM > 0:
+                            gn = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+                            if gn != gn:
+                                print(f"  [NaN grad] skip step {step}", flush=True)
+                                optimizer.zero_grad(); torch.cuda.empty_cache()
+                                continue
+                        optimizer.step(); scheduler.step(); optimizer.zero_grad()
+                        if CHONK_EMA_UPDATE_EVERY > 0 and step % CHONK_EMA_UPDATE_EVERY == 0:
+                            ema.update()
+                        if CHONK_OPTIMIZER_PAUSE:
+                            time.sleep(CHONK_OPTIMIZER_PAUSE)
+
+                        if step % SAVE_INTERVAL == 0 and step > 0:
+                            sp = f"{OUT_DIR}/chonk_step_{step}"
+                            os.makedirs(sp, exist_ok=True)
+                            model.save_pretrained(sp)
+                            torch.save({"optimizer": optimizer.state_dict(),
+                                        "scheduler": scheduler.state_dict(),
+                                        "ema": ema.shadow, "step": step, "epoch": epoch},
+                                       f"{sp}/training_state.pt")
+                            with open(f"{sp}/.chonk_loss", "w") as f:
+                                f.write(f"{last_loss * GRAD_ACCUM_STEPS:.6f}")
+                            print(f"Checkpoint -> {sp} (loss={last_loss*GRAD_ACCUM_STEPS:.4f})", flush=True)
+                            cleanup_checkpoints(OUT_DIR, KEEP_CHECKPOINTS)
+                        if step % LOG_INTERVAL == 0:
+                            ps = pool.stats()
+                            print(f"Step {step}: loss={last_loss*GRAD_ACCUM_STEPS:.4f} "
+                                  f"lr={scheduler.get_last_lr()[0]:.2e} "
+                                  f"pool={ps['totalUsed']/1e9:.2f}GB", flush=True)
+                        step += 1
                 if step >= MAX_STEPS:
                     break
+            if step >= MAX_STEPS or step >= total_steps:
+                break
 
     ema.apply_shadow()
     os.makedirs(f"{OUT_DIR}/chonk_final", exist_ok=True)

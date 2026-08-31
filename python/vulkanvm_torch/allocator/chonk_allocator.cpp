@@ -139,7 +139,7 @@ void allocLog(const char* op, void* ptr, size_t sz) {
 struct PoolBlockProvider : slab::Core::IProvider {
     size_t minBlockBytes = computeMinBlockBytes();  // default 1 MB
     size_t escalateSlackGB = envSizeGB("CHONK_ESCALATE_SLACK_GB", 2);
-    size_t minBlocksOnOOM = 1;  // aggressive: keep only 1 block on OOM release
+    size_t minBlocksOnOOM = 2;  // pressure relief keeps 2 warm blocks (validated design)
     std::unordered_map<void*, vvm::Allocation> blockAllocs_;
 
     size_t warmBlocks() const { return envSizeGB("CHONK_WARM_BLOCKS", 8); }
@@ -262,11 +262,12 @@ void* chonk_allocator_alloc(ssize_t size, int device, void* stream) {
     if (size < 0) return nullptr;  // ABI boundary: reject negative sizes explicitly
     if (!pool()) return nullptr;   // pool must be initialized before install
     size_t granted = 0;
-    // Aggressive empty-block release: before allocating, free any fully-empty
-    // blocks back to the Vulkan pool. With the 130 GB GTT heap, re-alloc is
-    // cheap; holding dead 1 MB - 4 GB blocks just fragments the GTT. The slab
-    // (best-fit) then reuses the released space for the next request.
-    core().releaseEmptyBlocks(0);
+    // NO per-alloc empty-block release here. Every slab block is a dedicated
+    // exportable allocation (vkAllocateMemory + dma-buf + HIP import), so
+    // releasing and re-creating blocks on the hot path round-trips the kernel
+    // and driver per chunk — the block churn that destabilized long runs.
+    // Warm blocks are retained; pressure relief happens only inside
+    // createBlock's retry path (releaseEmptyBlocks(minBlocksOnOOM)).
     void* ptr = core().alloc((size_t)size, &granted);
     if (ptr) allocLog("A", ptr, granted);
     return ptr;
