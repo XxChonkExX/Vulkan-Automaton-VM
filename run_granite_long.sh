@@ -1,5 +1,6 @@
 #!/bin/bash
-export LD_LIBRARY_PATH=/opt/rocm-7.1.0/lib:/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}
+export LD_LIBRARY_PATH=/home/chonke/torch_rocm_libs:${LD_LIBRARY_PATH}
+export HIPBLASLT_TENSILE_LIBPATH=/opt/rocm-7.1.0/lib/hipblaslt/library
 # Auto-restart wrapper: resumes from last checkpoint if a driver reset
 # or Vulkan OOM kills the trainer. Keeps the run alive.
 OUT_DIR="examples/granite_chonk/out/granite-finetuned"

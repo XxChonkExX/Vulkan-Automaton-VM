@@ -1,5 +1,6 @@
 #!/bin/bash
-export LD_LIBRARY_PATH=/opt/rocm-7.1.0/lib:/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}
+export LD_LIBRARY_PATH=/home/chonke/torch_rocm_libs:${LD_LIBRARY_PATH}
+export HIPBLASLT_TENSILE_LIBPATH=/opt/rocm-7.1.0/lib/hipblaslt/library
 # run_in_vt.sh — launch the Granite training from a text VT (frees the iGPU
 # from the GDM/Wayland display session to stop display-driver reset kernel
 # panics under sustained compute).
@@ -9,7 +10,8 @@ export LD_LIBRARY_PATH=/opt/rocm-7.1.0/lib:/usr/lib/x86_64-linux-gnu:${LD_LIBRAR
 #   From the desktop, you can do:  sudo chvt 3   then Ctrl+Alt+F3, log in.
 
 set -e
-export LD_LIBRARY_PATH=/opt/rocm-7.1.0/lib:/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}
+export LD_LIBRARY_PATH=/home/chonke/torch_rocm_libs:${LD_LIBRARY_PATH}
+export HIPBLASLT_TENSILE_LIBPATH=/opt/rocm-7.1.0/lib/hipblaslt/library
 
 # 1. Kill any stale training (safe: pkill -f exact names)
 pkill -TERM -f train_granite_chonk 2>/dev/null || true
