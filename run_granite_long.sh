@@ -3,8 +3,8 @@
 # or Vulkan OOM kills the trainer. Keeps the run alive.
 OUT_DIR="examples/granite_chonk/out/granite-finetuned"
 LOG="/home/chonke/Documents/train_granite.log"
-export PYTORCH_HIP_ALLOC_CONF="expandable_segments:False,garbage_collection_threshold:0.4"
-export PYTORCH_ALLOC_CONF="expandable_segments:False,garbage_collection_threshold:0.4"
+export PYTORCH_HIP_ALLOC_CONF="expandable_segments:True,garbage_collection_threshold:0.4"
+export PYTORCH_ALLOC_CONF="expandable_segments:True,garbage_collection_threshold:0.4"
 export CHONK_MAX_HEAP_FRACTION=0.92
 export CHONK_SEQ_LEN=131072
 export CHONK_CHUNK=512

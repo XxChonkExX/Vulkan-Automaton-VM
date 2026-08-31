@@ -23,8 +23,8 @@ import torch.nn as nn
 from torch.utils.data import IterableDataset
 
 # --- Chonk allocator MUST be installed before any CUDA tensor exists ---
-os.environ["PYTORCH_HIP_ALLOC_CONF"] = "expandable_segments:False,garbage_collection_threshold:0.4"
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:False,garbage_collection_threshold:0.4"
+os.environ["PYTORCH_HIP_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.4"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.4"
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python", "vulkanvm_torch"))
 
