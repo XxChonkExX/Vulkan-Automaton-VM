@@ -345,7 +345,7 @@ def main():
                         if CHONK_OPTIMIZER_PAUSE:
                             time.sleep(CHONK_OPTIMIZER_PAUSE)
 
-                        if step % SAVE_INTERVAL == 0 and step > 0:
+                        if step % SAVE_INTERVAL == 0:
                             sp = f"{OUT_DIR}/chonk_step_{step}"
                             os.makedirs(sp, exist_ok=True)
                             model.save_pretrained(sp)
