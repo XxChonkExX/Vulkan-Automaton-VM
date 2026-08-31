@@ -119,31 +119,25 @@ def dequantize_weight(qweight, scales, zeros, bits: int = 8, group_size=128,
 
 
 class QuantMatmulFn(torch.autograd.Function):
-    """Dequant + matmul with minimal graph retention.
+    """Dequant + matmul using a PRE-CACHED dequantized weight (w).
 
-    Saves ONLY the (pool-backed) quantized buffers for backward; the
-    dequantized weight is materialized transiently in forward and REBUILT
-    in backward. This keeps the autograd graph ~zero-cost: without it, every
-    chunk's forward saves 16GB+ of dequantized bf16 weights and the pool
-    carves that on top of the model-size savings.
+    The INT4 weights are frozen during LoRA fine-tuning, so the dequantized
+    bf16 weight is CONSTANT across chunks. Caching `w` on the QuantLinear
+    module and reusing it in forward AND backward eliminates the per-chunk
+    dequant/alloc churn that fragmented the pool (largest free block shrank
+    to ~512MB and caused vkAllocateMemory OOM -> HSA memory fault).
     """
 
     @staticmethod
-    def forward(ctx, x, qweight, scales, zeros, bits, group_size, bias):
-        ctx.save_for_backward(qweight, scales, zeros, bias)
-        ctx.bits = int(bits)
-        ctx.group_size = int(group_size)
-        w = dequantize_weight(qweight, scales, zeros, ctx.bits, ctx.group_size,
-                              dtype=torch.bfloat16)
+    def forward(ctx, x, w, bias):
+        ctx.save_for_backward(w, bias)
         return F.linear(x, w, bias)
 
     @staticmethod
     def backward(ctx, grad_output):
-        qweight, scales, zeros, bias = ctx.saved_tensors
-        w = dequantize_weight(qweight, scales, zeros, ctx.bits, ctx.group_size,
-                              dtype=torch.bfloat16)
+        w, bias = ctx.saved_tensors
         grad_x = grad_output @ w
-        return grad_x, None, None, None, None, None, None
+        return grad_x, None, None
 
 
 class QuantLinear(nn.Module):
@@ -164,6 +158,7 @@ class QuantLinear(nn.Module):
             self.bias = nn.Parameter(bias, requires_grad=False)
         else:
             self.register_buffer("bias", None)
+        self._cached_w = None  # lazy dequantized bf16 weight (constant)
 
     @property
     def weight(self):
@@ -174,10 +169,15 @@ class QuantLinear(nn.Module):
                                  self.bits, self.group_size,
                                  dtype=torch.bfloat16)
 
+    def _cached_weight(self):
+        if self._cached_w is None:
+            self._cached_w = self.dequantized_weight()
+        return self._cached_w
+
     def forward(self, x):
-        return QuantMatmulFn.apply(
-            x, self.qweight, self.scales, self.zeros,
-            self.bits, self.group_size, self.bias)
+        # Cache the dequantized weight once; reuse across chunks (weights frozen).
+        w = self._cached_weight()
+        return QuantMatmulFn.apply(x, w, self.bias)
 
 
 def quantize_module_weight(linear: nn.Module, bits=8, group_size=128):
