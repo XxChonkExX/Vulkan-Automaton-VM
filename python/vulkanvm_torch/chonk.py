@@ -487,6 +487,14 @@ class ChonkFullLayer(StaticLayer):
             self.keys[:b, :, start:start+kv_length].copy_(ks.detach())
             self.values[:b, :, start:start+kv_length].copy_(vs.detach())
 
+        # Stash the current-chunk states (small, grad-bearing) for the attention
+        # recompute patch. The patch reads the cached span from the persistent
+        # pool via get_cached_kv and the current chunk from these stashes — so
+        # it never has to hold views of the big transient [cached|current] cat
+        # (which retained 64 layers x 2 x ~268MB until backward: the pool climb).
+        self._last_k = ks
+        self._last_v = vs
+
         self.cumulative_length.add_(kv_length)
         if start == 0:
             return ks, vs

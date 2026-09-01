@@ -59,26 +59,31 @@ class GraniteAttnRecompute(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, q, k_cur, v_cur, scaling, n_groups, cached_k, cached_v, causal):
+    def forward(ctx, q, k_cur, v_cur, layer, cur_len, batch, scaling, n_groups, causal):
+        ctx.layer = layer        # plain attr: cache layer ref (dequant on demand)
+        ctx.cur_len = int(cur_len)
+        ctx.batch = int(batch)
         ctx.scaling = float(scaling)
         ctx.n_groups = int(n_groups)
         ctx.causal = bool(causal)
-        ctx.cached_k = cached_k  # plain attr: Chonk pool tensor, detached
-        ctx.cached_v = cached_v
         ctx.save_for_backward(q, k_cur, v_cur)
         qlen = q.shape[-2]
         B, H, _, D = q.shape
         kvH = k_cur.shape[1]
 
-        # Reconstruct full [cached | current] keys/values.
-        if cached_k.numel() > 0:
+        # Reconstruct full [cached | current] keys/values. The cached span comes
+        # from the cache layer (bf16: zero-copy pool views; INT4: transient
+        # dequant) — transient, NOT saved, so nothing position-proportional is
+        # retained between forward and backward.
+        if ctx.cur_len > 0:
+            cached_k, cached_v = layer.get_cached_kv(ctx.cur_len)
+            cached_k = cached_k[:ctx.batch, :, :ctx.cur_len]
+            cached_v = cached_v[:ctx.batch, :, :ctx.cur_len]
             k = torch.cat([cached_k, k_cur], dim=-2)
             v = torch.cat([cached_v, v_cur], dim=-2)
         else:
             k, v = k_cur, v_cur
         klen = k.shape[-2]
-        ctx.klen = klen
-        ctx.qlen = qlen
 
         # Grouped GQA: match HF's repeat_kv order (kv_head first, then group).
         # Standard GQA: head h = kv_head * g + group_idx  (repeat_interleave).
@@ -91,23 +96,23 @@ class GraniteAttnRecompute(torch.autograd.Function):
             scores = scores + _causal_mask(qlen, klen, q.device, q.dtype)
         # softmax in fp32 (matches HF), output back in q.dtype.
         p = torch.softmax(scores.float(), dim=-1).to(q.dtype)
-        pg = p.view(B, g, kvH, qlen, klen)
-        out = torch.matmul(pg, v.unsqueeze(1)).reshape(B, H, qlen, D)
+        pg = p.view(B, kvH, g, qlen, klen)
+        out = torch.matmul(pg, v.unsqueeze(2)).reshape(B, H, qlen, D)
         return out
 
     @staticmethod
     def backward(ctx, dout):
         q, k_cur, v_cur = ctx.saved_tensors
-        cached_k = ctx.cached_k
-        cached_v = ctx.cached_v
-        # Use the exact qlen saved at forward time (avoids any shape-derivation
-        # ambiguity from views/resizes between forward and backward).
-        qlen = ctx.qlen
+        layer = ctx.layer
+        qlen = q.shape[-2]
         B, H, _, D = q.shape
         kvH = k_cur.shape[1]
         g = ctx.n_groups
 
-        if cached_k.numel() > 0:
+        if ctx.cur_len > 0:
+            cached_k, cached_v = layer.get_cached_kv(ctx.cur_len)
+            cached_k = cached_k[:ctx.batch, :, :ctx.cur_len]
+            cached_v = cached_v[:ctx.batch, :, :ctx.cur_len]
             k = torch.cat([cached_k, k_cur], dim=-2)
             v = torch.cat([cached_v, v_cur], dim=-2)
         else:
@@ -163,19 +168,20 @@ class GraniteAttnRecompute(torch.autograd.Function):
             dq.to(q.dtype),
             dk_cur.to(q.dtype),
             dv_cur.to(v_cur.dtype),
-            None, None, None, None, None,
+            None, None, None, None, None, None,
         )
 
 
 def patch_granite_attention_recompute(model, kv_cache):
     """Swap Granite's eager attention for the Chonk recompute path.
 
-    Mirrors the reference patch_eager_attention_recompute but uses the correct
-    Granite-specific Function above. Requires the Chonk KV cache to expose
-    get_cached_kv(layer_idx OR cur_len) on each layer.
+    The patch hands the Function a reference to the cache LAYER plus metadata,
+    never views of the big transient [cached|current] cats. The Function reads
+    the cached span via layer.get_cached_kv() (bf16: zero-copy pool views;
+    INT4: transient dequant, recomputed in backward) and takes the current
+    chunk from the layer's stashed states — so nothing position-proportional
+    is retained between forward and backward (zero pool climb).
     """
-    import transformers.models.granite.modeling_granite as gran
-
     base = model.get_base_model() if hasattr(model, "get_base_model") else model
     first = next(l for l in base.model.layers if hasattr(l, "self_attn"))
     attn_mod = type(first.self_attn).__module__
@@ -186,44 +192,28 @@ def patch_granite_attention_recompute(model, kv_cache):
         if dropout > 0:
             return orig(module, query, key, value, attention_mask, scaling, dropout, **kwargs)
 
-        qlen = query.shape[-2]
-        cur_len = key.shape[-2] - qlen
+        layer = kv_cache.layers[module.layer_idx]
+        cur_len = key.shape[-2] - query.shape[-2]
 
-        # key/value are ALREADY the full [cached | current] cat (returned by
-        # the Chonk cache layer's update()). So slice the cached prefix directly
-        # instead of calling get_cached_kv — avoids a redundant second dequant
-        # of the cached span (the cache is INT4; update() dequantized it once
-        # to build this cat, re-dequantizing here would double the per-layer
-        # transient cost across 64 layers).
-        if cur_len > 0:
-            cached_k = key[..., :-qlen][: key.shape[0]].detach()
-            cached_v = value[..., :-qlen][: value.shape[0]].detach()
-        else:
-            cached_k = torch.empty(0, device=query.device, dtype=query.dtype).view(
-                query.shape[0], key.shape[1], 0, query.shape[-1]
-            )
-            cached_v = torch.empty(0, device=query.device, dtype=query.dtype).view(
-                query.shape[0], value.shape[1], 0, value.shape[-1]
-            )
+        # Current-chunk states: stashed by the cache layer's update() — the
+        # ORIGINAL grad-bearing tensors (pre-cat), tiny (~1 MB), so the big
+        # transient [cached|current] cat is never referenced by the graph.
+        k_cur = layer._last_k
+        v_cur = layer._last_v
 
-        # Current-chunk slices (views of key/value -> grad flows to projections).
-        k_cur = key[..., -qlen:]
-        v_cur = value[..., -qlen:]
-
-        # DEBUG disabled for production
-        # print(f"[recompute] q={query.shape} ...")
         out = GraniteAttnRecompute.apply(
             query,
             k_cur,
             v_cur,
+            layer,
+            cur_len,
+            query.shape[0],
             float(scaling),
             int(module.num_key_value_groups),
-            cached_k,
-            cached_v,
             True,
         )
         out = out.transpose(1, 2).contiguous()  # [B, qlen, H, D] per HF contract
         return out, None
 
     mod.eager_attention_forward = patched
-    print("[+] Granite eager attention -> Chonk recompute (vulkanvm_attn_granite)")
+    print("[+] Granite eager attention -> Chonk recompute (layer-direct, zero retention)")
