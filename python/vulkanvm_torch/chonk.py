@@ -528,13 +528,22 @@ class ChonkFullLayer(StaticLayer):
             return ks, vs
 
         if self._quantize:
+            # NO cat: write the current chunk into the shared scratch (the
+            # cached prefix is already dequantized there by _write_quantized's
+            # read path... actually dequantize the prefix first), then return
+            # the scratch view as the full [cached|current] k/v. The patched
+            # attention only reads shapes from these (it uses the layer paths),
+            # so a detached view is correct — and no full-prefix bf16 cat is
+            # ever allocated (the cat was the 8.6GB/32-chunk pool ratchet).
             k_cached, v_cached = self._dequantize_prefix(b, start)
-            k = torch.cat([k_cached.detach(), ks], dim=-2)
-            v = torch.cat([v_cached.detach(), vs], dim=-2)
+            sk, sv = type(self)._shared_scratch(self._prealloc_device)
+            sk[0, :, start:start+kv_length].copy_(ks[0].to(torch.bfloat16))
+            sv[0, :, start:start+kv_length].copy_(vs[0].to(torch.bfloat16))
+            return sk[:, :, :start+kv_length], sv[:, :, :start+kv_length]
         else:
             k = torch.cat([self.keys[:b, :, :start].detach(), ks], dim=-2)
             v = torch.cat([self.values[:b, :, :start].detach(), vs], dim=-2)
-        return k, v
+            return k, v
 
     @property
     def keys(self):

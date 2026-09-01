@@ -60,7 +60,11 @@ class GraniteAttnRecompute(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k_cur, v_cur, layer, cur_len, batch, scaling, n_groups, causal):
-        ctx.layer = layer        # plain attr: cache layer ref (dequant on demand)
+        """Split attention: the cached prefix and the current chunk are NEVER
+        concatenated. Scores/out are computed as cached-part + current-part
+        matmuls (grad flows only through the current part), so no full-prefix
+        K/V copy is ever allocated (the cat was the 8.6GB/32-chunk ratchet)."""
+        ctx.layer = layer
         ctx.cur_len = int(cur_len)
         ctx.batch = int(batch)
         ctx.scaling = float(scaling)
@@ -70,35 +74,40 @@ class GraniteAttnRecompute(torch.autograd.Function):
         qlen = q.shape[-2]
         B, H, _, D = q.shape
         kvH = k_cur.shape[1]
-
-        # Reconstruct full [cached | current] keys/values. The cached span comes
-        # from the cache layer (bf16: zero-copy pool views; INT4: transient
-        # dequant) — transient, NOT saved, so nothing position-proportional is
-        # retained between forward and backward.
-        if ctx.cur_len > 0:
-            cached_k, cached_v = layer.get_cached_kv(ctx.cur_len)
-            cached_k = cached_k[:ctx.batch, :, :ctx.cur_len]
-            cached_v = cached_v[:ctx.batch, :, :ctx.cur_len]
-            k = torch.cat([cached_k, k_cur], dim=-2)
-            v = torch.cat([cached_v, v_cur], dim=-2)
-        else:
-            k, v = k_cur, v_cur
-        klen = k.shape[-2]
-
-        # Grouped GQA: match HF's repeat_kv order (kv_head first, then group).
-        # Standard GQA: head h = kv_head * g + group_idx  (repeat_interleave).
-        # So split q into [B, kvH, g, qlen, D].
         g = ctx.n_groups
+        kc = ctx.cur_len
+
         qg = q.view(B, kvH, g, qlen, D)
-        scores = torch.matmul(qg, k.unsqueeze(2).transpose(-2, -1))
-        scores = scores.reshape(B, H, qlen, klen) * ctx.scaling
-        if causal:
-            scores = scores + _causal_mask(qlen, klen, q.device, q.dtype)
-        # softmax in fp32 (matches HF), output back in q.dtype.
-        p = torch.softmax(scores.float(), dim=-1).to(q.dtype)
-        pg = p.view(B, kvH, g, qlen, klen)
-        out = torch.matmul(pg, v.unsqueeze(2)).reshape(B, H, qlen, D)
-        return out
+
+        if kc > 0:
+            cached_k, cached_v = layer.get_cached_kv(kc)
+            cached_k = cached_k[:batch, :, :kc]
+            cached_v = cached_v[:batch, :, :kc]
+            klen = kc + qlen
+            # One scores tensor (needed for softmax), filled in two parts —
+            # NO k/v cat. cached part: no grad; current part: grad via k_cur.
+            scores = torch.empty(B, kvH, g, qlen, klen, dtype=q.dtype, device=q.device)
+            scores[..., :kc] = torch.matmul(qg, cached_k.unsqueeze(2).transpose(-2, -1))
+            scores[..., kc:] = torch.matmul(qg, k_cur.unsqueeze(2).transpose(-2, -1))
+            scores = scores.reshape(B, H, qlen, klen) * ctx.scaling
+            if causal:
+                scores = scores + _causal_mask(qlen, klen, q.device, q.dtype)
+            p = torch.softmax(scores.float(), dim=-1).to(q.dtype)
+            # out = p_cached @ v_cached + p_cur @ v_cur  (split; no v cat)
+            pg = p.view(B, kvH, g, qlen, klen)
+            out = torch.matmul(pg[..., :kc], cached_v.unsqueeze(2)) + \
+                  torch.matmul(pg[..., kc:], v_cur.unsqueeze(2))
+            return out.reshape(B, H, qlen, D)
+        else:
+            klen = qlen
+            scores = torch.matmul(qg, k_cur.unsqueeze(2).transpose(-2, -1))
+            scores = scores.reshape(B, H, qlen, klen) * ctx.scaling
+            if causal:
+                scores = scores + _causal_mask(qlen, klen, q.device, q.dtype)
+            p = torch.softmax(scores.float(), dim=-1).to(q.dtype)
+            pg = p.view(B, kvH, g, qlen, klen)
+            out = torch.matmul(pg, v_cur.unsqueeze(2)).reshape(B, H, qlen, D)
+            return out
 
     @staticmethod
     def backward(ctx, dout):
@@ -108,61 +117,58 @@ class GraniteAttnRecompute(torch.autograd.Function):
         B, H, _, D = q.shape
         kvH = k_cur.shape[1]
         g = ctx.n_groups
+        kc = ctx.cur_len
+        klen = kc + qlen
 
-        if ctx.cur_len > 0:
-            cached_k, cached_v = layer.get_cached_kv(ctx.cur_len)
-            cached_k = cached_k[:ctx.batch, :, :ctx.cur_len]
-            cached_v = cached_v[:ctx.batch, :, :ctx.cur_len]
-            k = torch.cat([cached_k, k_cur], dim=-2)
-            v = torch.cat([cached_v, v_cur], dim=-2)
-        else:
-            k, v = k_cur, v_cur
-        klen = k.shape[-2]
-
-        # Recompute probs in bf16 (checkpointing: p was not saved), NOT fp32.
-        # The position-proportional tensors (p/ds/dp, [B,H,qlen,klen]) at full
-        # 131K context are 32 x qlen x 131072; fp32 makes each ~8.6GB and the
-        # sum ~34GB -> HSA memory fault. bf16 halves it (matches the original
-        # C++ vulkanvm_autograd.hpp mt=bf16 path) so the backward fits.
         mt = torch.bfloat16 if q.dtype in (torch.bfloat16, torch.float16) else torch.float32
         qf = q.to(mt)
-        kf = k.to(mt)
-        vf = v.to(mt)
         qg = qf.view(B, kvH, g, qlen, D)
-        scores = torch.matmul(qg, kf.unsqueeze(2).transpose(-2, -1))
-        scores = scores.reshape(B, H, qlen, klen) * ctx.scaling
-        if ctx.causal:
-            scores = scores + _causal_mask(qlen, klen, q.device, mt)
-        p = torch.softmax(scores.float(), dim=-1).to(mt)  # [B,H,qlen,klen] bf16
-        pg = p.view(B, kvH, g, qlen, klen)
-
         dout_mt = dout.to(mt)
         dyg = dout_mt.view(B, kvH, g, qlen, D)
-        vg = vf.unsqueeze(2)  # [B,kvH,1,klen,D]
 
-        dv = torch.matmul(pg.transpose(-2, -1), dyg).sum(dim=2)        # [B,kvH,klen,D]
-        dp = torch.matmul(dyg, vg.transpose(-2, -1)).reshape(B, H, qlen, klen)
-        ds = p * (dp - (dp * p).sum(dim=-1, keepdim=True))             # [B,H,qlen,klen]
-        dsg = ds.view(B, kvH, g, qlen, klen)
-        dq = torch.matmul(dsg, kf.unsqueeze(2)).reshape(B, H, qlen, D) * ctx.scaling
-        dk = torch.matmul(dsg.transpose(-2, -1), qg).sum(dim=2) * ctx.scaling  # [B,kvH,klen,D]
+        if kc > 0:
+            cached_k, cached_v = layer.get_cached_kv(kc)
+            cached_k = cached_k[:ctx.batch, :, :kc].to(mt)
+            cached_v = cached_v[:ctx.batch, :, :kc].to(mt)
+            # Recompute p in two parts into one tensor (no k/v cat).
+            scores = torch.empty(B, kvH, g, qlen, klen, dtype=mt, device=q.device)
+            scores[..., :kc] = torch.matmul(qg, cached_k.unsqueeze(2).transpose(-2, -1))
+            scores[..., kc:] = torch.matmul(qg, k_cur.unsqueeze(2).transpose(-2, -1))
+            scores = scores.reshape(B, H, qlen, klen) * ctx.scaling
+            if ctx.causal:
+                scores = scores + _causal_mask(qlen, klen, q.device, mt)
+            p = torch.softmax(scores.float(), dim=-1).to(mt)
+            pg = p.view(B, kvH, g, qlen, klen)
 
-        # Slice only the current-chunk portion (cached prefix has no grad path).
-        # Use the SAVED k_cur's own shape as the source of truth for the
-        # return length -- guarantees the returned grad matches what
-        # save_for_backward stored, regardless of any view/reshape ambiguity.
-        def take_last_to(x, target_len):
-            n = x.shape[-2]
-            if n == target_len:
-                return x
-            if n > target_len:
-                return x[:, :, -target_len:, :]
-            pad = torch.zeros(*x.shape[:-2], target_len - n, x.shape[-1],
-                              device=x.device, dtype=x.dtype)
-            return torch.cat([pad, x], dim=-2)
-        cur_len = k_cur.shape[-2]
-        dk_cur = take_last_to(dk, cur_len)
-        dv_cur = take_last_to(dv, cur_len)
+            # dv_cur: only the current-chunk columns of p contribute (cached
+            # prefix has no grad path — skip the wasted full-length compute).
+            pq2 = pg[..., kc:]                              # [B,kvH,g,qlen,qlen]
+            dv_cur = torch.matmul(pq2.transpose(-2, -1), dyg).sum(dim=2)
+            # dp = dout @ v^T split into one [qlen, klen] tensor (no cat)
+            dp = torch.empty(B, kvH, g, qlen, klen, dtype=mt, device=q.device)
+            dp[..., :kc] = torch.matmul(dyg, cached_v.unsqueeze(2).transpose(-2, -1))
+            dp[..., kc:] = torch.matmul(dyg, v_cur.unsqueeze(2).to(mt).transpose(-2, -1))
+            dp = dp.reshape(B, H, qlen, klen)
+            ds = p * (dp - (dp * p).sum(dim=-1, keepdim=True))
+            dsg = ds.view(B, kvH, g, qlen, klen)
+            # dq = ds @ k split
+            dq = (torch.matmul(dsg[..., :kc], cached_k.unsqueeze(2)) +
+                  torch.matmul(dsg[..., kc:], k_cur.unsqueeze(2).to(mt))).reshape(B, H, qlen, D) * ctx.scaling
+            # dk_cur = ds[:, :, kc:]^T @ q  (only current cols)
+            dk_cur = torch.matmul(dsg[..., kc:].transpose(-2, -1), qg).sum(dim=2) * ctx.scaling
+        else:
+            scores = torch.matmul(qg, k_cur.unsqueeze(2).to(mt).transpose(-2, -1))
+            scores = scores.reshape(B, H, qlen, klen) * ctx.scaling
+            if ctx.causal:
+                scores = scores + _causal_mask(qlen, klen, q.device, mt)
+            p = torch.softmax(scores.float(), dim=-1).to(mt)
+            pg = p.view(B, kvH, g, qlen, klen)
+            dv_cur = torch.matmul(pg.transpose(-2, -1), dyg).sum(dim=2)
+            dp = torch.matmul(dyg, v_cur.unsqueeze(2).to(mt).transpose(-2, -1)).reshape(B, H, qlen, klen)
+            ds = p * (dp - (dp * p).sum(dim=-1, keepdim=True))
+            dsg = ds.view(B, kvH, g, qlen, klen)
+            dq = torch.matmul(dsg, k_cur.unsqueeze(2).to(mt)).reshape(B, H, qlen, D) * ctx.scaling
+            dk_cur = torch.matmul(dsg.transpose(-2, -1), qg).sum(dim=2) * ctx.scaling
 
         return (
             dq.to(q.dtype),
