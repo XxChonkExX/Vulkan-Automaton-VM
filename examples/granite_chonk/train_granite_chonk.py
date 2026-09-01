@@ -288,11 +288,25 @@ def main():
 
     step = resume_step
     model.train()
+    # Block-skip on resume: skip whole data blocks already trained, so a
+    # resumed run continues where the checkpoint left off instead of
+    # re-training from block 0. blocks_done derives from optimizer steps
+    # (opt_steps_per_block completed blocks).
+    blocks_to_skip = 0
+    if resume_step > 0:
+        blocks_to_skip = resume_step // opt_steps_per_block
+        if blocks_to_skip > 0:
+            print(f"[Resume] skipping first {blocks_to_skip} block(s) "
+                  f"(steps 0..{blocks_to_skip * opt_steps_per_block - 1} already trained)")
     for epoch in range(resume_epoch, CHONK_EPOCHS):
         gen = get_tokenized_dataset(DATA_PATH, SEQ_LEN, CHONK_SUBSAMPLE, epoch)
         t0 = time.time()
         print(f"\n--- Epoch {epoch + 1}/{CHONK_EPOCHS} ---")
+        block_idx = -1
         for input_ids in gen:
+            block_idx += 1
+            if block_idx < blocks_to_skip:
+                continue
             if step >= total_steps or step >= MAX_STEPS:
                 break
             input_ids = input_ids.unsqueeze(0).cuda()

@@ -1,9 +1,9 @@
 #!/bin/bash
 export LD_LIBRARY_PATH=/home/chonke/torch_rocm_libs:${LD_LIBRARY_PATH}
 export HIPBLASLT_TENSILE_LIBPATH=/opt/rocm-7.1.0/lib/hipblaslt/library
-# Auto-restart wrapper: resumes from last checkpoint if a driver reset
-# or Vulkan OOM kills the trainer. Keeps the run alive.
-OUT_DIR="examples/granite_chonk/out/granite-finetuned"
+# Resume from latest checkpoint if exists (re-detected EVERY restart; absolute path)
+REPO="/home/chonke/Vulkan-Automaton-VM"
+OUT_DIR="$REPO/examples/granite_chonk/out/granite-finetuned"
 LOG="/home/chonke/Documents/train_granite.log"
 export PYTORCH_HIP_ALLOC_CONF="expandable_segments:True,garbage_collection_threshold:0.4"
 export PYTORCH_ALLOC_CONF="expandable_segments:True,garbage_collection_threshold:0.4"
@@ -30,24 +30,22 @@ export CHONK_WARMUP=50
 export CHONK_SUBSAMPLE=1.0
 export CHONK_EPOCHS=1
 
-# Resume from latest checkpoint if exists
-LATEST=$(ls -1d $OUT_DIR/chonk_step_* 2>/dev/null | sort -V | tail -1)
-if [ -n "$LATEST" ]; then
-    echo "[wrap] Resuming from $LATEST"
-    export CHONK_RESUME_DIR="$LATEST"
-fi
-
-# Launch (loop restarts on crash/resume)
+# Launch (loop restarts on crash/resume; re-detects the latest checkpoint
+# on EVERY restart so progress made mid-wrapper is always picked up)
 while true; do
+    LATEST=$(ls -1d $OUT_DIR/chonk_step_* 2>/dev/null | sort -V | tail -1)
+    if [ -n "$LATEST" ] && [ -f "$LATEST/training_state.pt" ]; then
+        export CHONK_RESUME_DIR="$LATEST"
+        echo "[wrap] Resuming from $LATEST" >> $LOG
+    else
+        unset CHONK_RESUME_DIR
+    fi
     echo "[$(date)] Starting training (resume=${CHONK_RESUME_DIR:-none})" >> $LOG
-    cd /home/chonke/Vulkan-Automaton-VM && /home/chonke/venv-ds4/bin/python /home/chonke/Vulkan-Automaton-VM/examples/granite_chonk/train_granite_chonk.py >> $LOG 2>&1
+    cd "$REPO" && /home/chonke/venv-ds4/bin/python "$REPO/examples/granite_chonk/train_granite_chonk.py" >> $LOG 2>&1
     EXIT_CODE=$?
     echo "[$(date)] Exit code $EXIT_CODE" >> $LOG
-    if [ -n "$CHONK_RESUME_DIR" ] && [ -f "$CHONK_RESUME_DIR/training_state.pt" ]; then
-        echo "[wrap] Resume checkpoint intact; loop continues if needed." >> $LOG
-        # If completed (final saved), break
-        if [ -d "$OUT_DIR/chonk_final" ]; then break; fi
-    fi
+    # If completed (final saved), break
+    if [ -d "$OUT_DIR/chonk_final" ]; then break; fi
     # Short pause between restarts (display breath)
     sleep 5
 done
