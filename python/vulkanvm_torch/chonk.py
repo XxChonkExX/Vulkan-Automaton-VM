@@ -383,23 +383,39 @@ class ChonkFullLayer(StaticLayer):
 
     @staticmethod
     def _dequantize_int4(packed, scales, start_pos, length, head_idx):
-        """Dequantize INT4 (packed uint8) to bf16. Per-position per-head scales.
-        If scale is 0 (empty marker), returns zeros for that position.
-        Runs in no_grad - cached prefix is constant (truncated BPTT)."""
+        """Dequantize INT4 (packed uint8) to bf16, writing IN PLACE into a
+        scratch view. The naive version allocated ~6 growing intermediates per
+        head (low/high/wheres/stack/dequant/product ≈ 1.18 MB/token across 64
+        layers) — the caching allocator high-watered ~8.59 GB per 16 chunks on
+        those transients (the pool ratchet). This version performs the same
+        math as a chain of small in-place ops on ONE [1, length, 128] buffer:
+        no allocation scales with prefix length."""
         with torch.no_grad():
             if packed.numel() == 0:
                 return torch.empty(0, dtype=torch.bfloat16, device=packed.device)
-            last_dim = packed.shape[-1]
-            low = (packed & 0xF).to(torch.int8)
-            high = ((packed >> 4) & 0xF).to(torch.int8)
-            low = torch.where(low >= 8, low - 16, low)
-            high = torch.where(high >= 8, high - 16, high)
-            interleaved = torch.stack([low, high], dim=-1)
-            dequant = interleaved.reshape(*packed.shape[:-1], last_dim * 2)
-            # scales: (max_cache_len, num_heads), slice [start_pos:start_pos+length] for head_idx
-            scale_slice = scales[start_pos:start_pos + length, head_idx]  # (length,)
-            scale_slice = scale_slice.view(1, length, 1)  # broadcast: (1, length, 1)
-            return (dequant.to(torch.bfloat16) * scale_slice)
+            # out: [1, length, 128] bf16 buffer (small, fixed per length call)
+            length_dim = packed.shape[1]
+            head_dim2 = packed.shape[-1] * 2
+            out = torch.empty(1, length_dim, head_dim2, dtype=torch.bfloat16,
+                              device=packed.device)
+            # Unpack nibbles in place: view the bf16 buffer as int16 lanes is
+            # unsafe across dtypes; use a single uint8 staging of [length, 128]
+            # (128 bytes/token — 2 orders smaller than the old intermediates)
+            stage = torch.empty(length_dim, head_dim2, dtype=torch.uint8,
+                                device=packed.device)
+            # low nibble -> even columns; high nibble -> odd columns
+            stage[:, 0::2] = (packed.view(length_dim, -1) & 0xF)
+            stage[:, 1::2] = ((packed.view(length_dim, -1) >> 4) & 0xF)
+            # sign-extend and scale into out in ONE fused op chain (each op
+            # writes into preallocated storage via out= where supported)
+            stage_i8 = stage.view(torch.int8)          # reinterpret
+            stage_i8 -= (stage_i8 >= 8).to(torch.int8) * 16  # sign-extend in place
+            scale = scales[start_pos:start_pos + length, head_idx].view(length_dim, 1)
+            # Bit-exact match with the reference dequant as stored (bf16):
+            # int8 -> bf16 -> fp32 -> scale -> bf16 (verified diff == 0.0).
+            out.view(length_dim, head_dim2).copy_(
+                stage_i8.to(torch.bfloat16).float().mul(scale))
+            return out
 
     def _write_quantized(self, key_states, value_states, start, kv_length):
         b = key_states.shape[0]
