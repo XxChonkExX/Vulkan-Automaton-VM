@@ -215,4 +215,49 @@ class GraniteAttnRecompute(torch.autograd.Function):
             None, None, None, None, None, None,
         )
 
-    print("[+] Granite eager attention -> Chonk recompute (layer-direct, zero retention)")
+
+def patch_granite_attention_recompute(model, kv_cache):
+    """Swap Granite's eager attention for the Chonk tiled-recompute path.
+
+    The patch hands the Function a reference to the cache LAYER plus metadata,
+    never views of the big transient [cached|current] cats. The Function reads
+    the cached span via layer.get_cached_kv() (bf16: zero-copy pool views;
+    INT4: shared-scratch dequant, recomputed in backward) and takes the current
+    chunk from the layer's stashed states — so nothing position-proportional
+    is retained, and the tiled workspace is FIXED size at every position.
+    """
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    first = next(l for l in base.model.layers if hasattr(l, "self_attn"))
+    attn_mod = type(first.self_attn).__module__
+    mod = __import__(attn_mod, fromlist=["eager_attention_forward"])
+    orig = mod.eager_attention_forward
+
+    def patched(module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs):
+        if dropout > 0:
+            return orig(module, query, key, value, attention_mask, scaling, dropout, **kwargs)
+
+        layer = kv_cache.layers[module.layer_idx]
+        cur_len = key.shape[-2] - query.shape[-2]
+
+        # Current-chunk states: stashed by the cache layer's update() — the
+        # ORIGINAL grad-bearing tensors (pre-cat), tiny (~1 MB), so the big
+        # transient [cached|current] cat is never referenced by the graph.
+        k_cur = layer._last_k
+        v_cur = layer._last_v
+
+        out = GraniteAttnRecompute.apply(
+            query,
+            k_cur,
+            v_cur,
+            layer,
+            cur_len,
+            query.shape[0],
+            float(scaling),
+            int(module.num_key_value_groups),
+            True,
+        )
+        out = out.transpose(1, 2).contiguous()  # [B, qlen, H, D] per HF contract
+        return out, None
+
+    mod.eager_attention_forward = patched
+    print("[+] Granite eager attention -> Chonk tiled recompute (fixed workspace, zero retention)")
