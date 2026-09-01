@@ -373,6 +373,10 @@ class ChonkFullLayer(StaticLayer):
 
         self.dtype = self._compute_dtype
         self.device = self._prealloc_device
+        # Shared scratch dims (class-level, sized once from the first layer)
+        type(self)._scratch_kvH = self._num_kv_heads
+        type(self)._scratch_maxlen = self.max_cache_len
+        type(self)._scratch_D = self._head_dim
         # Create on CPU first to avoid ROCm lazy allocation issues
         self.cumulative_length = torch.tensor(0, dtype=torch.int32, device="cpu").to(self._prealloc_device)
         self.is_initialized = True
@@ -435,19 +439,43 @@ class ChonkFullLayer(StaticLayer):
             self._k_data[offset:offset+bytes_to_copy].copy_(k_packed.view(-1))
             self._v_data[offset:offset+bytes_to_copy].copy_(v_packed.view(-1))
 
+    # Shared dequant scratch (class-level: ONE pair for all 64 layers). The
+    # dequant transients grow with position; allocating them fresh per layer
+    # per chunk made the allocator ratchet the pool +8.6GB per 32 chunks
+    # (524 KB/token observed). A fixed scratch written in place — reused
+    # sequentially by forward, backward, and every layer — keeps the pool flat.
+    _shared_dequant_k = None
+    _shared_dequant_v = None
+
+    @classmethod
+    def _shared_scratch(cls, device):
+        # Assign on the BASE class so subclasses can't shadow it.
+        base = ChonkFullLayer
+        if base._shared_dequant_k is None or base._shared_dequant_k.device != torch.device(device):
+            base._shared_dequant_k = torch.empty(
+                1, cls._scratch_kvH, cls._scratch_maxlen, cls._scratch_D,
+                dtype=torch.bfloat16, device=device)
+            base._shared_dequant_v = torch.empty(
+                1, cls._scratch_kvH, cls._scratch_maxlen, cls._scratch_D,
+                dtype=torch.bfloat16, device=device)
+        return base._shared_dequant_k, base._shared_dequant_v
+
     def _dequantize_prefix(self, b, length):
-        """Dequantize prefix [0:length] into a temporary bf16 tensor.
-        Uses per-position scales stored alongside the quantized data."""
-        k_out = torch.empty(b, self._num_kv_heads, length, self._head_dim,
-                           dtype=self._compute_dtype, device=self._prealloc_device)
-        v_out = torch.empty(b, self._num_kv_heads, length, self._head_dim,
-                           dtype=self._compute_dtype, device=self._prealloc_device)
+        """Dequantize prefix [0:length] into the SHARED scratch (in place, no
+        per-call allocation) and return views of it. Valid until the next
+        dequant call — consumers (update cat, attention) read immediately."""
+        cls = type(self)
+        scratch_k, scratch_v = cls._shared_scratch(self._prealloc_device)
+        k_out = scratch_k[:, :, :length]
+        v_out = scratch_v[:, :, :length]
         packed_head_dim = self._head_dim // 2
         packed_stride = self.max_cache_len * packed_head_dim
         for h in range(self._num_kv_heads):
             offset = h * packed_stride
             k_packed = self._k_data[offset:offset + length * packed_head_dim].view(1, length, packed_head_dim)
             v_packed = self._v_data[offset:offset + length * packed_head_dim].view(1, length, packed_head_dim)
+            # _dequantize_int4 returns a fresh tensor per head; write it into
+            # the shared scratch in place.
             k_out[:, h] = self._dequantize_int4(k_packed, self._k_scales, 0, length, h)
             v_out[:, h] = self._dequantize_int4(v_packed, self._v_scales, 0, length, h)
         return k_out, v_out
