@@ -283,7 +283,11 @@ def main():
             ck = torch.load(st, map_location="cpu")
             optimizer.load_state_dict(ck["optimizer"])
             scheduler.load_state_dict(ck["scheduler"])
-            ema.shadow = ck["ema"]
+            # map_location="cpu" leaves the EMA shadow on CPU; move every
+            # shadow tensor back to its param's device (else ema.update()
+            # crashes mixing cuda params with cpu shadow at the first step).
+            _ref = next(p.data for p in model.parameters() if p.requires_grad)
+            ema.shadow = {n: s.to(_ref.device) for n, s in ck["ema"].items()}
             resume_step, resume_epoch = ck["step"], ck["epoch"]
 
     step = resume_step
