@@ -111,47 +111,59 @@ class GraniteAttnRecompute(torch.autograd.Function):
         g = ctx.n_groups
         kc = ctx.cur_len
 
-        qg = q.view(B, kvH, g, qlen, D)
         dev, qdt = q.device, q.dtype
 
-        # Online-softmax state (tiny: [B,kvH,g,qlen] each).
-        m = torch.full((B, kvH, g, qlen), float("-inf"), device=dev, dtype=torch.float32)
-        l = torch.zeros(B, kvH, g, qlen, device=dev, dtype=torch.float32)
-        acc = torch.zeros(B, kvH, g, qlen, D, device=dev, dtype=torch.float32)
+        # THE FIX: run the ENTIRE forward under no_grad. Our backward is fully
+        # hand-written (recomputes p from saved q/k_cur/v_cur + the stashed
+        # m/l/out), so the intermediate autograd graph was dead weight — and it
+        # was the ratchet: PyTorch records saved-for-backward buffers for every
+        # op inside Function.forward on grad-requiring tensors (q), so each
+        # tile's s_f/p_t (~268-536MB) was retained across ALL 64 layers until
+        # backward, growing +8.59GB per 16 chunks (one new tile's worth of
+        # saved temps per 8192 tokens). no_grad builds no graph at all.
+        with torch.no_grad():
+            qg = q.view(B, kvH, g, qlen, D)
 
-        if kc > 0:
-            ck, cv = layer.get_cached_kv(kc)
-            ck = ck[:batch, :, :kc]
-            cv = cv[:batch, :, :kc]
-            for j0 in range(0, kc, T):
-                j1 = min(j0 + T, kc)
-                kt = ck[:, :, j0:j1]                       # [B,kvH,w,D] view
-                vt = cv[:, :, j0:j1]
-                s = torch.matmul(qg, kt.unsqueeze(2).transpose(-2, -1)) * ctx.scaling
-                s_f = s.float()
-                m_new = torch.maximum(m, s_f.amax(dim=-1))
-                corr = torch.exp(m - m_new)                # first tile: exp(-inf)=0
-                p_t = torch.exp(s_f - m_new.unsqueeze(-1))
-                l = l * corr + p_t.sum(dim=-1)
-                acc = acc * corr.unsqueeze(-1) + \
-                    torch.matmul(p_t.to(vt.dtype), vt.unsqueeze(2)).float()
-                m = m_new
+            # Online-softmax state (tiny: [B,kvH,g,qlen] each).
+            m = torch.full((B, kvH, g, qlen), float("-inf"), device=dev, dtype=torch.float32)
+            l = torch.zeros(B, kvH, g, qlen, device=dev, dtype=torch.float32)
+            acc = torch.zeros(B, kvH, g, qlen, D, device=dev, dtype=torch.float32)
 
-        # Current-chunk tile (grad flows through k_cur/v_cur). No mask needed
-        # on cached tiles: every cached column c < kc <= kc + i is visible.
-        s = torch.matmul(qg, k_cur.unsqueeze(2).transpose(-2, -1)) * ctx.scaling
-        if causal:
-            s = s + _chunk_causal_mask(qlen, dev, qdt)
-        s_f = s.float()
-        m_new = torch.maximum(m, s_f.amax(dim=-1))
-        corr = torch.exp(m - m_new)
-        p_t = torch.exp(s_f - m_new.unsqueeze(-1))
-        l = l * corr + p_t.sum(dim=-1)
-        acc = acc * corr.unsqueeze(-1) + \
-            torch.matmul(p_t.to(v_cur.dtype), v_cur.unsqueeze(2)).float()
-        m = m_new
+            if kc > 0:
+                ck, cv = layer.get_cached_kv(kc)
+                ck = ck[:batch, :, :kc]
+                cv = cv[:batch, :, :kc]
+                for j0 in range(0, kc, T):
+                    j1 = min(j0 + T, kc)
+                    kt = ck[:, :, j0:j1]                       # [B,kvH,w,D] view
+                    vt = cv[:, :, j0:j1]
+                    s = torch.matmul(qg, kt.unsqueeze(2).transpose(-2, -1)) * ctx.scaling
+                    s_f = s.float()
+                    m_new = torch.maximum(m, s_f.amax(dim=-1))
+                    corr = torch.exp(m - m_new)                # first tile: exp(-inf)=0
+                    p_t = torch.exp(s_f - m_new.unsqueeze(-1))
+                    l = l * corr + p_t.sum(dim=-1)
+                    acc = acc * corr.unsqueeze(-1) + \
+                        torch.matmul(p_t.to(vt.dtype), vt.unsqueeze(2)).float()
+                    m = m_new
 
-        out = (acc / l.unsqueeze(-1)).to(qdt).reshape(B, H, qlen, D)
+            # Current-chunk tile (grad flows via k_cur/v_cur in BACKWARD only).
+            # No mask needed on cached tiles: every cached column c < kc <= kc+i
+            # is visible to every query.
+            s = torch.matmul(qg, k_cur.unsqueeze(2).transpose(-2, -1)) * ctx.scaling
+            if causal:
+                s = s + _chunk_causal_mask(qlen, dev, qdt)
+            s_f = s.float()
+            m_new = torch.maximum(m, s_f.amax(dim=-1))
+            corr = torch.exp(m - m_new)
+            p_t = torch.exp(s_f - m_new.unsqueeze(-1))
+            l = l * corr + p_t.sum(dim=-1)
+            acc = acc * corr.unsqueeze(-1) + \
+                torch.matmul(p_t.to(v_cur.dtype), v_cur.unsqueeze(2)).float()
+            m = m_new
+
+            out = (acc / l.unsqueeze(-1)).to(qdt).reshape(B, H, qlen, D)
+
         # Stash the tiny softmax state + output for the exact backward recompute.
         ctx.m_final = m
         ctx.l_final = l
