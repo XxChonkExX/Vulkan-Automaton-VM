@@ -337,20 +337,16 @@ def main():
                 torch.cuda.empty_cache()
                 if chunks_this_seq % 16 == 0:
                     ps = pool.stats()
-                    # Instrumentation: separate the torch CACHING allocator's
-                    # reserved-but-idle segments from genuinely live allocations,
-                    # and count live tensor bytes. If reserved climbs while live
-                    # stays flat, it's cache hoarding (distinct size classes as
-                    # kc grows); if live climbs, something truly retains.
-                    try:
-                        res = torch.cuda.memory_reserved() / 1e9
-                        alloc = torch.cuda.memory_allocated() / 1e9
-                        tor = f" torch[res={res:.2f} alloc={alloc:.2f}]"
-                    except Exception:
-                        tor = ""
+                    # Instrumentation: blockCount steps with each +8.59GB stair
+                    # => new dedicated-exportable pool blocks are being created
+                    # (kc-proportional demand crossing bucket rungs). largest-
+                    # FreeBlock shows whether existing blocks could have served.
                     print(f"  chunk {chunks_this_seq}/{chunks_per_block} "
                           f"({time.time()-t0:.0f}s loss={last_loss:.4f} "
-                          f"pool={ps['totalUsed']/1e9:.2f}GB{tor})", flush=True)
+                          f"pool={ps['totalUsed']/1e9:.2f}GB "
+                          f"blocks={ps.get('blockCount','?')} "
+                          f"largestFree={ps.get('largestFreeBlock',0)/1e9:.2f}GB)",
+                          flush=True)
 
                 # One optimizer step per GRAD_ACCUM_STEPS chunks (plus a partial
                 # step at block end for non-divisible configs). step/log/save
