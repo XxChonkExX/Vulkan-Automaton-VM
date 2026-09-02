@@ -335,7 +335,9 @@ def main():
                         del loss, outputs
                 chunks_this_seq += 1
                 torch.cuda.empty_cache()
-                if chunks_this_seq % 16 == 0:
+                # Diagnostic window: per-chunk heartbeat for the first 32 chunks
+                # (is the growth smooth ~537MB/chunk or 8GiB stairs?), then 16.
+                if chunks_this_seq <= 32 or chunks_this_seq % 16 == 0:
                     ps = pool.stats()
                     # Instrumentation: blockCount steps with each +8.59GB stair
                     # => new dedicated-exportable pool blocks are being created
