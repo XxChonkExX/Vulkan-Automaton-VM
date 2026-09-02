@@ -26,6 +26,12 @@ void chonk_allocator_free(void* ptr, size_t size, void* stream);
 // Release all allocator blocks and live-size bookkeeping (pool shutdown).
 void vvm_torch_chonk_allocator_reset();
 
+// Release fully-free slab blocks down to `keepFloor` blocks. Blocks are the
+// 2-GiB-class committed pool chunks; freeing them returns their capacity to
+// the pool. Used periodically (not on the hot path) to stop kc-proportional
+// transient blocks from ratcheting `totalUsed` upward every chunk.
+void vvm_torch_chonk_allocator_release_empty(size_t keepFloor);
+
 
 }  // namespace vvm_torch
 

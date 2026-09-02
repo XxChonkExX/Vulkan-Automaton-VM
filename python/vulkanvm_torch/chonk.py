@@ -309,6 +309,19 @@ class ChonkPool:
     def shutdown(self):
         pool_mod.shutdown()
 
+    def release_empty_blocks(self, keepFloor=2):
+        pool_mod.release_empty_blocks(keepFloor)
+
+
+def release_empty_blocks(keepFloor=2):
+    """Release fully-free slab blocks down to `keepFloor`, returning their
+    committed capacity to the pool. Safe to call periodically (e.g. each
+    optimizer step). No-op if the pool is not initialized."""
+    try:
+        pool_mod.release_empty_blocks(keepFloor)
+    except Exception:
+        pass
+
 
 class ChonkFullLayer(StaticLayer):
     """Static full-attention cache layer whose keys/values live in Chonk

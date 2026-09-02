@@ -284,4 +284,8 @@ void vvm_torch_chonk_allocator_reset() {
     core().reset();
 }
 
+void vvm_torch_chonk_allocator_release_empty(size_t keepFloor) {
+    core().releaseEmptyBlocks(keepFloor);
+}
+
 }  // namespace vvm_torch

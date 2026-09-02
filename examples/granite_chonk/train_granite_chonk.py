@@ -35,6 +35,7 @@ from chonk import (
     create_optimizer_states_in_chonk,
     patch_linear_cache_for_chunked_training,
     install_chonk_allocator,
+    release_empty_blocks,
 )
 
 # ---- config knobs (env-overridable) ----
@@ -367,6 +368,13 @@ def main():
                                 optimizer.zero_grad(); torch.cuda.empty_cache()
                                 continue
                         optimizer.step(); scheduler.step(); optimizer.zero_grad()
+                        # Reclaim fully-free slab blocks to the pool at each
+                        # optimizer step. The +2-GiB-every-4-chunks steps come
+                        # from slab blocks acquired for kc-growing transients
+                        # and never released (empty_cache only frees segments
+                        # back to the slab, not the slab's pool blocks).
+                        # Release down to a warm floor; NOT on the hot path.
+                        release_empty_blocks(keepFloor=2)
                         if CHONK_EMA_UPDATE_EVERY > 0 and step % CHONK_EMA_UPDATE_EVERY == 0:
                             ema.update()
                         if CHONK_OPTIMIZER_PAUSE:

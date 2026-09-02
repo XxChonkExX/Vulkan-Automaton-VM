@@ -166,6 +166,9 @@ PYBIND11_MODULE(vulkanvm_pool_test, m) {
     m.def("alloc_activations", &allocActivations, py::arg("size"), py::arg("name") = "");
     m.def("alloc_host_visible", &allocHostVisible, py::arg("size"), py::arg("name") = "");
     m.def("stats", &stats);
+    m.def("release_empty_blocks", [](size_t keepFloor) {
+        vvm_torch::vvm_torch_chonk_allocator_release_empty(keepFloor);
+    }, py::arg("keepFloor") = 2, "release fully-free slab blocks down to keepFloor");
     m.def("info", []() {
         if (!g_lastInitInfo) throw std::runtime_error("not initialized");
         return *g_lastInitInfo;
