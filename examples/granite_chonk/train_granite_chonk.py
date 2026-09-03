@@ -337,13 +337,6 @@ def main():
                         del loss, outputs
                 chunks_this_seq += 1
                 torch.cuda.empty_cache()
-                # Reclaim fully-free slab blocks to the pool EVERY chunk (not
-                # just at optimizer step). empty_cache() returns transient
-                # segments to the slab; the next chunk's kc-proportional sizes
-                # don't fit the freed holes so a new block is minted every ~4
-                # chunks. Releasing empty blocks here keeps the slab's committed
-                # capacity from ratcheting between optimizer steps.
-                release_empty_blocks(keepFloor=4)
                 # Diagnostic window: per-chunk heartbeat for the first 32 chunks
                 # (is the growth smooth ~537MB/chunk or 8GiB stairs?), then 16.
                 if chunks_this_seq <= 32 or chunks_this_seq % 16 == 0:
