@@ -1,24 +1,23 @@
 #!/usr/bin/env bash
 # run_vt_no_gdm.sh — FREE the iGPU device-local heap, THEN launch training.
 #
-# The confirmed root cause of the last several wall/rebo∞ts is that the
-# GDM/Wayland/gnome-shell session keeps running (and OpenCode's own GPU
-# process too), consuming the 91.4 GiB device-local heap that every slab
-# block (dedicated exportable) lands in. Vulkan then hits
-# VK_ERROR_OUT_OF_DEVICE_MEMORY at ~59GB of pool usage.
+# Confirmed root cause of the Exit-137 wall: the GDM/Wayland/gnome-shell
+# session (auto-login) keeps running and consumes the 91.4 GiB device-local
+# heap that every dedicated-exportable slab block lands in. Vulkan then hits
+# VK_ERROR_OUT_OF_DEVICE_MEMORY at ~59-90GB of pool usage.
 #
-# This script must be run FROM A REAL TEXT VT (not inside the Wayland/GNOME
-# session), because it stops GDM — which tears down the graphical session
-# you are currently sitting in.
+# The PREVIOUS version of this script had a fatal flaw: running
+# `sudo systemctl stop gdm3` from a VT still tore down the caller's session
+# (GDM restarts via autologin), killing the script before it could launch
+# training. This version decouples the two:
+#   1. stopping GDM is done via `systemctl stop` (mask first to defeat
+#      autologin respawn during the run);
+#   2. the training wrapper is launched detached via systemd-run so it is NOT
+#      a child of the (dying) GDM session and survives the teardown.
 #
 # ---------------------------------------------------------------- USAGE ---
 #   Ctrl+Alt+F3  -> log in as chonke (text console)
 #   /home/chonke/Vulkan-Automaton-VM/run_vt_no_gdm.sh
-#
-# It will:
-#   1. stop gdm (kills gnome-shell / Wayland / OpenCode GUI)
-#   2. verify the device-local heap is actually freed
-#   3. launch the existing training wrapper detached
 # ----------------------------------------------------------------
 
 set -uo pipefail
@@ -29,36 +28,52 @@ WRAP="$REPO/run_granite_long.sh"
 
 die() { echo "FATAL: $*" >&2; exit 1; }
 
-echo "=== [1/4] Killing any stale training ==="
+echo "=== [1/5] Killing any stale training (weak signals first) ==="
+pkill -INT -f train_granite_chonk 2>/dev/null || true
+pkill -INT -f run_granite_long   2>/dev/null || true
+sleep 2
 pkill -9 -f train_granite_chonk 2>/dev/null || true
 pkill -9 -f run_granite_long   2>/dev/null || true
-sleep 2
 
-echo "=== [2/4] Stopping GDM (frees the iGPU device-local heap) ==="
-sudo systemctl stop gdm3 2>/dev/null || sudo systemctl stop gdm 2>/dev/null || \
-    echo "  (sudo failed or gdm already stopped; will verify below)"
+echo "=== [2/5] Disabling GDM autologin respawn, then stopping it ==="
+# mask defeats the autologin respawn so it stays down for the run.
+if sudo -n true 2>/dev/null; then
+    SUDO="sudo"
+else
+    echo "  sudo needs a password — you will be prompted once here."
+    SUDO="sudo"
+fi
+$SUDO systemctl mask gdm3 2>/dev/null || $SUDO systemctl mask gdm 2>/dev/null || true
+$SUDO systemctl stop gdm3   2>/dev/null || $SUDO systemctl stop gdm 2>/dev/null || true
 
 sleep 3
 echo "--- remaining graphical/GPU consumers (should be empty / minimal) ---"
 pgrep -af 'gdm|gnome-shell|Xorg|wayland|opencode.*gpu-process' || echo "  none"
 
-echo "=== [3/4] Verify device-local heap is freed ==="
+echo "=== [3/5] Verify device-local heap is freed ==="
 for d in /sys/class/drm/card*/device; do
   vt=$(cat "$d/mem_info_vram_total" 2>/dev/null) || continue
   vu=$(cat "$d/mem_info_vram_used" 2>/dev/null) || continue
   gt=$(cat "$d/mem_info_gtt_total" 2>/dev/null) || continue
   gu=$(cat "$d/mem_info_gtt_used" 2>/dev/null) || continue
-  echo "  $d: vram_used=$(awk "BEGIN{printf \"%.1f\", $vu/1e9}")/$(awk "BEGIN{printf \"%.1f\", $vt/1e9}")GB  gtt_used=$(awk "BEGIN{printf \"%.1f\", $gu/1e9}")/$(awk "BEGIN{printf \"%.1f\", $gt/1e9}")GB"
+  echo "  $d: vram=$(awk "BEGIN{printf \"%.1f\", $vu/1e9}")/$(awk "BEGIN{printf \"%.1f\", $vt/1e9}")GB  gtt=$(awk "BEGIN{printf \"%.1f\", $gu/1e9}")/$(awk "BEGIN{printf \"%.1f\", $gt/1e9}")GB"
 done
-echo "--- system memory ---"
-free -g | awk 'NR<=2{print}'
+free -g | awk 'NR<=2{print "  "$0}'
 
-echo "=== [4/4] Launching training (detached, auto-resume) ==="
+echo "=== [4/5] Launching training detached (survives GDM teardown) ==="
 mkdir -p "$(dirname "$LOG")"
-setsid bash "$WRAP" >> "$LOG" 2>&1 </dev/null &
-sleep 2
-echo "wrapper PID: $(pgrep -f run_granite_long | head -1)"
+# systemd-run puts the wrapper outside the session cgroup so stopping GDM
+# cannot kill it. Fall back to setsid+nohup if systemd-run is unavailable.
+if command -v systemd-run >/dev/null 2>&1; then
+    nohup systemd-run --scope --unit=chonk-train bash "$WRAP" >> "$LOG" 2>&1 </dev/null &
+else
+    nohup setsid bash "$WRAP" >> "$LOG" 2>&1 </dev/null &
+fi
+sleep 3
+echo "wrapper: $(pgrep -af 'run_granite_long' | grep -v grep | head -1)"
+
+echo "=== [5/5] Done ==="
+echo "Monitor with:  tail -f $LOG"
 echo
-echo "Done. Monitor with:  tail -f $LOG"
-echo "Return to graphics (optional, resumes GDM — not advised during training):"
-echo "  sudo systemctl start gdm3"
+echo "To restore the desktop when done training:"
+echo "  $SUDO systemctl unmask gdm3 && $SUDO systemctl start gdm3"
