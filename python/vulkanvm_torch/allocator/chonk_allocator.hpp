@@ -30,7 +30,13 @@ void vvm_torch_chonk_allocator_reset();
 // 2-GiB-class committed pool chunks; freeing them returns their capacity to
 // the pool. Used periodically (not on the hot path) to stop kc-proportional
 // transient blocks from ratcheting `totalUsed` upward every chunk.
-void vvm_torch_chonk_allocator_release_empty(size_t keepFloor);
+// Returns the number of blocks released.
+size_t vvm_torch_chonk_allocator_release_empty(size_t keepFloor);
+
+// Return the slab's live block/liveBytes/freeBytes accounting as a compact
+// text string (no allocation). For diagnosing why releaseEmptyBlocks isn't
+// reclaiming: how many blocks, how many are fully-free, liveBytes each.
+const char* vvm_torch_chonk_allocator_slab_stats();
 
 
 }  // namespace vvm_torch

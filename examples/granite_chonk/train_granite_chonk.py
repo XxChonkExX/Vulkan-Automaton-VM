@@ -36,6 +36,7 @@ from chonk import (
     patch_linear_cache_for_chunked_training,
     install_chonk_allocator,
     release_empty_blocks,
+    slab_stats,
 )
 
 # ---- config knobs (env-overridable) ----
@@ -348,6 +349,8 @@ def main():
                           f"({time.time()-t0:.0f}s loss={last_loss:.4f} "
                           f"pool={ps['totalUsed']/1e9:.2f}GB "
                           f"blocks={ps.get('blockCount','?')} "
+                          f"dedicated={ps.get('dedicatedCount','?')} "
+                          f"allocations={ps.get('allocationCount','?')} "
                           f"largestFree={ps.get('largestFreeBlock',0)/1e9:.2f}GB)",
                           flush=True)
 
@@ -374,7 +377,10 @@ def main():
                         # and never released (empty_cache only frees segments
                         # back to the slab, not the slab's pool blocks).
                         # Release down to a warm floor; NOT on the hot path.
-                        release_empty_blocks(keepFloor=2)
+                        n_rel = release_empty_blocks(keepFloor=2)
+                        if step % 8 == 0 or n_rel > 0:
+                            print(f"  [slab] step {step}: {slab_stats()} "
+                                  f"released={n_rel}", flush=True)
                         if CHONK_EMA_UPDATE_EVERY > 0 and step % CHONK_EMA_UPDATE_EVERY == 0:
                             ema.update()
                         if CHONK_OPTIMIZER_PAUSE:

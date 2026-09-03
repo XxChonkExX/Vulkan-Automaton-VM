@@ -144,6 +144,7 @@ static py::dict stats() {
     out["fragmentationRatio"] = s.fragmentationRatio;
     out["blockCount"] = s.blockCount;
     out["allocationCount"] = s.allocationCount;
+    out["dedicatedCount"] = s.dedicatedCount;
     return out;
 }
 
@@ -167,8 +168,11 @@ PYBIND11_MODULE(vulkanvm_pool_test, m) {
     m.def("alloc_host_visible", &allocHostVisible, py::arg("size"), py::arg("name") = "");
     m.def("stats", &stats);
     m.def("release_empty_blocks", [](size_t keepFloor) {
-        vvm_torch::vvm_torch_chonk_allocator_release_empty(keepFloor);
-    }, py::arg("keepFloor") = 2, "release fully-free slab blocks down to keepFloor");
+        return vvm_torch::vvm_torch_chonk_allocator_release_empty(keepFloor);
+    }, py::arg("keepFloor") = 2, "release fully-free slab blocks down to keepFloor; returns count released");
+    m.def("slab_stats", []() {
+        return std::string(vvm_torch::vvm_torch_chonk_allocator_slab_stats());
+    }, "compact slab accounting string for diagnostics");
     m.def("info", []() {
         if (!g_lastInitInfo) throw std::runtime_error("not initialized");
         return *g_lastInitInfo;

@@ -318,9 +318,17 @@ def release_empty_blocks(keepFloor=2):
     committed capacity to the pool. Safe to call periodically (e.g. each
     optimizer step). No-op if the pool is not initialized."""
     try:
-        pool_mod.release_empty_blocks(keepFloor)
+        return pool_mod.release_empty_blocks(keepFloor)
     except Exception:
-        pass
+        return 0
+
+
+def slab_stats():
+    """Compact slab accounting string (blocks/live/free/capacity)."""
+    try:
+        return pool_mod.slab_stats()
+    except Exception:
+        return "n/a"
 
 
 class ChonkFullLayer(StaticLayer):

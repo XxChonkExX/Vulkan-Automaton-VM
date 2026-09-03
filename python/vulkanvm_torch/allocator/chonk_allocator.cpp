@@ -284,8 +284,21 @@ void vvm_torch_chonk_allocator_reset() {
     core().reset();
 }
 
-void vvm_torch_chonk_allocator_release_empty(size_t keepFloor) {
-    core().releaseEmptyBlocks(keepFloor);
+size_t vvm_torch_chonk_allocator_release_empty(size_t keepFloor) {
+    return core().releaseEmptyBlocks(keepFloor);
+}
+
+const char* vvm_torch_chonk_allocator_slab_stats() {
+    static thread_local std::string buf;
+    auto s = core().stats();
+    // Per-block liveBytes is I5-relevant; emit compact summary.
+    buf.clear();
+    char tmp[128];
+    snprintf(tmp, sizeof(tmp),
+             "blocks=%zu live=%zu free=%zu cap=%zu",
+             s.blocks, s.liveBytes, s.freeBytes, s.capacityBytes);
+    buf = tmp;
+    return buf.c_str();
 }
 
 }  // namespace vvm_torch
