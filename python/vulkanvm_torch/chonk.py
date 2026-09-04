@@ -403,39 +403,37 @@ class ChonkFullLayer(StaticLayer):
         self.is_initialized = True
 
     @staticmethod
-    def _dequantize_int4(packed, scales, start_pos, length, head_idx):
-        """Dequantize INT4 (packed uint8) to bf16, writing IN PLACE into a
-        scratch view. The naive version allocated ~6 growing intermediates per
-        head (low/high/wheres/stack/dequant/product ≈ 1.18 MB/token across 64
-        layers) — the caching allocator high-watered ~8.59 GB per 16 chunks on
-        those transients (the pool ratchet). This version performs the same
-        math as a chain of small in-place ops on ONE [1, length, 128] buffer:
-        no allocation scales with prefix length."""
+    def _dequantize_int4(packed, scales, start_pos, length, head_idx, out=None):
+        """Dequantize INT4 (packed uint8) to bf16, writing into `out` (a
+        caller-provided [length, head_dim] bf16 view of the shared scratch, or
+        a fresh tensor if None). The original version allocated a fresh
+        [1, length, 128] bf16 tensor PER HEAD PER CALL; with the prefix length
+        (kc) growing to 131072 that is 32MB/head x 16 heads (k+v) x 64 layers
+        x (fwd+bwd) — the ~1MB/token (+0.55GB/chunk) residual ratchet that
+        survived the activation-checkpointing fix. Writing straight into the
+        caller's scratch view keeps the dequant allocation O(1) in the prefix
+        length. The uint8 staging buffer (128 bytes/token) is the only transient
+        and is fixed per head."""
         with torch.no_grad():
             if packed.numel() == 0:
+                if out is not None:
+                    return out
                 return torch.empty(0, dtype=torch.bfloat16, device=packed.device)
-            # out: [1, length, 128] bf16 buffer (small, fixed per length call)
             length_dim = packed.shape[1]
             head_dim2 = packed.shape[-1] * 2
-            out = torch.empty(1, length_dim, head_dim2, dtype=torch.bfloat16,
-                              device=packed.device)
-            # Unpack nibbles in place: view the bf16 buffer as int16 lanes is
-            # unsafe across dtypes; use a single uint8 staging of [length, 128]
-            # (128 bytes/token — 2 orders smaller than the old intermediates)
+            if out is None:
+                out = torch.empty(1, length_dim, head_dim2, dtype=torch.bfloat16,
+                                  device=packed.device)
+            # Only transient: a [length, head_dim] uint8 staging buffer.
             stage = torch.empty(length_dim, head_dim2, dtype=torch.uint8,
                                 device=packed.device)
-            # low nibble -> even columns; high nibble -> odd columns
             stage[:, 0::2] = (packed.view(length_dim, -1) & 0xF)
             stage[:, 1::2] = ((packed.view(length_dim, -1) >> 4) & 0xF)
-            # sign-extend and scale into out in ONE fused op chain (each op
-            # writes into preallocated storage via out= where supported)
-            stage_i8 = stage.view(torch.int8)          # reinterpret
-            stage_i8 -= (stage_i8 >= 8).to(torch.int8) * 16  # sign-extend in place
+            stage_i8 = stage.view(torch.int8)
+            stage_i8 -= (stage_i8 >= 8).to(torch.int8) * 16
             scale = scales[start_pos:start_pos + length, head_idx].view(length_dim, 1)
-            # Bit-exact match with the reference dequant as stored (bf16):
-            # int8 -> bf16 -> fp32 -> scale -> bf16 (verified diff == 0.0).
-            out.view(length_dim, head_dim2).copy_(
-                stage_i8.to(torch.bfloat16).float().mul(scale))
+            out_flat = out.reshape(length_dim, head_dim2)
+            out_flat.copy_(stage_i8.to(torch.bfloat16).float().mul(scale))
             return out
 
     def _write_quantized(self, key_states, value_states, start, kv_length):
@@ -511,10 +509,10 @@ class ChonkFullLayer(StaticLayer):
             offset = h * packed_stride
             k_packed = self._k_data[offset:offset + length * packed_head_dim].view(1, length, packed_head_dim)
             v_packed = self._v_data[offset:offset + length * packed_head_dim].view(1, length, packed_head_dim)
-            # _dequantize_int4 returns a fresh tensor per head; write it into
-            # the shared scratch in place.
-            k_out[:, h] = self._dequantize_int4(k_packed, self._k_scales, 0, length, h)
-            v_out[:, h] = self._dequantize_int4(v_packed, self._v_scales, 0, length, h)
+            # Dequantize directly into the shared-scratch slice (no fresh
+            # [1,length,128] alloc per head — see _dequantize_int4 note).
+            self._dequantize_int4(k_packed, self._k_scales, 0, length, h, out=k_out[0, h])
+            self._dequantize_int4(v_packed, self._v_scales, 0, length, h, out=v_out[0, h])
         return k_out, v_out
 
     def get_cached_kv(self, length):

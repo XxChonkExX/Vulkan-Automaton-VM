@@ -58,7 +58,7 @@ GRAD_ACCUM_STEPS = int(os.environ.get("CHONK_GRAD_ACCUM", "4"))
 GRAD_CLIP_NORM = 1.0
 LOG_INTERVAL = 10
 SAVE_INTERVAL = int(os.environ.get("CHONK_SAVE_INTERVAL", "100"))
-KEEP_CHECKPOINTS = int(os.environ.get("CHONK_KEEP_CHECKPOINTS", "3"))
+KEEP_CHECKPOINTS = int(os.environ.get("CHONK_KEEP_CHECKPOINTS", "8"))
 
 CHONK_QUANT_BITS = int(os.environ.get("CHONK_QUANT_BITS", "4"))   # base weight quant
 CHONK_QUANT_GROUP = int(os.environ.get("CHONK_QUANT_GROUP", "128"))
@@ -433,9 +433,34 @@ def main():
                                         "scheduler": scheduler.state_dict(),
                                         "ema": ema.shadow, "step": step, "epoch": epoch},
                                        f"{sp}/training_state.pt")
+                            cur_loss = last_loss * GRAD_ACCUM_STEPS
                             with open(f"{sp}/.chonk_loss", "w") as f:
-                                f.write(f"{last_loss * GRAD_ACCUM_STEPS:.6f}")
-                            print(f"Checkpoint -> {sp} (loss={last_loss*GRAD_ACCUM_STEPS:.4f})", flush=True)
+                                f.write(f"{cur_loss:.6f}")
+                            print(f"Checkpoint -> {sp} (loss={cur_loss:.4f})", flush=True)
+                            # Persist the running BEST to a protected path so the
+                            # global-best adapter survives checkpoint trimming
+                            # (steps are loss-noisy; the per-step cleanup must not
+                            # delete the best model we ever saw).
+                            best_file = f"{OUT_DIR}/best_loss.txt"
+                            try:
+                                best_loss_so_far = float(open(best_file).read().strip())
+                            except (OSError, ValueError):
+                                best_loss_so_far = float("inf")
+                            if cur_loss < best_loss_so_far:
+                                best_dir = f"{OUT_DIR}/chonk_best"
+                                if os.path.exists(best_dir):
+                                    shutil.rmtree(best_dir, ignore_errors=True)
+                                os.makedirs(best_dir, exist_ok=True)
+                                model.save_pretrained(best_dir)
+                                torch.save({"step": step, "epoch": epoch, "loss": cur_loss,
+                                            "ema": ema.shadow},
+                                           f"{best_dir}/training_state.pt")
+                                with open(f"{best_dir}/.chonk_loss", "w") as f:
+                                    f.write(f"{cur_loss:.6f}")
+                                with open(best_file, "w") as f:
+                                    f.write(f"{cur_loss:.6f}")
+                                print(f"  [best] new best loss={cur_loss:.4f} "
+                                      f"-> {best_dir}", flush=True)
                             cleanup_checkpoints(OUT_DIR, KEEP_CHECKPOINTS)
                         if step % LOG_INTERVAL == 0:
                             ps = pool.stats()
