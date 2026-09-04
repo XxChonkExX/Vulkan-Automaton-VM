@@ -77,8 +77,13 @@ public:
         size_t freeBytes = 0;
         size_t capacityBytes = 0;
     };
-    Stats stats() const;
+Stats stats() const;
     size_t blockCount() const { return blocks_.size(); }
+
+    // Collect the counts/sizes of LIVE allocations, bucketed by size class
+    // (power-of-two), as comma-separated "size:count" pairs (descending). For
+    // diagnosing which transient is growing with sequence position.
+    void liveSizeHistogram(std::vector<std::pair<size_t, size_t>>& out) const;
 
     // Destroy every block via the provider and clear bookkeeping.
     void reset();

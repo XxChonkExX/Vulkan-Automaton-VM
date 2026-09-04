@@ -301,4 +301,15 @@ const char* vvm_torch_chonk_allocator_slab_stats() {
     return buf.c_str();
 }
 
+void vvm_torch_chonk_allocator_live_histogram(std::string& out) {
+    std::vector<std::pair<size_t, size_t>> hist;
+    core().liveSizeHistogram(hist);
+    out.clear();
+    char tmp[64];
+    for (const auto& kv : hist) {
+        snprintf(tmp, sizeof(tmp), "%zu:%zu ", kv.first, kv.second);
+        out += tmp;
+    }
+}
+
 }  // namespace vvm_torch

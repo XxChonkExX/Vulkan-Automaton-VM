@@ -173,6 +173,11 @@ PYBIND11_MODULE(vulkanvm_pool_test, m) {
     m.def("slab_stats", []() {
         return std::string(vvm_torch::vvm_torch_chonk_allocator_slab_stats());
     }, "compact slab accounting string for diagnostics");
+    m.def("live_histogram", []() {
+        std::string s;
+        vvm_torch::vvm_torch_chonk_allocator_live_histogram(s);
+        return s;
+    }, "slab live-allocation size histogram (sizeClass:count)");
     m.def("info", []() {
         if (!g_lastInitInfo) throw std::runtime_error("not initialized");
         return *g_lastInitInfo;

@@ -38,6 +38,11 @@ size_t vvm_torch_chonk_allocator_release_empty(size_t keepFloor);
 // reclaiming: how many blocks, how many are fully-free, liveBytes each.
 const char* vvm_torch_chonk_allocator_slab_stats();
 
+// Append the slab's LIVE-allocation size histogram as "sizeClass:count" pairs
+// (pooled into the caller's std::string, biggest first). Identifies the exact
+// size of the tensor(s) retained as sequence position grows.
+void vvm_torch_chonk_allocator_live_histogram(std::string& out);
+
 
 }  // namespace vvm_torch
 

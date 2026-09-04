@@ -37,6 +37,7 @@ from chonk import (
     install_chonk_allocator,
     release_empty_blocks,
     slab_stats,
+    live_histogram,
 )
 
 # ---- config knobs (env-overridable) ----
@@ -392,6 +393,8 @@ def main():
                           f"allocations={ps.get('allocationCount','?')} "
                           f"largestFree={ps.get('largestFreeBlock',0)/1e9:.2f}GB)",
                           flush=True)
+                    if chunks_this_seq in (8, 16, 32, 64, 128):
+                        print(f"    [hist] {live_histogram()}", flush=True)
 
                 # One optimizer step per GRAD_ACCUM_STEPS chunks (plus a partial
                 # step at block end for non-divisible configs). step/log/save

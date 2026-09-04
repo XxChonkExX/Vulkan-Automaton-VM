@@ -272,6 +272,23 @@ void Core::reset() {
     liveSizes_.clear();
 }
 
+void Core::liveSizeHistogram(std::vector<std::pair<size_t, size_t>>& out) const {
+    out.clear();
+    if (liveSizes_.empty()) return;
+    // bucket by power-of-two size class
+    std::unordered_map<size_t, size_t> buckets;
+    for (const auto& kv : liveSizes_) {
+        size_t sz = kv.second;
+        size_t cls = 512;
+        while (cls < sz) cls <<= 1;
+        buckets[cls] += 1;
+    }
+    out.reserve(buckets.size());
+    for (const auto& kv : buckets) out.push_back(kv);
+    std::sort(out.begin(), out.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+}
+
 }  // namespace slab
 }  // namespace vvm_torch
 

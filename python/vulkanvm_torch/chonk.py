@@ -331,6 +331,14 @@ def slab_stats():
         return "n/a"
 
 
+def live_histogram():
+    """Slab live-allocation size histogram (sizeClass:count), biggest first."""
+    try:
+        return pool_mod.live_histogram()
+    except Exception:
+        return "n/a"
+
+
 class ChonkFullLayer(StaticLayer):
     """Static full-attention cache layer whose keys/values live in Chonk
     Buffer pool memory. Writes in place and returns a view of only the
