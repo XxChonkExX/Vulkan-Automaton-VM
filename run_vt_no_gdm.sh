@@ -36,19 +36,14 @@ pkill -9 -f train_granite_chonk 2>/dev/null || true
 pkill -9 -f run_granite_long   2>/dev/null || true
 
 echo "=== [2/5] Disabling GDM autologin respawn, then stopping it ==="
-# One password prompt up-front; -v caches the credentials so the following
-# sudo calls run without re-prompting (the earlier version issued 4 separate
-# sudo invocations, each racing for a password the user couldn't type in time).
-if sudo -n true 2>/dev/null; then
-    SUDO="sudo -n"
-else
-    echo "  [sudo] enter your password ONCE now (credentials cached ~5 min)."
-    sudo -v || { echo "FATAL: sudo password required to stop GDM"; exit 1; }
-    SUDO="sudo -n"
-fi
-# mask defeats the autologin respawn so it stays down for the run.
-$SUDO systemctl mask gdm3 2>/dev/null || $SUDO systemctl mask gdm 2>/dev/null || true
-$SUDO systemctl stop gdm3   2>/dev/null || $SUDO systemctl stop gdm 2>/dev/null || true
+# Run mask+stop in a SINGLE sudo invocation so exactly one password prompt
+# happens (chained systemctl commands inside one sudo bash -c). No separate
+# sudo invocations, no racing prompts.
+echo "  [sudo] you will be prompted for your password ONCE (mask + stop gdm)."
+sudo bash -c '
+    systemctl mask gdm3 2>/dev/null || systemctl mask gdm 2>/dev/null || true
+    systemctl stop gdm3   2>/dev/null || systemctl stop gdm 2>/dev/null || true
+' || { echo "FATAL: sudo failed (wrong password?) — GDM not stopped"; }
 
 sleep 3
 echo "--- remaining graphical/GPU consumers (should be empty / minimal) ---"
@@ -80,4 +75,4 @@ echo "=== [5/5] Done ==="
 echo "Monitor with:  tail -f $LOG"
 echo
 echo "To restore the desktop when done training:"
-echo "  $SUDO systemctl unmask gdm3 && $SUDO systemctl start gdm3"
+echo "  sudo systemctl unmask gdm3 && sudo systemctl start gdm3"
