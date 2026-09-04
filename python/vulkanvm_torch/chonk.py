@@ -551,7 +551,14 @@ class ChonkFullLayer(StaticLayer):
         if self._quantize:
             ks = key_states.to(self._compute_dtype)
             vs = value_states.to(self._compute_dtype)
-            self._write_quantized(ks, vs, start, kv_length)
+            # Write the INT4 cache from DETACHED copies: the cache is frozen
+            # bookkeeping (read back via dequant, never differentiated). Running
+            # _write_quantized on grad-tracked ks/vs recorded every per-head
+            # [1,512,128] intermediate (k_h/k_quant/k_packed/v_*) in the autograd
+            # graph, and those 128KB slices accumulated across all chunks of a
+            # block (64 layers x 8 heads x 2 x chunks) = the +0.54GB/chunk
+            # ratchet the histogram caught (131072-byte class doubling with kc).
+            self._write_quantized(ks.detach(), vs.detach(), start, kv_length)
         else:
             ks = key_states.to(self.keys.dtype)
             vs = value_states.to(self.values.dtype)
