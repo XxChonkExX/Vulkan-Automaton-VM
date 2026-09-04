@@ -420,8 +420,9 @@ class ChonkFullLayer(StaticLayer):
         x (fwd+bwd) — the ~1MB/token (+0.55GB/chunk) residual ratchet that
         survived the activation-checkpointing fix. Writing straight into the
         caller's scratch view keeps the dequant allocation O(1) in the prefix
-        length. The uint8 staging buffer (128 bytes/token) is the only transient
-        and is fixed per head."""
+        length. The uint8 staging buffer is reused from a fixed class-level
+        pool (no per-call [length,128] alloc either — the 64KB size class that
+        the histogram still showed doubling with kc)."""
         with torch.no_grad():
             if packed.numel() == 0:
                 if out is not None:
@@ -432,12 +433,13 @@ class ChonkFullLayer(StaticLayer):
             if out is None:
                 out = torch.empty(1, length_dim, head_dim2, dtype=torch.bfloat16,
                                   device=packed.device)
-            # Only transient: a [length, head_dim] uint8 staging buffer.
-            stage = torch.empty(length_dim, head_dim2, dtype=torch.uint8,
-                                device=packed.device)
-            stage[:, 0::2] = (packed.view(length_dim, -1) & 0xF)
-            stage[:, 1::2] = ((packed.view(length_dim, -1) >> 4) & 0xF)
-            stage_i8 = stage.view(torch.int8)
+            # Reused fixed staging buffer (max prefix length), instead of a
+            # fresh [length,128] uint8 per head per call.
+            stage = ChonkFullLayer._get_stage(packed.device)
+            st = stage[:length_dim, :head_dim2]
+            st[:, 0::2] = (packed.view(length_dim, -1) & 0xF)
+            st[:, 1::2] = ((packed.view(length_dim, -1) >> 4) & 0xF)
+            stage_i8 = st.view(torch.int8)
             stage_i8 -= (stage_i8 >= 8).to(torch.int8) * 16
             scale = scales[start_pos:start_pos + length, head_idx].view(length_dim, 1)
             out_flat = out.reshape(length_dim, head_dim2)
@@ -489,6 +491,15 @@ class ChonkFullLayer(StaticLayer):
     # sequentially by forward, backward, and every layer — keeps the pool flat.
     _shared_dequant_k = None
     _shared_dequant_v = None
+    _shared_stage = None
+
+    @classmethod
+    def _get_stage(cls, device):
+        base = ChonkFullLayer
+        n = cls._scratch_maxlen * cls._scratch_D
+        if base._shared_stage is None or base._shared_stage.device != torch.device(device):
+            base._shared_stage = torch.empty(n, dtype=torch.uint8, device=device)
+        return base._shared_stage.view(cls._scratch_maxlen, cls._scratch_D)
 
     @classmethod
     def _shared_scratch(cls, device):

@@ -187,21 +187,21 @@ def patch_eager_attention_recompute(model, kv_cache):
 
 
 def enable_projection_checkpointing(model):
-    """Recompute (not store) the per-layer projection intermediates.
+    """Recompute (not store) the MLP gate/up/SiLU/down intermediates.
 
-    Checkpoints BOTH the MLP (gate/up/SiLU/down) AND the attention projections
-    (q/k/v/o_proj). These are all PURE Linears (LoRA-wrapped around a frozen
-    INT4-quantized base, no side effects), so wrapping each with
-    torch.utils.checkpoint is safe and drops the [1,512,4096] hidden-state and
-    [1,512,*] query/key/value activations that otherwise live for the whole
-    chunk until backward — the ~4MB/layer x 64 layers residual retention the
-    live-size histogram caught after the MLP-only checkpoint (4194304-byte
-    class still climbing).
+    The MLP is a PURE function of its input (no KV-cache side effect), so it is
+    safe to wrap with torch.utils.checkpoint: the gate/up/down activations
+    ([1,512,32768] bf16 each) are ~32MB per projection x3 x64 layers ~= 6GB of
+    kc-independent transient. Recomputing in backward cuts that peak without
+    touching the attention (which owns the KV cache update side effect).
 
-    The cache update() side effect lives in GraniteAttention.forward OUTSIDE the
-    projections, so it is untouched and does NOT re-run on the recompute pass.
+    NOTE: we deliberately checkpoint ONLY the MLP. Checkpointing the q/k/v/o
+    attention projections was measured as a NET LOSS: each projection's OUTPUT
+    is small (~4MB) but use_reentrant=False saves its INPUT (the [1,512,4096]
+    hidden state) 7x per layer, retaining ~28MB/layer extra — the pool went UP
+    ~5GB at the same chunk depths. Skip them.
 
-    We deliberately do NOT use transformers'
+    We also deliberately do NOT use transformers'
     gradient_checkpointing_enable(), which checkpoints the whole decoder layer
     INCLUDING self_attn -> the KV cache update() side effect re-runs during the
     recompute pass and corrupts the external KV cache.
@@ -214,28 +214,21 @@ def enable_projection_checkpointing(model):
         return checked
 
     base = model.get_base_model() if hasattr(model, "get_base_model") else model
-    n_proj = 0
+    n = 0
     for layer in base.model.layers:
-        attn = getattr(layer, "self_attn", None)
         mlp = getattr(layer, "mlp", None)
-        for mod in (getattr(attn, "q_proj", None),
-                    getattr(attn, "k_proj", None),
-                    getattr(attn, "v_proj", None),
-                    getattr(attn, "o_proj", None),
-                    getattr(mlp, "gate_proj", None),
-                    getattr(mlp, "up_proj", None),
-                    getattr(mlp, "down_proj", None)):
-            if mod is None or not hasattr(mod, "forward"):
-                continue
-            if getattr(mod, "_chonk_checked", False):
+        if mlp is None:
+            continue
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            mod = getattr(mlp, name, None)
+            if mod is None or getattr(mod, "_chonk_checked", False):
                 continue
             orig = mod.forward
             mod.forward = make_checked(orig)
             mod._chonk_checked = True
-            n_proj += 1
-    print(f"[+] projection gradient checkpointing enabled on {n_proj} modules "
-          f"(q/k/v/o + gate/up/down; recompute instead of store -> ~12GB+ "
-          f"kc-independent transient removed)")
+            n += 1
+    print(f"[+] MLP gradient checkpointing enabled on {n} projections "
+          f"(gate/up/down; ~6GB+ kc-independent transient removed)")
 
 
 def train_step(model, chunk_ids, kv_cache, chunk_start, chunk_end):
