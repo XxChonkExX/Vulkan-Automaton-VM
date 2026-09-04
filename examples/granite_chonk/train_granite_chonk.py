@@ -190,21 +190,19 @@ def enable_projection_checkpointing(model):
     """Recompute (not store) the MLP gate/up/SiLU/down intermediates.
 
     The MLP is a PURE function of its input (no KV-cache side effect), so it is
-    safe to wrap with torch.utils.checkpoint: the gate/up/down activations
-    ([1,512,32768] bf16 each) are ~32MB per projection x3 x64 layers ~= 6GB of
-    kc-independent transient. Recomputing in backward cuts that peak without
-    touching the attention (which owns the KV cache update side effect).
+    safe to wrap WHOLE mlp.forward with torch.utils.checkpoint: the gate/up/down
+    activations ([1,512,32768] bf16 each ~= 32MB) are recomputed in backward
+    instead of stored, cutting ~6GB of kc-independent transient.
 
-    NOTE: we deliberately checkpoint ONLY the MLP. Checkpointing the q/k/v/o
-    attention projections was measured as a NET LOSS: each projection's OUTPUT
-    is small (~4MB) but use_reentrant=False saves its INPUT (the [1,512,4096]
-    hidden state) 7x per layer, retaining ~28MB/layer extra — the pool went UP
-    ~5GB at the same chunk depths. Skip them.
+    IMPORTANT: checkpoint the WHOLE mlp.forward, NOT each projection separately.
+    Per-projection checkpointing (192 units) saves 3 inputs per layer and leaves
+    the 32MB gate/up OUTPUT activations materialized BETWEEN the checkpoints,
+    so the peak went UP ~8GB (chunk-1 baseline 49.95 -> 58.00GB). One unit per
+    layer (64) recomputes the whole MLP, so no 32MB intermediate is ever stored.
 
-    We also deliberately do NOT use transformers'
-    gradient_checkpointing_enable(), which checkpoints the whole decoder layer
-    INCLUDING self_attn -> the KV cache update() side effect re-runs during the
-    recompute pass and corrupts the external KV cache.
+    We deliberately do NOT use transformers' gradient_checkpointing_enable(),
+    which checkpoints the whole decoder layer INCLUDING self_attn -> the KV
+    cache update() side effect re-runs during recompute and corrupts the cache.
     """
     import torch.utils.checkpoint as ckpt
 
@@ -217,18 +215,14 @@ def enable_projection_checkpointing(model):
     n = 0
     for layer in base.model.layers:
         mlp = getattr(layer, "mlp", None)
-        if mlp is None:
+        if mlp is None or getattr(mlp, "_chonk_checked", False):
             continue
-        for name in ("gate_proj", "up_proj", "down_proj"):
-            mod = getattr(mlp, name, None)
-            if mod is None or getattr(mod, "_chonk_checked", False):
-                continue
-            orig = mod.forward
-            mod.forward = make_checked(orig)
-            mod._chonk_checked = True
-            n += 1
-    print(f"[+] MLP gradient checkpointing enabled on {n} projections "
-          f"(gate/up/down; ~6GB+ kc-independent transient removed)")
+        orig = mlp.forward
+        mlp.forward = make_checked(orig)
+        mlp._chonk_checked = True
+        n += 1
+    print(f"[+] MLP gradient checkpointing enabled on {n} layers "
+          f"(whole-mlp recompute; ~6GB kc-independent transient removed)")
 
 
 def train_step(model, chunk_ids, kv_cache, chunk_start, chunk_end):
