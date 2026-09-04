@@ -74,6 +74,7 @@ CHONK_EMA_UPDATE_EVERY = int(os.environ.get("CHONK_EMA_UPDATE_EVERY", "1"))
 CHONK_SUBSAMPLE = float(os.environ.get("CHONK_SUBSAMPLE", "1.0"))
 CHONK_EPOCHS = int(os.environ.get("CHONK_EPOCHS", "1"))
 CHONK_SMOKE = os.environ.get("CHONK_SMOKE", "0") == "1"
+CHONK_GRADIENT_CHECKPOINT = os.environ.get("CHONK_GRADIENT_CHECKPOINT", "1") == "1"
 
 if CHONK_SMOKE:
     SEQ_LEN = int(os.environ.get("CHONK_SMOKE_SEQ", "2048"))
@@ -184,6 +185,42 @@ def patch_eager_attention_recompute(model, kv_cache):
     m.patch_granite_attention_recompute(model, kv_cache)
 
 
+def enable_mlp_checkpointing(model):
+    """Recompute (not store) the MLP gate/up/SiLU/down intermediates.
+
+    The MLP is a PURE function of its input (no KV-cache side effect), so it is
+    safe to wrap with torch.utils.checkpoint: the ~gate/up/down activations
+    ([1,512,32768] bf16 each) are ~32MB per projection x3-4 per layer x64
+    layers ~= 8GB of kc-independent transient that currently lives for the
+    whole chunk until backward. Recomputing in backward cuts that ~8GB of peak
+    resident memory without touching the attention path (which owns the KV
+    cache update side effect and MUST NOT be checkpointed).
+
+    NOTE: we deliberately do NOT use transformers'
+    gradient_checkpointing_enable(), which checkpoints the whole decoder layer
+    INCLUDING self_attn -> the KV cache update() side effect re-runs during the
+    recompute pass and corrupts the external KV cache.
+    """
+    import torch.utils.checkpoint as ckpt
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    n = 0
+    for layer in base.model.layers:
+        mlp = getattr(layer, "mlp", None)
+        if mlp is None:
+            continue
+        orig = mlp.forward
+
+        def make_checked(orig_fn):
+            def checked(x):
+                return ckpt.checkpoint(orig_fn, x, use_reentrant=False)
+            return checked
+
+        mlp.forward = make_checked(orig)
+        n += 1
+    print(f"[+] MLP gradient checkpointing enabled on {n} layers "
+          f"(recompute gate/up/down; ~8GB+ peak transient removed)")
+
+
 def train_step(model, chunk_ids, kv_cache, chunk_start, chunk_end):
     cp = torch.arange(chunk_start, chunk_end, device="cuda")
     outputs = model(input_ids=chunk_ids, past_key_values=kv_cache,
@@ -249,6 +286,8 @@ def main():
     patch_linear_cache_for_chunked_training()
     if CHONK_ATTN == "eager" and CHONK_ATTN_RECOMPUTE:
         patch_eager_attention_recompute(model, kv_cache)
+    if CHONK_GRADIENT_CHECKPOINT:
+        enable_mlp_checkpointing(model)
 
     optimizer = ChonkAdamW([p for p in model.parameters() if p.requires_grad],
                            optimizer_states, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
