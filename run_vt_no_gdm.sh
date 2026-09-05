@@ -68,7 +68,8 @@ mkdir -p "$(dirname "$LOG")"
 # systemd-run puts the wrapper outside the session cgroup so stopping GDM
 # cannot kill it. Fall back to setsid+nohup if systemd-run is unavailable.
 if command -v systemd-run >/dev/null 2>&1; then
-    nohup systemd-run --scope --unit=chonk-train bash "$WRAP" >> "$LOG" 2>&1 </dev/null &
+    # --collect so a stale scope from an earlier attempt can't block startup.
+    nohup systemd-run --scope --collect --unit=chonk-train bash "$WRAP" >> "$LOG" 2>&1 </dev/null &
 else
     nohup setsid bash "$WRAP" >> "$LOG" 2>&1 </dev/null &
 fi
