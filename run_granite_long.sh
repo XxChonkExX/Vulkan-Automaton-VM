@@ -48,7 +48,7 @@ while true; do
     echo "[$(date)] Starting training (resume=${CHONK_RESUME_DIR:-none})" >> $LOG
     # Filter the per-allocation [INFO] allocateDedicatedExportable spam (the
     # 49MB log is ~90% these lines); [ERROR]/heartbeat/checkpoint lines pass.
-    cd "$REPO" && /home/chonke/venv-ds4/bin/python "$REPO/examples/granite_chonk/train_granite_chonk.py" 2>&1 | grep -av '^\[INFO\] allocateDedicatedExportable' >> $LOG 2>&1
+    cd "$REPO" && /home/chonke/venv-ds4/bin/python "$REPO/examples/granite_chonk/train_granite_chonk.py" 2>&1 | grep -av --line-buffered '^\[INFO\] allocateDedicatedExportable' >> $LOG 2>&1
     EXIT_CODE=${PIPESTATUS[0]}
     echo "[$(date)] Exit code $EXIT_CODE" >> $LOG
     # If completed (final saved), break
