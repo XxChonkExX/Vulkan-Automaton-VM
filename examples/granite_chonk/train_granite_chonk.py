@@ -76,6 +76,8 @@ CHONK_SUBSAMPLE = float(os.environ.get("CHONK_SUBSAMPLE", "1.0"))
 CHONK_EPOCHS = int(os.environ.get("CHONK_EPOCHS", "1"))
 CHONK_SMOKE = os.environ.get("CHONK_SMOKE", "0") == "1"
 CHONK_GRADIENT_CHECKPOINT = os.environ.get("CHONK_GRADIENT_CHECKPOINT", "1") == "1"
+CHONK_TENSOR_CENSUS = os.environ.get("CHONK_TENSOR_CENSUS", "0") == "1"
+CHONK_CENSUS_PATH = os.environ.get("CHONK_CENSUS_PATH", "")
 
 if CHONK_SMOKE:
     SEQ_LEN = int(os.environ.get("CHONK_SMOKE_SEQ", "2048"))
@@ -223,6 +225,71 @@ def enable_projection_checkpointing(model):
         n += 1
     print(f"[+] MLP gradient checkpointing enabled on {n} layers "
           f"(whole-mlp recompute; ~6GB kc-independent transient removed)")
+
+
+def dump_tensor_census(tag, path):
+    """Census of live CUDA tensor wrappers: who holds the retained bytes?
+
+    Groups python-side torch.Tensor objects by (size bucket, grad state) and,
+    for the suspect buckets (4MB/64KB/1KB/512B), samples referrers to NAME the
+    holder (module attr vs autograd node vs list). Read-only; costs one gc walk
+    (~seconds). The slab histogram shows sizes; this shows owners.
+    """
+    import gc
+    from collections import Counter
+    buckets = {}
+    try:
+        objs = gc.get_objects()
+    except Exception as e:
+        with open(path, "a") as f:
+            f.write(f"[{tag}] gc walk failed: {e}\n")
+        return
+    for o in objs:
+        try:
+            if not isinstance(o, torch.Tensor):
+                continue
+            if o.device.type != "cuda":
+                continue
+            n = o.numel() * o.element_size()
+        except Exception:
+            continue
+        c = 512
+        while c < n:
+            c <<= 1
+        b = buckets.setdefault(c, {"n": 0, "bytes": 0, "req_grad": 0,
+                                   "has_grad_fn": 0, "refkinds": Counter(),
+                                   "samples": []})
+        b["n"] += 1
+        b["bytes"] += n
+        try:
+            if o.requires_grad:
+                b["req_grad"] += 1
+            if o.grad_fn is not None:
+                b["has_grad_fn"] += 1
+        except Exception:
+            pass
+        if len(b["samples"]) < 3:
+            kinds = Counter()
+            try:
+                for r in gc.get_referrers(o):
+                    t = type(r).__name__
+                    if t == "frame":
+                        continue
+                    kinds[t] += 1
+            except Exception:
+                pass
+            b["samples"].append(dict(kinds))
+    try:
+        with open(path, "a") as f:
+            f.write(f"[{tag}] cuda tensor census:\n")
+            for c in sorted(buckets, reverse=True)[:14]:
+                b = buckets[c]
+                f.write(f"  size~{c}: n={b['n']} bytes={b['bytes']/1e6:.1f}MB "
+                        f"req_grad={b['req_grad']} grad_fn={b['has_grad_fn']}\n")
+                for s in b["samples"]:
+                    f.write(f"    holders={s}\n")
+    except Exception:
+        pass
 
 
 def train_step(model, chunk_ids, kv_cache, chunk_start, chunk_end):
@@ -470,6 +537,11 @@ def main():
                           flush=True)
                     if chunks_this_seq in (8, 16, 32, 64, 128):
                         print(f"    [hist] {live_histogram()}", flush=True)
+                        if CHONK_TENSOR_CENSUS:
+                            dump_tensor_census(
+                                f"chunk{chunks_this_seq}",
+                                CHONK_CENSUS_PATH or os.path.join(OUT_DIR, "tensor_census.log"))
+                            print(f"    [census] dumped chunk{chunks_this_seq}", flush=True)
 
                 # One optimizer step per GRAD_ACCUM_STEPS chunks (plus a partial
                 # step at block end for non-divisible configs). step/log/save
