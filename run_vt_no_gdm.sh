@@ -1,23 +1,25 @@
 #!/usr/bin/env bash
-# run_vt_no_gdm.sh — FREE the iGPU device-local heap, THEN launch training.
+# run_vt_no_gdm.sh — stop the display server, THEN launch training detached.
 #
-# Confirmed root cause of the Exit-137 wall: the GDM/Wayland/gnome-shell
-# session (auto-login) keeps running and consumes the 91.4 GiB device-local
-# heap that every dedicated-exportable slab block lands in. Vulkan then hits
-# VK_ERROR_OUT_OF_DEVICE_MEMORY at ~59-90GB of pool usage.
+# Why: under sustained iGPU compute the display driver resets and the box
+# drops to the boot/login screen, killing the run. Training from a text VT
+# with GDM stopped removes the compositor from the GPU so the driver stays
+# up. (Memory pressure from the desktop session is a secondary benefit.)
 #
-# The PREVIOUS version of this script had a fatal flaw: running
-# `sudo systemctl stop gdm3` from a VT still tore down the caller's session
-# (GDM restarts via autologin), killing the script before it could launch
-# training. This version decouples the two:
-#   1. stopping GDM is done via `systemctl stop` (mask first to defeat
-#      autologin respawn during the run);
-#   2. the training wrapper is launched detached via systemd-run so it is NOT
-#      a child of the (dying) GDM session and survives the teardown.
+# Design: mask defeats autologin respawn; the wrapper launches detached via
+# systemd-run so it survives the GDM teardown. No password prompts at launch:
+# systemctl mask/stop/unmask/start gdm are passwordless via the
+# chonk-gdm.sudoers drop-in (one-time install, see below).
 #
+# ------------------------------------------------------- ONE-TIME SETUP ---
+# Run ONCE from any terminal (one password prompt, no hurry):
+#   sudo install -m 440 /home/chonke/Vulkan-Automaton-VM/chonk-gdm.sudoers \
+#       /etc/sudoers.d/chonk-gdm && sudo visudo -c
 # ---------------------------------------------------------------- USAGE ---
 #   Ctrl+Alt+F3  -> log in as chonke (text console)
-#   /home/chonke/Vulkan-Automaton-VM/run_vt_no_gdm.sh
+#   /home/chonke/Vulkan-Automaton-VM/run_vt_no_gdm.sh     # no password asked
+#   ...training runs headless; desktop (incl. this chat) stays down until:
+#   sudo -n systemctl unmask gdm3 && sudo -n systemctl start gdm3
 # ----------------------------------------------------------------
 
 set -uo pipefail
@@ -36,14 +38,16 @@ pkill -9 -f train_granite_chonk 2>/dev/null || true
 pkill -9 -f run_granite_long   2>/dev/null || true
 
 echo "=== [2/5] Disabling GDM autologin respawn, then stopping it ==="
-# Run mask+stop in a SINGLE sudo invocation so exactly one password prompt
-# happens (chained systemctl commands inside one sudo bash -c). No separate
-# sudo invocations, no racing prompts.
-echo "  [sudo] you will be prompted for your password ONCE (mask + stop gdm)."
-sudo bash -c '
-    systemctl mask gdm3 2>/dev/null || systemctl mask gdm 2>/dev/null || true
-    systemctl stop gdm3   2>/dev/null || systemctl stop gdm 2>/dev/null || true
-' || { echo "FATAL: sudo failed (wrong password?) — GDM not stopped"; }
+# Passwordless via the chonk-gdm.sudoers drop-in (see header). sudo -n never
+# prompts: if the drop-in is missing this fails fast with a clear message
+# instead of racing a password prompt.
+if ! sudo -n systemctl mask gdm3 2>/dev/null && ! sudo -n systemctl mask gdm 2>/dev/null; then
+    echo "FATAL: passwordless sudo for systemctl is not installed."
+    echo "  Run once (one password prompt, no hurry):"
+    echo "    sudo install -m 440 $REPO/chonk-gdm.sudoers /etc/sudoers.d/chonk-gdm && sudo visudo -c"
+    exit 1
+fi
+sudo -n systemctl stop gdm3 2>/dev/null || sudo -n systemctl stop gdm 2>/dev/null || true
 
 sleep 3
 echo "--- remaining graphical/GPU consumers (should be empty / minimal) ---"
@@ -74,5 +78,5 @@ echo "wrapper: $(pgrep -af 'run_granite_long' | grep -v grep | head -1)"
 echo "=== [5/5] Done ==="
 echo "Monitor with:  tail -f $LOG"
 echo
-echo "To restore the desktop when done training:"
-echo "  sudo systemctl unmask gdm3 && sudo systemctl start gdm3"
+echo "To restore the desktop when done training (no password needed):"
+echo "  sudo -n systemctl unmask gdm3 && sudo -n systemctl start gdm3"

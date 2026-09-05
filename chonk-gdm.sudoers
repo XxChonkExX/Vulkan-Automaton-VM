@@ -1,0 +1,8 @@
+# chonk-gdm.sudoers — passwordless systemctl for the GDM-free training VT.
+#
+# Install ONCE (type your password once, no time pressure):
+#   sudo install -m 440 /home/chonke/Vulkan-Automaton-VM/chonk-gdm.sudoers /etc/sudoers.d/chonk-gdm && sudo visudo -c
+#
+# Effect: user chonke may mask/stop/unmask/start gdm3 (or gdm) with NO password,
+# so run_vt_no_gdm.sh never prompts. Nothing else is passwordless.
+chonke ALL=(root) NOPASSWD: /usr/bin/systemctl mask gdm3, /usr/bin/systemctl stop gdm3, /usr/bin/systemctl unmask gdm3, /usr/bin/systemctl start gdm3, /usr/bin/systemctl mask gdm, /usr/bin/systemctl stop gdm, /usr/bin/systemctl unmask gdm, /usr/bin/systemctl start gdm
