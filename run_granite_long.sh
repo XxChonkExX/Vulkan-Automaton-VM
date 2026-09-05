@@ -5,6 +5,10 @@ export HIPBLASLT_TENSILE_LIBPATH=/opt/rocm-7.1.0/lib/hipblaslt/library
 REPO="/home/chonke/Vulkan-Automaton-VM"
 OUT_DIR="$REPO/examples/granite_chonk/out/granite-finetuned"
 LOG="/home/chonke/Documents/train_granite.log"
+# Single-instance guard: two wrappers = two trainers = 2x memory (OOM) plus
+# checkpoint races on the same chonk_step_* dirs. Refuse a second instance.
+exec 9>"$REPO/.train_wrapper.lock"
+if ! flock -n 9; then echo "[$(date)] wrapper already running; refusing second instance" >> $LOG; exit 0; fi
 export PYTORCH_HIP_ALLOC_CONF="expandable_segments:True,garbage_collection_threshold:0.4"
 export PYTORCH_ALLOC_CONF="expandable_segments:True,garbage_collection_threshold:0.4"
 export CHONK_MAX_HEAP_FRACTION=0.94
@@ -42,8 +46,10 @@ while true; do
         unset CHONK_RESUME_DIR
     fi
     echo "[$(date)] Starting training (resume=${CHONK_RESUME_DIR:-none})" >> $LOG
-    cd "$REPO" && /home/chonke/venv-ds4/bin/python "$REPO/examples/granite_chonk/train_granite_chonk.py" >> $LOG 2>&1
-    EXIT_CODE=$?
+    # Filter the per-allocation [INFO] allocateDedicatedExportable spam (the
+    # 49MB log is ~90% these lines); [ERROR]/heartbeat/checkpoint lines pass.
+    cd "$REPO" && /home/chonke/venv-ds4/bin/python "$REPO/examples/granite_chonk/train_granite_chonk.py" 2>&1 | grep -av '^\[INFO\] allocateDedicatedExportable' >> $LOG 2>&1
+    EXIT_CODE=${PIPESTATUS[0]}
     echo "[$(date)] Exit code $EXIT_CODE" >> $LOG
     # If completed (final saved), break
     if [ -d "$OUT_DIR/chonk_final" ]; then break; fi

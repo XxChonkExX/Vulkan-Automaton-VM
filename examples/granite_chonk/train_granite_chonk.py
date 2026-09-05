@@ -239,7 +239,7 @@ def train_step(model, chunk_ids, kv_cache, chunk_start, chunk_end):
     return loss, outputs
 
 
-def cleanup_checkpoints(out_dir, keep=3):
+def cleanup_checkpoints(out_dir, keep=8):
     import glob
     steps = sorted(int(os.path.basename(p)[len("chonk_step_"):])
                    for p in glob.glob(f"{out_dir}/chonk_step_*"))
@@ -253,10 +253,14 @@ def cleanup_checkpoints(out_dir, keep=3):
                 best_loss, best = l, s
         except (OSError, ValueError):
             continue
-    protected = {max(steps), min(steps[-2:], default=None), best}
-    protected.discard(None)
+    # Keep the newest `keep` checkpoints plus the best-seen one. (The old
+    # code kept only {max, second-last, best} regardless of `keep`.)
+    # chonk_best/ and best_loss.txt are separate paths, never touched here.
+    keep_set = set(steps[-keep:])
+    if best is not None:
+        keep_set.add(best)
     for s in steps:
-        if s not in protected:
+        if s not in keep_set:
             shutil.rmtree(f"{out_dir}/chonk_step_{s}", ignore_errors=True)
 
 
@@ -328,12 +332,31 @@ def main():
             ck = torch.load(st, map_location="cpu")
             optimizer.load_state_dict(ck["optimizer"])
             scheduler.load_state_dict(ck["scheduler"])
+            # ChonkAdamW keeps its own step counter for bias correction; the
+            # default Optimizer state_dict does not persist custom attrs, so
+            # restore it explicitly (else bc1/bc2 restart at 1 after resume).
+            if "adam_step_count" in ck:
+                try:
+                    optimizer.step_count = int(ck["adam_step_count"])
+                except (TypeError, ValueError):
+                    pass
             # map_location="cpu" leaves the EMA shadow on CPU; move every
             # shadow tensor back to its param's device (else ema.update()
             # crashes mixing cuda params with cpu shadow at the first step).
             _ref = next(p.data for p in model.parameters() if p.requires_grad)
             ema.shadow = {n: s.to(_ref.device) for n, s in ck["ema"].items()}
             resume_step, resume_epoch = ck["step"], ck["epoch"]
+            # Snap mid-block resumes to the block boundary. Steps advance one
+            # per GRAD_ACCUM_STEPS chunks and blocks are trained whole; a
+            # mid-block resume would re-train the block prefix while the step
+            # counter advances (duplicate data, confusing loss). Flooring costs
+            # at most GRAD_ACCUM_STEPS-1 steps of re-training; the loaded
+            # scheduler/optimizer states stay as-is (a few-step offset over
+            # 11k steps is immaterial).
+            if opt_steps_per_block > 0 and resume_step % opt_steps_per_block != 0:
+                floored = (resume_step // opt_steps_per_block) * opt_steps_per_block
+                print(f"[Resume] snapping step {resume_step} -> {floored} (block boundary)")
+                resume_step = floored
 
     step = resume_step
     model.train()
@@ -362,6 +385,10 @@ def main():
             reset_chonk_cache(kv_cache)
             chunks_this_seq = 0
             skip_step = False
+            # Accumulation-window loss (unscaled sum + chunk count). Checkpoint
+            # / best / log values use the window MEAN, not the last chunk.
+            window_loss_sum = 0.0
+            window_loss_n = 0
             for chunk_start in range(0, SEQ_LEN, CHUNK_SIZE):
                 chunk_end = min(chunk_start + CHUNK_SIZE, SEQ_LEN)
                 chunk_ids = input_ids[:, chunk_start:chunk_end]
@@ -377,6 +404,8 @@ def main():
                         print("  [NaN] skipping chunk"); optimizer.zero_grad()
                         del loss, outputs; torch.cuda.empty_cache(); skip_step = True
                     else:
+                        window_loss_sum += last_loss * GRAD_ACCUM_STEPS
+                        window_loss_n += 1
                         del loss, outputs
                 chunks_this_seq += 1
                 torch.cuda.empty_cache()
@@ -408,14 +437,25 @@ def main():
                         print(f"  [skip opt step {step} — NaN chunk in window]", flush=True)
                         optimizer.zero_grad(); torch.cuda.empty_cache()
                         skip_step = False
+                        window_loss_sum = 0.0
+                        window_loss_n = 0
                     else:
                         if GRAD_CLIP_NORM > 0:
                             gn = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
                             if gn != gn:
                                 print(f"  [NaN grad] skip step {step}", flush=True)
                                 optimizer.zero_grad(); torch.cuda.empty_cache()
+                                window_loss_sum = 0.0
+                                window_loss_n = 0
                                 continue
                         optimizer.step(); scheduler.step(); optimizer.zero_grad()
+                        # Window-mean loss for checkpoint/best/log (stable across
+                        # noisy per-chunk values). Falls back to the last chunk
+                        # if the window is somehow empty.
+                        window_loss = (window_loss_sum / window_loss_n
+                                       if window_loss_n > 0 else last_loss * GRAD_ACCUM_STEPS)
+                        window_loss_sum = 0.0
+                        window_loss_n = 0
                         # Reclaim fully-free slab blocks to the pool at each
                         # optimizer step. The +2-GiB-every-4-chunks steps come
                         # from slab blocks acquired for kc-growing transients
@@ -437,9 +477,10 @@ def main():
                             model.save_pretrained(sp)
                             torch.save({"optimizer": optimizer.state_dict(),
                                         "scheduler": scheduler.state_dict(),
-                                        "ema": ema.shadow, "step": step, "epoch": epoch},
+                                        "ema": ema.shadow, "step": step, "epoch": epoch,
+                                        "adam_step_count": optimizer.step_count},
                                        f"{sp}/training_state.pt")
-                            cur_loss = last_loss * GRAD_ACCUM_STEPS
+                            cur_loss = float(window_loss)
                             with open(f"{sp}/.chonk_loss", "w") as f:
                                 f.write(f"{cur_loss:.6f}")
                             print(f"Checkpoint -> {sp} (loss={cur_loss:.4f})", flush=True)
@@ -470,7 +511,7 @@ def main():
                             cleanup_checkpoints(OUT_DIR, KEEP_CHECKPOINTS)
                         if step % LOG_INTERVAL == 0:
                             ps = pool.stats()
-                            print(f"Step {step}: loss={last_loss*GRAD_ACCUM_STEPS:.4f} "
+                            print(f"Step {step}: loss={float(window_loss):.4f} "
                                   f"lr={scheduler.get_last_lr()[0]:.2e} "
                                   f"pool={ps['totalUsed']/1e9:.2f}GB", flush=True)
                         step += 1
