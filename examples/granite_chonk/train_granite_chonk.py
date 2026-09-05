@@ -265,6 +265,25 @@ def cleanup_checkpoints(out_dir, keep=8):
 
 
 def main():
+    # Process-level single-instance guard. The wrapper flock only covers
+    # wrapper-vs-wrapper; a direct `python train_granite_chonk.py` (experiments,
+    # VT launches) would otherwise run a second 30B trainer alongside
+    # production -> instant OOM + session kill. Uses its OWN lock file: it must
+    # differ from the wrapper's, because flock descriptions conflict even
+    # across parent/child sharing an inherited fd (the trainer would refuse
+    # against its own wrapper). Held for process lifetime; the kernel releases
+    # it on death (no staleness).
+    global _train_lock_fh
+    try:
+        import fcntl
+        _lock_path = os.path.abspath(os.path.join(
+            os.path.dirname(__file__), "..", "..", ".train_process.lock"))
+        _train_lock_fh = open(_lock_path, "w")
+        fcntl.flock(_train_lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("[guard] another training process is already running; refusing "
+              "a second instance (two trainers = OOM).", flush=True)
+        sys.exit(0)
     print("=" * 60)
     print("Granite 30B QLoRA — Chonk Buffer Training")
     print("=" * 60)
