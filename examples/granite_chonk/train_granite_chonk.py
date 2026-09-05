@@ -322,14 +322,38 @@ def main():
     resume_step = resume_epoch = 0
     if RESUME_DIR:
         print(f"\n[Resume] {RESUME_DIR}")
-        adapter = os.path.join(RESUME_DIR, "adapter_model.safetensors")
-        if os.path.exists(adapter):
-            from safetensors.torch import load_file
-            from peft import set_peft_model_state_dict
-            set_peft_model_state_dict(model, load_file(adapter, device="cpu"))
-        st = os.path.join(RESUME_DIR, "training_state.pt")
-        if os.path.exists(st):
-            ck = torch.load(st, map_location="cpu")
+        # Try newest-first across checkpoint dirs so a torn write (crash
+        # mid-save leaves a partial training_state.pt) falls back to the
+        # previous valid checkpoint instead of crash-looping the wrapper.
+        import glob as _glob
+        _cands = sorted(
+            (p for p in _glob.glob(f"{OUT_DIR}/chonk_step_*")
+             if os.path.isfile(os.path.join(p, "training_state.pt"))),
+            key=lambda p: int(os.path.basename(p)[len("chonk_step_"):]),
+            reverse=True)
+        if RESUME_DIR in _cands:
+            _cands.remove(RESUME_DIR)
+            _cands.insert(0, RESUME_DIR)
+        ck = None
+        for _cd in _cands:
+            try:
+                st = os.path.join(_cd, "training_state.pt")
+                if not os.path.exists(st):
+                    continue
+                adapter = os.path.join(_cd, "adapter_model.safetensors")
+                if os.path.exists(adapter):
+                    from safetensors.torch import load_file
+                    from peft import set_peft_model_state_dict
+                    set_peft_model_state_dict(model, load_file(adapter, device="cpu"))
+                ck = torch.load(st, map_location="cpu")
+                if _cd != RESUME_DIR:
+                    print(f"[Resume] {RESUME_DIR} unreadable; fell back to {_cd}")
+                break
+            except Exception as e:
+                print(f"[Resume] {_cd} corrupt ({e}); trying older checkpoint")
+                ck = None
+                continue
+        if ck is not None:
             optimizer.load_state_dict(ck["optimizer"])
             scheduler.load_state_dict(ck["scheduler"])
             # ChonkAdamW keeps its own step counter for bias correction; the
