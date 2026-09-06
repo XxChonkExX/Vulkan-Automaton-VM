@@ -30,12 +30,37 @@ WRAP="$REPO/run_granite_long.sh"
 
 die() { echo "FATAL: $*" >&2; exit 1; }
 
-echo "=== [1/5] Killing any stale training (weak signals first) ==="
-pkill -INT -f train_granite_chonk 2>/dev/null || true
-pkill -INT -f run_granite_long   2>/dev/null || true
+echo "=== [1/5] Stopping any stale training (free its memory blocks) ==="
+pkill -TERM -f train_granite_chonk 2>/dev/null || true
+pkill -TERM -f run_granite_long   2>/dev/null || true
 sleep 2
+# Detached systemd scopes survive pkill of the name pattern when the unit
+# itself lingers; stop it explicitly (harmless if absent).
+systemctl stop chonk-train.scope 2>/dev/null || true
 pkill -9 -f train_granite_chonk 2>/dev/null || true
 pkill -9 -f run_granite_long   2>/dev/null || true
+sleep 2
+# Verify nothing survived: a leftover trainer keeps its dedicated GPU blocks
+# pinned, and launching beside it replays the two-trainer OOM. Processes in
+# uninterruptible sleep (D state, stuck in driver calls) ignore kill -9; the
+# only remedy then is a reboot before launching.
+strays=$(pgrep -af 'train_granite_chonk[.]py|run_granite_long[.]sh' 2>/dev/null || true)
+if [ -n "$strays" ]; then
+    echo "  STALE TRAINING STILL ALIVE after kill:"
+    echo "$strays" | while IFS= read -r line; do
+        _pid=$(echo "$line" | awk '{print $1}')
+        echo "    pid=$_pid state=$(ps -o stat= -p "$_pid" 2>/dev/null) :: $line"
+    done
+    if [ "${CHONK_ALLOW_STRAYS:-0}" != "1" ]; then
+        echo "  ABORTING launch (set CHONK_ALLOW_STRAYS=1 to override). If any"
+        echo "  survivor shows 'D' state, reboot first - its GPU blocks stay"
+        echo "  pinned until then and a new run beside it will OOM."
+        exit 1
+    fi
+    echo "  CHONK_ALLOW_STRAYS=1: proceeding anyway."
+else
+    echo "  none running - heap free"
+fi
 
 echo "=== [2/5] Disabling GDM autologin respawn, then stopping it ==="
 # Passwordless via the chonk-gdm.sudoers drop-in (see header). sudo -n never
