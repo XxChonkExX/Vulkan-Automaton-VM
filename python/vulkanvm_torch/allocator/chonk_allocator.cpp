@@ -220,21 +220,85 @@ struct PoolBlockProvider : slab::Core::IProvider {
         return b;
     }
 
+    // Blocks whose HIP teardown failed (GPU still referencing the import).
+    // Retried on later releases; without this the HIP-side GTT mapping leaks
+    // while the pool side already looks freed (GTT kept climbing with flat
+    // pool: 119GB GTT at 54GB pool).
+    struct PendingDestroy {
+        hipExternalMemory_t ext = nullptr;
+        int fd = -1;
+        vvm::Allocation alloc;
+        size_t size = 0;
+    };
+    std::vector<PendingDestroy> pending_;
+
+    // Drain fully-free transient state first: retry previously-failed HIP
+    // destroys. Returns number actually reclaimed.
+    size_t drainPending() {
+        size_t done = 0;
+        if (!pool()) return 0;
+        for (auto it = pending_.begin(); it != pending_.end();) {
+            hipError_t rc = hipDestroyExternalMemory(it->ext);
+            if (rc != hipSuccess) {
+                ++it;
+                continue;
+            }
+            if (it->fd >= 0) close(it->fd);
+            pool()->deallocate(std::move(it->alloc));
+            allocLog("R", nullptr, it->size);
+            it = pending_.erase(it);
+            ++done;
+        }
+        if (done > 0) {
+            fprintf(stderr, "[allocator] reclaimed %zu deferred block(s)\n", done);
+        }
+        return done;
+    }
+
     void destroyBlock(Block* b) override {
         // After pool.shutdown() the HIP context is gone; skip HIP destruction
         // during teardown (leak the handles; the OS reclaims them).
+        drainPending();
+        const size_t blockSize = b->size;
+        void* const base = b->base;
         if (b->extHandle && pool()) {
-            hipDestroyExternalMemory(static_cast<hipExternalMemory_t>(b->extHandle));
+            hipError_t rc = hipDestroyExternalMemory(
+                static_cast<hipExternalMemory_t>(b->extHandle));
+            if (rc != hipSuccess) {
+                // GPU still holds the import (in-flight work). Do NOT close
+                // the fd or free the Vulkan side yet; stash everything and
+                // retry on a later release. Dropping them here leaks the
+                // HIP-side GTT mapping permanently while the pool (and slab)
+                // already account the block as gone.
+                fprintf(stderr,
+                        "[allocator] hipDestroyExternalMemory failed (%d) for "
+                        "%zu bytes; deferring block teardown\n",
+                        (int)rc, blockSize);
+                auto it = blockAllocs_.find(base);
+                PendingDestroy pd;
+                pd.ext = static_cast<hipExternalMemory_t>(b->extHandle);
+                pd.fd = b->fd;
+                pd.size = blockSize;
+                if (it != blockAllocs_.end()) {
+                    pd.alloc = std::move(it->second);
+                    blockAllocs_.erase(it);
+                }
+                b->extHandle = nullptr;
+                b->fd = -1;
+                pending_.push_back(std::move(pd));
+                delete b;
+                return;
+            }
         }
         if (b->fd >= 0) close(b->fd);
         if (pool()) {
-            auto it = blockAllocs_.find(b->base);
+            auto it = blockAllocs_.find(base);
             if (it != blockAllocs_.end()) {
                 pool()->deallocate(std::move(it->second));
                 blockAllocs_.erase(it);
             }
         }
-        allocLog("R", b->base, b->size);
+        allocLog("R", base, blockSize);
         delete b;
     }
 };
@@ -285,7 +349,10 @@ void vvm_torch_chonk_allocator_reset() {
 }
 
 size_t vvm_torch_chonk_allocator_release_empty(size_t keepFloor) {
-    return core().releaseEmptyBlocks(keepFloor);
+    size_t n = core().releaseEmptyBlocks(keepFloor);
+    // Retry any deferred HIP teardowns while we're already on the slow path.
+    n += provider().drainPending();
+    return n;
 }
 
 const char* vvm_torch_chonk_allocator_slab_stats() {
