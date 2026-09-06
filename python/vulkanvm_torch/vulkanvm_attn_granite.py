@@ -165,9 +165,16 @@ class GraniteAttnRecompute(torch.autograd.Function):
             out = (acc / l.unsqueeze(-1)).to(qdt).reshape(B, H, qlen, D)
 
         # Stash the tiny softmax state + output for the exact backward recompute.
+        # NOTE: `out` MUST be stashed DETACHED. Stashing the grad-connected
+        # output makes node -> ctx -> out -> node a reference cycle through
+        # the autograd engine, which pins one 4MB out-segment per layer per
+        # chunk forever (+0.5GB/chunk pool ratchet; proven by bisection down
+        # from LoRA-q adapters to this single line in a CPU repro). m/l are
+        # already grad-free (built under no_grad). Values are bit-identical;
+        # backward only reads them.
         ctx.m_final = m
         ctx.l_final = l
-        ctx.out = out
+        ctx.out = out.detach()
         return out
 
     @staticmethod

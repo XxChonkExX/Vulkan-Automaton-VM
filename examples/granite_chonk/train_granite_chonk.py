@@ -71,6 +71,7 @@ CHONK_PAUSE = float(os.environ.get("CHONK_PAUSE", "0.05"))          # display dr
 CHONK_OPTIMIZER_PAUSE = float(os.environ.get("CHONK_OPTIMIZER_PAUSE", "1.0"))
 CHONK_ACT_GB = float(os.environ.get("CHONK_ACT_GB", "0.25"))            # activation scratch (log optimum)
 CHONK_STAGING_GB = float(os.environ.get("CHONK_STAGING_GB", "0.25"))    # host-visible staging
+CHONK_MAX_POOL_GB = float(os.environ.get("CHONK_MAX_POOL_GB", "85"))
 CHONK_EMA_UPDATE_EVERY = int(os.environ.get("CHONK_EMA_UPDATE_EVERY", "1"))
 CHONK_SUBSAMPLE = float(os.environ.get("CHONK_SUBSAMPLE", "1.0"))
 CHONK_EPOCHS = int(os.environ.get("CHONK_EPOCHS", "1"))
@@ -787,6 +788,22 @@ def main():
                                   f"gn={last_gn:.2f} "
                                   f"lr={scheduler.get_last_lr()[0]:.2e} "
                                   f"pool={ps['totalUsed']/1e9:.2f}GB", flush=True)
+                        # Pool high-water recycle: bound ANY ratchet (known or
+                        # not) by restarting in a fresh process before the
+                        # pinned-GTT pressure can freeze/OOM the box. The step
+                        # was just banked (SAVE_INTERVAL) and resume is exact
+                        # (block snap + window loss + moments + fallback), so
+                        # this loses nothing but the in-flight block prefix.
+                        # Exit 42 = intentional recycle (wrapper restarts).
+                        if CHONK_MAX_POOL_GB > 0:
+                            _pu = pool.stats()["totalUsed"] / 1e9
+                            if _pu >= CHONK_MAX_POOL_GB:
+                                print(f"[recycle] pool {_pu:.2f}GB >= "
+                                      f"{CHONK_MAX_POOL_GB:.0f}GB cap at step "
+                                      f"{step}; exiting clean for a fresh "
+                                      f"process", flush=True)
+                                import sys as _sys
+                                _sys.exit(42)
                         step += 1
                 if step >= MAX_STEPS:
                     break
