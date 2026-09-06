@@ -535,7 +535,7 @@ def main():
                           f"allocations={ps.get('allocationCount','?')} "
                           f"largestFree={ps.get('largestFreeBlock',0)/1e9:.2f}GB)",
                           flush=True)
-                    if chunks_this_seq in (8, 16, 32, 64, 128):
+                    if chunks_this_seq in (4, 6, 8, 16, 32, 64, 128):
                         print(f"    [hist] {live_histogram()}", flush=True)
                         if CHONK_TENSOR_CENSUS:
                             dump_tensor_census(
