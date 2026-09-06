@@ -280,6 +280,57 @@ def dump_tensor_census(tag, path):
                     info["storage"] = int(o.untyped_storage().nbytes())
                 except Exception:
                     pass
+                # Owner fingerprint: name the actual holder. Direct named
+                # attribute first (ClassName.attr); else one level up through
+                # list/dict/tuple containers (container owner + key/index).
+                try:
+                    found = False
+                    for r in gc.get_referrers(o):
+                        if type(r).__name__ == "frame":
+                            continue
+                        d = getattr(r, "__dict__", None)
+                        if isinstance(d, dict):
+                            for k, v in d.items():
+                                if v is o:
+                                    info["owner"] = f"{type(r).__name__}.{k}"
+                                    found = True
+                                    break
+                                if isinstance(v, (list, tuple)) and any(
+                                        x is o for x in v):
+                                    info["owner"] = (
+                                        f"{type(r).__name__}.{k}"
+                                        f"[{v.index(o) if o in v else '?'}]")
+                                    found = True
+                                    break
+                                if isinstance(v, dict):
+                                    for kk, vv in v.items():
+                                        if vv is o or (
+                                                isinstance(vv, (list, tuple))
+                                                and o in vv):
+                                            info["owner"] = (
+                                                f"{type(r).__name__}.{k}[{kk}]")
+                                            found = True
+                                            break
+                                    if found:
+                                        break
+                            if found:
+                                break
+                    if not found:
+                        # One level up through bare containers.
+                        for r in gc.get_referrers(o):
+                            if type(r).__name__ not in (
+                                    "list", "tuple", "dict", "set"):
+                                continue
+                            for rr in gc.get_referrers(r):
+                                if type(rr).__name__ == "frame":
+                                    continue
+                                info["owner2"] = type(rr).__name__
+                                found = True
+                                break
+                            if found:
+                                break
+                except Exception:
+                    pass
                 gf = o.grad_fn
                 if gf is not None:
                     info["op"] = type(gf).__name__
@@ -471,6 +522,28 @@ def main():
                     optimizer.step_count = int(ck["adam_step_count"])
                 except (TypeError, ValueError):
                     pass
+            # Restore Adam moments by parameter NAME into this run's fresh
+            # pool views (object identity does not survive restarts).
+            if ck.get("adam_moments"):
+                try:
+                    _restored, _missing = 0, 0
+                    for _n, _p in model.named_parameters():
+                        if not _p.requires_grad or _n not in ck["adam_moments"]:
+                            continue
+                        _dst = optimizer_states.get(_p)
+                        if _dst is None:
+                            _dst = optimizer.state.get(_p)
+                            if not isinstance(_dst, dict):
+                                _missing += 1
+                                continue
+                        _m_avg, _m_sq = ck["adam_moments"][_n]
+                        _dst["exp_avg"].copy_(_m_avg)
+                        _dst["exp_avg_sq"].copy_(_m_sq)
+                        _restored += 1
+                    print(f"[Resume] adam moments restored for {_restored} "
+                          f"params ({_missing} missing)")
+                except Exception as _e:
+                    print(f"[Resume] adam moments restore failed: {_e}")
             # map_location="cpu" leaves the EMA shadow on CPU; move every
             # shadow tensor back to its param's device (else ema.update()
             # crashes mixing cuda params with cpu shadow at the first step).
@@ -490,6 +563,7 @@ def main():
                 resume_step = floored
 
     step = resume_step
+    _grad_probed = False
     model.train()
     # Block-skip on resume: skip whole data blocks already trained, so a
     # resumed run continues where the checkpoint left off instead of
@@ -520,6 +594,7 @@ def main():
             # / best / log values use the window MEAN, not the last chunk.
             window_loss_sum = 0.0
             window_loss_n = 0
+            last_gn = float("nan")
             for chunk_start in range(0, SEQ_LEN, CHUNK_SIZE):
                 chunk_end = min(chunk_start + CHUNK_SIZE, SEQ_LEN)
                 chunk_ids = input_ids[:, chunk_start:chunk_end]
@@ -559,10 +634,16 @@ def main():
                     if chunks_this_seq in (4, 6, 8, 16, 32, 64, 128):
                         print(f"    [hist] {live_histogram()}", flush=True)
                         if CHONK_TENSOR_CENSUS:
+                            _cpath = (CHONK_CENSUS_PATH or
+                                      os.path.join(OUT_DIR, "tensor_census.log"))
                             dump_tensor_census(
-                                f"chunk{chunks_this_seq}",
-                                CHONK_CENSUS_PATH or os.path.join(OUT_DIR, "tensor_census.log"))
-                            print(f"    [census] dumped chunk{chunks_this_seq}", flush=True)
+                                f"chunk{chunks_this_seq}", _cpath)
+                            import gc as _gc
+                            _c0 = _gc.collect()
+                            dump_tensor_census(
+                                f"chunk{chunks_this_seq}+gc", _cpath)
+                            print(f"    [census] dumped chunk{chunks_this_seq} "
+                                  f"(gc.collect freed {_c0} objs)", flush=True)
 
                 # One optimizer step per GRAD_ACCUM_STEPS chunks (plus a partial
                 # step at block end for non-divisible configs). step/log/save
@@ -578,12 +659,44 @@ def main():
                     else:
                         if GRAD_CLIP_NORM > 0:
                             gn = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+                            last_gn = float(gn)
                             if gn != gn:
                                 print(f"  [NaN grad] skip step {step}", flush=True)
                                 optimizer.zero_grad(); torch.cuda.empty_cache()
                                 window_loss_sum = 0.0
                                 window_loss_n = 0
                                 continue
+                            if not _grad_probed:
+                                _grad_probed = True
+                                try:
+                                    from collections import defaultdict
+                                    _gg = defaultdict(lambda: [0.0, 0])
+                                    for _n, _p in model.named_parameters():
+                                        if not _p.requires_grad:
+                                            continue
+                                        _g = _p.grad
+                                        _key = "none"
+                                        if _g is not None:
+                                            for _t in ("q_proj", "k_proj",
+                                                       "v_proj", "o_proj",
+                                                       "gate_proj", "up_proj",
+                                                       "down_proj"):
+                                                if _t in _n:
+                                                    _key = _t
+                                                    break
+                                            _gg[_key][0] += float(
+                                                _g.detach().abs().mean())
+                                            _gg[_key][1] += 1
+                                        else:
+                                            _gg["none"][1] += 1
+                                    print(f"  [gradcheck] step {step} global_norm="
+                                          f"{float(gn):.4f} " + " ".join(
+                                              f"{k}={v[0]/max(1,v[1]):.2e}"
+                                              f"(n={v[1]})"
+                                              for k, v in sorted(_gg.items())),
+                                          flush=True)
+                                except Exception as _e:
+                                    print(f"  [gradcheck] failed: {_e}", flush=True)
                         optimizer.step(); scheduler.step(); optimizer.zero_grad()
                         # Window-mean loss for checkpoint/best/log (stable across
                         # noisy per-chunk values). Falls back to the last chunk
@@ -611,10 +724,33 @@ def main():
                             sp = f"{OUT_DIR}/chonk_step_{step}"
                             os.makedirs(sp, exist_ok=True)
                             model.save_pretrained(sp)
+                            # Persist Adam moments by parameter NAME (the live
+                            # state dict is keyed by object identity, which
+                            # does not survive a restart; without this every
+                            # resume silently re-warms moments from zero).
+                            _moments = {}
+                            try:
+                                _name_of = {p: n for n, p in
+                                            model.named_parameters()
+                                            if p.requires_grad}
+                                for _p in [p for p in
+                                           model.parameters()
+                                           if p.requires_grad]:
+                                    _st = optimizer_states.get(_p)
+                                    if _st is None:
+                                        _st = optimizer.state.get(_p, {})
+                                    if ("exp_avg" in _st and
+                                            "exp_avg_sq" in _st):
+                                        _moments[_name_of[_p]] = (
+                                            _st["exp_avg"].detach().cpu(),
+                                            _st["exp_avg_sq"].detach().cpu())
+                            except Exception:
+                                pass
                             torch.save({"optimizer": optimizer.state_dict(),
                                         "scheduler": scheduler.state_dict(),
                                         "ema": ema.shadow, "step": step, "epoch": epoch,
-                                        "adam_step_count": optimizer.step_count},
+                                        "adam_step_count": optimizer.step_count,
+                                        "adam_moments": _moments},
                                        f"{sp}/training_state.pt")
                             cur_loss = float(window_loss)
                             with open(f"{sp}/.chonk_loss", "w") as f:
@@ -648,6 +784,7 @@ def main():
                         if step % LOG_INTERVAL == 0:
                             ps = pool.stats()
                             print(f"Step {step}: loss={float(window_loss):.4f} "
+                                  f"gn={last_gn:.2f} "
                                   f"lr={scheduler.get_last_lr()[0]:.2e} "
                                   f"pool={ps['totalUsed']/1e9:.2f}GB", flush=True)
                         step += 1
