@@ -268,17 +268,32 @@ def dump_tensor_census(tag, path):
                 b["has_grad_fn"] += 1
         except Exception:
             pass
-        if len(b["samples"]) < 3:
-            kinds = Counter()
+        if c in (4194304, 65536, 1048576, 1024, 512) and len(b["samples"]) < 5:
+            info = {}
             try:
+                info["shape"] = str(list(o.shape))
+                info["dtype"] = str(o.dtype).replace("torch.", "")
+                info["leaf"] = bool(o.is_leaf)
+                gf = o.grad_fn
+                if gf is not None:
+                    info["op"] = type(gf).__name__
+                    nxt = []
+                    try:
+                        for fn, _ in (gf.next_functions or [])[:4]:
+                            nxt.append(type(fn).__name__ if fn is not None else "AccumulateGrad")
+                    except Exception:
+                        pass
+                    info["next"] = nxt
+                kinds = Counter()
                 for r in gc.get_referrers(o):
                     t = type(r).__name__
                     if t == "frame":
                         continue
                     kinds[t] += 1
-            except Exception:
-                pass
-            b["samples"].append(dict(kinds))
+                info["holders"] = dict(kinds)
+            except Exception as e:
+                info = {"err": str(e)[:80]}
+            b["samples"].append(info)
     try:
         with open(path, "a") as f:
             f.write(f"[{tag}] cuda tensor census:\n")
