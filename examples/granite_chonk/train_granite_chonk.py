@@ -274,6 +274,12 @@ def dump_tensor_census(tag, path):
                 info["shape"] = str(list(o.shape))
                 info["dtype"] = str(o.dtype).replace("torch.", "")
                 info["leaf"] = bool(o.is_leaf)
+                try:
+                    info["ptr"] = hex(o.data_ptr())
+                    info["nbytes"] = int(o.numel() * o.element_size())
+                    info["storage"] = int(o.untyped_storage().nbytes())
+                except Exception:
+                    pass
                 gf = o.grad_fn
                 if gf is not None:
                     info["op"] = type(gf).__name__
