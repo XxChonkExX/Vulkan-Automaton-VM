@@ -31,6 +31,9 @@ export CHONK_PAUSE=0.02
 export CHONK_OPTIMIZER_PAUSE=0.5
 export CHONK_MAX_STEPS=10000
 export CHONK_SAVE_INTERVAL=1
+# Checkpoints run ~7GB each (optimizer state + moments + EMA); keep 5 recent
+# plus the persisted best (disk was at 98% with 9+best retained).
+export CHONK_KEEP_CHECKPOINTS=5
 export CHONK_WARMUP=50
 export CHONK_SUBSAMPLE=1.0
 export CHONK_EPOCHS=1
