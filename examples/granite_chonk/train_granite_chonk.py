@@ -72,6 +72,18 @@ CHONK_OPTIMIZER_PAUSE = float(os.environ.get("CHONK_OPTIMIZER_PAUSE", "1.0"))
 CHONK_ACT_GB = float(os.environ.get("CHONK_ACT_GB", "0.25"))            # activation scratch (log optimum)
 CHONK_STAGING_GB = float(os.environ.get("CHONK_STAGING_GB", "0.25"))    # host-visible staging
 CHONK_MAX_POOL_GB = float(os.environ.get("CHONK_MAX_POOL_GB", "85"))
+# GTT (driver-pinned) wall: pool bytes cost ~1.5x in GTT, and GTT exhaustion
+# freezes the box (kswapd livelock on unevictable pins) instead of a clean
+# OOM. Recycle on EITHER metric. 0 disables a check.
+CHONK_MAX_GTT_GB = float(os.environ.get("CHONK_MAX_GTT_GB", "115"))
+
+
+def _read_gtt_gb():
+    try:
+        with open("/sys/class/drm/card1/device/mem_info_gtt_used") as f:
+            return int(f.read().strip()) / 1e9
+    except (OSError, ValueError):
+        return 0.0
 CHONK_EMA_UPDATE_EVERY = int(os.environ.get("CHONK_EMA_UPDATE_EVERY", "1"))
 CHONK_SUBSAMPLE = float(os.environ.get("CHONK_SUBSAMPLE", "1.0"))
 CHONK_EPOCHS = int(os.environ.get("CHONK_EPOCHS", "1"))
@@ -747,12 +759,18 @@ def main():
                                             _st["exp_avg_sq"].detach().cpu())
                             except Exception:
                                 pass
+                            # Atomic state write: a SIGKILL mid-save must not
+                            # leave a partial training_state.pt behind (a
+                            # partial newest dir previously poisoned wrapper
+                            # resume detection into a from-scratch retrain).
+                            _tmp_st = f"{sp}/training_state.pt.tmp"
                             torch.save({"optimizer": optimizer.state_dict(),
                                         "scheduler": scheduler.state_dict(),
                                         "ema": ema.shadow, "step": step, "epoch": epoch,
                                         "adam_step_count": optimizer.step_count,
                                         "adam_moments": _moments},
-                                       f"{sp}/training_state.pt")
+                                       _tmp_st)
+                            os.replace(_tmp_st, f"{sp}/training_state.pt")
                             cur_loss = float(window_loss)
                             with open(f"{sp}/.chonk_loss", "w") as f:
                                 f.write(f"{cur_loss:.6f}")
@@ -772,9 +790,11 @@ def main():
                                     shutil.rmtree(best_dir, ignore_errors=True)
                                 os.makedirs(best_dir, exist_ok=True)
                                 model.save_pretrained(best_dir)
+                                _tmp_best = f"{best_dir}/training_state.pt.tmp"
                                 torch.save({"step": step, "epoch": epoch, "loss": cur_loss,
                                             "ema": ema.shadow},
-                                           f"{best_dir}/training_state.pt")
+                                           _tmp_best)
+                                os.replace(_tmp_best, f"{best_dir}/training_state.pt")
                                 with open(f"{best_dir}/.chonk_loss", "w") as f:
                                     f.write(f"{cur_loss:.6f}")
                                 with open(best_file, "w") as f:
@@ -788,20 +808,32 @@ def main():
                                   f"gn={last_gn:.2f} "
                                   f"lr={scheduler.get_last_lr()[0]:.2e} "
                                   f"pool={ps['totalUsed']/1e9:.2f}GB", flush=True)
-                        # Pool high-water recycle: bound ANY ratchet (known or
-                        # not) by restarting in a fresh process before the
-                        # pinned-GTT pressure can freeze/OOM the box. The step
-                        # was just banked (SAVE_INTERVAL) and resume is exact
-                        # (block snap + window loss + moments + fallback), so
+                        # High-water recycle: bound ANY ratchet (known or not)
+                        # by restarting in a fresh process before pressure
+                        # freezes/OOMs the box. Pool cap alone is blind: pool
+                        # bytes pin ~1.5x in GTT, and GTT exhaustion livelocks
+                        # (kswapd on unevictable pins) while pool looks fine
+                        # (119GB GTT at 54GB pool observed). So check BOTH.
+                        # The step was just banked and resume is exact, so
                         # this loses nothing but the in-flight block prefix.
                         # Exit 42 = intentional recycle (wrapper restarts).
-                        if CHONK_MAX_POOL_GB > 0:
+                        if CHONK_MAX_POOL_GB > 0 or CHONK_MAX_GTT_GB > 0:
                             _pu = pool.stats()["totalUsed"] / 1e9
-                            if _pu >= CHONK_MAX_POOL_GB:
-                                print(f"[recycle] pool {_pu:.2f}GB >= "
-                                      f"{CHONK_MAX_POOL_GB:.0f}GB cap at step "
-                                      f"{step}; exiting clean for a fresh "
-                                      f"process", flush=True)
+                            _gu = _read_gtt_gb()
+                            _why = ""
+                            if (CHONK_MAX_POOL_GB > 0 and
+                                    _pu >= CHONK_MAX_POOL_GB):
+                                _why = (f"pool {_pu:.2f}GB >= "
+                                        f"{CHONK_MAX_POOL_GB:.0f}GB cap")
+                            elif (CHONK_MAX_GTT_GB > 0 and _gu > 0 and
+                                    _gu >= CHONK_MAX_GTT_GB):
+                                _why = (f"GTT {_gu:.2f}GB >= "
+                                        f"{CHONK_MAX_GTT_GB:.0f}GB cap "
+                                        f"(pool {_pu:.2f}GB)")
+                            if _why:
+                                print(f"[recycle] {_why} at step {step}; "
+                                      f"exiting clean for a fresh process",
+                                      flush=True)
                                 import sys as _sys
                                 _sys.exit(42)
                         step += 1

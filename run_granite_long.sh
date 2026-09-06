@@ -38,8 +38,14 @@ export CHONK_EPOCHS=1
 # Launch (loop restarts on crash/resume; re-detects the latest checkpoint
 # on EVERY restart so progress made mid-wrapper is always picked up)
 while true; do
-    LATEST=$(ls -1d $OUT_DIR/chonk_step_* 2>/dev/null | sort -V | tail -1)
-    if [ -n "$LATEST" ] && [ -f "$LATEST/training_state.pt" ]; then
+    # Newest checkpoint dir that actually contains a training state file. A
+    # SIGKILLed run can leave a partial newest dir (adapter without state);
+    # picking it blindly caused a from-scratch retrain over banked history.
+    LATEST=""
+    for cand in $(ls -1d $OUT_DIR/chonk_step_* 2>/dev/null | sort -Vr); do
+        if [ -f "$cand/training_state.pt" ]; then LATEST="$cand"; break; fi
+    done
+    if [ -n "$LATEST" ]; then
         export CHONK_RESUME_DIR="$LATEST"
         echo "[wrap] Resuming from $LATEST" >> $LOG
     else
