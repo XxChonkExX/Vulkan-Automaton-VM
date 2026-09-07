@@ -377,12 +377,17 @@ def dump_tensor_census(tag, path):
         pass
 
 
-def _maybe_recycle(pool, where):
+def _maybe_recycle(pool, where, save_state=None):
     """Exit(42) for a fresh process when pool or GTT crosses its high-water
     cap. Called every chunk (cheap: one stats dict + one sysfs read) so a
-    late-block surge can't slip between optimizer steps. Safe anywhere: resume
-    snaps to the block boundary and re-trains it, so only the in-flight
-    prefix is ever discarded."""
+    late-block surge can't slip between optimizer steps.
+
+    save_state: optional callable that persists a MID-BLOCK resume point
+    (adapter + optimizer + moments + chunk position). With it, the next
+    process resumes at this exact chunk instead of replaying the block from
+    chunk 0 — without it, process lifetimes shorter than a block turn the
+    recycle into a treadmill (observed: GTT cap at ~chunk 81 of every cycle,
+    block replayed from 0 forever, nothing net-banked)."""
     if CHONK_MAX_POOL_GB <= 0 and CHONK_MAX_GTT_GB <= 0:
         return
     _pu = pool.stats()["totalUsed"] / 1e9
@@ -396,8 +401,15 @@ def _maybe_recycle(pool, where):
     if _why:
         print(f"[recycle] {_why} at {where}; exiting clean for a fresh "
               f"process", flush=True)
+        if save_state is not None:
+            try:
+                save_state()
+            except Exception as e:
+                print(f"[recycle] mid-block save failed ({e}); falling back "
+                      f"to block-boundary resume", flush=True)
         import sys as _sys
-        _sys.exit(42)
+        import os as _os
+        _os._exit(42)  # hard exit: skip atexit/pool teardown under pressure
 
 
 def train_step(model, chunk_ids, kv_cache, chunk_start, chunk_end):
@@ -586,6 +598,18 @@ def main():
             _ref = next(p.data for p in model.parameters() if p.requires_grad)
             ema.shadow = {n: s.to(_ref.device) for n, s in ck["ema"].items()}
             resume_step, resume_epoch = ck["step"], ck["epoch"]
+            # Mid-block resume point (saved by the recycle guard): step stays
+            # at its last BANKED value (no snap needed — it is already at a
+            # boundary), and the block/chunk position is replayed no-grad to
+            # rebuild the KV cache, then training continues from that chunk.
+            # This is what lets process lifetimes shorter than a block still
+            # make net forward progress (the treadmill fix).
+            if "midblock_block" in ck:
+                main._midblock_resume = int(ck["midblock_block"])
+                main._midblock_chunk = int(ck["midblock_chunk"])
+                print(f"[Resume] mid-block point: block "
+                      f"{main._midblock_resume} chunk "
+                      f"{main._midblock_chunk} (step stays {resume_step})")
             # Snap mid-block resumes to the block boundary. Steps advance one
             # per GRAD_ACCUM_STEPS chunks and blocks are trained whole; a
             # mid-block resume would re-train the block prefix while the step
@@ -593,7 +617,7 @@ def main():
             # at most GRAD_ACCUM_STEPS-1 steps of re-training; the loaded
             # scheduler/optimizer states stay as-is (a few-step offset over
             # 11k steps is immaterial).
-            if opt_steps_per_block > 0 and resume_step % opt_steps_per_block != 0:
+            elif opt_steps_per_block > 0 and resume_step % opt_steps_per_block != 0:
                 floored = (resume_step // opt_steps_per_block) * opt_steps_per_block
                 print(f"[Resume] snapping step {resume_step} -> {floored} (block boundary)")
                 resume_step = floored
@@ -624,6 +648,17 @@ def main():
                 break
             input_ids = input_ids.unsqueeze(0).cuda()
             reset_chonk_cache(kv_cache)
+            # Mid-block resume: a recycle inside this block saved the chunk
+            # position (and grads-in-flight are forfeit by design); replay the
+            # data prefix WITHOUT optimizer steps to rebuild the KV cache to
+            # the saved chunk, then continue training from there. This is
+            # what breaks the treadmill: process lifetime < block length.
+            _resume_block = getattr(main, "_midblock_resume", None)
+            _resume_chunk = 0
+            if (_resume_block == block_idx and _resume_block is not None):
+                _resume_chunk = getattr(main, "_midblock_chunk", 0)
+                print(f"[Resume] mid-block: block {block_idx} -> chunk "
+                      f"{_resume_chunk} (replaying prefix no-grad)", flush=True)
             chunks_this_seq = 0
             skip_step = False
             # Accumulation-window loss (unscaled sum + chunk count). Checkpoint
@@ -631,9 +666,19 @@ def main():
             window_loss_sum = 0.0
             window_loss_n = 0
             last_gn = float("nan")
+            _midblock_replay = _resume_chunk
             for chunk_start in range(0, SEQ_LEN, CHUNK_SIZE):
                 chunk_end = min(chunk_start + CHUNK_SIZE, SEQ_LEN)
                 chunk_ids = input_ids[:, chunk_start:chunk_end]
+                if _midblock_replay > 0:
+                    # Prefix replay under no_grad: rebuilds the INT4 KV cache
+                    # only; no forward graph, no grads, no loss.
+                    with torch.no_grad():
+                        train_step(model, chunk_ids, kv_cache,
+                                   chunk_start, chunk_end)
+                    _midblock_replay -= 1
+                    chunks_this_seq += 1
+                    continue
                 loss, outputs = train_step(model, chunk_ids, kv_cache, chunk_start, chunk_end)
                 if CHONK_PAUSE:
                     time.sleep(CHONK_PAUSE)
@@ -658,7 +703,50 @@ def main():
                 # first few chunks so a misconfigured cap can't tight-loop
                 # restarts faster than progress.
                 if chunks_this_seq >= 4:
-                    _maybe_recycle(pool, f"chunk {chunks_this_seq}")
+                    def _save_midblock():
+                        """Persist an exact mid-block resume point so the next
+                        process replays only the KV prefix instead of the whole
+                        block. Steps NOT advanced for partial windows (grads in
+                        flight are forfeit); the step counter stays at its last
+                        banked value so accounting stays exact."""
+                        sp = f"{OUT_DIR}/chonk_step_{step}"
+                        os.makedirs(sp, exist_ok=True)
+                        model.save_pretrained(sp)
+                        _moments = {}
+                        try:
+                            _name_of = {p: n for n, p in
+                                        model.named_parameters()
+                                        if p.requires_grad}
+                            for _p in [p for p in model.parameters()
+                                       if p.requires_grad]:
+                                _st = optimizer_states.get(_p)
+                                if _st is None:
+                                    _st = optimizer.state.get(_p, {})
+                                if ("exp_avg" in _st and
+                                        "exp_avg_sq" in _st):
+                                    _moments[_name_of[_p]] = (
+                                        _st["exp_avg"].detach().cpu(),
+                                        _st["exp_avg_sq"].detach().cpu())
+                        except Exception:
+                            pass
+                        _tmp = f"{sp}/training_state.pt.tmp"
+                        torch.save({"optimizer": optimizer.state_dict(),
+                                    "scheduler": scheduler.state_dict(),
+                                    "ema": ema.shadow, "step": step,
+                                    "epoch": epoch,
+                                    "adam_step_count": optimizer.step_count,
+                                    "adam_moments": _moments,
+                                    "midblock_block": block_idx,
+                                    "midblock_chunk": chunks_this_seq},
+                                   _tmp)
+                        os.replace(_tmp, f"{sp}/training_state.pt")
+                        with open(f"{sp}/.chonk_loss", "w") as f:
+                            f.write(f"{float(window_loss):.6f}")
+                        print(f"[recycle] mid-block point saved: step {step} "
+                              f"block {block_idx} chunk {chunks_this_seq}",
+                              flush=True)
+                    _maybe_recycle(pool, f"chunk {chunks_this_seq}",
+                                   save_state=_save_midblock)
                 # Diagnostic window: per-chunk heartbeat for the first 32 chunks
                 # (is the growth smooth ~537MB/chunk or 8GiB stairs?), then 16.
                 if chunks_this_seq <= 32 or chunks_this_seq % 16 == 0:
