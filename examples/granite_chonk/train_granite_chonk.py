@@ -377,6 +377,29 @@ def dump_tensor_census(tag, path):
         pass
 
 
+def _maybe_recycle(pool, where):
+    """Exit(42) for a fresh process when pool or GTT crosses its high-water
+    cap. Called every chunk (cheap: one stats dict + one sysfs read) so a
+    late-block surge can't slip between optimizer steps. Safe anywhere: resume
+    snaps to the block boundary and re-trains it, so only the in-flight
+    prefix is ever discarded."""
+    if CHONK_MAX_POOL_GB <= 0 and CHONK_MAX_GTT_GB <= 0:
+        return
+    _pu = pool.stats()["totalUsed"] / 1e9
+    _gu = _read_gtt_gb()
+    _why = ""
+    if CHONK_MAX_POOL_GB > 0 and _pu >= CHONK_MAX_POOL_GB:
+        _why = f"pool {_pu:.2f}GB >= {CHONK_MAX_POOL_GB:.0f}GB cap"
+    elif CHONK_MAX_GTT_GB > 0 and _gu > 0 and _gu >= CHONK_MAX_GTT_GB:
+        _why = (f"GTT {_gu:.2f}GB >= {CHONK_MAX_GTT_GB:.0f}GB cap "
+                f"(pool {_pu:.2f}GB)")
+    if _why:
+        print(f"[recycle] {_why} at {where}; exiting clean for a fresh "
+              f"process", flush=True)
+        import sys as _sys
+        _sys.exit(42)
+
+
 def train_step(model, chunk_ids, kv_cache, chunk_start, chunk_end):
     cp = torch.arange(chunk_start, chunk_end, device="cuda")
     outputs = model(input_ids=chunk_ids, past_key_values=kv_cache,
@@ -628,6 +651,14 @@ def main():
                         del loss, outputs
                 chunks_this_seq += 1
                 torch.cuda.empty_cache()
+                # Per-chunk high-water check: the opt-step check alone missed
+                # a late-block GTT surge (119GB at 54GB pool) by ~16 chunks,
+                # long enough to thrash-lock the box. One stats dict + one
+                # sysfs read per chunk is noise next to a 90s chunk. Skip the
+                # first few chunks so a misconfigured cap can't tight-loop
+                # restarts faster than progress.
+                if chunks_this_seq >= 4:
+                    _maybe_recycle(pool, f"chunk {chunks_this_seq}")
                 # Diagnostic window: per-chunk heartbeat for the first 32 chunks
                 # (is the growth smooth ~537MB/chunk or 8GiB stairs?), then 16.
                 if chunks_this_seq <= 32 or chunks_this_seq % 16 == 0:
@@ -808,34 +839,11 @@ def main():
                                   f"gn={last_gn:.2f} "
                                   f"lr={scheduler.get_last_lr()[0]:.2e} "
                                   f"pool={ps['totalUsed']/1e9:.2f}GB", flush=True)
-                        # High-water recycle: bound ANY ratchet (known or not)
-                        # by restarting in a fresh process before pressure
-                        # freezes/OOMs the box. Pool cap alone is blind: pool
-                        # bytes pin ~1.5x in GTT, and GTT exhaustion livelocks
-                        # (kswapd on unevictable pins) while pool looks fine
-                        # (119GB GTT at 54GB pool observed). So check BOTH.
-                        # The step was just banked and resume is exact, so
-                        # this loses nothing but the in-flight block prefix.
+                        # High-water recycle (also checked every chunk below).
+                        # Here it runs right after a banked step, so nothing
+                        # but the in-flight block prefix is ever discarded.
                         # Exit 42 = intentional recycle (wrapper restarts).
-                        if CHONK_MAX_POOL_GB > 0 or CHONK_MAX_GTT_GB > 0:
-                            _pu = pool.stats()["totalUsed"] / 1e9
-                            _gu = _read_gtt_gb()
-                            _why = ""
-                            if (CHONK_MAX_POOL_GB > 0 and
-                                    _pu >= CHONK_MAX_POOL_GB):
-                                _why = (f"pool {_pu:.2f}GB >= "
-                                        f"{CHONK_MAX_POOL_GB:.0f}GB cap")
-                            elif (CHONK_MAX_GTT_GB > 0 and _gu > 0 and
-                                    _gu >= CHONK_MAX_GTT_GB):
-                                _why = (f"GTT {_gu:.2f}GB >= "
-                                        f"{CHONK_MAX_GTT_GB:.0f}GB cap "
-                                        f"(pool {_pu:.2f}GB)")
-                            if _why:
-                                print(f"[recycle] {_why} at step {step}; "
-                                      f"exiting clean for a fresh process",
-                                      flush=True)
-                                import sys as _sys
-                                _sys.exit(42)
+                        _maybe_recycle(pool, f"step {step}")
                         step += 1
                 if step >= MAX_STEPS:
                     break
