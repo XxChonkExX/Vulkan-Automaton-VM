@@ -42,14 +42,20 @@ export CHONK_EPOCHS=1
 # Launch (loop restarts on crash/resume; re-detects the latest checkpoint
 # on EVERY restart so progress made mid-wrapper is always picked up)
 while true; do
-    # Newest checkpoint dir that actually contains a training state file. A
-    # SIGKILLed run can leave a partial newest dir (adapter without state);
-    # picking it blindly caused a from-scratch retrain over banked history.
+    # Resume from the checkpoint whose training_state.pt was WRITTEN MOST
+    # RECENTLY. Rationale: mid-block resume points (chonk_step_192m81) carry
+    # older base-step numbers than a banked 198 but represent NEWER progress
+    # (198's weights + block replayed further); numeric sorts pick 198 and
+    # replay the block from 0 forever (the treadmill). State-file mtime is
+    # the single honest ordering. Dirs without a state file (torn saves) are
+    # skipped entirely.
     LATEST=""
-    for cand in $(ls -1d $OUT_DIR/chonk_step_* 2>/dev/null | sort -Vr); do
-        if [ -f "$cand/training_state.pt" ]; then LATEST="$cand"; break; fi
+    for st in $OUT_DIR/chonk_step_*/training_state.pt; do
+        [ -f "$st" ] || continue
+        if [ -z "$LATEST" ] || [ "$st" -nt "$LATEST" ]; then LATEST="$st"; fi
     done
     if [ -n "$LATEST" ]; then
+        LATEST=$(dirname "$LATEST")
         export CHONK_RESUME_DIR="$LATEST"
         echo "[wrap] Resuming from $LATEST" >> $LOG
     else

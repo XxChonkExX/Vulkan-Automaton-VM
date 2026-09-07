@@ -428,8 +428,13 @@ def train_step(model, chunk_ids, kv_cache, chunk_start, chunk_end):
 
 def cleanup_checkpoints(out_dir, keep=8):
     import glob
-    steps = sorted(int(os.path.basename(p)[len("chonk_step_"):])
-                   for p in glob.glob(f"{out_dir}/chonk_step_*"))
+    # Mid-block resume points (name like 192m81) sort as strings and must be
+    # treated as the same step as their base (192); keep them out of numeric
+    # bookkeeping, only cull them when their base step is culled.
+    def _base(p):
+        n = os.path.basename(p)[len("chonk_step_"):]
+        return int(n.split("m")[0]) if "m" in n else int(n)
+    steps = sorted({_base(p) for p in glob.glob(f"{out_dir}/chonk_step_*")})
     if len(steps) <= keep:
         return
     best, best_loss = None, float("inf")
@@ -449,6 +454,9 @@ def cleanup_checkpoints(out_dir, keep=8):
     for s in steps:
         if s not in keep_set:
             shutil.rmtree(f"{out_dir}/chonk_step_{s}", ignore_errors=True)
+            # remove any mid-block points of a culled base step
+            for mb in glob.glob(f"{out_dir}/chonk_step_{s}m*"):
+                shutil.rmtree(mb, ignore_errors=True)
 
 
 def main():
@@ -532,10 +540,18 @@ def main():
         # mid-save leaves a partial training_state.pt) falls back to the
         # previous valid checkpoint instead of crash-looping the wrapper.
         import glob as _glob
+        def _ck_key(p):
+            # mid-block points (192m81) sort after their base step so the
+            # newest-with-state scan prefers them over older banked steps
+            n = os.path.basename(p)[len("chonk_step_"):]
+            if "m" in n:
+                b, c = n.split("m")
+                return (int(b), int(c))
+            return (int(n), -1)
         _cands = sorted(
             (p for p in _glob.glob(f"{OUT_DIR}/chonk_step_*")
              if os.path.isfile(os.path.join(p, "training_state.pt"))),
-            key=lambda p: int(os.path.basename(p)[len("chonk_step_"):]),
+            key=_ck_key,
             reverse=True)
         if RESUME_DIR in _cands:
             _cands.remove(RESUME_DIR)
@@ -708,8 +724,14 @@ def main():
                         process replays only the KV prefix instead of the whole
                         block. Steps NOT advanced for partial windows (grads in
                         flight are forfeit); the step counter stays at its last
-                        banked value so accounting stays exact."""
-                        sp = f"{OUT_DIR}/chonk_step_{step}"
+                        banked value so accounting stays exact.
+
+                        CRITICAL: saved under a DEDICATED dir (chonk_step_
+                        {step}m{chunk}) so (a) the wrapper's newest-with-state
+                        scan picks it over the older banked step dirs, and (b)
+                        it never overwrites a clean banked checkpoint. The 'm'
+                        suffix keeps sort -V ordering after the base step."""
+                        sp = f"{OUT_DIR}/chonk_step_{step}m{chunks_this_seq}"
                         os.makedirs(sp, exist_ok=True)
                         model.save_pretrained(sp)
                         _moments = {}
