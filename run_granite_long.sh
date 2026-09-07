@@ -43,14 +43,12 @@ export CHONK_EPOCHS=1
 # on EVERY restart so progress made mid-wrapper is always picked up)
 while true; do
     # Resume from the checkpoint whose training_state.pt was WRITTEN MOST
-    # RECENTLY. Rationale: mid-block resume points (chonk_step_192m81) carry
-    # older base-step numbers than a banked 198 but represent NEWER progress
-    # (198's weights + block replayed further); numeric sorts pick 198 and
-    # replay the block from 0 forever (the treadmill). State-file mtime is
-    # the single honest ordering. Dirs without a state file (torn saves) are
-    # skipped entirely.
+    # RECENTLY, across both naming schemes (ckpt_{pos} new, chonk_step_*
+    # legacy). Mid-block points carry older base numbers than a banked step
+    # but represent NEWER progress; state-file mtime is the honest ordering.
+    # Dirs without a state file (torn saves) are skipped entirely.
     LATEST=""
-    for st in $OUT_DIR/chonk_step_*/training_state.pt; do
+    for st in $OUT_DIR/ckpt_*/training_state.pt $OUT_DIR/chonk_step_*/training_state.pt; do
         [ -f "$st" ] || continue
         if [ -z "$LATEST" ] || [ "$st" -nt "$LATEST" ]; then LATEST="$st"; fi
     done
@@ -68,8 +66,7 @@ while true; do
     EXIT_CODE=${PIPESTATUS[0]}
     echo "[$(date)] Exit code $EXIT_CODE" >> $LOG
     # If completed (final saved), break
-    if [ -d "$OUT_DIR/chonk_final" ]; then break; fi
-    # Short pause between restarts (display breath)
+    if [ -d "$OUT_DIR/chonk_final" ]; then break; fi    # Short pause between restarts (display breath)
     sleep 5
 done
 echo "[$(date)] Training loop finished (final at $OUT_DIR/chonk_final)." >> $LOG

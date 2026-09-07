@@ -377,6 +377,32 @@ def dump_tensor_census(tag, path):
         pass
 
 
+def _pos_of_dirname(name, chunks_per_block, opt_steps_per_block, grad_accum):
+    """Global chunk position of a checkpoint dir name. New scheme:
+    ckpt_{pos} (pos = block*chunks_per_block + chunk, monotonic forever).
+    Legacy: chonk_step_{s} -> window-end chunk of step s; chonk_step_{s}m{c}
+    -> block boundary of s + chunk c. Returns None if unparseable."""
+    n = os.path.basename(name)
+    if n.startswith("ckpt_"):
+        try:
+            return int(n[len("ckpt_"):])
+        except ValueError:
+            return None
+    if n.startswith("chonk_step_"):
+        tail = n[len("chonk_step_"):]
+        try:
+            if "m" in tail:
+                s, c = tail.split("m")
+                return ((int(s) // opt_steps_per_block) * chunks_per_block
+                        + int(c))
+            s = int(tail)
+            return ((s // opt_steps_per_block) * chunks_per_block
+                    + (s % opt_steps_per_block) * grad_accum)
+        except ValueError:
+            return None
+    return None
+
+
 def _maybe_recycle(pool, where, save_state=None):
     """Exit(42) for a fresh process when pool or GTT crosses its high-water
     cap. Called every chunk (cheap: one stats dict + one sysfs read) so a
@@ -426,37 +452,36 @@ def train_step(model, chunk_ids, kv_cache, chunk_start, chunk_end):
     return loss, outputs
 
 
-def cleanup_checkpoints(out_dir, keep=8):
+def cleanup_checkpoints(out_dir, keep=8, chunks_per_block=256,
+                        opt_steps_per_block=16, grad_accum=16):
     import glob
-    # Mid-block resume points (name like 192m81) sort as strings and must be
-    # treated as the same step as their base (192); keep them out of numeric
-    # bookkeeping, only cull them when their base step is culled.
-    def _base(p):
-        n = os.path.basename(p)[len("chonk_step_"):]
-        return int(n.split("m")[0]) if "m" in n else int(n)
-    steps = sorted({_base(p) for p in glob.glob(f"{out_dir}/chonk_step_*")})
-    if len(steps) <= keep:
+    # Unified by global position: ckpt_{pos} directly; legacy chonk_step_*
+    # names map through _pos_of_dirname. keep = newest N positions + best.
+    # chonk_best/ and best_loss.txt are separate paths, never touched here.
+    dirs = [d for d in glob.glob(f"{out_dir}/ckpt_*")
+            + glob.glob(f"{out_dir}/chonk_step_*")]
+    pos_of = {}
+    for d in dirs:
+        p = _pos_of_dirname(d, chunks_per_block, opt_steps_per_block,
+                            grad_accum)
+        if p is not None:
+            pos_of[d] = p
+    if len(pos_of) <= keep:
         return
     best, best_loss = None, float("inf")
-    for s in steps:
+    for d, p in pos_of.items():
         try:
-            l = float(open(f"{out_dir}/chonk_step_{s}/.chonk_loss").read().strip())
+            l = float(open(os.path.join(d, ".chonk_loss")).read().strip())
             if l < best_loss:
-                best_loss, best = l, s
+                best_loss, best = l, d
         except (OSError, ValueError):
             continue
-    # Keep the newest `keep` checkpoints plus the best-seen one. (The old
-    # code kept only {max, second-last, best} regardless of `keep`.)
-    # chonk_best/ and best_loss.txt are separate paths, never touched here.
-    keep_set = set(steps[-keep:])
+    keep_set = set(sorted(pos_of.values())[-keep:])
     if best is not None:
-        keep_set.add(best)
-    for s in steps:
-        if s not in keep_set:
-            shutil.rmtree(f"{out_dir}/chonk_step_{s}", ignore_errors=True)
-            # remove any mid-block points of a culled base step
-            for mb in glob.glob(f"{out_dir}/chonk_step_{s}m*"):
-                shutil.rmtree(mb, ignore_errors=True)
+        keep_set.add(pos_of[best])
+    for d, p in pos_of.items():
+        if p not in keep_set:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 def main():
@@ -540,18 +565,18 @@ def main():
         # mid-save leaves a partial training_state.pt) falls back to the
         # previous valid checkpoint instead of crash-looping the wrapper.
         import glob as _glob
-        def _ck_key(p):
-            # mid-block points (192m81) sort after their base step so the
-            # newest-with-state scan prefers them over older banked steps
-            n = os.path.basename(p)[len("chonk_step_"):]
-            if "m" in n:
-                b, c = n.split("m")
-                return (int(b), int(c))
-            return (int(n), -1)
         _cands = sorted(
-            (p for p in _glob.glob(f"{OUT_DIR}/chonk_step_*")
+            (p for p in
+             _glob.glob(f"{OUT_DIR}/ckpt_*")
+             + _glob.glob(f"{OUT_DIR}/chonk_step_*")
              if os.path.isfile(os.path.join(p, "training_state.pt"))),
-            key=_ck_key,
+            # (position, state-mtime): newest progress first; mtime breaks
+            # ties between same-position rewrites.
+            key=lambda p: (_pos_of_dirname(p, chunks_per_block,
+                                           opt_steps_per_block,
+                                           GRAD_ACCUM_STEPS) or -1,
+                           os.path.getmtime(
+                               os.path.join(p, "training_state.pt"))),
             reverse=True)
         if RESUME_DIR in _cands:
             _cands.remove(RESUME_DIR)
@@ -614,25 +639,21 @@ def main():
             _ref = next(p.data for p in model.parameters() if p.requires_grad)
             ema.shadow = {n: s.to(_ref.device) for n, s in ck["ema"].items()}
             resume_step, resume_epoch = ck["step"], ck["epoch"]
-            # Mid-block resume point (saved by the recycle guard): step stays
-            # at its last BANKED value (no snap needed — it is already at a
-            # boundary), and the block/chunk position is replayed no-grad to
-            # rebuild the KV cache, then training continues from that chunk.
-            # This is what lets process lifetimes shorter than a block still
-            # make net forward progress (the treadmill fix).
-            if "midblock_block" in ck:
-                main._midblock_resume = int(ck["midblock_block"])
-                main._midblock_chunk = int(ck["midblock_chunk"])
-                print(f"[Resume] mid-block point: block "
-                      f"{main._midblock_resume} chunk "
-                      f"{main._midblock_chunk} (step stays {resume_step})")
-            # Snap mid-block resumes to the block boundary. Steps advance one
-            # per GRAD_ACCUM_STEPS chunks and blocks are trained whole; a
-            # mid-block resume would re-train the block prefix while the step
-            # counter advances (duplicate data, confusing loss). Flooring costs
-            # at most GRAD_ACCUM_STEPS-1 steps of re-training; the loaded
-            # scheduler/optimizer states stay as-is (a few-step offset over
-            # 11k steps is immaterial).
+            # Position-based resume: pos = block*chunks_per_block + chunk.
+            # The no-grad prefix replay makes ANY position exactly resumable,
+            # so the block-boundary snap is obsolete (kept only as a fallback
+            # for unparseable legacy names). Step counter loads as-banked and
+            # never rewinds.
+            _pos = ck.get("pos")
+            if _pos is None and RESUME_DIR:
+                _pos = _pos_of_dirname(RESUME_DIR, chunks_per_block,
+                                       opt_steps_per_block, GRAD_ACCUM_STEPS)
+            if _pos is not None:
+                main._midblock_resume = _pos // chunks_per_block
+                main._midblock_chunk = _pos % chunks_per_block
+                print(f"[Resume] position {_pos} = block "
+                      f"{main._midblock_resume} chunk {main._midblock_chunk} "
+                      f"(step {resume_step})")
             elif opt_steps_per_block > 0 and resume_step % opt_steps_per_block != 0:
                 floored = (resume_step // opt_steps_per_block) * opt_steps_per_block
                 print(f"[Resume] snapping step {resume_step} -> {floored} (block boundary)")
@@ -646,11 +667,13 @@ def main():
     # re-training from block 0. blocks_done derives from optimizer steps
     # (opt_steps_per_block completed blocks).
     blocks_to_skip = 0
-    if resume_step > 0:
+    if getattr(main, "_midblock_resume", None) is not None:
+        blocks_to_skip = main._midblock_resume
+    elif resume_step > 0:
         blocks_to_skip = resume_step // opt_steps_per_block
-        if blocks_to_skip > 0:
-            print(f"[Resume] skipping first {blocks_to_skip} block(s) "
-                  f"(steps 0..{blocks_to_skip * opt_steps_per_block - 1} already trained)")
+    if blocks_to_skip > 0:
+        print(f"[Resume] skipping first {blocks_to_skip} block(s) "
+              f"(already trained)")
     for epoch in range(resume_epoch, CHONK_EPOCHS):
         gen = get_tokenized_dataset(DATA_PATH, SEQ_LEN, CHONK_SUBSAMPLE, epoch)
         t0 = time.time()
@@ -726,12 +749,14 @@ def main():
                         flight are forfeit); the step counter stays at its last
                         banked value so accounting stays exact.
 
-                        CRITICAL: saved under a DEDICATED dir (chonk_step_
-                        {step}m{chunk}) so (a) the wrapper's newest-with-state
-                        scan picks it over the older banked step dirs, and (b)
-                        it never overwrites a clean banked checkpoint. The 'm'
-                        suffix keeps sort -V ordering after the base step."""
-                        sp = f"{OUT_DIR}/chonk_step_{step}m{chunks_this_seq}"
+                        CRITICAL: named ckpt_{global position} — a single
+                        monotonic number (block*chunks_per_block + chunk).
+                        The old chonk_step_{step}m{chunk} names made three
+                        dirs mean overlapping things (192, 198, 192m81 all
+                        describe block 12) and even the resume logic tripped
+                        over the ordering twice. Positions never rewind."""
+                        _pos = block_idx * chunks_per_block + chunks_this_seq
+                        sp = f"{OUT_DIR}/ckpt_{_pos}"
                         os.makedirs(sp, exist_ok=True)
                         model.save_pretrained(sp)
                         _moments = {}
@@ -758,6 +783,7 @@ def main():
                                     "epoch": epoch,
                                     "adam_step_count": optimizer.step_count,
                                     "adam_moments": _moments,
+                                    "pos": _pos,
                                     "midblock_block": block_idx,
                                     "midblock_chunk": chunks_this_seq},
                                    _tmp)
@@ -875,7 +901,14 @@ def main():
                             time.sleep(CHONK_OPTIMIZER_PAUSE)
 
                         if step % SAVE_INTERVAL == 0:
-                            sp = f"{OUT_DIR}/chonk_step_{step}"
+                            # Named by global position (block*chunks+chunk):
+                            # monotonic, no step-window ambiguity, mid-block
+                            # resumable via no-grad prefix replay. The `step`
+                            # value rides INSIDE the state dict for the LR
+                            # schedule, not in the dir name.
+                            _pos = (block_idx * chunks_per_block
+                                    + chunks_this_seq)
+                            sp = f"{OUT_DIR}/ckpt_{_pos}"
                             os.makedirs(sp, exist_ok=True)
                             model.save_pretrained(sp)
                             # Persist Adam moments by parameter NAME (the live
@@ -909,7 +942,8 @@ def main():
                                         "scheduler": scheduler.state_dict(),
                                         "ema": ema.shadow, "step": step, "epoch": epoch,
                                         "adam_step_count": optimizer.step_count,
-                                        "adam_moments": _moments},
+                                        "adam_moments": _moments,
+                                        "pos": _pos},
                                        _tmp_st)
                             os.replace(_tmp_st, f"{sp}/training_state.pt")
                             cur_loss = float(window_loss)
@@ -942,7 +976,10 @@ def main():
                                     f.write(f"{cur_loss:.6f}")
                                 print(f"  [best] new best loss={cur_loss:.4f} "
                                       f"-> {best_dir}", flush=True)
-                            cleanup_checkpoints(OUT_DIR, KEEP_CHECKPOINTS)
+                            cleanup_checkpoints(OUT_DIR, KEEP_CHECKPOINTS,
+                                                chunks_per_block,
+                                                opt_steps_per_block,
+                                                GRAD_ACCUM_STEPS)
                         if step % LOG_INTERVAL == 0:
                             ps = pool.stats()
                             print(f"Step {step}: loss={float(window_loss):.4f} "
