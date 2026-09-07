@@ -564,4 +564,66 @@ attention workspace (~8 GB → ~4 GB), which fits in headroom:
   0.5-2GB of the same unified memory out of a ~4-8GB margin (chunk 2048
   historically froze the machine).
 
-*End of log*
+*End of log (2026-08-22 era above; Granite chapter below)*
+
+---
+
+## Granite 4.2 30B QLoRA @131072 — stable run (Strix Halo, Sep 2026)
+
+Native 131072-token context, QLoRA r=64/alpha=128, INT4 base + INT4 KV,
+batch 1, chunk 512, grad-accum 16, whole-MLP activation checkpointing.
+Machine reports 128GB; physically 112GB (`MemTotal` 109.7GB), BIOS UMA carve
+lowered 16→8→2GB to return ~14GB to the OS (`MemTotal` now 123.5GB).
+
+### Config (run_granite_long.sh)
+`CHONK_SEQ_LEN=131072 CHONK_CHUNK=512 CHONK_GRAD_ACCUM=16
+CHONK_QUANTIZE_KV=1 CHONK_LORA_R=64 CHONK_MIN_BLOCK_MB=64
+CHONK_GRADIENT_CHECKPOINT=1 CHONK_SAVE_INTERVAL=1 CHONK_KEEP_CHECKPOINTS=5
+CHONK_MAX_POOL_GB=85 CHONK_MAX_GTT_GB=115`
+
+### Findings that made it stable
+- **Duplicate trainers were the early OOMs.** Two wrappers (no mutual
+  exclusion) ran two 30B trainers at once: 121GB VSZ each, racing writes to
+  the same `chonk_step_*` dirs. Fixed with flock guards at wrapper level
+  (`run_granite_long.sh`) AND trainer level (own lock file — sharing one
+  file deadlocks parent/child via flock description semantics, verified).
+- **4MB/chunk ratchet: `ctx.out = out` pinned one segment/layer/chunk**
+  (node→ctx→out→node cycle through the autograd engine; bisected from LoRA
+  adapters down to the single line in a CPU repro). Fix: stash
+  `out.detach()` (bit-identical values; backward only reads). Pool slope
+  went +0.5GB/chunk → +0.07GB/chunk (genuine INT4 KV data rate).
+- **INT4 KV-write ran on grad-tracked tensors** (per-head quant intermediates
+  retained: 128KB class doubling with kc). Fix: write from detached copies
+  (the bf16 branch already did).
+- **GTT costs ~1.52x pool bytes** (measured live: Vulkan BO + dma-buf export
+  + HIP import). Effective ceiling ≈ 65-70GB pool on this box, not 110GB.
+  `hipDestroyExternalMemory` failures were silently ignored (leaking GTT
+  mappings); destroy now defers + retries instead.
+- **Resume was wrong in four ways**, all fixed + verified live: Adam
+  `step_count` never persisted (bias correction restarted); Adam *moments*
+  never persisted at all (pool-keyed by object id — every restart re-warmed
+  from zero); mid-block resumes re-trained prefixes with advancing counters
+  (now snapped to block boundary); checkpoint loss used the last chunk only
+  (now 16-chunk window mean); `cleanup_checkpoints` kept 3 regardless of
+  `keep` (now newest-N + best; best also persisted to `chonk_best/`).
+- **Partial newest checkpoints poisoned resume** (SIGKILLed save left a dir
+  without state → wrapper fell back to from-scratch). Wrapper now scans
+  newest-first for a dir *with* state; state writes are atomic (tmp+rename).
+- **OOM killers vs the desktop.** `systemd-oomd` (default config) assassinates
+  whole sessions; kernel OOM picks the biggest process. Recipe that held:
+  stop oomd+socket for training stretches (reversible), or run headless via
+  `run_vt_no_gdm.sh` (passwordless sudo drop-in `chonk-gdm.sudoers`, GDM
+  mask/stop, systemd-run detached launch, stale-scope + stray verification
+  with D-state abort).
+- **Recycle guards** (pool 85GB / GTT 115GB caps → clean exit 42 right after
+  a banked step; wrapper restarts fresh). Never fired once the slope died —
+  present as backstop only.
+
+### Status (2026-09-06, running)
+- Step ~199/11248, best loss **1.5156** (`chonk_best/`).
+- Pool **flat ~52-54GB through chunk 128** (was +0.5GB/chunk, dying ~chunk 64);
+  slab `live` pinned ~6.5GB; 4MB live class 63 (was ~3900).
+- Per-chunk losses ~0.10-0.15, descending window-means; grad flow to all LoRA
+  targets verified non-zero.
+- Known steady state: ~54GB pool × ~1.5 GTT + desktop ≈ box edge on 123GB;
+  VT+GDM-down is the recommended posture for long stretches.
