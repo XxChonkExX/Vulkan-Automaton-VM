@@ -482,6 +482,15 @@ def cleanup_checkpoints(out_dir, keep=8, chunks_per_block=256,
     for d, p in pos_of.items():
         if p not in keep_set:
             shutil.rmtree(d, ignore_errors=True)
+    # KV snapshots (~9GB each) are only useful for the NEWEST checkpoint
+    # (older positions are never resumed once superseded). Strip them from
+    # every other kept dir or `keep` snapshots eat the disk.
+    newest = max(pos_of.values()) if pos_of else None
+    for d, p in pos_of.items():
+        if p != newest:
+            snap = os.path.join(d, "kv_snapshot.pt")
+            if os.path.exists(snap):
+                os.remove(snap)
 
 
 def main():
@@ -654,6 +663,32 @@ def main():
                 print(f"[Resume] position {_pos} = block "
                       f"{main._midblock_resume} chunk {main._midblock_chunk} "
                       f"(step {resume_step})")
+                # Instant resume: reload the INT4 KV snapshot into the fresh
+                # pool's cache views and mark it loaded (the replay loop then
+                # just fast-forwards its counters). Any failure falls back to
+                # the standard no-grad replay.
+                _snap = os.path.join(_cd, "kv_snapshot.pt") \
+                    if "_cd" in dir() else None
+                if (_snap and os.path.exists(_snap)
+                        and main._midblock_chunk > 0):
+                    try:
+                        _kv = torch.load(_snap, map_location="cpu")
+                        for _lyr, (_k, _v, _ks, _vs, _cum) in zip(
+                                kv_cache.layers, _kv):
+                            _lyr._k_data.copy_(_k)
+                            _lyr._v_data.copy_(_v)
+                            _lyr._k_scales.copy_(_ks)
+                            _lyr._v_scales.copy_(_vs)
+                            _lyr.cumulative_length.fill_(_cum)
+                            _lyr.is_initialized = True
+                        _kv = None
+                        main._kv_snapshot_loaded = True
+                        print(f"[Resume] KV snapshot loaded "
+                              f"({main._midblock_chunk} chunks, instant "
+                              f"resume)", flush=True)
+                    except Exception as _e:
+                        print(f"[Resume] kv snapshot unusable ({_e}); "
+                              f"falling back to no-grad replay", flush=True)
             elif opt_steps_per_block > 0 and resume_step % opt_steps_per_block != 0:
                 floored = (resume_step // opt_steps_per_block) * opt_steps_per_block
                 print(f"[Resume] snapping step {resume_step} -> {floored} (block boundary)")
@@ -710,13 +745,26 @@ def main():
                 chunk_end = min(chunk_start + CHUNK_SIZE, SEQ_LEN)
                 chunk_ids = input_ids[:, chunk_start:chunk_end]
                 if _midblock_replay > 0:
+                    if getattr(main, "_kv_snapshot_loaded", False):
+                        # KV was restored from the disk snapshot: no replay
+                        # compute at all — just advance the counters to the
+                        # resume position (instant).
+                        _midblock_replay -= 1
+                        chunks_this_seq += 1
+                        continue
                     # Prefix replay under no_grad: rebuilds the INT4 KV cache
-                    # only; no forward graph, no grads, no loss.
+                    # only; no forward graph, no grads, no loss. Heartbeat so
+                    # a deep replay never looks like a freeze (a 177-chunk
+                    # replay runs ~90 silent minutes otherwise).
                     with torch.no_grad():
                         train_step(model, chunk_ids, kv_cache,
                                    chunk_start, chunk_end)
                     _midblock_replay -= 1
                     chunks_this_seq += 1
+                    if chunks_this_seq % 16 == 0:
+                        print(f"  replay {chunks_this_seq}/{_resume_chunk} "
+                              f"({time.time()-t0:.0f}s) rebuilding KV",
+                              flush=True)
                     continue
                 loss, outputs = train_step(model, chunk_ids, kv_cache, chunk_start, chunk_end)
                 if CHONK_PAUSE:
@@ -790,6 +838,28 @@ def main():
                         os.replace(_tmp, f"{sp}/training_state.pt")
                         with open(f"{sp}/.chonk_loss", "w") as f:
                             f.write(f"{float(window_loss):.6f}")
+                        # KV cache snapshot: persist the actual INT4 cache so
+                        # resume is INSTANT instead of a ~90-min no-grad
+                        # replay of the prefix (replay = full forward cost of
+                        # every cached chunk; snapshot = one ~9GB NVMe dump,
+                        # ~30-60s). Pool memory is process-local so this is
+                        # the only way state survives. Falls back to replay
+                        # on any failure.
+                        try:
+                            _kv = []
+                            for _lyr in kv_cache.layers:
+                                _kv.append((
+                                    _lyr._k_data.cpu(), _lyr._v_data.cpu(),
+                                    _lyr._k_scales.cpu(),
+                                    _lyr._v_scales.cpu(),
+                                    int(_lyr.cumulative_length.item())))
+                            torch.save(_kv, f"{sp}/kv_snapshot.pt.tmp")
+                            os.replace(f"{sp}/kv_snapshot.pt.tmp",
+                                       f"{sp}/kv_snapshot.pt")
+                            _kv = None
+                        except Exception as _e:
+                            print(f"[recycle] kv snapshot failed ({_e}); "
+                                  f"resume will no-grad replay", flush=True)
                         print(f"[recycle] mid-block point saved: step {step} "
                               f"block {block_idx} chunk {chunks_this_seq}",
                               flush=True)
