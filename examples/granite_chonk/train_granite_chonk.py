@@ -792,17 +792,35 @@ def main():
                 if chunks_this_seq >= 4:
                     def _save_midblock():
                         """Persist an exact mid-block resume point so the next
-                        process replays only the KV prefix instead of the whole
-                        block. Steps NOT advanced for partial windows (grads in
-                        flight are forfeit); the step counter stays at its last
-                        banked value so accounting stays exact.
+                        process resumes instantly (KV snapshot) instead of
+                        replaying the block. Steps NOT advanced for partial
+                        windows (grads in flight are forfeit); the step counter
+                        stays at its last banked value so accounting stays
+                        exact.
 
-                        CRITICAL: named ckpt_{global position} — a single
-                        monotonic number (block*chunks_per_block + chunk).
-                        The old chonk_step_{step}m{chunk} names made three
-                        dirs mean overlapping things (192, 198, 192m81 all
-                        describe block 12) and even the resume logic tripped
-                        over the ordering twice. Positions never rewind."""
+                        MEMORY-SAFE SAVES (a first version wedged the box for
+                        10h here): (1) reclaim slab/pool transients FIRST —
+                        empty_cache + release_empty_blocks returns several GB
+                        of GTT pins while we still own the process; (2) NEVER
+                        materialize .cpu() dicts — torch.save streams CUDA
+                        storages one at a time (peak ~70MB) when handed the
+                        device tensors directly; (3) skip the ~9GB KV snapshot
+                        if RAM is still too tight and fall back to replay."""
+                        def _avail_gb():
+                            try:
+                                with open("/proc/meminfo") as f:
+                                    for ln in f:
+                                        if ln.startswith("MemAvailable"):
+                                            return int(ln.split()[1]) / 1e6
+                            except OSError:
+                                pass
+                            return 64.0
+                        try:
+                            torch.cuda.empty_cache()
+                            release_empty_blocks(keepFloor=0)
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
                         _pos = block_idx * chunks_per_block + chunks_this_seq
                         sp = f"{OUT_DIR}/ckpt_{_pos}"
                         os.makedirs(sp, exist_ok=True)
@@ -819,9 +837,11 @@ def main():
                                     _st = optimizer.state.get(_p, {})
                                 if ("exp_avg" in _st and
                                         "exp_avg_sq" in _st):
+                                    # Device refs only — torch.save streams
+                                    # them to disk storage-by-storage.
                                     _moments[_name_of[_p]] = (
-                                        _st["exp_avg"].detach().cpu(),
-                                        _st["exp_avg_sq"].detach().cpu())
+                                        _st["exp_avg"].detach(),
+                                        _st["exp_avg_sq"].detach())
                         except Exception:
                             pass
                         _tmp = f"{sp}/training_state.pt.tmp"
@@ -836,27 +856,32 @@ def main():
                                     "midblock_chunk": chunks_this_seq},
                                    _tmp)
                         os.replace(_tmp, f"{sp}/training_state.pt")
+                        _moments = None  # drop refs before the KV snapshot
                         with open(f"{sp}/.chonk_loss", "w") as f:
                             f.write(f"{float(window_loss):.6f}")
                         # KV cache snapshot: persist the actual INT4 cache so
                         # resume is INSTANT instead of a ~90-min no-grad
-                        # replay of the prefix (replay = full forward cost of
-                        # every cached chunk; snapshot = one ~9GB NVMe dump,
-                        # ~30-60s). Pool memory is process-local so this is
-                        # the only way state survives. Falls back to replay
-                        # on any failure.
+                        # replay of the prefix. Pool memory is process-local
+                        # so this is the only way state survives. The device
+                        # tensors are handed to torch.save DIRECTLY (streams
+                        # one ~70MB storage at a time); the old .cpu()-first
+                        # version materialized 8.6GB at once and wedged the
+                        # box for 10h under zero-RAM reclaim. Skipped entirely
+                        # if RAM is still too tight (replay fallback).
                         try:
-                            _kv = []
-                            for _lyr in kv_cache.layers:
-                                _kv.append((
-                                    _lyr._k_data.cpu(), _lyr._v_data.cpu(),
-                                    _lyr._k_scales.cpu(),
-                                    _lyr._v_scales.cpu(),
-                                    int(_lyr.cumulative_length.item())))
-                            torch.save(_kv, f"{sp}/kv_snapshot.pt.tmp")
-                            os.replace(f"{sp}/kv_snapshot.pt.tmp",
-                                       f"{sp}/kv_snapshot.pt")
-                            _kv = None
+                            if _avail_gb() >= 2.0:
+                                torch.save(
+                                    [(_lyr._k_data, _lyr._v_data,
+                                      _lyr._k_scales, _lyr._v_scales,
+                                      int(_lyr.cumulative_length.item()))
+                                     for _lyr in kv_cache.layers],
+                                    f"{sp}/kv_snapshot.pt.tmp")
+                                os.replace(f"{sp}/kv_snapshot.pt.tmp",
+                                           f"{sp}/kv_snapshot.pt")
+                            else:
+                                print(f"[recycle] kv snapshot skipped "
+                                      f"(only {_avail_gb():.1f}GB RAM avail); "
+                                      f"resume will replay", flush=True)
                         except Exception as _e:
                             print(f"[recycle] kv snapshot failed ({_e}); "
                                   f"resume will no-grad replay", flush=True)
@@ -998,9 +1023,12 @@ def main():
                                         _st = optimizer.state.get(_p, {})
                                     if ("exp_avg" in _st and
                                             "exp_avg_sq" in _st):
+                                        # Device refs — torch.save streams
+                                        # storages; .cpu() dicts once wedged
+                                        # the box under memory pressure.
                                         _moments[_name_of[_p]] = (
-                                            _st["exp_avg"].detach().cpu(),
-                                            _st["exp_avg_sq"].detach().cpu())
+                                            _st["exp_avg"].detach(),
+                                            _st["exp_avg_sq"].detach())
                             except Exception:
                                 pass
                             # Atomic state write: a SIGKILL mid-save must not
