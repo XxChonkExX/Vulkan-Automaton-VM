@@ -870,9 +870,16 @@ def main():
                         # if RAM is still too tight (replay fallback).
                         try:
                             if _avail_gb() >= 2.0:
+                                # Scale tensors are dtype-views into the same
+                                # pool storage as the packed data; torch.save
+                                # refuses storages aliased as different dtypes
+                                # ("view the same data as different types").
+                                # clone() gives each its own storage — tiny
+                                # (max_len*heads*2B = 4MB/layer) and cheap.
                                 torch.save(
                                     [(_lyr._k_data, _lyr._v_data,
-                                      _lyr._k_scales, _lyr._v_scales,
+                                      _lyr._k_scales.clone(),
+                                      _lyr._v_scales.clone(),
                                       int(_lyr.cumulative_length.item()))
                                      for _lyr in kv_cache.layers],
                                     f"{sp}/kv_snapshot.pt.tmp")
