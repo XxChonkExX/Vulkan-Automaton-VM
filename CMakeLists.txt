@@ -82,6 +82,8 @@ option(VVM_USE_VOLK "Use Volk for Vulkan loading" ON)
 option(VVM_BUILD_NETWORK "Build network/multi-node module" ON)
 option(VVM_BUILD_PYTORCH "Build PyTorch C++ extension" OFF)
 option(VVM_BUILD_ONNX "Build ONNX Runtime integration" OFF)
+option(VVM_BUILD_STORAGE_STREAM "Build SSD->GPU MoE expert streaming (pure Vulkan + DirectStorage stub)" ON)
+option(VVM_BUILD_DSTORAGE "Enable DirectStorage SDK path (Windows, experimental)" OFF)
 
 # Vulkan
 find_package(Vulkan REQUIRED)
@@ -172,6 +174,14 @@ if(VVM_BUILD_SHARED)
         src/cross_gpu/external_memory.cpp
         src/cross_gpu/multi_gpu_manager.cpp
         src/offload/host_shadow.cpp
+        src/offload/storage_stream.cpp
+        src/offload/storage_stream_dstorage.cpp
+        src/offload/storage/pack_format.cpp
+        src/offload/storage/cache.cpp
+        src/offload/storage/request_queue.cpp
+        src/offload/storage/ioring_backend.cpp
+        src/offload/storage/dstorage_backend.cpp
+        src/offload/storage/scheduler.cpp
         src/utils/vulkan_utils.cpp
         src/utils/error_handling.cpp
         src/placement/shard_placer.cpp
@@ -184,6 +194,14 @@ else()
         src/cross_gpu/external_memory.cpp
         src/cross_gpu/multi_gpu_manager.cpp
         src/offload/host_shadow.cpp
+        src/offload/storage_stream.cpp
+        src/offload/storage_stream_dstorage.cpp
+        src/offload/storage/pack_format.cpp
+        src/offload/storage/cache.cpp
+        src/offload/storage/request_queue.cpp
+        src/offload/storage/ioring_backend.cpp
+        src/offload/storage/dstorage_backend.cpp
+        src/offload/storage/scheduler.cpp
         src/utils/vulkan_utils.cpp
         src/utils/error_handling.cpp
         src/placement/shard_placer.cpp
@@ -213,6 +231,14 @@ target_compile_definitions(vulkan_vm PRIVATE
 )
 if(WIN32)
     target_compile_definitions(vulkan_vm PRIVATE VK_USE_PLATFORM_WIN32_KHR=1)
+endif()
+if(VVM_BUILD_DSTORAGE)
+    target_compile_definitions(vulkan_vm PUBLIC VVM_HAS_DSTORAGE=1)
+    message(STATUS "VulkanVM: DirectStorage path enabled (experimental, needs SDK + d3d12)")
+endif()
+if(WIN32)
+    # D3D12 shared-heap bridge (zero-copy DirectStorage destination)
+    target_link_libraries(vulkan_vm PUBLIC d3d12 dxgi)
 endif()
 
 if(VVM_BUILD_SHARED)

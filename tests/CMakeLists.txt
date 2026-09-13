@@ -76,6 +76,86 @@ target_include_directories(external_handle_test PRIVATE
 )
 add_test(NAME external_handle_test COMMAND external_handle_test)
 
+# CPU-only MoE pack + registry tests (no GPU needed; GPU streamer gated)
+add_executable(storage_stream_test storage_stream_test.cpp)
+target_link_libraries(storage_stream_test PRIVATE vulkan_vm)
+target_include_directories(storage_stream_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
+add_test(NAME storage_stream_test COMMAND storage_stream_test)
+
+# L0 pack format v2 (widths, checksums, round-trip) — CPU-only
+add_executable(storage_pack_test storage_pack_test.cpp)
+target_link_libraries(storage_pack_test PRIVATE vulkan_vm)
+target_include_directories(storage_pack_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
+add_test(NAME storage_pack_test COMMAND storage_pack_test)
+
+# L1 cache core (state machine, eviction policies, fuzz) — CPU-only
+add_executable(storage_cache_test storage_cache_test.cpp)
+target_link_libraries(storage_cache_test PRIVATE vulkan_vm)
+target_include_directories(storage_cache_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
+add_test(NAME storage_cache_test COMMAND storage_cache_test)
+
+# L2 request queue (Little's Law, submit/poll split, fake backend) — CPU-only
+add_executable(storage_queue_test storage_queue_test.cpp)
+target_link_libraries(storage_queue_test PRIVATE vulkan_vm)
+target_include_directories(storage_queue_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
+add_test(NAME storage_queue_test COMMAND storage_queue_test)
+
+# L3 IoRing/OVERLAPPED backend — real file I/O (skips on non-Windows)
+add_executable(storage_backend_test storage_backend_test.cpp)
+target_link_libraries(storage_backend_test PRIVATE vulkan_vm)
+target_include_directories(storage_backend_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
+add_test(NAME storage_backend_test COMMAND storage_backend_test)
+
+# L3 DirectStorage zero-copy bridge — GPU-gated (skips without GPU/driver import)
+add_executable(storage_dstorage_test storage_dstorage_test.cpp)
+target_link_libraries(storage_dstorage_test PRIVATE vulkan_vm)
+target_include_directories(storage_dstorage_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
+add_test(NAME storage_dstorage_test COMMAND storage_dstorage_test)
+
+# L4 tiering scheduler (lanes, predictor, placement, rebalance) — CPU-only
+add_executable(storage_sched_test storage_sched_test.cpp)
+target_link_libraries(storage_sched_test PRIVATE vulkan_vm)
+target_include_directories(storage_sched_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
+add_test(NAME storage_sched_test COMMAND storage_sched_test)
+
+# E2E MoE expert streaming against a real model pack — real IO, real NVMe
+add_executable(storage_e2e_stream_test storage_e2e_stream_test.cpp)
+target_link_libraries(storage_e2e_stream_test PRIVATE vulkan_vm)
+target_include_directories(storage_e2e_stream_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
+
+# GPU round-trip: ExpertStreamer SSD->Chonk->readback (skips cleanly w/o GPU)
+add_executable(storage_stream_gpu_test storage_stream_gpu_test.cpp)
+target_link_libraries(storage_stream_gpu_test PRIVATE vulkan_vm)
+target_include_directories(storage_stream_gpu_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
+add_test(NAME storage_stream_gpu_test COMMAND storage_stream_gpu_test)
+
 # Sparse / residency virtual memory test (requires sparseResidencyBuffer feature)
 add_executable(sparse_test sparse_test.cpp)
 target_link_libraries(sparse_test PRIVATE vulkan_vm)

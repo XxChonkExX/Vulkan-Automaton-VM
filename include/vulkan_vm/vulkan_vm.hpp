@@ -7,6 +7,7 @@
 #include "vulkan_vm/core.hpp"
 #include "vulkan_vm/cross_gpu.hpp"
 #include "vulkan_vm/offload.hpp"
+#include "vulkan_vm/storage_stream.hpp"
 #include "vulkan_vm/placement.hpp"
 #include "vulkan_vm/sparse.hpp"
 // Transport layers (network, tensor transport, RDMA/UCX) are OPTIONAL and

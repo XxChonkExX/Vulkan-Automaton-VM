@@ -343,6 +343,7 @@ enum class ExternalHandleType {
     OpaqueFd,              // Linux: VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT
     OpaqueWin32,           // Windows: VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
     D3D12Heap,             // Windows: VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT
+    D3D12Resource,         // Windows: VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT
     DmaBuf,                // Linux: VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
     AndroidHardwareBuffer  // Android: VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID
 };

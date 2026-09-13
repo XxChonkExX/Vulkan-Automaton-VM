@@ -35,6 +35,17 @@ VulkanVM
 │   ├── Tensor operations & collectives
 │   └── Layout conversion (SPIR-V compute)
 │
+├── Storage  (vvm::storage)              # SSD -> GPU streaming for MoE offload
+│   ├── L0 Pack format — sharded .vmex, width-swappable, self-describing
+│   ├── L1 Software cache — BaM-style per-line state + refcount pinning +
+│   │     swappable eviction (Clock/LRU/FIFO)
+│   ├── L2 Request queue — Little's Law depth, submit/poll split, coalescing
+│   ├── L3 Backends — IoRing (Windows, dynamic-loaded, OVERLAPPED floor),
+│   │     DirectStorage zero-copy bridge (LUID-matched D3D12 shared heap ->
+│   │     VK import), Uring/GDS/uGDS (Linux, designed)
+│   └── L4 Tiering scheduler — two lanes (weights/KV), MoE predictor,
+│         FlexGen-style hot/warm/cold placement
+│
 └── Integrations
     ├── PyTorch — Chonk pluggable allocator + parameter binding + autograd ops
     ├── ONNX Runtime — execution provider
@@ -117,10 +128,14 @@ Qwen3.6-40B Q4_K_M, 21.5 t/s decode pooled across RX 7900 XTX + Arc Pro B70.
 | Android Adreno AHardwareBuffer (S24+) | **1 — Verified** |
 | Intel Level Zero GPU-direct | 2 — Compile-tested |
 | UCX · Windows ND · NDK transport | 2 — Compile-tested |
+| Windows IoRing backend (real NVMe reads, `mode=ioring`) | **1 — Verified** |
+| DStorage zero-copy bridge (shared-committed D3D12 heap -> VK import, B70) | **1 — Verified** |
 | NVIDIA (CUDA/Vulkan) · Tenstorrent | 3 — Designed |
 | Mali · PowerVR · Xclipse | Untested |
 
-Full evidence-linked matrix: [docs/HARDWARE_SUPPORT.md](docs/HARDWARE_SUPPORT.md)
+Full evidence-linked matrix: [docs/HARDWARE_SUPPORT.md](docs/HARDWARE_SUPPORT.md).
+Storage-stream architecture + backend-selection research:
+[docs/STORAGE_STREAM_ARCHITECTURE.md](docs/STORAGE_STREAM_ARCHITECTURE.md).
 
 ---
 
@@ -138,6 +153,7 @@ Full evidence-linked matrix: [docs/HARDWARE_SUPPORT.md](docs/HARDWARE_SUPPORT.md
 | [explainfordummyuser.md](explainfordummyuser.md) | The relay-race tour of everything above, for humans |
 | [docs/AUDIT_NOTES_2026-08-15.md](docs/AUDIT_NOTES_2026-08-15.md) | External audit response + sync notes |
 | [docs/LINUX_TEST_RESULTS_2026-08-25.md](docs/LINUX_TEST_RESULTS_2026-08-25.md) | Native Linux campaign: cross-vendor DMA-BUF P2P verified, verbs/RDMA fixes, full evidence |
+| [docs/STORAGE_STREAM_ARCHITECTURE.md](docs/STORAGE_STREAM_ARCHITECTURE.md) | SSD->GPU streaming: L0-L4 protocol, BaM/uGDS/GDS/DirectStorage research, backend selection |
 
 ---
 
@@ -150,6 +166,16 @@ ctest --test-dir build -R "buddy_test|chonk_slab_test|placement_test"
 # Slab allocator fuzz (audit Priority 3): boundaries, double-free,
 # overlap tracking, invariants after every op:
 ./build/tests/chonk_slab_test 100000        # 1M for nightly runs
+
+# Storage-stream suite (L0-L4; pack/cache/queue are CPU-only, backend is
+# real file I/O, dstorage bridge is GPU-gated, scheduler is CPU-only):
+ctest --test-dir build -R "storage_pack_test|storage_cache_test|storage_queue_test"
+./build/tests/storage_backend_test.exe          # real IoRing/OVERLAPPED file I/O
+./build/tests/storage_dstorage_test.exe         # D3D12 bridge (GPU-gated, skips cleanly)
+./build/tests/storage_sched_test.exe            # L4 two-lane scheduler + fuzz
+
+# E2E MoE expert streaming against a real model pack (real NVMe):
+./build/tests/storage_e2e_stream_test.exe <pack.vmex> 2
 
 # Autograd numerical validation (needs torch + the extension):
 python -m pytest python/vulkanvm_torch/test_autograd_numerics.py -v
@@ -176,6 +202,13 @@ framework. The honest list:
 - ONNX provider: CPU fallback path
 - Network layer: wire parser hardened; system-level hardening roadmap in
   [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)
+- Storage stream: L0-L4 built; IoRing backend verified on real NVMe (3.29 GB/s
+  e2e over a 13.69 GB real-model expert pack, Qwen3.5-35B-A3B Q8_0); DirectStorage
+  zero-copy bridge verified on the B70 (shared-committed path — AMD/Intel refuse
+  raw D3D12_HEAP imports; NVIDIA is the HEAP vendor); DirectStorage producer needs
+  the SDK NuGet + runtime (gated, exact sequence documented); serve parity at
+  real-model scale (20 t/s decode, -1.5-2% vs stock, within noise); Linux backends
+  (Uring/GDS/uGDS) designed per docs/STORAGE_STREAM_ARCHITECTURE.md §6-7
 
 What we claim, we test. What we haven't tested, we say.
 
@@ -265,6 +298,29 @@ campaign (2026-08-25): cross-vendor P2P + verbs/RDMA verification, RDMA
 teardown hang root-caused and fixed, ANV 26.0.3 import crash characterized,
 validation-layer VUID cleanup — full evidence in
 [docs/LINUX_TEST_RESULTS_2026-08-25.md](docs/LINUX_TEST_RESULTS_2026-08-25.md).
+
+**Storage stream (2026-09-13):** SSD -> GPU streaming for MoE expert offload,
+built against frontier systems (BaM ASPLOS'23, uGDS, NVIDIA GDS, Microsoft
+DirectStorage, Mooncake, FlexGen, ZeRO-Infinity — see
+[docs/STORAGE_STREAM_ARCHITECTURE.md](docs/STORAGE_STREAM_ARCHITECTURE.md)):
+- L0 width-swappable sharded pack (self-describing field widths, per-shard
+  FNV-1a64), L1 BaM-style cache (per-line state machine, atomic refcount
+  pinning, swappable Clock/LRU/FIFO eviction), L2 request queue (Little's Law
+  depth sizing, submit/poll split, `coalesceRuns`), L4 two-lane tiering
+  scheduler (MoE predictor, FlexGen-style hot/warm/cold placement).
+- L3 backends: **Windows IoRing** (dynamic-loaded from kernelbase, honest
+  OVERLAPPED floor when the kernel path is unavailable, tag-based completion
+  reap) and the **DirectStorage zero-copy bridge** (LUID-matched D3D12 shared
+  heap -> `vkImportMemoryWin32HandleKHR`; HEAP-first with a shared-committed
+  resource fallback — AMD/Intel Windows drivers refuse raw D3D12_HEAP imports,
+  the committed path lights up on the B70).
+- Verified end-to-end on a real model: Qwen3.5-35B-A3B Q8_0 (36.9 GB) sliced
+  into 4,096 expert shards (3.19 MiB each), streamed at **3.29 GB/s** through
+  the full stack on real NVMe; serve parity through the chonk-buffer llama.cpp
+  branch at real-model scale (20 t/s decode, -1.5-2% vs stock, within noise).
+- Build-out caught and fixed: `readHash` static-member null-`this` fault,
+  request-queue correlation-id overwrite, `assert()`-side-effect Release-build
+  skips, `CreateSharedHandle` placed-resource restriction.
 
 **Recent fixes (2026-08-25, Windows CI + lifecycle):**
 - Windows MSVC full matrix builds & links end-to-end: OpenSSL include-dir

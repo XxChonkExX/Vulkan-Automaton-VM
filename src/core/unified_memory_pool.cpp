@@ -1370,7 +1370,8 @@ std::optional<ExternalMemoryInfo> UnifiedMemoryPool::exportMemory(
         return info;
     }
     #elif defined(VVM_PLATFORM_WINDOWS)
-    if (type == ExternalHandleType::OpaqueWin32 || type == ExternalHandleType::D3D12Heap) {
+    if (type == ExternalHandleType::OpaqueWin32 || type == ExternalHandleType::D3D12Heap ||
+        type == ExternalHandleType::D3D12Resource) {
         VkMemoryGetWin32HandleInfoKHR handleInfo{};
         handleInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR;
         handleInfo.memory = alloc.memory;
@@ -1381,6 +1382,9 @@ std::optional<ExternalMemoryInfo> UnifiedMemoryPool::exportMemory(
                 break;
             case ExternalHandleType::D3D12Heap:
                 handleInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
+                break;
+            case ExternalHandleType::D3D12Resource:
+                handleInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
                 break;
             default:
                 return std::nullopt;
@@ -1424,6 +1428,8 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
         importHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
     } else if (info.type == ExternalHandleType::D3D12Heap) {
         importHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT;
+    } else if (info.type == ExternalHandleType::D3D12Resource) {
+        importHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
     } else
     #endif
     {

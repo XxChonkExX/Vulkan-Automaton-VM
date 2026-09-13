@@ -60,6 +60,11 @@ add_executable(model_registry_test model_registry_test.cpp)
 target_link_libraries(model_registry_test PRIVATE vulkan_vm vulkan_vm_network)
 target_include_directories(model_registry_test PRIVATE ${EXAMPLE_EXTRA_INCLUDES})
 
+# MoE pack tool (CPU-only: pack/list/verify/slice/demo .vmex files)
+add_executable(moe_pack moe_pack.cpp)
+target_link_libraries(moe_pack PRIVATE vulkan_vm)
+target_include_directories(moe_pack PRIVATE ${EXAMPLE_EXTRA_INCLUDES})
+
 # Multi-GPU example (requires multiple GPUs)
 # add_executable(multi_gpu multi_gpu.cpp)
 # target_link_libraries(multi_gpu PRIVATE vulkan_vm)
