@@ -23,6 +23,7 @@
 #include "vulkan_vm/storage/request_queue.hpp"
 #include "vulkan_vm/core.hpp" // vvm::Result
 
+#include <list>
 #include <memory>
 #include <string>
 #include <vector>
@@ -86,6 +87,8 @@ public:
     // "ioring" or "overlapped" — what submitBatch/pollCompletions actually use.
     const char* activeMode() const { return ioringMode_ ? "ioring" : "overlapped"; }
     bool ioringActive() const { return ioringMode_; }
+    // BypassIO active (NTFS + filters skipped straight to the volume stack).
+    bool bypassIo() const { return bypassIo_; }
 
     // Staging arena (backend-owned; dstSlot indexes it).
     void* slotPtr(uint32_t slot) const;
@@ -107,6 +110,7 @@ private:
     BackendConfig cfg_;
     bool open_ = false;
     bool ioringMode_ = false;
+    bool bypassIo_ = false;
 
     void* arena_ = nullptr;            // VirtualAlloc'd, slotCount * slotBytes
 
@@ -118,11 +122,14 @@ private:
     std::vector<uint8_t> regInfo_;     // IORING_BUFFER_INFO array (must stay valid)
 
     // OVERLAPPED pending pool (reads in Overlapped mode + all writes).
+    // std::list: node addresses are STABLE. The kernel writes completion
+    // status into the OVERLAPPED while the IO is in flight, so a vector
+    // reallocation (which moves the structs) would strand completions.
     struct Pending {
         uint64_t id = 0;
         OVERLAPPED ov{};               // must stay valid until completion
     };
-    std::vector<Pending> pending_;
+    std::list<Pending> pending_;
 
     void* file_ = nullptr;             // HANDLE
 #endif

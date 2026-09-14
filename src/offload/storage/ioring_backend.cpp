@@ -24,6 +24,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <winioctl.h> // FSCTL_MANAGE_BYPASS_IO
 
 namespace vvm {
 namespace storage {
@@ -118,6 +119,21 @@ Result IoRingBackend::open() {
         file_ = nullptr;
         close();
         return Result::error(ErrorCode::InvalidConfig, "CreateFileW failed: " + cfg_.packPath);
+    }
+
+    // 2b) BypassIO: skip NTFS + all filesystem filters (Defender included)
+    // straight to the volume stack. Best-effort: unsupported volumes/configs
+    // fail the ioctl and we continue on the normal filtered path.
+    // (winioctl.h: FS_BPIO_INPUT with FS_BPIO_OP_ENABLE.)
+    {
+        FS_BPIO_INPUT in{};
+        in.Operation = FS_BPIO_OP_ENABLE;
+        in.InFlags = FSBPIO_INFL_None;
+        DWORD br = 0;
+        if (::DeviceIoControl(static_cast<HANDLE>(file_), FSCTL_MANAGE_BYPASS_IO,
+                              &in, sizeof(in), nullptr, 0, &br, nullptr)) {
+            bypassIo_ = true;
+        }
     }
 
 #ifdef VVM_HAS_IORING_HEADER
@@ -239,7 +255,13 @@ uint32_t IoRingBackend::submitBatch(const std::vector<IORequest>& batch) {
 #endif
         {
             // OVERLAPPED floor: reads (Overlapped mode) and ALL writes.
-            Pending p;
+            // The node MUST exist in the list BEFORE issuing the IO: the
+            // kernel captures the OVERLAPPED pointer at ReadFile/WriteFile
+            // time and completes into it asynchronously. Issuing against a
+            // stack temporary and moving it afterwards strands the completion
+            // (and lets the kernel smash the reused stack slot).
+            pending_.emplace_back();
+            Pending& p = pending_.back();
             p.id = r.id;
             LARGE_INTEGER li;
             li.QuadPart = static_cast<LONGLONG>(r.fileOffset);
@@ -258,8 +280,9 @@ uint32_t IoRingBackend::submitBatch(const std::vector<IORequest>& batch) {
             // ERROR_IO_PENDING -> in flight; TRUE -> completed synchronously
             // (still reaped via GetOverlappedResult); other -> rejected.
             if (ok || ::GetLastError() == ERROR_IO_PENDING) {
-                pending_.push_back(std::move(p));
                 issued = true;
+            } else {
+                pending_.pop_back(); // rejected: release the node
             }
         }
 
