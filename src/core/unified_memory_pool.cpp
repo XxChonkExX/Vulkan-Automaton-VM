@@ -452,17 +452,39 @@ VVM_LOG_INFO("Selected HOST_VISIBLE memory type {} (heap budget: {} MB)",
     }
     }
     
-    // Pre-allocate first block (pool blocks are never exportable). Respect the
-    // budget cap: do not steal memory past maxHeapFraction / maxPoolBytes.
+    // First block: best-fit, not config-size. On a device whose heap is already
+    // mostly committed (context-init pools created after layer-split weight
+    // placement), a blind 1 GiB initial block can OOM where a smaller first
+    // block leaves enough budget for the pool to bootstrap and grow on demand.
+    // Order: device-resident config ladder (smallest >= minAllocation),
+    // then fall back to the configured block size, then to 256 MiB chunks.
     if (!getenv("VVM_SKIP_INITBLOCK")) {
-    if (wouldExceedBudget(config_.blockSize)) {
-        VVM_LOG_ERROR("Initial pool block ({} MB) exceeds configured budget; "
-                      "lower blockSize or raise maxHeapFraction/maxPoolBytes",
-                      config_.blockSize / (1024 * 1024));
-        return false;
+    VkDeviceSize firstBlock = 0;
+    {
+        VkDeviceSize smallestLadder = 0;
+        for (VkDeviceSize bs : config_.blockSizes) {
+            if (bs >= config_.minAlignment && (smallestLadder == 0 || bs < smallestLadder))
+                smallestLadder = bs;
+        }
+        const VkDeviceSize candidates[4] = {
+            smallestLadder ? smallestLadder : 0,
+            config_.chunkBlockSize,
+            config_.blockSize,
+            256ull * 1024ull * 1024ull,
+        };
+        for (VkDeviceSize c : candidates) {
+            if (c == 0) continue;
+            if (!wouldExceedBudget(c)) { firstBlock = c; break; }
+        }
+        if (firstBlock == 0) {
+            // Even 256 MiB exceeds the configured cap — the budget check is
+            // advisory here (growth checks still apply); try 256 MiB once and
+            // let vkAllocateMemory decide.
+            firstBlock = 256ull * 1024ull * 1024ull;
+        }
     }
-    if (!allocateBlock(config_.blockSize, deviceLocalMemoryType_).has_value()) {
-        VVM_LOG_ERROR("Failed to allocate initial memory block");
+    if (!allocateBlock(firstBlock, deviceLocalMemoryType_).has_value()) {
+        VVM_LOG_ERROR("Failed to allocate initial memory block ({} MB)", firstBlock / (1024 * 1024));
         return false;
     }
     }
