@@ -335,3 +335,36 @@ MMQ kernel efficiency, not architecture, not Windows, not storage.
 - MTP/draft head: 3.4x SLOWER on any expert-offload config (lukaLLM);
   skipping it cost us nothing.
 - Full server-side detail: D:\AI_Bundle\qwen38next\SERVE_TEST_RESULTS.md
+
+## X-sourced baselines (2026-09-14 sweep of x.com via DDG/fxtwitter)
+
+**SergeB @SergiiioBS (Sep 11 2026), dual Arc Pro B70, llama.cpp SYCL
+(cookbook: github.com/SergiioB/intel-arc-pro-b70-inference-cookbook):**
+
+| Cell | Decode |
+|---|---|
+| 8K p512, no-spec (pinned build) | 23.38 t/s |
+| 8K + MTP + fused multi-token MUL_MAT_ID | **33.25 t/s** (code) / 30.68 (prose) |
+| 128K near-boundary (~120.7K prompt) | 18.38 t/s |
+| Prefill F16 cold | 585.9 t/s |
+
+Same model (Flash-Next), same GPU model as our second card - but a
+different placement class: 2x B70 = 64 GB VRAM holds ALL weights (88 GiB
+mixed IQ3_S/IQ4_NL); only the 35.8 GiB N-gram table sits on CPU. 32 GB
+host RAM is enough - "RAM is the purchase" applies to OUR class, not
+theirs. Linux + SYCL + custom kernel patches.
+
+**Per-VRAM-GB efficiency (our streaming box vs their VRAM-resident box):**
+ours 15.79/24 GB = 0.66 t/s per GB; theirs 23.38/64 GB = 0.37 t/s per GB.
+We are ~1.8x more efficient per GB of VRAM; they are 1.5x faster in
+absolute terms with 2.7x the VRAM.
+
+**The kernel lead, confirmed from an independent source:** their +60%
+decode gain came from fusing MTP verify MoE ops into one multi-token
+MUL_MAT_ID GEMV, replacing a per-row counting-sort path (~144 ops/round
+-> ~85 ms verify, down from 118). That counting-sort path is the same
+class of inefficiency our sweep exposed in the Vulkan backend - and the
+fix exists for SYCL but NOT for Vulkan/RDNA3. This is the upstream PR
+pattern to watch/port; until then the CPU-experts champion config stands.
+Their MTP gain (+42%) is consistent with lukaLLM: MTP pays only when no
+experts are offloaded.
