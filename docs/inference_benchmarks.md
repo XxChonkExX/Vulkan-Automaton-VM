@@ -368,3 +368,30 @@ fix exists for SYCL but NOT for Vulkan/RDNA3. This is the upstream PR
 pattern to watch/port; until then the CPU-experts champion config stands.
 Their MTP gain (+42%) is consistent with lukaLLM: MTP pays only when no
 experts are offloaded.
+
+## HIP backend sweep (2026-09-14 evening) - kernels were the bottleneck, proven
+
+Built the same chonk-buffer tree with `GGML_HIP=ON` (ROCm 7.2, gfx1100,
+Clang 21). Same sweep protocol as above:
+
+| --n-cpu-moe | GPU layers | Vulkan | HIP |
+|---|---|---|---|
+| 999 (experts CPU) | 0 | 15.79 | 15.57 |
+| 40 | 8 | 7.24 | 17.33 |
+| 36 | 12 | - | 18.31 |
+| **34** | **14** | - | **19.34 <- champion** |
+| 33 | 15 | - | 15.94 (VRAM spill) |
+
+Conclusions:
+1. The GPU-expert sweep direction INVERTED with the native driver: HIP gains
+   +0.22 t/s per expert layer (NVIDIA-like) where Vulkan lost 0.85. The
+   Vulkan Q3_K MUL_MAT_ID kernel was the entire deficit - matching the
+   SergeB SYCL fused-kernel findings on Arc.
+2. New champion config (single XTX, Windows): HIP build + --n-cpu-moe 34
+   = **19.34 t/s** (+22.5% over the Vulkan champion), ~85% of the insiderllm
+   3090+62GB CUDA rig (22.6-24.5) on one 24 GB card.
+3. VRAM spill cliff: 15 expert layers (~17.3 GiB) + dense + KV + compute
+   exceeds the 23.7 GB heap -> driver shared-memory spill halves decode.
+   Budget the layer count conservatively (14 at 24 GB, Q3_K_XL).
+4. The Chonk-HIP adapter (IDeviceMemoryBackend seam) is justified: native
+   kernels win, so the unified pool should follow them across backends.
