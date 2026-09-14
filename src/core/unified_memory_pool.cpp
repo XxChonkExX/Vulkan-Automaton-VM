@@ -295,6 +295,10 @@ UnifiedMemoryPool::~UnifiedMemoryPool() {
     // teardown (blocks_/dedicatedAllocations_ are mutated under mutex_).
     std::lock_guard<std::mutex> lock(mutex_);
     if (device_) {
+        VVM_LOG_WARN("~UnifiedMemoryPool destroying LIVE pool (device={}, blocks={}, "
+                     "dedicated={}) - if this is not process exit, a move/ownership bug "
+                     "is freeing a stored pool",
+                     (void*)device_, blocks_.size(), dedicatedAllocations_.size());
         // Clean up dedicated allocations (exportable/imported)
         for (auto& alloc : dedicatedAllocations_) {
             if (alloc.buffer) {
