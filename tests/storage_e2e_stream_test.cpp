@@ -80,12 +80,15 @@ int main(int argc, char** argv) {
     }
     std::cout << "backend: " << be.activeMode() << "\n";
 
-    // ---- L2 queue: Little's Law depth ----
+    // ---- L2 queue: Little's Law depth from MEASURED latency ----
+    // Depth-1 measurement on this NVMe: ~7.6 ms per 2 MiB random read
+    // (includes IoRing submit/poll overhead). Depth = throughput x latency /
+    // ioSize = 7 GB/s x 7.6 ms / 2.18 MB ~= 25 concurrent IOs to saturate.
     QueueConfig qcfg;
-    qcfg.targetBytesPerSec = 7ull << 30;   // NVMe-class target
-    qcfg.deviceLatencyUs = 350.0;          // measured 3 MiB random-read latency
+    qcfg.targetBytesPerSec = 7ull << 30;
+    qcfg.deviceLatencyUs = 7600.0;
     qcfg.ioSize = kSlotBytes;
-    qcfg.maxDepth = kSlots * 4;
+    qcfg.maxDepth = kSlots; // one in-flight IO per staging slot
     RequestQueue q(qcfg);
     std::cout << "queue depth: " << q.depth() << "\n";
 
@@ -93,6 +96,9 @@ int main(int argc, char** argv) {
 
     for (int pass = 0; pass < passes; ++pass) {
         const bool cold = (pass == 0);
+        // Fresh queue per pass: the cold pass's leftovers must not starve the
+        // warm pass (outstandingCap is shared queue state).
+        RequestQueue q(qcfg);
         auto t0 = std::chrono::steady_clock::now();
 
         uint64_t streamed = 0;
@@ -109,7 +115,9 @@ int main(int argc, char** argv) {
                 req.id = next + 1; // correlation handle (CQE UserData)
                 req.shardKey = table[next].id;
                 req.fileOffset = table[next].offset;
-                req.size = static_cast<uint32_t>(table[next].size);
+                // O_DIRECT requires 4 KiB-aligned sizes; the pack v2 layout
+                // pads between blobs, so reading up to the pad is safe.
+                req.size = static_cast<uint32_t>((table[next].size + 4095) & ~4095ull);
                 req.dstSlot = static_cast<uint32_t>(next % kSlots);
                 req.isRead = true;
                 if (q.enqueue(req) != RequestQueue::Enqueue::Ok) break;
@@ -121,7 +129,7 @@ int main(int argc, char** argv) {
             for (uint64_t id : done) {
                 // latency per shard: measure submit->complete on the window
                 ++shards;
-                streamed += table[id - 1].size;
+                streamed += table[id - 1].size; // true (unpadded) size
             }
             if (done.empty()) ::Sleep(0);
         }
