@@ -110,7 +110,10 @@ private:
 
     void* arena_ = nullptr;            // VirtualAlloc'd, slotCount * slotBytes
 
-    // IoRing plumbing (dynamic-loaded; null when unavailable).
+#ifdef _WIN32
+    // IoRing plumbing (dynamic-loaded; null when unavailable). Windows types
+    // only: OVERLAPPED/HANDLE do not exist elsewhere, and the non-Windows
+    // branch of the .cpp implements this class as a pure stub.
     void* ring_ = nullptr;             // HIORING
     std::vector<uint8_t> regInfo_;     // IORING_BUFFER_INFO array (must stay valid)
 
@@ -122,6 +125,7 @@ private:
     std::vector<Pending> pending_;
 
     void* file_ = nullptr;             // HANDLE
+#endif
     uint64_t inFlight_ = 0;
 };
 
