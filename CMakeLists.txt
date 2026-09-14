@@ -169,6 +169,7 @@ endif()
 if(VVM_BUILD_SHARED)
     add_library(vulkan_vm SHARED
         src/core/unified_memory_pool.cpp
+        src/core/vulkan_mem_backend.cpp
         src/core/sparse_memory.cpp
         src/allocator/buddy_allocator.cpp
         src/cross_gpu/external_memory.cpp
@@ -189,6 +190,7 @@ if(VVM_BUILD_SHARED)
 else()
     add_library(vulkan_vm STATIC
         src/core/unified_memory_pool.cpp
+        src/core/vulkan_mem_backend.cpp
         src/core/sparse_memory.cpp
         src/allocator/buddy_allocator.cpp
         src/cross_gpu/external_memory.cpp

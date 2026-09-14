@@ -353,6 +353,8 @@ struct VVM_API OffloadManagerDeleter {
 
 class UniqueAllocation;  // forward declaration for deallocate(UniqueAllocation&&)
 
+class IDeviceMemoryBackend;  // vendor seam (mem_backend.hpp); member below
+
 class VVM_API UnifiedMemoryPool {
 public:
     // Factory
@@ -442,8 +444,17 @@ public:
 private:
     friend class MultiGPUPoolManager;
     friend struct GPUInstance;
-    UnifiedMemoryPool() = default;
+    // Out-of-line (defined in unified_memory_pool.cpp): the inline-defaulted
+    // form generated member-destruction code in every including TU, which
+    // requires IDeviceMemoryBackend to be complete there.
+    UnifiedMemoryPool();
     bool initialize(const DeviceConfig& device, const PoolConfig& config);
+
+    // Vendor seam (mem_backend.hpp): the memory plane behind the pool's
+    // allocation policy. Vulkan today; HIP/L0 adapters follow the same
+    // interface. Created in initialize(), destroyed with the pool (out-of-line
+    // destructor keeps the incomplete type legal here).
+    std::unique_ptr<IDeviceMemoryBackend> backend_;
     
     // Verify required Vulkan features/extensions were enabled at device creation.
     bool validateDeviceCapabilities() const;

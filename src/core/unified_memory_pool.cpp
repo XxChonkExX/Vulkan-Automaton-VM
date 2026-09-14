@@ -1,6 +1,8 @@
 #include "vulkan_vm/vulkan_vm.hpp"
 #include "vulkan_vm/buddy_allocator.hpp"
 #include "vulkan_vm/utils.hpp"
+#include "vulkan_vm/mem_backend.hpp"
+#include "vulkan_vm/vulkan_mem_backend.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -17,6 +19,10 @@ void OffloadManagerDeleter::operator()(OffloadManager* p) const {
 // ============================================================================
 // UnifiedMemoryPool Implementation
 // ============================================================================
+
+// Out-of-line default ctor: see core.hpp note. Destroys the unique_ptr
+// member with the complete backend type.
+UnifiedMemoryPool::UnifiedMemoryPool() = default;
 
 MemoryTopologyType detectMemoryTopology(VkPhysicalDevice physicalDevice) {
     VkPhysicalDeviceMemoryProperties props;
@@ -228,7 +234,8 @@ UnifiedMemoryPool::UnifiedMemoryPool(UnifiedMemoryPool&& other) noexcept
     debugUtilsEnabled_ = other.debugUtilsEnabled_;
     fnSetDebugName_ = other.fnSetDebugName_;
     offloadManager_ = std::move(other.offloadManager_);
-    
+    backend_ = std::move(other.backend_);
+
     // Invalidate source
     other.device_ = VK_NULL_HANDLE;
     other.transferCmdPool_ = VK_NULL_HANDLE;
@@ -236,6 +243,7 @@ UnifiedMemoryPool::UnifiedMemoryPool(UnifiedMemoryPool&& other) noexcept
     other.blocks_.clear();
     other.dedicatedAllocations_.clear();
     other.offloadManager_.reset();
+    other.backend_.reset();
 }
 
 UnifiedMemoryPool& UnifiedMemoryPool::operator=(UnifiedMemoryPool&& other) noexcept {
@@ -249,16 +257,16 @@ UnifiedMemoryPool& UnifiedMemoryPool::operator=(UnifiedMemoryPool&& other) noexc
     std::lock_guard<std::mutex> lock_other(other.mutex_, std::adopt_lock);
     
     // Cleanup current
-    if (device_) {
+    if (device_ && backend_) {
         for (auto& alloc : dedicatedAllocations_) {
-            if (alloc.buffer) vkDestroyBuffer(device_, alloc.buffer, nullptr);
-            if (alloc.memory) vkFreeMemory(device_, alloc.memory, nullptr);
+            if (alloc.buffer) backend_->destroy_buffer(reinterpret_cast<uint64_t>(alloc.buffer));
+            if (alloc.memory) backend_->free(reinterpret_cast<uint64_t>(alloc.memory));
         }
         dedicatedAllocations_.clear();
-        
+
         for (auto& block : blocks_) {
             if (block.memory) {
-                vkFreeMemory(device_, block.memory, nullptr);
+                backend_->free(reinterpret_cast<uint64_t>(block.memory));
             }
         }
         if (transferCmdPool_) {
@@ -279,6 +287,7 @@ UnifiedMemoryPool& UnifiedMemoryPool::operator=(UnifiedMemoryPool&& other) noexc
     debugUtilsEnabled_ = other.debugUtilsEnabled_;
     fnSetDebugName_ = other.fnSetDebugName_;
     offloadManager_ = std::move(other.offloadManager_);
+    backend_ = std::move(other.backend_);
     // mutex_ is not moved - keep our own
     
     other.device_ = VK_NULL_HANDLE;
@@ -287,6 +296,7 @@ UnifiedMemoryPool& UnifiedMemoryPool::operator=(UnifiedMemoryPool&& other) noexc
     other.blocks_.clear();
     other.dedicatedAllocations_.clear();
     other.offloadManager_.reset();
+    other.backend_.reset();
     return *this;
 }
 
@@ -302,23 +312,23 @@ UnifiedMemoryPool::~UnifiedMemoryPool() {
         // Clean up dedicated allocations (exportable/imported)
         for (auto& alloc : dedicatedAllocations_) {
             if (alloc.buffer) {
-                vkDestroyBuffer(device_, alloc.buffer, nullptr);
+                backend_->destroy_buffer(reinterpret_cast<uint64_t>(alloc.buffer));
             }
             if (alloc.memory) {
                 if (alloc.hostPtr) {
-                    vkUnmapMemory(device_, alloc.memory);
+                    backend_->unmap(reinterpret_cast<uint64_t>(alloc.memory));
                 }
-                vkFreeMemory(device_, alloc.memory, nullptr);
+                backend_->free(reinterpret_cast<uint64_t>(alloc.memory));
             }
         }
         dedicatedAllocations_.clear();
-        
+
         for (auto& block : blocks_) {
             if (block.memory) {
                 if (block.hostPtr) {
-                    vkUnmapMemory(device_, block.memory);
+                    backend_->unmap(reinterpret_cast<uint64_t>(block.memory));
                 }
-                vkFreeMemory(device_, block.memory, nullptr);
+                backend_->free(reinterpret_cast<uint64_t>(block.memory));
             }
         }
         if (transferCmdPool_) {
@@ -331,7 +341,15 @@ bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig&
     deviceConfig_ = device;
     config_ = config;
     device_ = device.device;
-    
+
+    // Vendor seam: Vulkan today (see mem_backend.hpp for the HIP/L0 plan).
+    // Created first so every later allocation path can route through it.
+    backend_ = create_memory_backend(MemBackendKind::Vulkan, deviceConfig_);
+    if (!backend_) {
+        VVM_LOG_ERROR("failed to create the Vulkan memory backend");
+        return false;
+    }
+
     // Verify the device was created with the features/extensions the pool needs.
     if (!validateDeviceCapabilities()) {
         return false;
@@ -750,51 +768,35 @@ bool UnifiedMemoryPool::validateDeviceCapabilities() const {
 
 std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
     VkDeviceSize size, uint32_t memoryTypeIndex, bool isChunk, uint32_t chunkTier) {
-    
-    VkMemoryAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.allocationSize = size;
-    allocInfo.memoryTypeIndex = memoryTypeIndex;
-    
+
     // Pool blocks are strictly NON-exportable. Cross-GPU sharing must use
     // allocateDedicatedExportable() which gives each exported allocation its
     // own dedicated VkDeviceMemory (required for reliable external import).
-    void* pNext = nullptr;
+    //
+    // NOTE: Do NOT chain a dedicated-allocation hint here for sub-allocated
+    // blocks. A dedicated allocation is bound to a SINGLE resource.
+    // Sub-allocating multiple buffers from one "dedicated" memory violates
+    // the spec. Exportable allocations should use allocateDedicatedExportable()
+    // instead.
 
-    // Device address support for bindless
-    VkMemoryAllocateFlagsInfo flagsInfo{};
-    if (config_.enableDeviceAddress) {
-        flagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
-        flagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-        flagsInfo.pNext = pNext;
-        pNext = &flagsInfo;
-    }
-
-    // Memory priority (VK_EXT_memory_priority): without this the driver may
-    // evict/degrade low-priority allocations when the heap fills up, which
-    // silently turns VRAM-resident blocks into PCIe-bound memory.
-    VkMemoryPriorityAllocateInfoEXT priorityInfo{};
-    if (config_.memoryPriority > 0.0f) {
-        priorityInfo.sType = VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT;
-        priorityInfo.priority = config_.memoryPriority;
-        priorityInfo.pNext = pNext;
-        pNext = &priorityInfo;
-    }
-
-    // NOTE: Do NOT chain VkMemoryDedicatedAllocateInfo here for sub-allocated blocks.
-    // A dedicated allocation is bound to a SINGLE resource. Sub-allocating multiple
-    // buffers from one "dedicated" memory violates the spec. Exportable allocations
-    // should use allocateDedicatedExportable() instead.
-
-    allocInfo.pNext = pNext;
-
-    VkDeviceMemory memory;
-    VkResult result = vkAllocateMemory(device_, &allocInfo, nullptr, &memory);
-    if (result != VK_SUCCESS) {
-        VVM_LOG_ERROR("vkAllocateMemory failed: {} (size={}, type={})",
-                      vkResultToString(result).c_str(), size, memoryTypeIndex);
+    int err = 0;
+    const BackendMemory mem = backend_->allocate(
+        {static_cast<uint64_t>(size), memoryTypeIndex,
+         /*exportable=*/false,
+         /*deviceAddress=*/config_.enableDeviceAddress,
+         /*priority=*/config_.memoryPriority,
+         /*dedicatedFor=*/0},
+        &err);
+    if (mem == 0) {
+        int native = 0;
+        const bool known = decode_backend_error(err, &native);
+        VVM_LOG_ERROR("backend allocate failed: {} (size={}, type={})",
+                      known ? vkResultToString(static_cast<VkResult>(native)).c_str()
+                            : "unknown",
+                      size, memoryTypeIndex);
         return std::nullopt;
     }
+    VkDeviceMemory memory = reinterpret_cast<VkDeviceMemory>(mem);
 
     // VRAM high-water warning (VRAM_OVERFLOW_FINDINGS.md): committing past
     // ~90% of the device-local heap lets the driver spill to shared memory,
@@ -824,9 +826,10 @@ std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
     bool isCoherent = (memFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
     
     if (isHostVisible) {
-        result = vkMapMemory(device_, memory, 0, VK_WHOLE_SIZE, 0, &hostPtr);
-        if (result != VK_SUCCESS) {
-            VVM_LOG_WARN("vkMapMemory failed: {}", vkResultToString(result).c_str());
+        bool mapOk = false;
+        hostPtr = backend_->map(reinterpret_cast<uint64_t>(memory), &mapOk);
+        if (!mapOk || !hostPtr) {
+            VVM_LOG_WARN("backend map failed for host-visible block");
             hostPtr = nullptr;
             isHostVisible = false;
         }
@@ -902,7 +905,16 @@ static VkExternalMemoryHandleTypeFlags filterExportableBits(
 }
 
 // Allocate a dedicated VkDeviceMemory for a single exportable buffer.
-        std::optional<Allocation> UnifiedMemoryPool::allocateDedicatedExportable(
+        // ---------------------------------------------------------------------------
+// Dedicated / exportable / import allocation paths.
+//
+// v1 BACKEND SCOPE NOTE: these paths remain Vulkan-direct. Cross-GPU
+// export/import needs vendor queuing + handle-type semantics beyond the
+// memory plane (see mem_backend.hpp v1 scope); route them through
+// IDeviceMemoryBackend when the HIP/L0 adapters land.
+// ---------------------------------------------------------------------------
+
+std::optional<Allocation> UnifiedMemoryPool::allocateDedicatedExportable(
         VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags flags) {
         
         VVM_LOG_INFO("allocateDedicatedExportable: size={}, usage={}, flags={}", size, usage, flags);
@@ -1933,9 +1945,9 @@ void UnifiedMemoryPool::defragment() {
         if (block.used != 0) continue;
         if (block.memory) {
             if (block.hostPtr) {
-                vkUnmapMemory(device_, block.memory);
+                backend_->unmap(reinterpret_cast<uint64_t>(block.memory));
             }
-            vkFreeMemory(device_, block.memory, nullptr);
+            backend_->free(reinterpret_cast<uint64_t>(block.memory));
         }
         blocks_.erase(blocks_.begin() + i);
     }
@@ -1952,9 +1964,9 @@ void UnifiedMemoryPool::trim() {
         if (block.used != 0) continue;
         if (block.memory) {
             if (block.hostPtr) {
-                vkUnmapMemory(device_, block.memory);
+                backend_->unmap(reinterpret_cast<uint64_t>(block.memory));
             }
-            vkFreeMemory(device_, block.memory, nullptr);
+            backend_->free(reinterpret_cast<uint64_t>(block.memory));
         }
         blocks_.erase(blocks_.begin() + i);
     }
@@ -1994,44 +2006,30 @@ std::optional<Allocation> UnifiedMemoryPool::subAllocate(VkDeviceSize size,
     VkDeviceSize offset = *offsetOpt;
     
     // Create buffer with the caller's usage flags (device address is added when
-    // enabled at pool creation; buffers in a shared block are NOT exportable).
-    VkBufferCreateInfo bufferInfo{};
-    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufferInfo.size = size;
-    bufferInfo.usage = usage;
+    // enabled at pool creation; buffers in a shared block are NOT exportable),
+    // bound into the block at the buddy-assigned offset.
+    uint64_t usageBits = static_cast<uint64_t>(usage);
     if (config_.enableDeviceAddress) {
-        bufferInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        usageBits |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
-    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    
-    VkBuffer buffer;
-    VkResult result = vkCreateBuffer(device_, &bufferInfo, nullptr, &buffer);
-    if (result != VK_SUCCESS) {
-        VVM_LOG_ERROR("vkCreateBuffer failed: {}", vkResultToString(result).c_str());
+
+    int err = 0;
+    const BackendBuffer bufHandle = backend_->create_buffer(
+        reinterpret_cast<uint64_t>(block.memory), static_cast<uint64_t>(offset),
+        static_cast<uint64_t>(size), usageBits, /*exportable=*/false, &err);
+    if (bufHandle == 0) {
+        int native = 0;
+        const bool known = decode_backend_error(err, &native);
+        VVM_LOG_ERROR("backend create_buffer failed: {}",
+                      known ? vkResultToString(static_cast<VkResult>(native)).c_str()
+                            : "unknown");
         block.buddy->deallocate(offset, size);
         return std::nullopt;
     }
-    
-    // Bind to memory at offset
-    VkBindBufferMemoryInfo bindInfo{};
-    bindInfo.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO;
-    bindInfo.buffer = buffer;
-    bindInfo.memory = block.memory;
-    bindInfo.memoryOffset = offset;
-    
-    VkBindBufferMemoryDeviceGroupInfo deviceGroupInfo{};
-    // For cross-GPU, we'd set device indices here
-    
-    result = vkBindBufferMemory2(device_, 1, &bindInfo);
-    if (result != VK_SUCCESS) {
-        VVM_LOG_ERROR("vkBindBufferMemory2 failed: {}", vkResultToString(result).c_str());
-        vkDestroyBuffer(device_, buffer, nullptr);
-        block.buddy->deallocate(offset, size);
-        return std::nullopt;
-    }
-    
+    VkBuffer buffer = reinterpret_cast<VkBuffer>(bufHandle);
+
     block.used += size;
-    
+
     Allocation alloc;
     alloc.buffer = buffer;
     alloc.memory = block.memory;
@@ -2042,15 +2040,12 @@ std::optional<Allocation> UnifiedMemoryPool::subAllocate(VkDeviceSize size,
     alloc.isMapped = (block.hostPtr != nullptr);
     alloc.isCoherent = block.isCoherent;
     alloc.memoryFlags = block.memoryFlags;
-    alloc.hostPtr = alloc.isHostVisible 
-        ? static_cast<char*>(block.hostPtr) + offset 
+    alloc.hostPtr = alloc.isHostVisible
+        ? static_cast<char*>(block.hostPtr) + offset
         : nullptr;
-    
+
     if (config_.enableDeviceAddress) {
-        VkBufferDeviceAddressInfo addrInfo{};
-        addrInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
-        addrInfo.buffer = buffer;
-        alloc.deviceAddress = vkGetBufferDeviceAddress(device_, &addrInfo);
+        alloc.deviceAddress = backend_->buffer_device_address(bufHandle);
     }
     
     // Generation counter for handle validation
@@ -2081,10 +2076,10 @@ void UnifiedMemoryPool::subDeallocate(Allocation&& alloc) {
             alloc.hostPtr = nullptr;
             return;
         }
-        if (alloc.buffer) vkDestroyBuffer(device_, alloc.buffer, nullptr);
+        if (alloc.buffer) backend_->destroy_buffer(reinterpret_cast<uint64_t>(alloc.buffer));
         if (alloc.memory) {
-            if (alloc.hostPtr) vkUnmapMemory(device_, alloc.memory);
-            vkFreeMemory(device_, alloc.memory, nullptr);
+            if (alloc.hostPtr) backend_->unmap(reinterpret_cast<uint64_t>(alloc.memory));
+            backend_->free(reinterpret_cast<uint64_t>(alloc.memory));
         }
         // Remove from dedicatedAllocations_ to prevent double-free in destructor
         dedicatedAllocations_.erase(
@@ -2101,7 +2096,7 @@ void UnifiedMemoryPool::subDeallocate(Allocation&& alloc) {
 
     if (alloc.blockIndex >= blocks_.size()) return;
 
-    vkDestroyBuffer(device_, alloc.buffer, nullptr);
+    backend_->destroy_buffer(reinterpret_cast<uint64_t>(alloc.buffer));
     alloc.buffer = VK_NULL_HANDLE;
 
     auto& block = blocks_[alloc.blockIndex];
