@@ -347,6 +347,22 @@ bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig&
             return false;
         }
     }
+    // Multi-tier ladder: thresholds strictly ascending, each block a power of
+    // two >= its threshold and >= minAlignment.
+    {
+        VkDeviceSize prevThreshold = 0;
+        for (size_t i = 0; i < config_.chunkTiers.size(); ++i) {
+            const auto& [th, bs] = config_.chunkTiers[i];
+            if (th == 0 || bs == 0 || th <= prevThreshold || !pow2(bs) ||
+                bs < config_.minAlignment || bs < th) {
+                VVM_LOG_ERROR("Invalid chunkTiers[{}]: (threshold={}, block={}) "
+                              "(thresholds strictly ascending; blocks power-of-two >= threshold and >= minAlignment)",
+                              i, th, bs);
+                return false;
+            }
+            prevThreshold = th;
+        }
+    }
     if (config_.allocationAlignment != 0 &&
         (!pow2(config_.allocationAlignment) || config_.allocationAlignment < config_.minAlignment)) {
         VVM_LOG_ERROR("Invalid allocationAlignment {} (must be power of two >= minAlignment {})",
@@ -521,6 +537,68 @@ VVM_LOG_INFO("Selected HOST_VISIBLE memory type {} (heap budget: {} MB)",
     return true;
 }
 
+// Adaptive block sizing: size new buddy blocks to the observed request
+// pattern instead of the static pick. Two rules, both cheap and local:
+//   1. Pair-packing: if recent requests cluster around the current size,
+//      size the block to hold TWO plus slack (pow2) instead of stranding a
+//      tail the next sibling cannot reuse.
+//   2. Small-heap cap: never commit more than a quarter of the device-local
+//      heap in one block, so older/smaller GPUs get many small blocks rather
+//      than a few huge ones (with a 256 MiB floor so the block stays useful).
+// The result is snapped up to a power of two (buddy requirement) and never
+// below the request itself. Static pick wins when adaptive is disabled.
+VkDeviceSize UnifiedMemoryPool::adaptiveBlockSizeFor(VkDeviceSize requestSize,
+                                                     VkDeviceSize staticPick) {
+    // File-local pow2 helpers (buddy's own are private to the audited core).
+    auto ceilPow2 = [](VkDeviceSize v) -> VkDeviceSize {
+        if (v <= 1) return 1;
+        --v;
+        v |= v >> 1;  v |= v >> 2;  v |= v >> 4;
+        v |= v >> 8;  v |= v >> 16; v |= v >> 32;
+        return v + 1;
+    };
+    auto floorPow2 = [](VkDeviceSize v) -> VkDeviceSize {
+        if (v == 0) return 0;
+        VkDeviceSize r = 1;
+        while ((r << 1) != 0 && (r << 1) <= v) r <<= 1;
+        return r;
+    };
+
+    VkDeviceSize pick = staticPick;
+
+    // Rule 1: cluster check over the recent window (sizes within ~[0.75x, 1.33x]).
+    uint32_t cluster = 0;
+    const uint32_t n = recentCount_ < kSizeHistory ? recentCount_ : kSizeHistory;
+    for (uint32_t i = 0; i < n; ++i) {
+        const VkDeviceSize s = recentSizes_[i];
+        if (s >= (requestSize * 3) / 4 && s <= (requestSize * 4) / 3) ++cluster;
+    }
+    if (cluster >= 3) {
+        const VkDeviceSize pairTarget = ceilPow2(2 * requestSize + config_.minAlignment);
+        if (pairTarget > pick) pick = pairTarget;
+    }
+
+    // Rule 2: small-heap cap (a quarter of the device-local heap, floored).
+    {
+        const auto info = getDeviceMemoryInfo();
+        if (deviceLocalHeapIndex_ < info.heapSizes.size()) {
+            const VkDeviceSize heapSize = info.heapSizes[deviceLocalHeapIndex_];
+            VkDeviceSize cap = heapSize / 4;
+            const VkDeviceSize floor = 256ull * 1024ull * 1024ull;
+            if (cap < floor) cap = floor;
+            if (pick > cap) {
+                // Shrink to the largest pow2 <= cap that still fits the request.
+                VkDeviceSize shrunk = floorPow2(cap);
+                const VkDeviceSize need = ceilPow2(
+                    alignUp(requestSize, config_.minAlignment));
+                pick = (shrunk >= need) ? shrunk : need;
+            }
+        }
+    }
+
+    return pick;
+}
+
 std::optional<uint32_t> UnifiedMemoryPool::findMemoryType(
     VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred) {
     
@@ -667,7 +745,7 @@ bool UnifiedMemoryPool::validateDeviceCapabilities() const {
 }
 
 std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
-    VkDeviceSize size, uint32_t memoryTypeIndex, bool isChunk) {
+    VkDeviceSize size, uint32_t memoryTypeIndex, bool isChunk, uint32_t chunkTier) {
     
     VkMemoryAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -759,6 +837,7 @@ std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
     block.isHostVisible = isHostVisible;
     block.isCoherent = isCoherent;
     block.isChunk = isChunk;
+    block.chunkTier = isChunk ? chunkTier : UINT32_MAX;
     
     // Create buddy allocator for this block
     block.buddy = std::make_unique<BuddyAllocator>(size, config_.minAlignment);
@@ -1172,10 +1251,34 @@ std::optional<Allocation> UnifiedMemoryPool::allocate(VkDeviceSize size,
     // Align size
     size = alignUp(size, config_.minAlignment);
 
-    // Chonk Chunks: route small requests to chunk blocks (size-class routing).
-    const bool wantChunk = config_.smallAllocThreshold > 0 &&
-                           config_.chunkBlockSize > 0 &&
-                           size <= config_.smallAllocThreshold;
+    // Chonk Chunks: route small requests to tiered chunk blocks.
+    // Tier resolution: first tier with size <= threshold wins; when chunkTiers
+    // is empty the legacy single-tier pair acts as one implicit tier.
+    // tier == UINT32_MAX means "not a chunk request" (buddy path).
+    uint32_t tier = UINT32_MAX;
+    VkDeviceSize tierBlock = 0;
+    if (!config_.chunkTiers.empty()) {
+        for (uint32_t i = 0; i < config_.chunkTiers.size(); ++i) {
+            if (size <= config_.chunkTiers[i].first) {
+                tier = i;
+                tierBlock = config_.chunkTiers[i].second;
+                break;
+            }
+        }
+    } else if (config_.smallAllocThreshold > 0 && config_.chunkBlockSize > 0 &&
+               size <= config_.smallAllocThreshold) {
+        tier = 0;
+        tierBlock = config_.chunkBlockSize;
+    }
+    const bool wantChunk = (tier != UINT32_MAX);
+
+    // Record buddy-path request sizes for adaptive sizing (cheap ring store
+    // under the already-held lock; chunk-path sizes have their own tiers).
+    if (!wantChunk && config_.adaptiveBlockSize) {
+        recentSizes_[recentIdx_ % kSizeHistory] = size;
+        recentIdx_++;
+        if (recentCount_ < kSizeHistory) recentCount_++;
+    }
 
     // Best-fit block selection within the size class: pick the block with the
     // SMALLEST largest-free that still fits. First-fit scattered allocations
@@ -1189,6 +1292,7 @@ std::optional<Allocation> UnifiedMemoryPool::allocate(VkDeviceSize size,
         if (!block.buddy) continue;
         if (block.isHostVisible != wantHostVisible) continue;
         if (block.isChunk != wantChunk) continue;
+        if (wantChunk && block.chunkTier != tier) continue; // per-tier packing
         const VkDeviceSize lf = block.buddy->getLargestFree();
         if (lf >= size && lf < bestFree) {
             bestFree = lf;
@@ -1216,9 +1320,10 @@ std::optional<Allocation> UnifiedMemoryPool::allocate(VkDeviceSize size,
         return std::nullopt;
     }
 
-    // Pick the block size for this request: chunks get chunkBlockSize,
-    // regular allocations use the configured ladder (if any).
-    VkDeviceSize blockSize = wantChunk ? config_.chunkBlockSize : config_.blockSize;
+    // Pick the block size for this request: the request's chunk tier, or the
+    // regular configured ladder for buddy-path allocations, refined by the
+    // adaptive sizer (pair-packing + small-heap cap) when enabled.
+    VkDeviceSize blockSize = wantChunk ? tierBlock : config_.blockSize;
     if (!wantChunk && !config_.blockSizes.empty()) {
         // Pick the smallest block size >= request size (aligned)
         VkDeviceSize alignedSize = alignUp(size, config_.minAlignment);
@@ -1232,6 +1337,9 @@ std::optional<Allocation> UnifiedMemoryPool::allocate(VkDeviceSize size,
         if (blockSize == config_.blockSize && !config_.blockSizes.empty()) {
             blockSize = *std::max_element(config_.blockSizes.begin(), config_.blockSizes.end());
         }
+    }
+    if (!wantChunk && config_.adaptiveBlockSize) {
+        blockSize = adaptiveBlockSizeFor(size, blockSize);
     }
     
     // Budget check: fail soft instead of stealing VRAM past the configured cap.
@@ -1249,7 +1357,7 @@ std::optional<Allocation> UnifiedMemoryPool::allocate(VkDeviceSize size,
         ? (hostVisibleMemoryType_ != UINT32_MAX ? hostVisibleMemoryType_ : deviceLocalMemoryType_)
         : deviceLocalMemoryType_;
     
-    if (!allocateBlock(blockSize, memType, wantChunk).has_value()) {
+    if (!allocateBlock(blockSize, memType, wantChunk, wantChunk ? tier : 0).has_value()) {
         return std::nullopt;
     }
     

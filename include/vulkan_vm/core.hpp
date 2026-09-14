@@ -112,11 +112,30 @@ struct VVM_API PoolConfig {
     VkDeviceSize smallAllocThreshold = 0;
     VkDeviceSize chunkBlockSize = 0;
 
+    // Multi-tier chunk ladder: ascending (threshold, blockSize) pairs.
+    // A request <= thresholds[i] is served from blockSizes[i] blocks.
+    // When non-empty this takes precedence over the single-tier
+    // smallAllocThreshold/chunkBlockSize pair (which then acts as one
+    // implicit tier [(threshold, block)] for backward compatibility).
+    // Rationale: pack sub-64 MiB requests into right-sized chunk blocks so
+    // they stop fragmenting full-size buddy blocks; smaller blocks also mean
+    // smaller commit granularity under memory pressure. Smoothness and best
+    // fit over raw speed.
+    std::vector<std::pair<VkDeviceSize, VkDeviceSize>> chunkTiers;
+
     // Chain VkMemoryDedicatedAllocateInfo on dedicated allocations (default
     // true). ggml's native path does NOT use the dedicated hint; on some
     // drivers the hint changes placement strategy. Benchmark both.
     bool dedicatedAllocateInfo = true;
     
+    // Adaptive block sizing: when a new buddy block is needed, look at recent
+    // request sizes and size the block to the observed pattern (pack pairs of
+    // clustered requests instead of stranding tails), capped by a fraction of
+    // the heap so small/older GPUs get many small blocks instead of a few
+    // huge ones. Best-fit *sizing* to complement best-fit *selection*.
+    // Disable (strictly static sizes) with adaptiveBlockSize = false.
+    bool adaptiveBlockSize = true;
+
     // Hard cap on total pool memory in bytes (0 = no explicit cap).
     VkDeviceSize maxPoolBytes = 0;
 
@@ -219,6 +238,9 @@ struct VVM_API BlockInfo {
     bool isHostVisible = false;
     bool isCoherent = false;
     bool isChunk = false;   // Chonk Chunk block (serves small allocations)
+    uint32_t chunkTier = UINT32_MAX;  // index into PoolConfig::chunkTiers (or
+                                      // 0 for the legacy single tier); ignored
+                                      // when isChunk is false
 };
 
 // ============================================================================
@@ -449,7 +471,8 @@ private:
                                            VkMemoryPropertyFlags preferred);
     std::optional<VkDeviceMemory> allocateBlock(VkDeviceSize size,
                                                  uint32_t memoryTypeIndex,
-                                                 bool isChunk = false);
+                                                 bool isChunk = false,
+                                                 uint32_t chunkTier = 0);
     std::optional<Allocation> subAllocate(VkDeviceSize size,
                                           VkDeviceSize alignment,
                                           uint32_t blockIndex,
@@ -492,6 +515,14 @@ private:
     // Live (not-yet-freed) generations. An allocation's generation is valid
     // iff it is present here; deallocate() retires it.
     std::unordered_set<uint64_t> liveGenerations_;
+
+    // Adaptive sizing history: ring of recent buddy-path request sizes.
+    // Drives adaptiveBlockSize(); guarded by mutex_ like everything else.
+    static constexpr uint32_t kSizeHistory = 8;
+    VkDeviceSize recentSizes_[kSizeHistory] = {};
+    uint32_t recentIdx_ = 0;
+    uint32_t recentCount_ = 0;
+    VkDeviceSize adaptiveBlockSizeFor(VkDeviceSize requestSize, VkDeviceSize staticPick);
 };
 
 // ============================================================================
