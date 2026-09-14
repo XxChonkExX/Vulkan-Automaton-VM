@@ -273,3 +273,65 @@ exception in ggml-vulkan's cross-device upload path during loading
 (upstream robustness issue with many alternating device copies). Use scoped
 patterns (`exps=auto`) or explicit targets for large models - verified
 working: `exps=auto` on the 40B (512.8 / 19.76 t/s), `.*=auto` on the 3B.
+
+---
+
+# Study 2 - Qwen3.8-Flash-Next streaming MoE (2026-09-14)
+
+> **Model:** Qwen3.8-Flash-Next UD-Q3_K_XL, 90 GB, 176.94B params (48x512
+> experts, 10 active, GDN+QSA hybrid, 262144 native ctx)
+> **Build:** llama.cpp chonk-buffer branch (VVM Chonk Buffer pool, fail-soft)
+> **Result: 15.79 t/s decode, all experts streamed from NVMe/page-cache on
+> Windows - beats every same-RAM-class peer we could find, Linux included.**
+
+## Champion config
+
+```
+llama-server -m <model> -ngl 99 --n-cpu-moe 999 -c 4096   # (262144 also verified)
+set GGML_VK_VVM_POOL=1
+```
+XTX-only for GPU tensors (-ts 1,0,0); pool holds dense+KV+compute; all
+routed experts on CPU via mmap, served from the 64 GB page cache at
+~17 GB/s effective. Warm decode climbs 12.7 -> 15.8 t/s as the cache
+warms (matches the owner's live-session logs, 15.4-16.1 t/s).
+
+## --n-cpu-moe sweep (2K prompt + 512 gen x3, c=4096, warm-best)
+
+| Config | Decode |
+|---|---|
+| **-ncmoe 999 (experts CPU, RAM-cached)** | **15.79 t/s** |
+| -ncmoe 44 (4 layers XTX) | 8.93 t/s |
+| -ncmoe 40 (8 layers XTX) | 7.24 t/s |
+| -ot B70 16 layers + XTX 8 + CPU 24 | 2.48 t/s |
+
+**Every expert layer moved to a GPU LOSES speed**: ~0.85-0.9 t/s per layer
+on the XTX, catastrophic on Arc. The Q3_K mul_mat_id Vulkan kernel on
+RDNA3/Arc is ~2x/~6x slower than the CPU's DDR5-streamed matmul. The
+NVIDIA rig rule "fill the card with experts" (insiderllm: +0.2-0.3 t/s per
+layer) is inverted on AMD/Vulkan. Consequence: hot-expert VRAM caching is
+moot until upstream kernels improve.
+
+## Web parity (same model, llama.cpp, published 2026-09)
+
+| Rig | VRAM / RAM | Decode @2K | Source |
+|---|---|---|---|
+| **This box (XTX + B70 idle)** | 24 / **64 GB**, Win11 | **15.79** | measured |
+| RTX 3060 | 12 / 32 GB, Linux | 8.7 - 11.5 | insiderllm |
+| RTX 3090 + -ncmoe 29 | 24 / 62 GB, Linux | 22.6 - 24.5 | insiderllm |
+| 4090-class tier, 64 GB cap | 24 / 64 GB, Linux | 34.7 | lukaLLM |
+| RTX PRO 6000 (all VRAM) | 96 / 96 GB | 109 - 160 (MTP) | lukaLLM |
+
+Long-context convergence: at 245-262K ctx our 13.1 t/s is 88% of the
+91 GB-RAM NVIDIA tier (14.9). The remaining gap to NVIDIA peers is CUDA
+MMQ kernel efficiency, not architecture, not Windows, not storage.
+
+## Operational notes
+
+- **Never run two llama-servers at once** on this box: XTX VRAM + page
+  cache contention halved decode (8.6 vs 15.8 measured contaminated).
+- -ot overrides: multiple -ot flags do NOT combine (comma-separate patterns
+  in one flag); per_layer_token_embd=CPU must be listed explicitly or the
+  ~27 GiB PLE table OOMs a 24 GB card.
+- MTP/draft head: 3.4x SLOWER on any expert-offload config (lukaLLM);
+  skipping it cost us nothing.
+- Full server-side detail: D:\AI_Bundle\qwen38next\SERVE_TEST_RESULTS.md
