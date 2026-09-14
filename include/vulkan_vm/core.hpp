@@ -165,6 +165,9 @@ struct VVM_API DeviceConfig {
     VkQueue graphicsQueue = VK_NULL_HANDLE;
     VkQueue computeQueue = VK_NULL_HANDLE;
     VkQueue transferQueue = VK_NULL_HANDLE;
+    // Non-Vulkan backends (HIP/L0): vendor device index. Ignored by the
+    // Vulkan backend. Sits in this struct's tail padding - zero size change.
+    int32_t backendDeviceIndex = -1;
 };
 
 // Memory usage intent (hides raw VkMemoryPropertyFlags)

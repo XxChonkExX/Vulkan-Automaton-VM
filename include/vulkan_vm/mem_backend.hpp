@@ -121,6 +121,9 @@ public:
     virtual uint64_t buffer_device_address(BackendBuffer buf) const = 0;
 
     // ---- Capabilities ---------------------------------------------------
+    // Vendor equivalent of the bufferDeviceAddress device feature (Vulkan:
+    // feature at device creation; HIP: always available on device pointers).
+    virtual bool has_device_address() const = 0;
     virtual bool supports_export(ExternalHandleType type) const = 0;
 };
 
@@ -128,8 +131,8 @@ public:
 // whose adapter is not linked into this build.
 enum class MemBackendKind { Vulkan, Hip, Level0 };
 
-std::unique_ptr<IDeviceMemoryBackend> create_memory_backend(MemBackendKind kind,
-                                                            const DeviceConfig& cfg);
+VVM_API std::unique_ptr<IDeviceMemoryBackend> create_memory_backend(MemBackendKind kind,
+                                                                     const DeviceConfig& cfg);
 
 } // namespace vvm
 

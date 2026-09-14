@@ -8,7 +8,7 @@
 
 namespace vvm {
 
-class VulkanMemoryBackend final : public IDeviceMemoryBackend {
+class VVM_API VulkanMemoryBackend final : public IDeviceMemoryBackend {
 public:
     explicit VulkanMemoryBackend(const DeviceConfig& cfg);
 
@@ -32,6 +32,7 @@ public:
     void destroy_buffer(BackendBuffer buf) override;
     uint64_t buffer_device_address(BackendBuffer buf) const override;
 
+    bool has_device_address() const override { return deviceAddressFeature_; }
     bool supports_export(ExternalHandleType type) const override;
 
 private:
@@ -39,6 +40,7 @@ private:
     VkPhysicalDevice physical_ = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties memProps_{};
     PFN_vkGetBufferDeviceAddress pfnGetBufferDeviceAddress = nullptr;
+    bool deviceAddressFeature_ = false;
 };
 
 } // namespace vvm

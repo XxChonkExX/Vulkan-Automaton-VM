@@ -13,6 +13,7 @@
 // ============================================================================
 
 #include "vulkan_vm/vulkan_mem_backend.hpp"
+#include "vulkan_vm/hip_mem_backend.hpp"
 
 #include <cstring>
 
@@ -29,9 +30,22 @@ int asError(VkResult r) { return encode_backend_error(static_cast<int>(r)); }
 VulkanMemoryBackend::VulkanMemoryBackend(const DeviceConfig& cfg) {
     device_ = cfg.device;
     physical_ = cfg.physicalDevice;
-    vkGetPhysicalDeviceMemoryProperties(physical_, &memProps_);
+    if (physical_ != VK_NULL_HANDLE) {
+        vkGetPhysicalDeviceMemoryProperties(physical_, &memProps_);
+    }
     pfnGetBufferDeviceAddress = reinterpret_cast<PFN_vkGetBufferDeviceAddress>(
         vkGetDeviceProcAddr(device_, "vkGetBufferDeviceAddress"));
+
+    // bufferDeviceAddress lives in Vulkan-1.2 features, not the core struct.
+    if (physical_ != VK_NULL_HANDLE) {
+        VkPhysicalDeviceVulkan12Features features12{};
+        features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+        VkPhysicalDeviceFeatures2 features2{};
+        features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        features2.pNext = &features12;
+        vkGetPhysicalDeviceFeatures2(physical_, &features2);
+        deviceAddressFeature_ = features12.bufferDeviceAddress != VK_FALSE;
+    }
 }
 
 const char* VulkanMemoryBackend::name() const { return "vulkan"; }
@@ -254,8 +268,12 @@ std::unique_ptr<IDeviceMemoryBackend> create_memory_backend(MemBackendKind kind,
         case MemBackendKind::Vulkan:
             return std::make_unique<VulkanMemoryBackend>(cfg);
         case MemBackendKind::Hip:
+            // Dynamic amdhip64 loader; nullptr when HIP is absent. The
+            // DeviceConfig's Vulkan handles are irrelevant here - the
+            // backendDeviceIndex selects the HIP device.
+            return HipMemoryBackend::create(cfg.backendDeviceIndex);
         case MemBackendKind::Level0:
-            return nullptr;   // adapters land with their vendor integration
+            return nullptr;   // adapter lands with the Intel integration
     }
     return nullptr;
 }
