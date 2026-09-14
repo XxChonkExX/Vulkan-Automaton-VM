@@ -170,6 +170,14 @@ Each layer lands with a CPU-only regression test (no GPU needed) so CI stays
 green on machines without Vulkan hardware, mirroring the existing `buddy_test` /
 `chonk_slab_test` pattern.
 
+> **Known cosmetic issue (2026-09-14, non-blocking):** the `/vvm/stats`
+> `capacityBytes` field reads ~2.7 TB on pools whose `usedBytes + freeBytes`
+> sum to the correct ~9 GiB. All load-bearing fields (`usedBytes`,
+> `freeBytes`, `blocks`, `allocations`, `largestFreeBytes`) are internally
+> consistent and verified against live serving; only the `totalCapacity`
+> accumulation (`maxPoolBytes + sum(blocks)`) is suspect. Does not affect
+> allocation behavior, budget checks, or throughput.
+
 ---
 
 ## 6. Linux-side structure (parallel, richer surface)
