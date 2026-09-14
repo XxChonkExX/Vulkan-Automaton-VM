@@ -354,15 +354,19 @@ bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig&
         return false;
     }
     
-    // Use MemoryTypeSelector for optimal memory type selection
+    // Use MemoryTypeSelector for optimal memory type selection.
+    // NOTE: type selection is decoupled from capacity here (minHeapBudget=0).
+    // Demanding a full blockSize of *free budget* at type-selection time would
+    // refuse to create pools on heaps that are merely nearly full (e.g. a
+    // context-init pool created after layer-split weight placement committed
+    // ~97% of the heap) — even though the best-fit first-block ladder below
+    // can bootstrap from a small block. Capacity is enforced per-allocation
+    // by wouldExceedBudget + vkAllocateMemory, where it belongs.
     MemoryTypeSelector selector(deviceConfig_.physicalDevice);
-
-    // Prefer DEVICE_LOCAL for primary allocations
     auto devLocalResult = selector.select(
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         config_.preferredFlags,
-        config_.blockSize  // Ensure enough budget for at least one block
-    );
+        0);
 
     if (devLocalResult.memoryTypeIndex == UINT32_MAX) {
         VVM_LOG_ERROR("Failed to find DEVICE_LOCAL memory type with sufficient budget");
