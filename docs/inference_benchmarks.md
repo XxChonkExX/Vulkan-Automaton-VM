@@ -395,3 +395,30 @@ Conclusions:
    Budget the layer count conservatively (14 at 24 GB, Q3_K_XL).
 4. The Chonk-HIP adapter (IDeviceMemoryBackend seam) is justified: native
    kernels win, so the unified pool should follow them across backends.
+
+## Auto-placement: the planner replaces --n-cpu-moe (2026-09-15)
+
+`auto_place_experts()` (src/core/device_registry.cpp) computes the full
+tensor placement from the model file itself: `read_gguf_inventory()` parses
+names + exact byte sizes (offset diffs, split-aware, no quant tables),
+`classify_tensor()` arch-tags them, and the greedy policy fills
+HIP-discrete to 90% heap -> CPU mmap cache -> L0 overflow ->
+Vulkan-discrete last resort, PLE always CPU, dense co-located on the
+biggest HIP sink.
+
+Ground-truth validation (tools/auto_place_test.cpp, real 90 GB inventory:
+1224 tensors, 52 GiB experts / 48 layers, 26.8 GiB PLE): the planner
+outputs **14/48 layers on XTX-HIP + 34 on CPU** - the hand-swept ncmoe-34
+champion, rediscovered from first principles.
+
+Loader wiring (llama chonk-buffer branch): `ggml_*_vvm_auto_plan(path, kv)`
+once per load + `*_auto_pick_named(name, size)` per tensor, for both the
+Vulkan and HIP backends (consumer-filtered device lists, snapshot-then-
+resolve locking, budget-pick fallback). Trigger: `--vvm-split
+ffn_.*_exps.=auto,per_layer_token_embd=CPU`. Zero behavior change without
+=auto overrides.
+
+Measured live (90 GB, no hand-tuning):
+- Vulkan build: plan "all 48 on CPU" -> **16.03 t/s** (matches ncmoe-999)
+- HIP build: plan "14/48 on GPU, 34 on CPU" -> **15.73 t/s** (evening
+  thermal level; same-window native 15.47)
