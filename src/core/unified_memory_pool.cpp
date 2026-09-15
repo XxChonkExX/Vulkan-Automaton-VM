@@ -342,16 +342,20 @@ bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig&
     config_ = config;
     device_ = device.device;
 
-    // Vendor seam: Vulkan today (see mem_backend.hpp for the HIP/L0 plan).
-    // Created first so every later allocation path can route through it.
-    backend_ = create_memory_backend(MemBackendKind::Vulkan, deviceConfig_);
+    // Vendor seam: dispatch on what the DeviceConfig carries. A Vulkan pool
+    // has a physical device; anything else selects by backendDeviceIndex
+    // (HIP today; Level0 gets an explicit marker when it lands).
+    const bool isVulkan = deviceConfig_.physicalDevice != VK_NULL_HANDLE;
+    backend_ = create_memory_backend(
+        isVulkan ? MemBackendKind::Vulkan : MemBackendKind::Hip, deviceConfig_);
     if (!backend_) {
-        VVM_LOG_ERROR("failed to create the Vulkan memory backend");
+        VVM_LOG_ERROR("failed to create the {} memory backend",
+                      isVulkan ? "Vulkan" : "HIP");
         return false;
     }
 
     // Verify the device was created with the features/extensions the pool needs.
-    if (!validateDeviceCapabilities()) {
+    if (isVulkan && !validateDeviceCapabilities()) {
         return false;
     }
 
@@ -391,7 +395,11 @@ bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig&
                       config_.allocationAlignment, config_.minAlignment);
         return false;
     }
-    
+
+    // Discovery dispatch: the Vulkan path below is byte-identical to the
+    // historical behavior; the else-branch drives discovery through the
+    // backend seam (HIP today).
+    if (isVulkan) {
     // Use MemoryTypeSelector for optimal memory type selection.
     // NOTE: type selection is decoupled from capacity here (minHeapBudget=0).
     // Demanding a full blockSize of *free budget* at type-selection time would
@@ -475,12 +483,60 @@ VVM_LOG_INFO("Selected HOST_VISIBLE memory type {} (heap budget: {} MB)",
             VVM_LOG_WARN("No suitable HOST_VISIBLE memory type found");
         }
     }
-    
-    // Create transfer command pool
+    } else {
+        // Backend-driven discovery (HIP today): the backend's synthetic
+        // topology replaces the Vulkan queries; policy stays pool-side.
+        const auto types = backend_->memoryTypes();
+        uint32_t typeIdx = UINT32_MAX;
+        for (size_t i = 0; i < types.size(); ++i) {
+            if (types[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+                typeIdx = static_cast<uint32_t>(i);
+                break;
+            }
+        }
+        if (typeIdx != UINT32_MAX && config_.preferPureDeviceLocal &&
+            (types[typeIdx].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+            for (size_t i = 0; i < types.size(); ++i) {
+                const uint32_t f = types[i].propertyFlags;
+                if ((f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+                    !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+                    typeIdx = static_cast<uint32_t>(i);
+                    break;
+                }
+            }
+        }
+        if (typeIdx == UINT32_MAX) {
+            VVM_LOG_ERROR("backend reports no DEVICE_LOCAL memory type");
+            return false;
+        }
+        deviceLocalMemoryType_ = typeIdx;
+        deviceLocalHeapIndex_ = types[typeIdx].heapIndex;
+
+        const BackendBudget budget = backend_->heapBudget(deviceLocalHeapIndex_);
+        memoryBudgetAvailable_ = budget.valid;
+        if (budget.valid) {
+            VVM_LOG_INFO("live device budget available ({} MB total, {} MB used) - "
+                         "budget-aware pool growth enabled",
+                         static_cast<uint64_t>(budget.budgetBytes) / (1024 * 1024),
+                         static_cast<uint64_t>(budget.usedBytes) / (1024 * 1024));
+        }
+        VVM_LOG_INFO("Selected DEVICE_LOCAL memory type {} via {} backend (heap budget: {} MB, utilization: {} percent)",
+                     deviceLocalMemoryType_, backend_->name(),
+                     static_cast<uint64_t>(budget.budgetBytes) / (1024 * 1024),
+                     budget.valid && budget.budgetBytes
+                         ? (budget.usedBytes * 100.0f / budget.budgetBytes) : 0.0f);
+
+        if (config_.enableHostVisible) {
+            VVM_LOG_WARN("enableHostVisible is not supported by non-Vulkan backends yet - ignored");
+        }
+    }
+
+    // Create transfer command pool (Vulkan only: the HIP memory plane has no
+    // Vulkan queuing; the copyBuffer path is a Vulkan-direct v1 API).
     // Bisect knobs (GGML_VVM_NO_CMDPOOL / GGML_VVM_NO_INITBLOCK via env are
     // handled by the integration layer flipping these config-adjacent statics;
     // here we only honor the internal skip flags).
-    if (!getenv("VVM_SKIP_CMDPOOL")) {
+    if (isVulkan && !getenv("VVM_SKIP_CMDPOOL")) {
     VkCommandPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     poolInfo.queueFamilyIndex = deviceConfig_.transferQueueFamily != UINT32_MAX 
@@ -531,8 +587,9 @@ VVM_LOG_INFO("Selected HOST_VISIBLE memory type {} (heap budget: {} MB)",
     }
     }
     
-    // Create OffloadManager if offload is enabled
-    if (config_.enableHostVisible) {
+    // Create OffloadManager if offload is enabled (Vulkan only in v1; the
+    // discovery branch above already warned for non-Vulkan configs).
+    if (isVulkan && config_.enableHostVisible) {
         OffloadConfig offloadConfig;
         VkDeviceSize shadow = static_cast<VkDeviceSize>(config_.blockSize * config_.hostShadowMultiplier);
         if (config_.maxHostShadowBytes > 0) {
@@ -602,9 +659,19 @@ VkDeviceSize UnifiedMemoryPool::adaptiveBlockSizeFor(VkDeviceSize requestSize,
 
     // Rule 2: small-heap cap (a quarter of the device-local heap, floored).
     {
-        const auto info = getDeviceMemoryInfo();
-        if (deviceLocalHeapIndex_ < info.heapSizes.size()) {
-            const VkDeviceSize heapSize = info.heapSizes[deviceLocalHeapIndex_];
+        uint64_t heapSize = 0;
+        if (deviceConfig_.physicalDevice != VK_NULL_HANDLE) {
+            const auto info = getDeviceMemoryInfo();
+            if (deviceLocalHeapIndex_ < info.heapSizes.size()) {
+                heapSize = info.heapSizes[deviceLocalHeapIndex_];
+            }
+        } else if (backend_) {
+            const auto heaps = backend_->heaps();
+            if (deviceLocalHeapIndex_ < heaps.size()) {
+                heapSize = heaps[deviceLocalHeapIndex_].size;
+            }
+        }
+        if (heapSize > 0) {
             VkDeviceSize cap = heapSize / 4;
             const VkDeviceSize floor = 256ull * 1024ull * 1024ull;
             if (cap < floor) cap = floor;
@@ -657,36 +724,46 @@ bool UnifiedMemoryPool::wouldExceedBudget(VkDeviceSize additionalBytes) const {
         return true;
     }
 
-    // Heap-fraction cap (VK_EXT_memory_budget when available).
+    // Heap-fraction cap (VK_EXT_memory_budget / hipMemGetInfo when available).
     if (config_.maxHeapFraction > 0.0f) {
         VkDeviceSize heapBudget = 0;
         VkDeviceSize heapUsed = 0;
-        VkPhysicalDeviceMemoryProperties2 props2{};
-        props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
-        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
-        budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
-        if (memoryBudgetAvailable_) {
-            props2.pNext = &budget;
-        }
-        vkGetPhysicalDeviceMemoryProperties2(deviceConfig_.physicalDevice, &props2);
-        const auto& memProps = props2.memoryProperties;
-        if (deviceLocalHeapIndex_ < memProps.memoryHeapCount) {
-            if (memoryBudgetAvailable_ && deviceLocalHeapIndex_ < VK_MAX_MEMORY_HEAPS) {
-                heapBudget = budget.heapBudget[deviceLocalHeapIndex_];
-                heapUsed = budget.heapUsage[deviceLocalHeapIndex_];
+        VkDeviceSize heapSize = 0;
+        if (deviceConfig_.physicalDevice != VK_NULL_HANDLE) {
+            VkPhysicalDeviceMemoryProperties2 props2{};
+            props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+            VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+            budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+            if (memoryBudgetAvailable_) {
+                props2.pNext = &budget;
             }
-            if (heapBudget == 0) {
-                heapBudget = memProps.memoryHeaps[deviceLocalHeapIndex_].size;
+            vkGetPhysicalDeviceMemoryProperties2(deviceConfig_.physicalDevice, &props2);
+            const auto& memProps = props2.memoryProperties;
+            if (deviceLocalHeapIndex_ < memProps.memoryHeapCount) {
+                if (memoryBudgetAvailable_ && deviceLocalHeapIndex_ < VK_MAX_MEMORY_HEAPS) {
+                    heapBudget = budget.heapBudget[deviceLocalHeapIndex_];
+                    heapUsed = budget.heapUsage[deviceLocalHeapIndex_];
+                }
+                if (heapBudget == 0) {
+                    heapBudget = memProps.memoryHeaps[deviceLocalHeapIndex_].size;
+                }
+                heapSize = memProps.memoryHeaps[deviceLocalHeapIndex_].size;
             }
+        } else if (backend_) {
+            const BackendBudget b = backend_->heapBudget(deviceLocalHeapIndex_);
+            const auto heaps = backend_->heaps();
+            heapBudget = b.valid ? b.budgetBytes
+                                 : (deviceLocalHeapIndex_ < heaps.size()
+                                        ? heaps[deviceLocalHeapIndex_].size : 0);
+            heapUsed = b.valid ? b.usedBytes : 0;
+            heapSize = deviceLocalHeapIndex_ < heaps.size()
+                           ? heaps[deviceLocalHeapIndex_].size : heapBudget;
         }
         // Cap against the STATIC heap size, not the dynamic budget: VK_EXT
         // budget fluctuates with desktop/other-process VRAM usage, so a
         // budget-based cap fails unpredictably (measured: 256K q8 workload
         // at ~92% VRAM failed at fraction 0.95/0.98). Spill occurs when
         // system-wide usage crosses the heap size - that is the ceiling.
-        const VkDeviceSize heapSize = (deviceLocalHeapIndex_ < memProps.memoryHeapCount)
-            ? memProps.memoryHeaps[deviceLocalHeapIndex_].size
-            : heapBudget;
         const VkDeviceSize cap = static_cast<VkDeviceSize>(heapSize * config_.maxHeapFraction);
         if (heapUsed + additionalBytes > cap) {
             VVM_LOG_WARN("budget: heap usage {} MB + {} MB would exceed {} MB ({:.0f}% of {} MB); allocate() failing soft instead of stealing VRAM",
@@ -802,25 +879,38 @@ std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
     // ~90% of the device-local heap lets the driver spill to shared memory,
     // which silently halves decode throughput. Warn once per pool.
     if (config_.maxHeapFraction > 0.0f && !warnedHighWater_) {
-        auto info = getDeviceMemoryInfo();
-        if (deviceLocalHeapIndex_ < VK_MAX_MEMORY_HEAPS) {
-            const VkDeviceSize budget = info.budget.heapBudget[deviceLocalHeapIndex_];
-            const VkDeviceSize used = info.budget.heapUsage[deviceLocalHeapIndex_];
-            if (budget > 0 && used > (VkDeviceSize)(budget * 0.90)) {
-                VVM_LOG_WARN("heap {} is {}% committed - the driver may spill to "
-                             "shared memory and ~2x decode throughput. Reduce "
-                             "context/model or rebalance across GPUs.",
-                             deviceLocalHeapIndex_,
-                             (int)(used * 100 / budget));
-                warnedHighWater_ = true;
+        uint64_t budget = 0, used = 0;
+        if (deviceConfig_.physicalDevice != VK_NULL_HANDLE) {
+            auto info = getDeviceMemoryInfo();
+            if (deviceLocalHeapIndex_ < VK_MAX_MEMORY_HEAPS) {
+                budget = info.budget.heapBudget[deviceLocalHeapIndex_];
+                used = info.budget.heapUsage[deviceLocalHeapIndex_];
             }
+        } else {
+            const BackendBudget b = backend_->heapBudget(deviceLocalHeapIndex_);
+            if (b.valid) { budget = b.budgetBytes; used = b.usedBytes; }
+        }
+        if (budget > 0 && used > (uint64_t)(budget * 0.90)) {
+            VVM_LOG_WARN("heap {} is {}% committed - the driver may spill to "
+                         "shared memory and ~2x decode throughput. Reduce "
+                         "context/model or rebalance across GPUs.",
+                         deviceLocalHeapIndex_,
+                         (int)(used * 100 / budget));
+            warnedHighWater_ = true;
         }
     }
     
     // Map if host-visible
     void* hostPtr = nullptr;
-    VkMemoryPropertyFlags memFlags;
-    getMemoryTypeProperties(memoryTypeIndex, memFlags, getDeviceMemoryInfo().memProps);
+    VkMemoryPropertyFlags memFlags = 0;
+    if (deviceConfig_.physicalDevice != VK_NULL_HANDLE) {
+        getMemoryTypeProperties(memoryTypeIndex, memFlags, getDeviceMemoryInfo().memProps);
+    } else {
+        const auto types = backend_->memoryTypes();
+        if (memoryTypeIndex < types.size()) {
+            memFlags = types[memoryTypeIndex].propertyFlags;
+        }
+    }
     
     bool isHostVisible = (memFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
     bool isCoherent = (memFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
@@ -1102,6 +1192,62 @@ VVM_LOG_INFO("allocateDedicatedExportable: bind succeeded");
     return alloc;
 }
 
+std::optional<Allocation> UnifiedMemoryPool::allocateDedicatedBackend(
+    VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags flags) {
+    // Standalone backend allocation for non-Vulkan pools (HIP today):
+    // the backend's dedicated equivalent is a plain hipMalloc - there is no
+    // buffer/memory split, no pNext chain, no import/export. Tracked in
+    // dedicatedAllocations_ so subDeallocate/dtor free it correctly.
+    (void)usage;
+    (void)flags;   // device-local type as selected at init
+
+    if (wouldExceedBudget(size)) {
+        VVM_LOG_WARN("allocateDedicatedBackend: would exceed budget ({} MB)",
+                     size / (1024 * 1024));
+        return std::nullopt;
+    }
+
+    int err = 0;
+    const BackendMemory mem = backend_->allocate(
+        {static_cast<uint64_t>(size), deviceLocalMemoryType_,
+         /*exportable=*/false, /*deviceAddress=*/false,
+         /*priority=*/0.0f, /*dedicatedFor=*/0},
+        &err);
+    if (mem == 0) {
+        int native = 0;
+        const bool known = decode_backend_error(err, &native);
+        VVM_LOG_ERROR("allocateDedicatedBackend: backend allocate failed (err {})",
+                      known ? native : err);
+        return std::nullopt;
+    }
+    const BackendBuffer buf = backend_->create_buffer(
+        mem, 0, static_cast<uint64_t>(size),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        /*exportable=*/false, &err);
+    if (buf == 0) {
+        VVM_LOG_ERROR("allocateDedicatedBackend: backend create_buffer failed");
+        backend_->free(mem);
+        return std::nullopt;
+    }
+
+    Allocation alloc;
+    alloc.buffer = reinterpret_cast<VkBuffer>(buf);
+    alloc.memory = reinterpret_cast<VkDeviceMemory>(mem);
+    alloc.offset = 0;
+    alloc.size = size;
+    alloc.blockIndex = UINT32_MAX;
+    alloc.isHostVisible = false;
+    alloc.isCoherent = false;
+    alloc.isMapped = false;
+    alloc.memoryFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    alloc.hostPtr = nullptr;
+    alloc.deviceAddress = backend_->buffer_device_address(buf);
+    alloc.generation = nextGeneration();
+    dedicatedAllocations_.push_back(alloc);
+    return alloc;
+}
+
 std::optional<Allocation> UnifiedMemoryPool::allocateDedicated(
     VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags flags) {
     // NOTE: caller (allocate) holds mutex_ -- do NOT lock here or we deadlock.
@@ -1329,9 +1475,11 @@ std::optional<Allocation> UnifiedMemoryPool::allocate(VkDeviceSize size,
     // maxBlocks == 0 means unlimited (documented contract in PoolConfig).
     if (config_.maxBlocks > 0 && blocks_.size() >= config_.maxBlocks) {
         // Oversized allocation: can't create another pool block. Fall back to
-        // a dedicated VkDeviceMemory if the request still fits the budget.
+        // a dedicated allocation if the request still fits the budget.
         if (size > config_.blockSize) {
-            return allocateDedicated(size, usage, flags);
+            return deviceConfig_.physicalDevice != VK_NULL_HANDLE
+                       ? allocateDedicated(size, usage, flags)
+                       : allocateDedicatedBackend(size, usage, flags);
         }
         return std::nullopt;
     }
@@ -1366,7 +1514,9 @@ std::optional<Allocation> UnifiedMemoryPool::allocate(VkDeviceSize size,
     // Request larger than the picked block: allocate dedicated memory instead
     // of growing the pool by a block that still couldn't hold the request.
     if (size > blockSize) {
-        return allocateDedicated(size, usage, flags);
+        return deviceConfig_.physicalDevice != VK_NULL_HANDLE
+                   ? allocateDedicated(size, usage, flags)
+                   : allocateDedicatedBackend(size, usage, flags);
     }
     
     uint32_t memType = (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) 

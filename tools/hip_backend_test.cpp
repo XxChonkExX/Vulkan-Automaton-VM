@@ -1,8 +1,10 @@
-// HipMemoryBackend smoke test: dynamic loader + allocate/free/budget plane.
-// Build: cl hip_backend_test.cpp (links vulkan_vm import lib, loads
-// vulkan_vm.dll; the HIP runtime itself is loaded dynamically at runtime).
+// HipMemoryBackend smoke test: dynamic loader + allocate/free/budget plane,
+// PLUS a full UnifiedMemoryPool created over the HIP backend (backend-driven
+// discovery path). Build: cl hip_backend_test.cpp (links the vulkan_vm
+// import lib; the HIP runtime itself is loaded dynamically at runtime).
 #include "vulkan_vm/mem_backend.hpp"
 #include "vulkan_vm/hip_mem_backend.hpp"
+#include "vulkan_vm/vulkan_vm.hpp"
 
 #include <cstdio>
 #include <vector>
@@ -87,6 +89,46 @@ int main() {
     std::printf("%s: vulkan backend construct %s\n",
                 vk ? "ok" : "FAIL", vk ? vk->name() : "(null)");
     if (!vk) ++failures;
+
+    // 7. FULL POOL over the HIP backend: backend-driven discovery, buddy
+    //    sub-allocation, budget policy - the Part-A end-to-end gate.
+    DeviceConfig hipCfg{};
+    hipCfg.backendDeviceIndex = 0;   // sole visible HIP device (the XTX)
+    PoolConfig pcfg;
+    pcfg.blockSize = 64ull * 1024ull * 1024ull;      // small blocks for the test
+    pcfg.maxBlocks = 4;
+    pcfg.enableHostVisible = false;
+    auto pool = UnifiedMemoryPool::create(hipCfg, pcfg);
+    if (!pool.has_value()) {
+        std::printf("FAIL: pool create over HIP backend\n");
+        ++failures;
+    } else {
+        std::printf("ok: UnifiedMemoryPool created over HIP backend\n");
+        // Sub-allocate through the pool's policy layer (AllocDesc path).
+        vvm::AllocDesc desc;
+        desc.size = 8ull * 1024ull * 1024ull;
+        desc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        desc.memoryUsage = vvm::MemoryUsage::GpuOnly;
+        auto a1 = pool->allocate(desc);
+        if (!a1.has_value()) {
+            std::printf("FAIL: pool allocate 8 MiB\n");
+            ++failures;
+        } else {
+            const uint64_t ptr = reinterpret_cast<uint64_t>(a1->buffer);
+            std::printf("ok: pool allocate 8 MiB -> device ptr %p (echo %s)\n",
+                        (void*)ptr, ptr == reinterpret_cast<uint64_t>(a1->memory) ? "yes" : "no");
+            if (a1->deviceAddress != 0) {
+                std::printf("ok: device address %llu\n", (unsigned long long)a1->deviceAddress);
+            }
+            pool->deallocate(std::move(*a1));
+            std::printf("ok: pool deallocate\n");
+        }
+        const PoolStats st = pool->getStats();
+        std::printf("ok: pool stats: blocks=%u used=%llu MB cap=%llu MB\n",
+                    st.blockCount,
+                    (unsigned long long)(st.totalUsed / (1024 * 1024)),
+                    (unsigned long long)(st.totalCapacity / (1024 * 1024)));
+    }
 
     if (failures == 0) {
         std::printf("ALL HIP BACKEND TESTS PASSED\n");

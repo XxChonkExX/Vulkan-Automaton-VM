@@ -394,6 +394,13 @@ public:
     std::optional<Allocation> allocateDedicated(
         VkDeviceSize size, VkBufferUsageFlags usage,
         VkMemoryPropertyFlags flags = 0);
+
+    // Non-Vulkan standalone allocation (oversized requests on HIP/L0 pools):
+    // a backend-native dedicated allocation, tracked in dedicatedAllocations_
+    // so lifetime/free paths treat it identically to Vulkan dedicateds.
+    std::optional<Allocation> allocateDedicatedBackend(
+        VkDeviceSize size, VkBufferUsageFlags usage,
+        VkMemoryPropertyFlags flags = 0);
     
     std::optional<Allocation> allocateTensor(VkDeviceSize size,
                                              VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
