@@ -80,4 +80,73 @@ private:
     std::string json_;
 };
 
+// ============================================================================
+// Auto tensor placement: the --n-cpu-moe replacement.
+//
+// Decides, from a model tensor inventory + the enumerated devices + a KV
+// estimate, where every tensor class lives. Encodes the measured rules:
+//   - PLE (per_layer_token_embd) ALWAYS on CPU (55.6x decode penalty on
+//     GPU, measured by lukaLLM on this exact model family).
+//   - Expert fill order: HIP-discrete (fast kernels, +0.22 t/s/layer
+//     measured on gfx1100) -> CPU RAM cache (page cache degrades
+//     gracefully, measured working at 1.3x RAM oversubscription) ->
+//     L0-discrete (unmeasured kernels: overflow only) ->
+//     Vulkan-discrete (slow Q3_K kernels, -0.85/layer measured: last
+//     resort only).
+//   - Dense/attention/head on the biggest discrete GPU (any backend;
+//     dense runs fine everywhere, even Vulkan).
+//   - Fill any device only to maxFraction of its heap (0.90 default:
+//     the measured spill cliff sits at 92-98%).
+//   - CPU is an unbounded sink (mmap page cache - streaming works).
+// ============================================================================
+
+enum class TensorClass : int32_t {
+    Expert,        // routed expert FFN weight, layer-tagged
+    Attention,     // attention/QSA/DeltaNet projections
+    Dense,         // shared experts, norms, head, embeddings
+    LookupTable,   // per_layer_token_embd (the N-gram/PLE table)
+    Other,
+};
+
+struct TensorSpec {
+    char     name[256] = {};
+    uint64_t size = 0;
+    TensorClass cls = TensorClass::Other;
+    int32_t  layer = -1;     // expert layer index for Expert, else -1
+};
+
+// Where one expert layer landed. backend==Vulkan+index<0 means CPU/mmap.
+struct ExpertPlacement {
+    int32_t layer = -1;
+    MemBackendKind backend = MemBackendKind::Vulkan;
+    int32_t deviceIndex = -1;
+    bool onCpu = true;
+};
+
+struct PlacementPlan {
+    std::vector<ExpertPlacement> experts;  // one per expert layer found
+    MemBackendKind denseBackend = MemBackendKind::Vulkan;
+    int32_t denseDeviceIndex = -1;
+    bool   pleOnCpu = true;
+    // Human-readable one-liner (ncmoe equivalent when CPU layers are a
+    // suffix, else "mixed - use the per-layer map").
+    char   summary[256] = {};
+};
+
+VVM_API TensorClass classify_tensor(const char* name, int32_t* layerOut);
+VVM_API PlacementPlan auto_place_experts(
+    const std::vector<BackendDeviceInfo>& devices,
+    const std::vector<TensorSpec>& tensors,
+    uint64_t kvCacheBytes,
+    float maxFraction = 0.90f);
+// Extended form: hostCacheBytes bounds the CPU mmap sink (default
+// unbounded - page cache degrades gracefully). Small-RAM boxes pass
+// their usable RAM here so overflow routes to L0/Vulkan instead.
+VVM_API PlacementPlan auto_place_experts_ex(
+    const std::vector<BackendDeviceInfo>& devices,
+    const std::vector<TensorSpec>& tensors,
+    uint64_t kvCacheBytes,
+    uint64_t hostCacheBytes,
+    float maxFraction = 0.90f);
+
 } // namespace vvm

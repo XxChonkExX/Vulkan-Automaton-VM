@@ -10,6 +10,7 @@
 #include "vulkan_vm/utils.hpp"
 
 #include <vulkan/vulkan.h>
+#include <algorithm>
 #include <cstring>
 #include <cstdio>
 
@@ -219,6 +220,195 @@ const char* UnifiedPoolSet::aggregate_stats_json() {
     }
     json_ += "]";
     return json_.c_str();
+}
+
+// ---------------------------------------------------------------------------
+// Auto tensor placement
+// ---------------------------------------------------------------------------
+
+TensorClass classify_tensor(const char* name, int32_t* layerOut) {
+    if (layerOut) *layerOut = -1;
+    if (!name) return TensorClass::Other;
+    const std::string n(name);
+    if (n.find("per_layer_token_embd") != std::string::npos) {
+        return TensorClass::LookupTable;
+    }
+    // Routed experts: blk.N.ffn_(gate|up|down)_exps (qwen4exp) and the
+    // generic ffn_*exps / expert spellings of other MoE arches.
+    std::size_t blk = n.find("blk.");
+    if (blk != std::string::npos) {
+        const bool isExpert = n.find("ffn_") != std::string::npos &&
+                              (n.find("_exps") != std::string::npos ||
+                               n.find("experts") != std::string::npos);
+        if (isExpert) {
+            int layer = -1;
+            if (sscanf(n.c_str() + blk, "blk.%d.", &layer) == 1 && layer >= 0) {
+                if (layerOut) *layerOut = layer;
+                return TensorClass::Expert;
+            }
+        }
+        if (n.find("attn_") != std::string::npos ||
+            n.find("ssm_") != std::string::npos ||
+            n.find("qsa_") != std::string::npos ||
+            n.find("deltanet") != std::string::npos) {
+            return TensorClass::Attention;
+        }
+        return TensorClass::Dense;
+    }
+    return TensorClass::Dense;
+}
+
+PlacementPlan auto_place_experts(
+    const std::vector<BackendDeviceInfo>& devices,
+    const std::vector<TensorSpec>& tensors,
+    uint64_t kvCacheBytes,
+    float maxFraction) {
+
+    return auto_place_experts_ex(devices, tensors, kvCacheBytes,
+                                 UINT64_MAX, maxFraction);
+}
+
+PlacementPlan auto_place_experts_ex(
+    const std::vector<BackendDeviceInfo>& devices,
+    const std::vector<TensorSpec>& tensors,
+    uint64_t kvCacheBytes,
+    uint64_t hostCacheBytes,
+    float maxFraction) {
+
+    PlacementPlan plan{};
+    if (maxFraction <= 0.0f || maxFraction > 1.0f) maxFraction = 0.90f;
+
+    // Inventory: per-layer expert bytes, dense bytes, PLE bytes.
+    uint64_t denseBytes = 0, pleBytes = 0;
+    std::vector<uint64_t> expertBytes;   // indexed by layer
+    int maxLayer = -1;
+    for (const auto& t : tensors) {
+        if (t.cls == TensorClass::LookupTable) {
+            pleBytes += t.size;
+        } else if (t.cls == TensorClass::Expert && t.layer >= 0) {
+            if (t.layer > maxLayer) maxLayer = t.layer;
+        } else {
+            denseBytes += t.size;
+        }
+    }
+    expertBytes.assign(maxLayer >= 0 ? static_cast<size_t>(maxLayer) + 1 : 0, 0);
+    for (const auto& t : tensors) {
+        if (t.cls == TensorClass::Expert && t.layer >= 0 &&
+            static_cast<size_t>(t.layer) < expertBytes.size()) {
+            expertBytes[static_cast<size_t>(t.layer)] += t.size;
+        }
+    }
+
+    // Candidate GPU sinks. Expert fill order (measured):
+    //   rank 0: HIP discrete (fast kernels, +0.22 t/s/layer on gfx1100)
+    //   rank 1: CPU RAM cache (unbounded mmap sink; degrades gracefully -
+    //           measured working at 1.3x RAM oversubscription)
+    //   rank 2: L0 discrete (unmeasured kernels: overflow only, and only
+    //           after the CPU sink - never ahead of it)
+    //   rank 3: Vulkan discrete (slow Q3_K kernels, -0.85 t/s/layer
+    //           measured: last resort only)
+    struct Sink {
+        MemBackendKind kind;
+        int32_t vendorIndex;
+        uint64_t cap;      // maxFraction * heap
+        uint64_t used = 0;
+        int rank;          // lower = preferred
+        bool overflowOnly = false;
+        bool isCpu = false;
+    };
+    std::vector<Sink> sinks;
+    for (const auto& d : devices) {
+        if (d.preferred == MemBackendKind::Hip && !d.integrated) {
+            sinks.push_back({MemBackendKind::Hip, d.vendorIndex,
+                             static_cast<uint64_t>(d.totalMem * maxFraction), 0, 0});
+        } else if (d.preferred == MemBackendKind::Level0 && !d.integrated) {
+            sinks.push_back({MemBackendKind::Level0, d.vendorIndex,
+                             static_cast<uint64_t>(d.totalMem * maxFraction), 0, 2, true});
+        }
+    }
+    // CPU sink: unbounded unless the caller caps the host cache.
+    sinks.push_back({MemBackendKind::Vulkan, -1, hostCacheBytes, 0, 1, false, true});
+    // Vulkan-discrete last resort: enumerated, not pooled (the app's VkDevice
+    // would be needed; llama's tensor split handles it). Listed for the map.
+    for (const auto& d : devices) {
+        if (d.source == DeviceSource::Vulkan && !d.integrated &&
+            (d.vendorId == 0x1002 || d.vendorId == 0x8086)) {
+            sinks.push_back({MemBackendKind::Vulkan, d.vendorIndex,
+                             static_cast<uint64_t>(d.totalMem * maxFraction), 0, 3, true});
+        }
+    }
+    // Dense target: co-locate with experts on the biggest rank-0 (HIP) sink;
+    // without one, the biggest discrete sink; without any, CPU.
+    Sink* denseSink = nullptr;
+    for (auto& s : sinks) {
+        if (s.isCpu || s.overflowOnly || s.rank != 0) continue;
+        if (!denseSink || s.cap > denseSink->cap) denseSink = &s;
+    }
+    if (!denseSink) {
+        for (auto& s : sinks) {
+            if (s.isCpu) continue;
+            if (!denseSink || s.cap > denseSink->cap) denseSink = &s;
+        }
+    }
+    if (!denseSink) {
+        for (auto& s : sinks) {
+            if (s.isCpu) { denseSink = &s; break; }
+        }
+    }
+    plan.pleOnCpu = true;   // always (the 55.6x rule)
+    plan.denseBackend = denseSink ? denseSink->kind : MemBackendKind::Vulkan;
+    plan.denseDeviceIndex = denseSink ? denseSink->vendorIndex : -1;
+    if (denseSink) denseSink->used += denseBytes + kvCacheBytes;
+
+    // Experts greedy in rank order.
+    std::sort(sinks.begin(), sinks.end(),
+              [](const Sink& a, const Sink& b) { return a.rank < b.rank; });
+    plan.experts.reserve(expertBytes.size());
+    int cpuLayers = 0, gpuLayers = 0;
+    int firstCpu = -1, lastGpu = -1;
+    for (size_t l = 0; l < expertBytes.size(); ++l) {
+        ExpertPlacement p{};
+        p.layer = static_cast<int32_t>(l);
+        p.onCpu = true;
+        for (auto& s : sinks) {
+            // Rank order does the policy work: HIP fill -> CPU cache ->
+            // L0 overflow -> Vulkan-discrete last resort (measured slower
+            // than CPU streaming, but better than OOM).
+            if (s.used + expertBytes[l] <= s.cap) {
+                s.used += expertBytes[l];
+                p.onCpu = s.isCpu;
+                p.backend = s.kind;
+                p.deviceIndex = s.vendorIndex;
+                break;
+            }
+        }
+        if (p.onCpu) {
+            ++cpuLayers;
+            if (firstCpu < 0) firstCpu = static_cast<int>(l);
+        } else {
+            ++gpuLayers;
+            lastGpu = static_cast<int>(l);
+        }
+        plan.experts.push_back(p);
+    }
+
+    // ncmoe-style summary when CPU layers form a suffix (llama's model);
+    // otherwise the per-layer map is authoritative.
+    if (!plan.experts.empty() && firstCpu >= 0 &&
+        (lastGpu < 0 || static_cast<size_t>(lastGpu) < plan.experts.size() - 1)) {
+        // mixed layout - report both counts and the equivalent suffix
+        std::snprintf(plan.summary, sizeof(plan.summary),
+                      "%d/%zu expert layers on GPU, %d on CPU (mixed)",
+                      gpuLayers, plan.experts.size(), cpuLayers);
+    } else if (firstCpu >= 0) {
+        std::snprintf(plan.summary, sizeof(plan.summary),
+                      "%d/%zu expert layers on GPU, %d on CPU (~--n-cpu-moe %d)",
+                      gpuLayers, plan.experts.size(), cpuLayers, firstCpu);
+    } else {
+        std::snprintf(plan.summary, sizeof(plan.summary),
+                      "all %zu expert layers on GPU", plan.experts.size());
+    }
+    return plan;
 }
 
 } // namespace vvm
