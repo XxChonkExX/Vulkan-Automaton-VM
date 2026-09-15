@@ -26,6 +26,7 @@ constexpr int32_t kZeSuccess = 0;
 constexpr uint32_t kZeStypeContextDesc        = 0xd;   // ze_context_desc_t
 constexpr uint32_t kZeStypeDeviceMemAllocDesc = 0x15;  // ze_device_mem_alloc_desc_t
 constexpr uint32_t kZeStypeDeviceMemProps     = 0x7;   // ze_device_memory_properties_t
+constexpr uint32_t kZeStypeDeviceProps        = 0x3;   // ze_device_properties_t (classic)
 constexpr uint32_t kZeMaxDeviceName           = 256;
 
 struct ZeContextDesc {
@@ -66,10 +67,12 @@ struct ZeApi {
     ze_result_t (*zeMemFree)(ze_context_handle_t hContext, void* ptr) = nullptr;
     ze_result_t (*zeDeviceGetMemoryProperties)(ze_device_handle_t hDevice, uint32_t* pCount,
                                                ZeDeviceMemoryProperties* pMemProperties) = nullptr;
+    ze_result_t (*zeDeviceGetPropertiesRaw)(ze_device_handle_t hDevice, void* props /*4096B*/) = nullptr;
     // Context handle owned by this process's backend instance (resolved from
     // the shared api struct at create()).
     ze_context_handle_t context = nullptr;
     bool ok = false;
+    bool enumOk = false;
 };
 
 ZeApi g_zeApi = {};
@@ -98,11 +101,108 @@ bool loadZeApi() {
     g_zeApi.zeDeviceGetMemoryProperties =
         reinterpret_cast<ze_result_t (*)(ze_device_handle_t, uint32_t*,
                                          ZeDeviceMemoryProperties*)>(r("zeDeviceGetMemoryProperties"));
+    g_zeApi.zeDeviceGetPropertiesRaw =
+        reinterpret_cast<ze_result_t (*)(ze_device_handle_t, void*)>(r("zeDeviceGetProperties"));
     g_zeApi.ok = g_zeApi.zeInit && g_zeApi.zeDriverGet && g_zeApi.zeDeviceGet &&
                  g_zeApi.zeContextCreate && g_zeApi.zeMemAllocDevice &&
                  g_zeApi.zeMemFree && g_zeApi.zeDeviceGetMemoryProperties;
+    g_zeApi.enumOk = g_zeApi.ok && g_zeApi.zeDeviceGetPropertiesRaw != nullptr;
     return g_zeApi.ok;
 }
+
+} // namespace
+
+int l0_enumerate_count() {
+    // Cheap loader-presence probe: the full enumeration (below) re-resolves.
+    HMODULE m = ::GetModuleHandleW(L"ze_loader.dll");
+    if (!m) m = ::LoadLibraryW(L"ze_loader.dll");
+    if (!m) return 0;
+    if (!loadZeApi() || !g_zeApi.enumOk) return 0;
+    if (g_zeApi.zeInit(0) != kZeSuccess) return 0;
+    uint32_t driverCount = 0;
+    if (g_zeApi.zeDriverGet(&driverCount, nullptr) != kZeSuccess) return 0;
+    int total = 0;
+    for (uint32_t d = 0; d < driverCount; ++d) {
+        ze_driver_handle_t driver = nullptr;
+        uint32_t one = 1;
+        if (g_zeApi.zeDriverGet(&one, &driver) != kZeSuccess || !driver) continue;
+        uint32_t devCount = 0;
+        if (g_zeApi.zeDeviceGet(driver, &devCount, nullptr) == kZeSuccess) {
+            total += static_cast<int>(devCount);
+        }
+    }
+    return total;
+}
+
+bool l0_runtime_present() {
+    return loadZeApi();
+}
+
+bool l0_enumerate_device(int idx, char* nameOut, size_t nameLen,
+                         uint64_t* totalMemOut, uint32_t* vendorOut,
+                         uint32_t* deviceOut, bool* integratedOut) {
+    if (!loadZeApi() || !g_zeApi.enumOk) return false;
+    if (g_zeApi.zeInit(0) != kZeSuccess) return false;
+    uint32_t driverCount = 0;
+    if (g_zeApi.zeDriverGet(&driverCount, nullptr) != kZeSuccess) return false;
+
+    // Flat (driver, device) enumeration, same as create().
+    struct Pair { ze_driver_handle_t driver; ze_device_handle_t device; };
+    std::vector<Pair> all;
+    for (uint32_t d = 0; d < driverCount; ++d) {
+        ze_driver_handle_t driver = nullptr;
+        uint32_t one = 1;
+        if (g_zeApi.zeDriverGet(&one, &driver) != kZeSuccess || !driver) continue;
+        uint32_t devCount = 0;
+        if (g_zeApi.zeDeviceGet(driver, &devCount, nullptr) != kZeSuccess) continue;
+        std::vector<ze_device_handle_t> list(devCount);
+        if (g_zeApi.zeDeviceGet(driver, &devCount, list.data()) != kZeSuccess) continue;
+        for (uint32_t i = 0; i < devCount; ++i) all.push_back({driver, list[i]});
+    }
+    if (idx < 0 || static_cast<size_t>(idx) >= all.size()) return false;
+    ze_device_handle_t device = all[static_cast<size_t>(idx)].device;
+
+    // ze_device_properties_t read through the verified layout (see file
+    // header comment): vendorId@20, deviceId@24, flags@28 (INTEGRATED=bit0),
+    // name[256]@112. 4 KB zeroed buffer keeps the write-back safe.
+    alignas(16) unsigned char props[4096] = {};
+    *reinterpret_cast<uint32_t*>(props) = kZeStypeDeviceProps;   // classic stype
+    if (g_zeApi.zeDeviceGetPropertiesRaw(device, props) != kZeSuccess) return false;
+    const uint32_t vendorId  = *reinterpret_cast<uint32_t*>(props + 20);
+    const uint32_t deviceId  = *reinterpret_cast<uint32_t*>(props + 24);
+    const uint32_t flags     = *reinterpret_cast<uint32_t*>(props + 28);
+    if (nameOut && nameLen > 0) {
+        props[112 + 255] = 0;
+        size_t n = 0;
+        while (n + 1 < nameLen && n < 255 && props[112 + n] != 0) {
+            nameOut[n] = static_cast<char>(props[112 + n]);
+            ++n;
+        }
+        nameOut[n] = 0;
+    }
+
+    // Largest memory totalSize (totalSize u64 @32 in
+    // ze_device_memory_properties_t).
+    uint32_t memCount = 0;
+    uint64_t total = 0;
+    if (g_zeApi.zeDeviceGetMemoryProperties(device, &memCount, nullptr) == kZeSuccess && memCount > 0) {
+        std::vector<ZeDeviceMemoryProperties> mp(memCount);
+        for (auto& p : mp) { p.stype = kZeStypeDeviceMemProps; p.pNext = nullptr; }
+        if (g_zeApi.zeDeviceGetMemoryProperties(device, &memCount, mp.data()) == kZeSuccess) {
+            for (const auto& p : mp) {
+                if (p.totalSize > total) total = p.totalSize;
+            }
+        }
+    }
+
+    if (totalMemOut) *totalMemOut = total;
+    if (vendorOut) *vendorOut = vendorId;
+    if (deviceOut) *deviceOut = deviceId;
+    if (integratedOut) *integratedOut = (flags & 1u) != 0;
+    return true;
+}
+
+namespace {
 
 constexpr int kL0ErrorBase = -3000000;   // distinct from Vulkan/HIP ranges
 int asError(int32_t zeErr) { return encode_backend_error(kL0ErrorBase - static_cast<int>(zeErr)); }
@@ -321,6 +421,10 @@ bool L0MemoryBackend::bind_buffer(BackendBuffer, BackendMemory) { return false; 
 void L0MemoryBackend::destroy_buffer(BackendBuffer) {}
 uint64_t L0MemoryBackend::buffer_device_address(BackendBuffer) const { return 0; }
 bool L0MemoryBackend::supports_export(ExternalHandleType) const { return false; }
+
+int  l0_enumerate_count() { return 0; }
+bool l0_runtime_present() { return false; }
+bool l0_enumerate_device(int, char*, size_t, uint64_t*, uint32_t*, uint32_t*, bool*) { return false; }
 
 } // namespace vvm
 

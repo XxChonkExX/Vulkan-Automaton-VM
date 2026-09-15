@@ -58,4 +58,11 @@ private:
     uint64_t totalMem_ = 0;
 };
 
+// Lightweight enumeration (no pool needed). HIP is AMD-only so vendor is
+// implied 0x1002. Safe to call when the runtime is absent (returns 0/false).
+VVM_API int  hip_enumerate_count();
+VVM_API bool hip_runtime_present();
+VVM_API bool hip_enumerate_device(int idx, char* nameOut, size_t nameLen,
+                                  uint64_t* totalMemOut, bool* integratedOut);
+
 } // namespace vvm

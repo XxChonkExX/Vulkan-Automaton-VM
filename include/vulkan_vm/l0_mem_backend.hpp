@@ -63,4 +63,12 @@ private:
     char deviceName_[256] = {};
 };
 
+// Lightweight enumeration (no pool needed). Safe to call when the loader is
+// absent (returns 0/false).
+VVM_API int  l0_enumerate_count();
+VVM_API bool l0_runtime_present();
+VVM_API bool l0_enumerate_device(int idx, char* nameOut, size_t nameLen,
+                                 uint64_t* totalMemOut, uint32_t* vendorOut,
+                                 uint32_t* deviceOut, bool* integratedOut);
+
 } // namespace vvm

@@ -21,8 +21,14 @@ struct HipApi {
     int  (*hipMemGetInfo)(size_t* freeBytes, size_t* totalBytes) = nullptr;
     int  (*hipSetDevice)(int device) = nullptr;
     int  (*hipGetDeviceCount)(int* count) = nullptr;
+    int  (*hipDeviceTotalMem)(size_t* bytes, int device) = nullptr;
+    int  (*hipGetDeviceProperties)(void* prop /* >1KB zeroed buffer */, int device) = nullptr;
+    int  (*hipDeviceGetAttribute)(int* pi, int attrib, int device) = nullptr;
     bool ok = false;
+    bool enumOk = false;
 };
+
+const int kHipAttrIntegrated = 18;   // hipDeviceAttributeIntegrated (CUDA-compatible numbering)
 
 const HipApi& hipApi() {
     static HipApi api = [] {
@@ -39,11 +45,60 @@ const HipApi& hipApi() {
         a.hipMemGetInfo     = reinterpret_cast<int (*)(size_t*, size_t*)>(resolve("hipMemGetInfo"));
         a.hipSetDevice      = reinterpret_cast<int (*)(int)>(resolve("hipSetDevice"));
         a.hipGetDeviceCount = reinterpret_cast<int (*)(int*)>(resolve("hipGetDeviceCount"));
+        a.hipDeviceTotalMem = reinterpret_cast<int (*)(size_t*, int)>(resolve("hipDeviceTotalMem"));
+        a.hipGetDeviceProperties = reinterpret_cast<int (*)(void*, int)>(resolve("hipGetDeviceProperties"));
+        a.hipDeviceGetAttribute  = reinterpret_cast<int (*)(int*, int, int)>(resolve("hipDeviceGetAttribute"));
         a.ok = a.hipMalloc && a.hipFree && a.hipMemGetInfo && a.hipSetDevice;
+        a.enumOk = a.ok && a.hipDeviceTotalMem && a.hipGetDeviceProperties && a.hipDeviceGetAttribute;
         return a;
     }();
     return api;
 }
+
+} // namespace
+
+int hip_enumerate_count() {
+    const HipApi& api = hipApi();
+    if (!api.ok) return 0;
+    int count = 0;
+    if (api.hipGetDeviceCount(&count) != 0 || count < 0) return 0;
+    return count;
+}
+
+bool hip_runtime_present() {
+    const HipApi& api = hipApi();
+    return api.ok;
+}
+
+bool hip_enumerate_device(int idx, char* nameOut, size_t nameLen,
+                          uint64_t* totalMemOut, bool* integratedOut) {
+    const HipApi& api = hipApi();
+    if (!api.enumOk) return false;
+    int count = 0;
+    if (api.hipGetDeviceCount(&count) != 0 || idx < 0 || idx >= count) return false;
+    // hipDeviceProp_t: name[256] at offset 0 (CUDA-compatible layout; we
+    // only read the name, from a 4 KB zeroed buffer so the write-back is
+    // always safe even if the struct is smaller).
+    alignas(16) unsigned char prop[4096] = {};
+    if (api.hipGetDeviceProperties(prop, idx) != 0) return false;
+    size_t total = 0;
+    if (api.hipDeviceTotalMem(&total, idx) != 0) return false;
+    int integrated = 0;
+    if (api.hipDeviceGetAttribute(&integrated, kHipAttrIntegrated, idx) != 0) {
+        integrated = 0;
+    }
+    if (nameOut && nameLen > 0) {
+        prop[255] = 0;
+        size_t n = 0;
+        while (n + 1 < nameLen && n < 255 && prop[n] != 0) { nameOut[n] = (char)prop[n]; ++n; }
+        nameOut[n] = 0;
+    }
+    if (totalMemOut) *totalMemOut = total;
+    if (integratedOut) *integratedOut = integrated != 0;
+    return true;
+}
+
+namespace {
 
 constexpr int kHipErrorBase = -2000000;   // distinct from the Vulkan range
 int asError(int hipErr) { return encode_backend_error(kHipErrorBase - hipErr); }
@@ -228,6 +283,10 @@ bool HipMemoryBackend::bind_buffer(BackendBuffer, BackendMemory) { return false;
 void HipMemoryBackend::destroy_buffer(BackendBuffer) {}
 uint64_t HipMemoryBackend::buffer_device_address(BackendBuffer) const { return 0; }
 bool HipMemoryBackend::supports_export(ExternalHandleType) const { return false; }
+
+int  hip_enumerate_count() { return 0; }
+bool hip_runtime_present() { return false; }
+bool hip_enumerate_device(int, char*, size_t, uint64_t*, bool*) { return false; }
 
 } // namespace vvm
 
