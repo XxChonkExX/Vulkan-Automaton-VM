@@ -422,3 +422,26 @@ Measured live (90 GB, no hand-tuning):
 - Vulkan build: plan "all 48 on CPU" -> **16.03 t/s** (matches ncmoe-999)
 - HIP build: plan "14/48 on GPU, 34 on CPU" -> **15.73 t/s** (evening
   thermal level; same-window native 15.47)
+
+## WSL2 Intel GPU-PV probe (2026-09-15): viable toolchain, non-viable inference
+
+Environment: WSL2 (kernel 6.18, Ubuntu 26.04) on the reference box, oneAPI
+2026.1 (icx/icpx + MKL), NEO 26.31/26.27 userspace from compute-runtime
+GitHub releases, Windows host driver PRO 8974.
+
+- SYCL toolchain: builds and runs. `sycl-ls` shows `level_zero:gpu`
+  (B70 0xe223) after installing `libze-intel-gpu1`; llama.cpp SYCL backend
+  compiles clean (needs `intel-oneapi-mkl-devel` + `-DMKL_ROOT` or
+  `CMAKE_PREFIX_PATH` - plain `find_package(MKL)` does not resolve).
+- Upstream main has NO qwen4exp arch support (verified at e95dae1) -
+  Flash-Next needs SergeB'"'"'s pinned tree + patches, not stock main.
+- **Blocker: WSL2 GPU VA reservation caps at ~256-320 MB total.**
+  Measured: 1 MB OK, 256 MB single OK, 5th concurrent 64 MB chunk aborts;
+  dmesg shows `dxgkio_reserve_gpu_va: Ioctl failed: -75` (EOVERFLOW) and
+  NEO fail-fasts in `mapMultiHandleAllocationWithRetry` (UNRECOVERABLE_IF
+  on reserveGpuVirtualAddress). OpenCL reports the full 31.16 GiB, so this
+  is a VA-space ceiling, not a memory ceiling. Downgrading NEO 26.31 ->
+  26.27 does not move it (same abort line).
+- Conclusion: WSL2 is a valid SYCL *toolchain* lab (enumerate, compile,
+  small kernels) but cannot serve LLM inference - anything over ~256 MB
+  of GPU VA dies. Bare-metal Linux is required for Phase 4 serve tests.
