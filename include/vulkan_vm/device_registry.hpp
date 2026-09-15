@@ -134,6 +134,10 @@ struct PlacementPlan {
 };
 
 VVM_API TensorClass classify_tensor(const char* name, int32_t* layerOut);
+// Reads names + exact byte sizes for every tensor in a (possibly split)
+// GGUF file. Sizes come from section offset diffs - no quant tables needed.
+// Returns an empty vector when the file cannot be parsed.
+VVM_API std::vector<TensorSpec> read_gguf_inventory(const std::string& firstPartPath);
 VVM_API PlacementPlan auto_place_experts(
     const std::vector<BackendDeviceInfo>& devices,
     const std::vector<TensorSpec>& tensors,

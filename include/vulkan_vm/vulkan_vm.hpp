@@ -10,6 +10,7 @@
 #include "vulkan_vm/storage_stream.hpp"
 #include "vulkan_vm/placement.hpp"
 #include "vulkan_vm/sparse.hpp"
+#include "vulkan_vm/device_registry.hpp"
 // Transport layers (network, tensor transport, RDMA/UCX) are OPTIONAL and
 // live in separate headers/targets so the core memory pool (Chonk Buffer)
 // builds and ships standalone:

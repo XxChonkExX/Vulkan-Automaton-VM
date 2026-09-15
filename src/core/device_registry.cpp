@@ -394,7 +394,10 @@ PlacementPlan auto_place_experts_ex(
 
     // ncmoe-style summary when CPU layers form a suffix (llama's model);
     // otherwise the per-layer map is authoritative.
-    if (!plan.experts.empty() && firstCpu >= 0 &&
+    if (gpuLayers == 0) {
+        std::snprintf(plan.summary, sizeof(plan.summary),
+                      "all %zu expert layers on CPU", plan.experts.size());
+    } else if (!plan.experts.empty() && firstCpu >= 0 &&
         (lastGpu < 0 || static_cast<size_t>(lastGpu) < plan.experts.size() - 1)) {
         // mixed layout - report both counts and the equivalent suffix
         std::snprintf(plan.summary, sizeof(plan.summary),
