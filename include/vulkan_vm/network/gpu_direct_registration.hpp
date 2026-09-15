@@ -1,5 +1,10 @@
 #pragma once
 
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
+
 // Forward declare Vulkan types to avoid including vulkan.h (which pulls in
 // conflicting Windows SDK headers). Full Vulkan types are defined in vulkan.h
 // when the implementation file includes it.
@@ -15,11 +20,6 @@ typedef uint64_t VkQueue;
 typedef uint64_t VkRemoteAddressNV;
 static constexpr uint64_t VK_NULL_HANDLE = 0;
 #endif
-
-#include <optional>
-#include <string>
-#include <cstdint>
-#include <memory>
 
 #if defined(VVM_NETWORK_HAS_VERBS)
 #include <infiniband/verbs.h>

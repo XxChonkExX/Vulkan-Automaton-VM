@@ -1,5 +1,9 @@
+// NOTE: vulkan.h must come FIRST: gpu_direct_registration.hpp emits
+// hand-rolled Vulkan typedefs unless VK_VERSION_1_0 is already defined.
+#include <vulkan/vulkan.h>
 #include "vulkan_vm/network/gpu_direct_registration.hpp"
 #include "vulkan_vm/logging.hpp"
+#include "vulkan_vm/utils.hpp"
 
 #include <mutex>
 #include <vector>

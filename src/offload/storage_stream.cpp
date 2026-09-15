@@ -44,11 +44,15 @@ bool writePackFile(const std::string& path,
     f.write(reinterpret_cast<const char*>(table.data()),
             static_cast<std::streamsize>(sizeof(ExpertEntry) * table.size()));
 
-    // Pad to first blob.
+    // Pad to first blob. NOTE: `cursor` after the table loop holds
+    // END-OF-ALL-BLOBS (it advanced past every entry during offset
+    // assignment); the pad must reach table[0].fileOffset, not cursor.
     const uint64_t afterTable = sizeof(hdr) + sizeof(ExpertEntry) * table.size();
+    const uint64_t firstBlob =
+        table.empty() ? afterTable : table.front().fileOffset;
     std::vector<char> zeros;
-    if (cursor > afterTable) {
-        zeros.assign(static_cast<size_t>(cursor - afterTable), 0);
+    if (firstBlob > afterTable) {
+        zeros.assign(static_cast<size_t>(firstBlob - afterTable), 0);
         f.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
     }
 

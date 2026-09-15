@@ -120,12 +120,15 @@ endif()
 if(Vulkan_FOUND AND (IBVERBS_FOUND OR LevelZero_FOUND))
     message(STATUS "VulkanVM network: GPU-direct registration enabled")
     add_library(vulkan_vm_gpu_direct STATIC gpu_direct_registration.cpp)
+    set_target_properties(vulkan_vm_gpu_direct PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_include_directories(vulkan_vm_gpu_direct PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include
         ${Vulkan_INCLUDE_DIRS}
     )
     target_link_libraries(vulkan_vm_gpu_direct PRIVATE ${Vulkan_LIBRARIES})
-    target_compile_definitions(vulkan_vm_gpu_direct PRIVATE VK_USE_PLATFORM_WIN32_KHR=1)
+    if(WIN32)
+        target_compile_definitions(vulkan_vm_gpu_direct PRIVATE VK_USE_PLATFORM_WIN32_KHR=1)
+    endif()
     set(NETWORK_EXTRA_LIBS ${NETWORK_EXTRA_LIBS} vulkan_vm_gpu_direct)
 endif()
 
