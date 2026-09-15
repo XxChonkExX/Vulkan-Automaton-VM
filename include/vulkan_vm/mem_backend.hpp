@@ -128,8 +128,9 @@ public:
 };
 
 // Factory. kind selects the vendor implementation; returns nullptr for kinds
-// whose adapter is not linked into this build.
-enum class MemBackendKind { Vulkan, Hip, Level0 };
+// whose adapter is not linked into this build. DeviceConfig::memBackendKind
+// carries one of these values (-1 = Auto, resolved by the pool).
+enum class MemBackendKind : int32_t { Auto = -1, Vulkan = 0, Hip = 1, Level0 = 2 };
 
 VVM_API std::unique_ptr<IDeviceMemoryBackend> create_memory_backend(MemBackendKind kind,
                                                                      const DeviceConfig& cfg);

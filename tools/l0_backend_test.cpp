@@ -1,7 +1,9 @@
 // L0MemoryBackend smoke test: dynamic ze_loader + allocate/free plane
-// against the real Intel device (B70 on the reference box).
+// against the real Intel device (B70 on the reference box), PLUS a full
+// UnifiedMemoryPool created over the L0 backend (backend-driven discovery).
 #include "vulkan_vm/mem_backend.hpp"
 #include "vulkan_vm/l0_mem_backend.hpp"
+#include "vulkan_vm/vulkan_vm.hpp"
 
 #include <cstdio>
 
@@ -54,6 +56,43 @@ int main() {
         l0->destroy_buffer(buf);
         l0->free(mem);
         std::printf("ok: %s allocate/echo/free\n", c.name);
+    }
+
+    // FULL POOL over the L0 backend: explicit kind hint, backend-driven
+    // discovery, buddy sub-allocation.
+    DeviceConfig l0Cfg{};
+    l0Cfg.memBackendKind = static_cast<int32_t>(MemBackendKind::Level0);
+    l0Cfg.backendDeviceIndex = 0;   // the B70
+    PoolConfig pcfg;
+    pcfg.blockSize = 64ull * 1024ull * 1024ull;
+    pcfg.maxBlocks = 4;
+    pcfg.enableHostVisible = false;
+    auto pool = UnifiedMemoryPool::create(l0Cfg, pcfg);
+    if (!pool.has_value()) {
+        std::printf("FAIL: pool create over L0 backend\n");
+        ++failures;
+    } else {
+        std::printf("ok: UnifiedMemoryPool created over L0 backend\n");
+        AllocDesc desc;
+        desc.size = 8ull * 1024ull * 1024ull;
+        desc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        desc.memoryUsage = vvm::MemoryUsage::GpuOnly;
+        auto a1 = pool->allocate(desc);
+        if (!a1.has_value()) {
+            std::printf("FAIL: pool allocate 8 MiB\n");
+            ++failures;
+        } else {
+            const uint64_t ptr = reinterpret_cast<uint64_t>(a1->buffer);
+            std::printf("ok: pool allocate 8 MiB -> device ptr %p (echo %s)\n",
+                        (void*)ptr, ptr == reinterpret_cast<uint64_t>(a1->memory) ? "yes" : "no");
+            pool->deallocate(std::move(*a1));
+            std::printf("ok: pool deallocate\n");
+        }
+        const PoolStats st = pool->getStats();
+        std::printf("ok: pool stats: blocks=%u used=%llu MB cap=%llu MB\n",
+                    st.blockCount,
+                    (unsigned long long)(st.totalUsed / (1024 * 1024)),
+                    (unsigned long long)(st.totalCapacity / (1024 * 1024)));
     }
 
     if (failures == 0) {

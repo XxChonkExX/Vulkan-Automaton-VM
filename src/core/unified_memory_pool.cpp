@@ -342,12 +342,18 @@ bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig&
     config_ = config;
     device_ = device.device;
 
-    // Vendor seam: dispatch on what the DeviceConfig carries. A Vulkan pool
-    // has a physical device; anything else selects by backendDeviceIndex
-    // (HIP today; Level0 gets an explicit marker when it lands).
-    const bool isVulkan = deviceConfig_.physicalDevice != VK_NULL_HANDLE;
-    backend_ = create_memory_backend(
-        isVulkan ? MemBackendKind::Vulkan : MemBackendKind::Hip, deviceConfig_);
+    // Vendor seam: dispatch on what the DeviceConfig carries. Explicit kind
+    // wins; Auto means Vulkan when a physical device is present, HIP
+    // otherwise (Level0 has no implicit signal and needs an explicit value).
+    const MemBackendKind explicitKind =
+        static_cast<MemBackendKind>(deviceConfig_.memBackendKind);
+    const bool isVulkan = (explicitKind == MemBackendKind::Vulkan) ||
+        (explicitKind == MemBackendKind::Auto &&
+         deviceConfig_.physicalDevice != VK_NULL_HANDLE);
+    const MemBackendKind kind = isVulkan ? MemBackendKind::Vulkan
+        : (explicitKind == MemBackendKind::Level0 ? MemBackendKind::Level0
+                                                 : MemBackendKind::Hip);
+    backend_ = create_memory_backend(kind, deviceConfig_);
     if (!backend_) {
         VVM_LOG_ERROR("failed to create the {} memory backend",
                       isVulkan ? "Vulkan" : "HIP");

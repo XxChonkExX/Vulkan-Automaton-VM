@@ -168,6 +168,13 @@ struct VVM_API DeviceConfig {
     // Non-Vulkan backends (HIP/L0): vendor device index. Ignored by the
     // Vulkan backend. Sits in this struct's tail padding - zero size change.
     int32_t backendDeviceIndex = -1;
+    // Vendor selector for UnifiedMemoryPool::create, as a MemBackendKind
+    // value (see mem_backend.hpp): -1 = Auto (Vulkan when physicalDevice is
+    // set, else HIP), 0/1/2 = Vulkan/HIP/Level0 explicit. Level0 needs an
+    // explicit value - there is no implicit signal for it.
+    // NOTE: this field grew DeviceConfig to 64 bytes - the Vulkan ABI rule
+    // applies (rebuild llama ggml-vulkan + ggml-hip together with vulkan_vm).
+    int32_t memBackendKind = -1;
 };
 
 // Memory usage intent (hides raw VkMemoryPropertyFlags)
