@@ -772,9 +772,9 @@ bool UnifiedMemoryPool::wouldExceedBudget(VkDeviceSize additionalBytes) const {
         // system-wide usage crosses the heap size - that is the ceiling.
         const VkDeviceSize cap = static_cast<VkDeviceSize>(heapSize * config_.maxHeapFraction);
         if (heapUsed + additionalBytes > cap) {
-            VVM_LOG_WARN("budget: heap usage {} MB + {} MB would exceed {} MB ({:.0f}% of {} MB); allocate() failing soft instead of stealing VRAM",
+            VVM_LOG_WARN("budget: heap usage {} MB + {} MB would exceed {} MB ({}% of {} MB cap); allocate() failing soft instead of stealing VRAM",
                          heapUsed / (1024 * 1024), additionalBytes / (1024 * 1024),
-                         cap / (1024 * 1024), config_.maxHeapFraction * 100.0f,
+                         cap / (1024 * 1024), static_cast<int>(config_.maxHeapFraction * 100.0f),
                          heapBudget / (1024 * 1024));
             return true;
         }
@@ -1226,6 +1226,8 @@ std::optional<Allocation> UnifiedMemoryPool::allocateDedicatedBackend(
                       known ? native : err);
         return std::nullopt;
     }
+    VVM_LOG_INFO("allocateDedicatedBackend: {} MB via backend (offset-0 standalone)",
+                 static_cast<unsigned long long>(size / (1024 * 1024)));
     const BackendBuffer buf = backend_->create_buffer(
         mem, 0, static_cast<uint64_t>(size),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |

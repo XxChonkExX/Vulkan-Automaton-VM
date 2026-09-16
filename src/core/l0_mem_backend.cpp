@@ -381,14 +381,19 @@ void L0MemoryBackend::unmap(BackendMemory mem) {
 BackendBuffer L0MemoryBackend::create_buffer(BackendMemory mem, uint64_t offset,
                                              uint64_t size, uint64_t usageBits,
                                              bool exportable, int* resultError) {
-    // A Level Zero device pointer IS the buffer (echo semantics).
-    (void)size; (void)usageBits; (void)exportable;
+    // A Level Zero device pointer IS the buffer, so sub-allocations are
+    // pointer+offset - exactly how compute consumes them. Lifetime stays
+    // with the pool: blocks free via the base memory handle, dedicated
+    // allocations via their own handle; destroy_buffer is a deliberate
+    // no-op, so sub-pointers are never freed individually.
+    // (Previously offset != 0 was rejected, which silently forced every
+    // tensor into its own dedicated driver allocation.)
     if (resultError) *resultError = 0;
-    if (offset != 0) {
+    if (mem == 0) {
         if (resultError) *resultError = asError(4);
         return 0;
     }
-    return mem;
+    return mem + offset;
 }
 
 bool L0MemoryBackend::bind_buffer(BackendBuffer buf, BackendMemory mem) {
