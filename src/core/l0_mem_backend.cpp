@@ -7,9 +7,15 @@
 #include "vulkan_vm/l0_mem_backend.hpp"
 #include "vulkan_vm/utils.hpp"
 
+#include <cstdio>
+#include <cstring>
+#include <vector>
+
 #ifdef _WIN32
 #include <windows.h>
-#include <cstring>
+#else
+#include <dlfcn.h>
+#endif
 
 namespace vvm {
 
@@ -79,10 +85,17 @@ ZeApi g_zeApi = {};
 
 bool loadZeApi() {
     if (g_zeApi.ok || g_zeApi.zeInit) return g_zeApi.ok;
+#ifdef _WIN32
     HMODULE m = ::GetModuleHandleW(L"ze_loader.dll");
     if (!m) m = ::LoadLibraryW(L"ze_loader.dll");
     if (!m) return false;
-    auto r = [&](const char* n) { return ::GetProcAddress(m, n); };
+    auto r = [&](const char* n) { return reinterpret_cast<void*>(::GetProcAddress(m, n)); };
+#else
+    void* m = ::dlopen("libze_loader.so.1", RTLD_NOW | RTLD_GLOBAL);
+    if (!m) m = ::dlopen("libze_loader.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!m) return false;
+    auto r = [&](const char* n) { return ::dlsym(m, n); };
+#endif
     g_zeApi.zeInit = reinterpret_cast<ze_result_t (*)(uint32_t)>(r("zeInit"));
     g_zeApi.zeDriverGet =
         reinterpret_cast<ze_result_t (*)(uint32_t*, ze_driver_handle_t*)>(r("zeDriverGet"));
@@ -99,7 +112,7 @@ bool loadZeApi() {
     g_zeApi.zeMemFree =
         reinterpret_cast<ze_result_t (*)(ze_context_handle_t, void*)>(r("zeMemFree"));
     g_zeApi.zeDeviceGetMemoryProperties =
-        reinterpret_cast<ze_result_t (*)(ze_device_handle_t, uint32_t*,
+        reinterpret_cast<ze_result_t (*)(ze_driver_handle_t, uint32_t*,
                                          ZeDeviceMemoryProperties*)>(r("zeDeviceGetMemoryProperties"));
     g_zeApi.zeDeviceGetPropertiesRaw =
         reinterpret_cast<ze_result_t (*)(ze_device_handle_t, void*)>(r("zeDeviceGetProperties"));
@@ -110,13 +123,23 @@ bool loadZeApi() {
     return g_zeApi.ok;
 }
 
+bool loaderPresent() {
+#ifdef _WIN32
+    HMODULE m = ::GetModuleHandleW(L"ze_loader.dll");
+    if (!m) m = ::LoadLibraryW(L"ze_loader.dll");
+    return m != nullptr;
+#else
+    void* m = ::dlopen("libze_loader.so.1", RTLD_NOW | RTLD_GLOBAL);
+    if (!m) m = ::dlopen("libze_loader.so", RTLD_NOW | RTLD_GLOBAL);
+    return m != nullptr;
+#endif
+}
+
 } // namespace
 
 int l0_enumerate_count() {
     // Cheap loader-presence probe: the full enumeration (below) re-resolves.
-    HMODULE m = ::GetModuleHandleW(L"ze_loader.dll");
-    if (!m) m = ::LoadLibraryW(L"ze_loader.dll");
-    if (!m) return 0;
+    if (!loaderPresent()) return 0;
     if (!loadZeApi() || !g_zeApi.enumOk) return 0;
     if (g_zeApi.zeInit(0) != kZeSuccess) return 0;
     uint32_t driverCount = 0;
@@ -386,46 +409,3 @@ bool L0MemoryBackend::supports_export(ExternalHandleType type) const {
 }
 
 } // namespace vvm
-
-#else
-// Non-Windows: dlopen-based ze_loader loader is a follow-up. Safe no-ops.
-
-#include "vulkan_vm/l0_mem_backend.hpp"
-#include "vulkan_vm/utils.hpp"
-
-namespace vvm {
-
-std::unique_ptr<L0MemoryBackend> L0MemoryBackend::create(int deviceIndex) {
-    (void)deviceIndex;
-    VVM_LOG_WARN("l0 backend: not available on this platform yet");
-    return nullptr;
-}
-
-std::vector<BackendHeap> L0MemoryBackend::heaps() const { return {}; }
-std::vector<BackendMemType> L0MemoryBackend::memoryTypes() const { return {}; }
-BackendBudget L0MemoryBackend::heapBudget(uint32_t) const { return {}; }
-bool L0MemoryBackend::type_is_host_visible(uint32_t) const { return false; }
-BackendMemory L0MemoryBackend::allocate(const BackendAllocRequest&, int* e) {
-    if (e) *e = encode_backend_error(-1);
-    return 0;
-}
-void L0MemoryBackend::free(BackendMemory) {}
-void* L0MemoryBackend::map(BackendMemory, bool* ok) { if (ok) *ok = false; return nullptr; }
-void L0MemoryBackend::unmap(BackendMemory) {}
-BackendBuffer L0MemoryBackend::create_buffer(BackendMemory, uint64_t, uint64_t,
-                                             uint64_t, bool, int* e) {
-    if (e) *e = encode_backend_error(-1);
-    return 0;
-}
-bool L0MemoryBackend::bind_buffer(BackendBuffer, BackendMemory) { return false; }
-void L0MemoryBackend::destroy_buffer(BackendBuffer) {}
-uint64_t L0MemoryBackend::buffer_device_address(BackendBuffer) const { return 0; }
-bool L0MemoryBackend::supports_export(ExternalHandleType) const { return false; }
-
-int  l0_enumerate_count() { return 0; }
-bool l0_runtime_present() { return false; }
-bool l0_enumerate_device(int, char*, size_t, uint64_t*, uint32_t*, uint32_t*, bool*) { return false; }
-
-} // namespace vvm
-
-#endif  // _WIN32
