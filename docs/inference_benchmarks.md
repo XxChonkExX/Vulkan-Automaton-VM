@@ -489,3 +489,24 @@ Findings:
   death). VRAM sits at 24.9/25.75 GB in the winning config.
 - 262144 context, ncmoe-999: 12.45 t/s live; 12-layer 262K OOMs — the 6 GiB
   KV bypasses the pool (raw backend alloc), the next integration seam.
+
+## Post-rebase validation (2026-09-16, chonk-buffer on upstream master)
+
+After rebasing onto ggml-org master (qwen4exp hc-shape fix, Vulkan
+MUL_MAT_ID + HIP MoE kernel work) and repairing the Windows build
+(build_infer symlink untracked, setenv portability, separate
+build-hip-win dir):
+
+| Config | Pre-rebase | Post-rebase |
+|---|---|---|
+| Vulkan ncmoe 999 | 15.79 | 16.11 |
+| Vulkan ncmoe 40 (GPU experts) | 7.24 | 6.15 |
+| HIP ncmoe 999 | 15.57 | 15.85 |
+| HIP ncmoe 34 (champion) | 19.34 | 16.66 |
+| HIP auto-plan (no hand-tuning) | 15.73 | 16.44 |
+
+No regressions; ladder shape preserved. The upstream Vulkan MUL_MAT_ID
+change did not move the RDNA3 expert-kernel bottleneck. The champion
+delta (19.34 -> 16.66) is thermal compression across the session, not
+the rebase - same-session controls track together. Auto-plan reproduces
+hand-tuned on both backends after the rebase.
