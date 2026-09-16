@@ -445,3 +445,24 @@ GitHub releases, Windows host driver PRO 8974.
 - Conclusion: WSL2 is a valid SYCL *toolchain* lab (enumerate, compile,
   small kernels) but cannot serve LLM inference - anything over ~256 MB
   of GPU VA dies. Bare-metal Linux is required for Phase 4 serve tests.
+
+## Native Linux serve (2026-09-15) — HIP champion path on Taichi
+
+llama.cpp chonk-buffer branch, `GGML_HIP=ON` (ROCm 7.2.1, gfx1100-only:
+modern HIP-language CMake config — legacy hipcc-as-compiler pulls both the
+XTX *and* Raphael gfx1036 into offload-arch and trips ggml-cpu PCH; plus a
+libxml2.so.2 symlink for ROCm's bundled lld on Ubuntu 26.04). VVM pool via
+`GGML_HIP_VVM_POOL=1` + `build_infer` symlink.
+
+**Display-GPU lesson (hard):** the XTX drives the desktop. A 14-layer plan
+fills VRAM until the Wayland compositor can't pin framebuffers
+(amdgpu -ENOMEM) and the whole GNOME session dies to the login screen.
+Mitigations that work: `GGML_VVM_HEAP_FRACTION=0.80` (pool self-caps,
+leaves ~5 GB for display), and/or fewer GPU layers at large context.
+
+Measured (Qwen3.8-Flash-Next UD-Q3_K_XL, 90 GB, XTX only):
+- 4K, `--vvm-split auto`, pool+dense+KV: **15.1 → 17.0 t/s** warm climb.
+- 262144, `--n-cpu-moe 999` + PLE-on-CPU: **12.45 t/s**, coherent output.
+- 262144, 12 GPU layers: OOM — the 6 GiB KV goes through the raw backend,
+  bypassing the pool; 13 + 5 + 6 GiB does not leave display headroom.
+  KV-through-pool at 262K is the open item.
