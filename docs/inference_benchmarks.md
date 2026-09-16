@@ -466,3 +466,25 @@ Measured (Qwen3.8-Flash-Next UD-Q3_K_XL, 90 GB, XTX only):
 - 262144, 12 GPU layers: OOM — the 6 GiB KV goes through the raw backend,
   bypassing the pool; 13 + 5 + 6 GiB does not leave display headroom.
   KV-through-pool at 262K is the open item.
+
+## Native Linux HIP head-to-head vs Windows champion (2026-09-15, Taichi)
+
+Same silicon (7900X + XTX, dual-boot), ROCm 7.2.1, gfx1100-only build
+(modern HIP-language CMake config; legacy hipcc-mode pulls the Raphael
+gfx1036 and trips ggml-cpu PCH — see doc notes). `GGML_HIP_VVM_POOL=1`,
+heap fraction tuned for a display-attached card.
+
+| Config | Windows | Linux | Notes |
+|---|---|---|---|
+| ncmoe-999 (CPU experts) | 15.57 | 15.4 | parity; author measured 14.2 mid-warm |
+| ncmoe-34 (14 GPU layers) | **19.34** | **19.86** | **Linux wins +2.7%** @0.85 heap fraction |
+
+Findings:
+- `-t 24` is ~40% SLOWER than default 12 threads here (memory-bound Q3_K
+  kernels; SMT adds contention, zero bandwidth). Do not oversubscribe.
+- `GGML_VVM_HEAP_FRACTION=0.85` is the sweet spot on a display-attached
+  XTX: 0.80 costs ~2 t/s (5 budget soft-fails push layers out of pool),
+  0.90 kills the Wayland compositor (amdgpu framebuffer -ENOMEM, session
+  death). VRAM sits at 24.9/25.75 GB in the winning config.
+- 262144 context, ncmoe-999: 12.45 t/s live; 12-layer 262K OOMs — the 6 GiB
+  KV bypasses the pool (raw backend alloc), the next integration seam.
