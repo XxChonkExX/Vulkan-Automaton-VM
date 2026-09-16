@@ -351,6 +351,21 @@ BackendMemory L0MemoryBackend::allocate(const BackendAllocRequest& req,
         return 0;
     }
     ZeDeviceMemAllocDesc desc{kZeStypeDeviceMemAllocDesc, nullptr, 0, 0};
+    // Relaxed allocation limits (ZE_experimental_relaxed_allocation_limits):
+    // stateful addressing caps single USM allocs at 4 GiB. Chain the
+    // extension descriptor ONLY for oversized requests so drivers that
+    // predate the extension keep working for normal sizes. Values verified
+    // against /usr/include/level_zero/ze_api.h (NEO 26.x):
+    //   ZE_STRUCTURE_TYPE_RELAXED_ALLOCATION_LIMITS_EXP_DESC = 0x20001
+    //   ZE_RELAXED_ALLOCATION_LIMITS_EXP_FLAG_MAX_SIZE = bit 0
+    struct RelaxedLimits {
+        uint32_t stype = 0x00020001u;
+        const void* pNext = nullptr;
+        uint32_t flags = 0x1u;
+    } relaxed;
+    if (static_cast<uint64_t>(req.size) > 0x100000000ull) {
+        desc.pNext = &relaxed;
+    }
     void* ptr = nullptr;
     const ze_result_t rc = g_zeApi.zeMemAllocDevice(
         g_zeApi.context, &desc, static_cast<size_t>(req.size),
