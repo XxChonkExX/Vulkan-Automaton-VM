@@ -13,7 +13,14 @@
 #include <string>
 #include <vector>
 
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#ifdef __linux__
+#include <linux/fs.h>
+#include <sys/ioctl.h>
+#endif
 #include <sys/types.h>
 #include <thread>
 
@@ -35,11 +42,33 @@ int main(int argc, char** argv) {
 
     // file size (for random range); stat() covers files and block devices.
     struct stat st{};
-    if (::stat(path.c_str(), &st) != 0 || st.st_size <= 0) {
+    if (::stat(path.c_str(), &st) != 0) {
         std::cerr << "open/size failed\n";
         return 1;
     }
-    const uint64_t fileBytes = static_cast<uint64_t>(st.st_size);
+    uint64_t fileBytes = 0;
+    if (S_ISBLK(st.st_mode)) {
+        // Raw namespaces report st_size=0: ask the block layer instead.
+        int bfd = ::open(path.c_str(), O_RDONLY);
+        uint64_t sectors = 0;
+        if (bfd < 0 ||
+#ifdef BLKGETSIZE64
+            ::ioctl(bfd, BLKGETSIZE64, &sectors) != 0 ||
+#endif
+            sectors == 0) {
+            std::cerr << "open/size failed\n";
+            if (bfd >= 0) ::close(bfd);
+            return 1;
+        }
+        ::close(bfd);
+        fileBytes = sectors;
+    } else {
+        if (st.st_size <= 0) {
+            std::cerr << "open/size failed\n";
+            return 1;
+        }
+        fileBytes = static_cast<uint64_t>(st.st_size);
+    }
     std::cout << "file: " << (fileBytes >> 30) << " GiB, mode=" << (seq ? "seq" : "rand")
               << ", target=" << (targetBytes >> 30) << " GiB, depth=" << depth
               << ", io=" << ioMiB << " MiB\n";
