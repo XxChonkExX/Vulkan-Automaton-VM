@@ -71,6 +71,10 @@ int main() {
     std::cout << "  mode=" << be.activeMode() << "\n";
 
     int failures = 0;
+    if (!be.canSubmit()) {
+        std::cerr << "  FAIL: live backend reports canSubmit()=false\n";
+        ++failures;
+    }
 
     // 3) stream the whole file through the backend: 8 reads of 1 MiB.
     //    2 reads in flight per slot; verify each slot as it lands.
@@ -187,6 +191,27 @@ int main() {
 
     be.close();
     std::remove(path.c_str());
+
+    // canSubmit gate: a live backend reports true; a backend whose open()
+    // failed must report false so RequestQueue::flush fails loud instead of
+    // spinning a silent 0-accept retry loop.
+    {
+        BackendConfig bad;
+        bad.packPath = "/nonexistent-dir-xyz/nope.vmex";
+        bad.slotCount = 2;
+        bad.slotBytes = 1u << 20;
+        bad.queueDepth = 8;
+        IoRingBackend dead(bad);
+        if (dead.open()) {
+            std::cerr << "  FAIL: open of missing pack succeeded\n";
+            ++failures;
+        } else if (dead.canSubmit()) {
+            std::cerr << "  FAIL: failed backend reports canSubmit()=true\n";
+            ++failures;
+        } else {
+            std::cout << "  canSubmit gate OK (failed open -> false)\n";
+        }
+    }
 
     std::cout << (failures == 0 ? "All backend tests passed!\n" : "Backend tests FAILED\n");
     return failures == 0 ? 0 : 1;

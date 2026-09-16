@@ -128,6 +128,78 @@ int main() {
                     st.blockCount,
                     (unsigned long long)(st.totalUsed / (1024 * 1024)),
                     (unsigned long long)(st.totalCapacity / (1024 * 1024)));
+
+        // Budget reservation (KV pattern): hold 1 GiB for a late-arriving
+        // giant, verify small allocs still land, release, then land the
+        // giant itself as a dedicated allocation. Unreserve saturates.
+        constexpr uint64_t kHold = 1ull * 1024 * 1024 * 1024;
+        if (!pool->reserve(kHold)) {
+            std::printf("FAIL: reserve 1 GiB\n");
+            ++failures;
+        } else if (pool->reservedBytes() != kHold ||
+                   pool->getStats().reservedBytes != kHold) {
+            std::printf("FAIL: reservation not visible in stats\n");
+            ++failures;
+        } else {
+            std::printf("ok: reserve 1 GiB held\n");
+        }
+        if (pool->reserve(100ull * 1024 * 1024 * 1024 * 1024)) {
+            std::printf("FAIL: absurd reservation accepted\n");
+            ++failures;
+        } else if (pool->reservedBytes() != kHold) {
+            std::printf("FAIL: failed reserve mutated the hold\n");
+            ++failures;
+        } else {
+            std::printf("ok: absurd reservation refused, hold intact\n");
+        }
+        vvm::AllocDesc rd;
+        rd.size = 8ull * 1024ull * 1024ull;
+        rd.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        rd.memoryUsage = vvm::MemoryUsage::GpuOnly;
+        auto ra = pool->allocate(rd);
+        if (!ra.has_value()) {
+            std::printf("FAIL: 8 MiB alongside reservation\n");
+            ++failures;
+        } else {
+            pool->deallocate(std::move(*ra));
+            std::printf("ok: 8 MiB alongside reservation\n");
+        }
+        pool->unreserve(kHold);
+        pool->unreserve(kHold);  // double-release must saturate, not underflow
+        if (pool->reservedBytes() != 0) {
+            std::printf("FAIL: unreserve did not clear\n");
+            ++failures;
+        } else {
+            std::printf("ok: unreserve clears + saturates\n");
+        }
+        vvm::AllocDesc gd;
+        gd.size = kHold;
+        gd.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        gd.memoryUsage = vvm::MemoryUsage::GpuOnly;
+        auto ga = pool->allocate(gd);
+        if (!ga.has_value() || ga->blockIndex != UINT32_MAX) {
+            std::printf("FAIL: 1 GiB giant did not land dedicated\n");
+            ++failures;
+            if (ga.has_value()) pool->deallocate(std::move(*ga));
+        } else {
+            const PoolStats gs = pool->getStats();
+            if (gs.dedicatedCount < 1) {
+                std::printf("FAIL: giant missing from dedicated tracking\n");
+                ++failures;
+            } else {
+                std::printf("ok: 1 GiB giant landed dedicated\n");
+            }
+            pool->deallocate(std::move(*ga));
+            const PoolStats gs2 = pool->getStats();
+            if (gs2.dedicatedCount != 0 || gs2.reservedBytes != 0) {
+                std::printf("FAIL: teardown leftovers (dedicated=%u reserved=%llu)\n",
+                            gs2.dedicatedCount,
+                            (unsigned long long)gs2.reservedBytes);
+                ++failures;
+            } else {
+                std::printf("ok: giant freed, stats clean\n");
+            }
+        }
     }
 
     if (failures == 0) {

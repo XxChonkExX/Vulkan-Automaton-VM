@@ -267,6 +267,7 @@ struct VVM_API PoolStats {
     uint32_t allocationCount = 0;
     uint32_t dedicatedCount = 0;
     VkDeviceSize totalCapacity = 0;
+    VkDeviceSize reservedBytes = 0;  // budget held via reserve(), not yet allocated
 };
 
 struct VVM_API DeviceMemoryInfo {
@@ -415,6 +416,19 @@ public:
     void deallocate(Allocation&& alloc);
     void deallocate(UniqueAllocation&& alloc);
 
+    // Budget reservation for late-arriving giants (e.g. the KV cache, which
+    // allocates at context creation, long after model tensors filled the
+    // pool). reserve() counts bytes as committed for budget purposes without
+    // allocating; the planner's KV estimate belongs here at plan time, and
+    // unreserve() releases the hold once the reserved allocation lands
+    // (which then counts normally via blocks_/dedicatedAllocations_).
+    // Contract: every successful reserve() needs exactly one unreserve()
+    // after its allocation succeeds (or is abandoned); unreserve() saturates
+    // at zero so double-release is harmless.
+    bool reserve(VkDeviceSize bytes);
+    void unreserve(VkDeviceSize bytes);
+    VkDeviceSize reservedBytes() const;
+
     // Cross-GPU: Export/Import
     // NOTE: exportMemory only supports dedicated allocations (created via
     // allocateDedicatedExportable). Sub-allocated blocks are NOT supported
@@ -513,6 +527,7 @@ private:
     // Mapping/wiring helpers
     VkMemoryPropertyFlags usageToFlags(MemoryUsage usage) const;
     bool wouldExceedBudget(VkDeviceSize additionalBytes) const;
+    VkDeviceSize heapSizeBytes() const;
     void setDebugName(VkObjectType objectType, uint64_t objectHandle,
                       const char* name) const;
     
@@ -525,6 +540,9 @@ private:
     std::vector<BlockInfo> blocks_;
     // Dedicated allocations (exportable/imported) tracked separately from blocks
     std::vector<Allocation> dedicatedAllocations_;
+    // Budget held via reserve(): counts as committed in wouldExceedBudget
+    // until unreserve()d. Guarded by mutex_ like everything else.
+    VkDeviceSize reservedBytes_ = 0;
     uint32_t deviceLocalMemoryType_ = UINT32_MAX;
     uint32_t hostVisibleMemoryType_ = UINT32_MAX;
     uint32_t deviceLocalHeapIndex_ = UINT32_MAX;

@@ -716,9 +716,64 @@ VkMemoryPropertyFlags UnifiedMemoryPool::usageToFlags(MemoryUsage usage) const {
     }
 }
 
+bool UnifiedMemoryPool::reserve(VkDeviceSize bytes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (bytes == 0) return true;
+    // Sanity ceiling independent of fraction settings: a hold larger than
+    // the entire heap can never be satisfied.
+    const VkDeviceSize heap = heapSizeBytes();
+    if (heap > 0 && bytes > heap) {
+        VVM_LOG_WARN("reserve: {} MB exceeds heap size {} MB - refused",
+                     bytes / (1024 * 1024), heap / (1024 * 1024));
+        return false;
+    }
+    if (wouldExceedBudget(bytes)) {
+        VVM_LOG_WARN("reserve: {} MB does not fit remaining budget",
+                     bytes / (1024 * 1024));
+        return false;
+    }
+    reservedBytes_ += bytes;
+    VVM_LOG_INFO("reserve: holding {} MB (total reserved {} MB)",
+                 bytes / (1024 * 1024), reservedBytes_ / (1024 * 1024));
+    return true;
+}
+
+void UnifiedMemoryPool::unreserve(VkDeviceSize bytes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const VkDeviceSize before = reservedBytes_;
+    reservedBytes_ = (bytes >= reservedBytes_) ? 0 : reservedBytes_ - bytes;
+    VVM_LOG_INFO("unreserve: released {} MB (reserved {} -> {} MB)",
+                 (before - reservedBytes_) / (1024 * 1024),
+                 before / (1024 * 1024), reservedBytes_ / (1024 * 1024));
+}
+
+VkDeviceSize UnifiedMemoryPool::reservedBytes() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return reservedBytes_;
+}
+
+// Static heap size on either path (Vulkan physical device or standalone
+// backend). Caller must hold mutex_. Returns 0 when unknown.
+VkDeviceSize UnifiedMemoryPool::heapSizeBytes() const {
+    if (deviceConfig_.physicalDevice != VK_NULL_HANDLE) {
+        const auto info = getDeviceMemoryInfo();
+        if (deviceLocalHeapIndex_ < info.heapSizes.size()) {
+            return info.heapSizes[deviceLocalHeapIndex_];
+        }
+        return 0;
+    }
+    if (backend_) {
+        const auto heaps = backend_->heaps();
+        if (deviceLocalHeapIndex_ < heaps.size()) {
+            return heaps[deviceLocalHeapIndex_].size;
+        }
+    }
+    return 0;
+}
+
 bool UnifiedMemoryPool::wouldExceedBudget(VkDeviceSize additionalBytes) const {
     // Note: caller must hold mutex_ if called from within another locked method
-    VkDeviceSize currentPool = 0;
+    VkDeviceSize currentPool = reservedBytes_;
     for (const auto& block : blocks_) currentPool += block.size;
     for (const auto& alloc : dedicatedAllocations_) currentPool += alloc.size;
 
@@ -770,8 +825,10 @@ bool UnifiedMemoryPool::wouldExceedBudget(VkDeviceSize additionalBytes) const {
         // budget-based cap fails unpredictably (measured: 256K q8 workload
         // at ~92% VRAM failed at fraction 0.95/0.98). Spill occurs when
         // system-wide usage crosses the heap size - that is the ceiling.
+        // reservedBytes_ counts as committed here: the driver-reported usage
+        // cannot see memory we intend to allocate but haven't yet.
         const VkDeviceSize cap = static_cast<VkDeviceSize>(heapSize * config_.maxHeapFraction);
-        if (heapUsed + additionalBytes > cap) {
+        if (heapUsed + reservedBytes_ + additionalBytes > cap) {
             VVM_LOG_WARN("budget: heap usage {} MB + {} MB would exceed {} MB ({}% of {} MB cap); allocate() failing soft instead of stealing VRAM",
                          heapUsed / (1024 * 1024), additionalBytes / (1024 * 1024),
                          cap / (1024 * 1024), static_cast<int>(config_.maxHeapFraction * 100.0f),
@@ -2054,6 +2111,7 @@ PoolStats UnifiedMemoryPool::getStats() const {
         stats.totalUsed += alloc.size;
         stats.allocationCount++;
     }
+    stats.reservedBytes = reservedBytes_;
     
     if (stats.totalAllocated > 0) {
         stats.fragmentationRatio = 1.0f - 

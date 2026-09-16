@@ -84,6 +84,11 @@ public:
     void close();
 
     bool isOpen() const { return open_; }
+    // canSubmit mirrors open state: a backend whose open() failed (bad path,
+    // no ring, no fd) must report false so RequestQueue::flush fails loud
+    // instead of spinning a silent 0-accept retry loop. Both the io_uring
+    // path and the sync pread/pwrite floor submit whenever open.
+    bool canSubmit() const override { return open_; }
     // "ioring" or the portable floor — what submitBatch/pollCompletions actually use.
     const char* activeMode() const {
 #if defined(_WIN32)
