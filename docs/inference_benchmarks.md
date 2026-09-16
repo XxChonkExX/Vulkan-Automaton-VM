@@ -75,7 +75,8 @@ No long-lived hard fork needed conceptually — but since llama.cpp has no plugi
 
 ## Phase 1 results — Chonk-backed ggml buffer (2026-08-23)
 
-Integration: branch `chonk-buffer` of llama.cpp @ `b10588`. `ggml_backend_buffer_type_alloc_buffer` routes through `vvm::UnifiedMemoryPool` when `GGML_VK_VVM_POOL=1`; `get_max_size` capped to the pool block size so ggml chunks its reservations into Chonk-sized blocks.
+Integration: branch [`chonk-buffer`](https://github.com/XxChonkExX/chonkllama.cpp/tree/chonk-buffer)
+of llama.cpp @ `b10588` (preserved fork: [XxChonkExX/chonkllama.cpp](https://github.com/XxChonkExX/chonkllama.cpp)). `ggml_backend_buffer_type_alloc_buffer` routes through `vvm::UnifiedMemoryPool` when `GGML_VK_VVM_POOL=1`; `get_max_size` capped to the pool block size so ggml chunks its reservations into Chonk-sized blocks.
 
 ### The debugging ladder (each row is a real measurement)
 
