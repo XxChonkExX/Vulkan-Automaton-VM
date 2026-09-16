@@ -28,7 +28,7 @@ struct HipApi {
     bool enumOk = false;
 };
 
-const int kHipAttrIntegrated = 18;   // hipDeviceAttributeIntegrated (CUDA-compatible numbering)
+const int kHipAttrIntegrated = 16;   // hipDeviceAttributeIntegrated (HIP enum is NOT CUDA-numbered: verified against /opt/rocm/include/hip/hip_runtime_api.h; 18 is a different attribute)
 
 const HipApi& hipApi() {
     static HipApi api = [] {
@@ -275,7 +275,7 @@ struct HipApi {
     bool enumOk = false;
 };
 
-const int kHipAttrIntegrated = 18;
+const int kHipAttrIntegrated = 16;   // HIP enum; NOT CUDA-numbered (18 is another attribute)
 
 const HipApi& hipApi() {
     static HipApi api = [] {

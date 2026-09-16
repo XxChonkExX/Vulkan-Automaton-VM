@@ -8,12 +8,15 @@
 
 using namespace vvm;
 
-int main() {
+int main(int argc, char** argv) {
     int failures = 0;
     try {
     // The library inventory reader (same code the loader will call).
-    const std::vector<TensorSpec> specs = read_gguf_inventory(
-        "D:\\AI_Bundle\\qwen38next\\UD-Q3_K_XL\\Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf");
+    // argv[1] = first shard path (multi-part GGUF); Windows default kept
+    // for CI compat.
+    const char* model = argc > 1 ? argv[1]
+        : "D:\\AI_Bundle\\qwen38next\\UD-Q3_K_XL\\Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf";
+    const std::vector<TensorSpec> specs = read_gguf_inventory(model);
     if (specs.empty()) {
         std::printf("FAIL: inventory empty\n");
         return 1;
