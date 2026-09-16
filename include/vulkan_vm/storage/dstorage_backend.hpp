@@ -71,8 +71,11 @@ public:
 
     // --- StreamBackend (producer path) ---
     // The producer requires the DirectStorage SDK (dstorage.h). Without it
-    // these report unsupported (0 accepted / 0 reaped) — same API, no link
-    // dependency on the SDK.
+    // the backend reports canSubmit() == false so callers fail loud instead
+    // of livelocking on 0-accept; the import bridge above remains fully
+    // usable (any D3D12 producer - including a test harness - can fill the
+    // heap). No link dependency on the SDK either way.
+    bool canSubmit() const override;
     uint32_t submitBatch(const std::vector<IORequest>& batch) override;
     uint32_t pollCompletions(std::vector<uint64_t>* outIds,
                              std::vector<uint64_t>* outFailed = nullptr) override;

@@ -1,4 +1,5 @@
 #include "vulkan_vm/storage/request_queue.hpp"
+#include "vulkan_vm/logging.hpp"
 
 #include <algorithm>
 
@@ -115,6 +116,18 @@ uint32_t RequestQueue::submit(StreamBackend* backend) {
 
     uint32_t accepted = taken;
     if (backend) {
+        if (!backend->canSubmit()) {
+            // Backend present but unable to accept (e.g. unimplemented
+            // producer): fail loud once instead of spinning a silent
+            // 0-accept retry loop. Requests stay queued (backpressure).
+            static bool warnedNoSubmit = false;
+            if (!warnedNoSubmit) {
+                warnedNoSubmit = true;
+                VVM_LOG_ERROR("RequestQueue::flush: backend '{}' cannot accept submissions; "
+                              "requests held. Check backend configuration.", backend->name());
+            }
+            return 0;
+        }
         accepted = backend->submitBatch(batch);
         if (accepted > taken) accepted = taken;
     }

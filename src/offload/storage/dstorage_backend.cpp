@@ -1,4 +1,5 @@
 #include "vulkan_vm/storage/dstorage_backend.hpp"
+#include "vulkan_vm/logging.hpp"
 
 #ifdef VVM_PLATFORM_WINDOWS
 
@@ -231,7 +232,21 @@ DStorageBackend::~DStorageBackend() {
 
 uint32_t DStorageBackend::submitBatch(const std::vector<IORequest>& batch) {
     (void)batch;
-    return 0; // TODO(producer): EnqueueRequest into dstResource_ when SDK lands
+    // Producer unimplemented without the DirectStorage SDK: fail loud (once)
+    // instead of returning a silent 0 that the queue would read as
+    // backpressure and retry forever. canSubmit() lets callers avoid us.
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        VVM_LOG_ERROR("DStorageBackend::submitBatch: producer requires the DirectStorage SDK (dstorage.h); "
+                      "no requests accepted. Attach the IoRing backend for the read+write lane.");
+    }
+    return 0;
+}
+
+bool DStorageBackend::canSubmit() const {
+    // False until the SDK-backed producer lands (see TODO above).
+    return false;
 }
 
 uint32_t DStorageBackend::pollCompletions(std::vector<uint64_t>* outIds,
@@ -264,6 +279,7 @@ Result DStorageBackend::importToPool(UnifiedMemoryPool*, VkPhysicalDevice, VkDev
 }
 uint32_t DStorageBackend::submitBatch(const std::vector<IORequest>&) { return 0; }
 uint32_t DStorageBackend::pollCompletions(std::vector<uint64_t>*, std::vector<uint64_t>*) { return 0; }
+bool DStorageBackend::canSubmit() const { return false; }  // Windows-only producer, unimplemented without the SDK
 
 } // namespace backend
 } // namespace storage

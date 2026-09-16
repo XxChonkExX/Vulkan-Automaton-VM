@@ -97,6 +97,11 @@ public:
     virtual uint32_t pollCompletions(std::vector<uint64_t>* outIds,
                                      std::vector<uint64_t>* outFailed = nullptr) = 0;
     virtual const char* name() const = 0;
+    // Whether this backend can currently accept submissions. Backends whose
+    // producer is unimplemented (DStorage without the SDK) return false so
+    // the queue fails loud instead of retrying into a silent 0-accept loop
+    // (a 0 return otherwise reads as ordinary backpressure). Default true.
+    virtual bool canSubmit() const { return true; }
 };
 
 // Pure helper: merge contiguous same-direction runs into larger device
