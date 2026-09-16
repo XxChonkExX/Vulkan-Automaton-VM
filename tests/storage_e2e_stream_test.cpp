@@ -20,15 +20,7 @@
 #include <string>
 #include <vector>
 
-#ifdef VVM_PLATFORM_WINDOWS
-
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
+#include <thread>
 
 using namespace vvm::storage;
 using namespace vvm::storage::pack;
@@ -131,7 +123,7 @@ int main(int argc, char** argv) {
                 ++shards;
                 streamed += table[id - 1].size; // true (unpadded) size
             }
-            if (done.empty()) ::Sleep(0);
+            if (done.empty()) std::this_thread::yield();
         }
         auto t1 = std::chrono::steady_clock::now();
 
@@ -157,12 +149,3 @@ int main(int argc, char** argv) {
     std::cout << (failures == 0 ? "E2E streaming OK\n" : "E2E streaming FAILED\n");
     return failures == 0 ? 0 : 1;
 }
-
-#else // !VVM_PLATFORM_WINDOWS
-
-int main() {
-    std::cout << "storage_e2e_stream_test: SKIP (Windows-only)\n";
-    return 0;
-}
-
-#endif
