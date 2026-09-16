@@ -88,3 +88,6 @@ examples/granite_chonk/out/*/chonk_final/
 examples/granite_chonk/out/*/chonk_step_*/
 examples/granite_chonk/data/*/tokens.bin
 *.safetensors
+
+# Local-only convenience symlink for GGML_HIP_VVM_POOL find_library
+/build_infer
