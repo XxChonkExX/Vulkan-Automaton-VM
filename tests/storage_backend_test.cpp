@@ -13,15 +13,7 @@
 #include <iostream>
 #include <vector>
 
-#ifdef VVM_PLATFORM_WINDOWS
-
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
+#include <thread>
 
 using namespace vvm;
 using namespace vvm::storage::backend;
@@ -58,8 +50,8 @@ int main() {
     std::vector<uint8_t> file(kFileBytes);
     for (uint64_t b = 0; b < kFileBytes / 4096; ++b) fillBlock(file, b);
     {
-        FILE* f = nullptr;
-        if (fopen_s(&f, path.c_str(), "wb") != 0 || !f) {
+        FILE* f = ::fopen(path.c_str(), "wb");
+        if (!f) {
             std::cerr << "  FAIL: create temp file\n";
             return 1;
         }
@@ -128,7 +120,7 @@ int main() {
                 ++verified;
             }
         }
-        if (done.empty()) ::Sleep(0);
+        if (done.empty()) std::this_thread::yield();
     }
     if (verified != kChunks) {
         std::cerr << "  FAIL: verified " << verified << "/" << kChunks << "\n";
@@ -160,7 +152,7 @@ int main() {
             be.pollCompletions(&done, &failed);
             if (!done.empty()) writeDone = true;
             if (!failed.empty()) { std::cerr << "  FAIL: write failed\n"; ++failures; break; }
-            if (!writeDone) ::Sleep(0);
+            if (!writeDone) std::this_thread::yield();
         }
 
         if (writeDone) {
@@ -180,7 +172,7 @@ int main() {
                 be.pollCompletions(&done, &failed);
                 if (!done.empty()) readDone = true;
                 if (!failed.empty()) { std::cerr << "  FAIL: readback failed\n"; ++failures; break; }
-                if (!readDone) ::Sleep(0);
+                if (!readDone) std::this_thread::yield();
             }
             if (readDone) {
                 const uint8_t* p = static_cast<const uint8_t*>(be.slotPtr(1));
@@ -200,11 +192,3 @@ int main() {
     return failures == 0 ? 0 : 1;
 }
 
-#else // !VVM_PLATFORM_WINDOWS
-
-int main() {
-    std::cout << "storage_backend_test: SKIP (Windows-only backend)\n";
-    return 0;
-}
-
-#endif // VVM_PLATFORM_WINDOWS

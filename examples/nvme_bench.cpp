@@ -13,15 +13,9 @@
 #include <string>
 #include <vector>
 
-#ifdef VVM_PLATFORM_WINDOWS
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#include <winioctl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <thread>
 
 using namespace vvm::storage::backend;
 using vvm::storage::queue::IORequest;
@@ -39,26 +33,13 @@ int main(int argc, char** argv) {
     const uint32_t ioBytes = ioMiB << 20;
     const bool forceOverlapped = argc > 6 && std::string(argv[6]) == "ovlp";
 
-    // file size (for random range); raw volumes via IOCTL_DISK_GET_LENGTH_INFO
-    LARGE_INTEGER fsize{};
-    {
-        HANDLE h = ::CreateFileA(path.c_str(), GENERIC_READ,
-                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                 nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h == INVALID_HANDLE_VALUE) { std::cerr << "open failed\n"; return 1; }
-        GET_LENGTH_INFORMATION lenInfo{};
-        DWORD br = 0;
-        if (::DeviceIoControl(h, IOCTL_DISK_GET_LENGTH_INFO, nullptr, 0,
-                              &lenInfo, sizeof(lenInfo), &br, nullptr)) {
-            fsize.QuadPart = lenInfo.Length.QuadPart;
-        } else if (!::GetFileSizeEx(h, &fsize)) {
-            std::cerr << "size failed\n";
-            ::CloseHandle(h);
-            return 1;
-        }
-        ::CloseHandle(h);
+    // file size (for random range); stat() covers files and block devices.
+    struct stat st{};
+    if (::stat(path.c_str(), &st) != 0 || st.st_size <= 0) {
+        std::cerr << "open/size failed\n";
+        return 1;
     }
-    const uint64_t fileBytes = static_cast<uint64_t>(fsize.QuadPart);
+    const uint64_t fileBytes = static_cast<uint64_t>(st.st_size);
     std::cout << "file: " << (fileBytes >> 30) << " GiB, mode=" << (seq ? "seq" : "rand")
               << ", target=" << (targetBytes >> 30) << " GiB, depth=" << depth
               << ", io=" << ioMiB << " MiB\n";
@@ -113,7 +94,7 @@ int main(int argc, char** argv) {
         done += d.size();
         bytes = done * ioBytes;
         if (!f.empty()) { std::cerr << "failures: " << f.size() << "\n"; return 1; }
-        if (d.empty()) ::Sleep(0);
+        if (d.empty()) std::this_thread::yield();
     }
     auto t1 = std::chrono::steady_clock::now();
 
@@ -125,9 +106,3 @@ int main(int argc, char** argv) {
     return 0;
 }
 
-#else
-int main() {
-    std::cout << "nvme_bench: SKIP (Windows-only)\n";
-    return 0;
-}
-#endif

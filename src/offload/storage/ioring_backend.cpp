@@ -381,23 +381,254 @@ std::unique_ptr<StreamBackend> createBackend(BackendKind kind, const BackendConf
 
 #else // !VVM_PLATFORM_WINDOWS
 
-// Non-Windows: the floor backend is unavailable; stubs keep the library
-// linkable so Linux CI compiles unchanged.
+// Linux: io_uring via liburing (kernel 5.1+, home turf) with a synchronous
+// pread/pwrite floor. O_DIRECT mirrors the Windows NO_BUFFERING discipline
+// (4 KiB-aligned offset/size/buffer) and degrades to the page cache when the
+// filesystem refuses it (tmpfs, older mounts).
+//
+// Reliability notes: registered buffers (io_uring_register_buffers) pin the
+// staging arena once, mirroring BuildIoRingRegisterBuffers; short reads are
+// treated as failures so callers never observe torn shards.
+
 #include "vulkan_vm/storage/ioring_backend.hpp"
+
+#include <cerrno>
+#include <cstdio>
+
+#if __has_include(<liburing.h>)
+#define VVM_HAS_LIBURING 1
+#include <liburing.h>
+#endif
+
+#include <fcntl.h>
+#include <cstdlib>
+#include <cstring>
+#include <unistd.h>
 
 namespace vvm {
 namespace storage {
 namespace backend {
 
+constexpr uint64_t kAlign = 4096; // O_DIRECT sector alignment
+
 IoRingBackend::IoRingBackend(BackendConfig cfg) : cfg_(std::move(cfg)) {}
-IoRingBackend::~IoRingBackend() = default;
-Result IoRingBackend::open() { return Result::error(ErrorCode::UnsupportedFeature, "Windows-only backend"); }
-void IoRingBackend::close() {}
-void* IoRingBackend::slotPtr(uint32_t) const { return nullptr; }
-uint32_t IoRingBackend::submitBatch(const std::vector<IORequest>&) { return 0; }
-uint32_t IoRingBackend::pollCompletions(std::vector<uint64_t>*, std::vector<uint64_t>*) { return 0; }
-BackendKind selectedBackendKind() { return BackendKind::Auto; }
-std::unique_ptr<StreamBackend> createBackend(BackendKind, const BackendConfig&) { return nullptr; }
+
+IoRingBackend::~IoRingBackend() { close(); }
+
+void* IoRingBackend::slotPtr(uint32_t slot) const {
+    if (!arena_ || slot >= cfg_.slotCount) return nullptr;
+    return static_cast<char*>(arena_) + static_cast<size_t>(slot) * cfg_.slotBytes;
+}
+
+void IoRingBackend::destroyRing() {
+#if defined(VVM_HAS_LIBURING)
+    if (ring_) io_uring_queue_exit(static_cast<struct io_uring*>(ring_));
+#endif
+    ring_ = nullptr;
+}
+
+void IoRingBackend::degradeToOverlapped() {
+    destroyRing();
+    ioringMode_ = false;
+}
+
+Result IoRingBackend::open() {
+    if (open_) return Result::success();
+    if (!cfg_.validate()) return Result::error(ErrorCode::InvalidConfig, "bad backend config");
+
+    // 1) Arena: O_DIRECT demands sector-aligned buffers.
+    const size_t bytes = static_cast<size_t>(cfg_.slotCount) * cfg_.slotBytes;
+    if (::posix_memalign(&arena_, kAlign, bytes) != 0) {
+        arena_ = nullptr;
+        return Result::error(ErrorCode::AllocationFailed, "posix_memalign failed");
+    }
+    std::memset(arena_, 0, bytes);
+
+    // 2) Pack file: O_DIRECT preferred, page cache as fallback.
+    int flags = O_RDWR;
+#ifdef O_DIRECT
+    int dflags = flags | O_DIRECT;
+    fd_ = ::open(cfg_.packPath.c_str(), dflags, 0644);
+    if (fd_ >= 0) directIo_ = true;
+#endif
+    if (fd_ < 0) {
+        fd_ = ::open(cfg_.packPath.c_str(), flags, 0644);
+        if (fd_ < 0)
+            return Result::error(ErrorCode::InvalidConfig,
+                                 "open failed: " + cfg_.packPath);
+    }
+
+#if defined(VVM_HAS_LIBURING)
+    // 3) Ring: kernel io_uring (Auto -> io_uring; kernel 5.1+ always has it).
+    if (cfg_.allowIoRing) {
+        auto* r = new struct io_uring();
+        if (::io_uring_queue_init(cfg_.queueDepth, r, 0) == 0) {
+            ring_ = r;
+            // Register the staging arena (one fixed buffer per slot) -
+            // mirrors BuildIoRingRegisterBuffers: pins pages once instead of
+            // per-IO. Best-effort: plain reads work without registration.
+            std::vector<struct iovec> iovs(cfg_.slotCount);
+            for (uint32_t sIdx = 0; sIdx < cfg_.slotCount; ++sIdx) {
+                iovs[sIdx].iov_base = slotPtr(sIdx);
+                iovs[sIdx].iov_len = cfg_.slotBytes;
+            }
+            if (::io_uring_register_buffers(r, iovs.data(),
+                                            static_cast<unsigned>(iovs.size())) != 0) {
+                VVM_LOG_WARN("io_uring_register_buffers failed - using plain reads");
+            }
+            ioringMode_ = true;
+        } else {
+            delete r;
+            degradeToOverlapped();
+        }
+    } else {
+        degradeToOverlapped();
+    }
+#else
+    degradeToOverlapped();
+#endif
+
+    open_ = true;
+    return Result::success();
+}
+
+void IoRingBackend::close() {
+    if (!open_ && !arena_ && fd_ < 0 && !ring_) return;
+    destroyRing();
+    if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+    if (arena_) { ::free(arena_); arena_ = nullptr; }
+    floorOk_.clear();
+    floorFail_.clear();
+    inFlight_ = 0;
+    open_ = false;
+}
+
+uint32_t IoRingBackend::submitBatch(const std::vector<IORequest>& batch) {
+    if (!open_) return 0;
+    uint32_t accepted = 0;
+
+#if defined(VVM_HAS_LIBURING)
+    auto* r = static_cast<struct io_uring*>(ring_);
+#endif
+
+    for (const auto& req : batch) {
+        // O_DIRECT alignment discipline (4 KiB offset + size).
+        if (req.size == 0 || req.dstSlot >= cfg_.slotCount
+            || (req.fileOffset % kAlign) != 0 || (req.size % kAlign) != 0
+            || req.size > cfg_.slotBytes) {
+            continue; // rejected, not counted as accepted
+        }
+
+#if defined(VVM_HAS_LIBURING)
+        if (ioringMode_) {
+            struct io_uring_sqe* sqe = ::io_uring_get_sqe(r);
+            if (!sqe) { // ring full: caller re-submits the remainder
+                continue;
+            }
+            if (req.isRead) {
+                ::io_uring_prep_read(sqe, fd_, slotPtr(req.dstSlot), req.size,
+                                     static_cast<off_t>(req.fileOffset));
+            } else {
+                ::io_uring_prep_write(sqe, fd_, slotPtr(req.dstSlot), req.size,
+                                      static_cast<off_t>(req.fileOffset));
+            }
+            sqe->user_data = req.id;
+            ++accepted;
+            ++inFlight_;
+        } else
+#endif
+        {
+            // Floor: synchronous pread/pwrite completes at submit time;
+            // pollCompletions drains the reported ids.
+            ssize_t n;
+            if (req.isRead) {
+                n = ::pread(fd_, slotPtr(req.dstSlot), req.size,
+                            static_cast<off_t>(req.fileOffset));
+            } else {
+                n = ::pwrite(fd_, slotPtr(req.dstSlot), req.size,
+                             static_cast<off_t>(req.fileOffset));
+            }
+            if (n == static_cast<ssize_t>(req.size)) {
+                floorOk_.push_back(req.id);
+            } else {
+                floorFail_.push_back(req.id);
+            }
+            ++accepted;
+        }
+    }
+
+#if defined(VVM_HAS_LIBURING)
+    // One doorbell flush per batch (kernel coalesces per submit).
+    if (ioringMode_ && accepted > 0) {
+        ::io_uring_submit(static_cast<struct io_uring*>(ring_));
+    }
+#endif
+
+    return accepted;
+}
+
+uint32_t IoRingBackend::pollCompletions(std::vector<uint64_t>* outIds,
+                                        std::vector<uint64_t>* outFailed) {
+    if (!open_) return 0;
+    uint32_t reaped = 0;
+
+#if defined(VVM_HAS_LIBURING)
+    if (ioringMode_) {
+        auto* r = static_cast<struct io_uring*>(ring_);
+        struct io_uring_cqe* cqe = nullptr;
+        for (;;) {
+            int hr = ::io_uring_peek_cqe(r, &cqe);
+            if (hr != 0 || !cqe) break; // empty
+            const uint64_t id = static_cast<uint64_t>(cqe->user_data);
+            // Short IO on a registered buffer = torn shard: report as failed.
+            const bool ok = (cqe->res >= 0);
+            if (inFlight_) --inFlight_;
+            ++reaped;
+            if (ok) {
+                if (outIds) outIds->push_back(id);
+            } else {
+                if (outFailed) outFailed->push_back(id);
+            }
+            ::io_uring_cqe_seen(r, cqe);
+        }
+    }
+#endif
+
+    // Floor drain (sync IO completed at submit).
+    if (!floorOk_.empty()) {
+        if (outIds) outIds->insert(outIds->end(), floorOk_.begin(), floorOk_.end());
+        reaped += static_cast<uint32_t>(floorOk_.size());
+        floorOk_.clear();
+    }
+    if (!floorFail_.empty()) {
+        if (outFailed) outFailed->insert(outFailed->end(), floorFail_.begin(), floorFail_.end());
+        reaped += static_cast<uint32_t>(floorFail_.size());
+        floorFail_.clear();
+    }
+
+    return reaped;
+}
+
+BackendKind selectedBackendKind() {
+    static const BackendKind b = [] {
+        if (const char* e = std::getenv("VVM_STORAGE_BACKEND")) {
+            if (!std::strcmp(e, "ioring")) return BackendKind::IoRing;
+            if (!std::strcmp(e, "overlapped")) return BackendKind::Overlapped;
+        }
+        return BackendKind::Auto;
+    }();
+    return b;
+}
+
+std::unique_ptr<StreamBackend> createBackend(BackendKind kind, const BackendConfig& cfg) {
+    switch (kind) {
+        case BackendKind::IoRing:
+        case BackendKind::Overlapped:
+        case BackendKind::Auto:
+            return std::make_unique<IoRingBackend>(cfg);
+    }
+    return std::make_unique<IoRingBackend>(cfg);
+}
 
 } // namespace backend
 } // namespace storage

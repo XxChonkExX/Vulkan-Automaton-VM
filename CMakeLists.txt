@@ -191,6 +191,13 @@ if(VVM_BUILD_SHARED)
         src/utils/error_handling.cpp
         src/placement/shard_placer.cpp
     )
+    if(UNIX AND NOT APPLE)
+        find_library(LIBURING_LIBRARY uring)
+        if(LIBURING_LIBRARY)
+            target_link_libraries(vulkan_vm PRIVATE ${LIBURING_LIBRARY})
+            message(STATUS "VulkanVM storage: io_uring backend enabled (${LIBURING_LIBRARY})")
+        endif()
+    endif()
 else()
     add_library(vulkan_vm STATIC
         src/core/unified_memory_pool.cpp

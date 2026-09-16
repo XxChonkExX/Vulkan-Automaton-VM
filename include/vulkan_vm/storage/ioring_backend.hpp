@@ -84,8 +84,14 @@ public:
     void close();
 
     bool isOpen() const { return open_; }
-    // "ioring" or "overlapped" — what submitBatch/pollCompletions actually use.
-    const char* activeMode() const { return ioringMode_ ? "ioring" : "overlapped"; }
+    // "ioring" or the portable floor — what submitBatch/pollCompletions actually use.
+    const char* activeMode() const {
+#if defined(_WIN32)
+        return ioringMode_ ? "ioring" : "overlapped";
+#else
+        return ioringMode_ ? "io_uring" : "pread";
+#endif
+    }
     bool ioringActive() const { return ioringMode_; }
     // BypassIO active (NTFS + filters skipped straight to the volume stack).
     bool bypassIo() const { return bypassIo_; }
@@ -132,6 +138,15 @@ private:
     std::list<Pending> pending_;
 
     void* file_ = nullptr;             // HANDLE
+#elif defined(__linux__)
+    // io_uring plumbing (liburing; ring_ null when unavailable) + the
+    // synchronous pread/pwrite floor.
+    void* ring_ = nullptr;             // struct io_uring*
+    int fd_ = -1;
+    bool directIo_ = false;            // O_DIRECT open succeeded
+    // Floor mode: sync IO completes at submit time; poll drains these.
+    std::vector<uint64_t> floorOk_;
+    std::vector<uint64_t> floorFail_;
 #endif
     uint64_t inFlight_ = 0;
 };
