@@ -66,10 +66,9 @@ target_link_libraries(moe_pack PRIVATE vulkan_vm)
 target_include_directories(moe_pack PRIVATE ${EXAMPLE_EXTRA_INCLUDES})
 
 # NVMe ceiling probe through the L3 IoRing backend (seq vs rand, real file I/O)
-add_executable(nvme_bench nvme_bench.cpp)
-target_link_libraries(nvme_bench PRIVATE vulkan_vm)
-target_include_directories(nvme_bench PRIVATE ${EXAMPLE_EXTRA_INCLUDES})
-
-# Multi-GPU example (requires multiple GPUs)
-# add_executable(multi_gpu multi_gpu.cpp)
-# target_link_libraries(multi_gpu PRIVATE vulkan_vm)
+# POSIX-only: uses unistd.h / ioctl(BLKGETSIZE64) for raw block-device size.
+if(NOT WIN32)
+    add_executable(nvme_bench nvme_bench.cpp)
+    target_link_libraries(nvme_bench PRIVATE vulkan_vm)
+    target_include_directories(nvme_bench PRIVATE ${EXAMPLE_EXTRA_INCLUDES})
+endif()

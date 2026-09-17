@@ -28,6 +28,17 @@ add_test(NAME basic_test COMMAND basic_test)
 # Minimal test for debugging
 add_executable(minimal_test minimal_test.cpp)
 target_link_libraries(minimal_test PRIVATE vulkan_vm)
+
+# Pool test: dedicated UnifiedMemoryPool coverage (sub-allocation lifecycle,
+# exhaustion/dedicated fallback, budget caps, chunk tiers). Skips cleanly
+# when no creatable backend (HIP/L0) is present on the box.
+add_executable(pool_test pool_test.cpp)
+target_link_libraries(pool_test PRIVATE vulkan_vm)
+target_include_directories(pool_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
+add_test(NAME pool_test COMMAND pool_test)
 target_include_directories(minimal_test PRIVATE
     ${CMAKE_SOURCE_DIR}/include
     ${TEST_EXTRA_INCLUDES}
@@ -53,17 +64,22 @@ target_include_directories(chonk_slab_test PRIVATE
     ${TEST_EXTRA_INCLUDES}
 )
 if(WIN32)
-    target_include_directories(chonk_slab_test SYSTEM PRIVATE
-        "C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/ucrt"
-        "C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/um"
-        "C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/shared"
-        "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231/include"
-    )
-    target_link_directories(chonk_slab_test PRIVATE
-        "C:/Program Files (x86)/Windows Kits/10/Lib/10.0.26100.0/ucrt/x64"
-        "C:/Program Files (x86)/Windows Kits/10/Lib/10.0.26100.0/um/x64"
-        "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231/lib/x64"
-    )
+    # Only pin the VS18 STL when actually compiling with the VS18 toolchain
+    # (Linux-side pin). Mixing the 14.51 STL with a 14.44 toolchain trips
+    # STL1001, so gate on the compiler, not the install's existence.
+    if (MSVC_VERSION GREATER_EQUAL 1950)
+        target_include_directories(chonk_slab_test SYSTEM PRIVATE
+            "C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/ucrt"
+            "C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/um"
+            "C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/shared"
+            "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231/include"
+        )
+        target_link_directories(chonk_slab_test PRIVATE
+            "C:/Program Files (x86)/Windows Kits/10/Lib/10.0.26100.0/ucrt/x64"
+            "C:/Program Files (x86)/Windows Kits/10/Lib/10.0.26100.0/um/x64"
+            "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231/lib/x64"
+        )
+    endif()
 endif()
 add_test(NAME chonk_slab_test COMMAND chonk_slab_test)
 
