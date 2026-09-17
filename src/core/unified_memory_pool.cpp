@@ -235,6 +235,16 @@ UnifiedMemoryPool::UnifiedMemoryPool(UnifiedMemoryPool&& other) noexcept
     fnSetDebugName_ = other.fnSetDebugName_;
     offloadManager_ = std::move(other.offloadManager_);
     backend_ = std::move(other.backend_);
+    // Pool state that deallocate()/budget paths depend on (audit: dropping
+    // these orphaned every pre-move allocation's generation -> leak).
+    reservedBytes_ = other.reservedBytes_;
+    generationCounter_ = other.generationCounter_;
+    liveGenerations_ = std::move(other.liveGenerations_);
+    warnedHighWater_ = other.warnedHighWater_;
+    recentIdx_ = other.recentIdx_;
+    recentCount_ = other.recentCount_;
+    std::copy(std::begin(other.recentSizes_), std::end(other.recentSizes_),
+              std::begin(recentSizes_));
 
     // Invalidate source
     other.device_ = VK_NULL_HANDLE;
@@ -244,6 +254,11 @@ UnifiedMemoryPool::UnifiedMemoryPool(UnifiedMemoryPool&& other) noexcept
     other.dedicatedAllocations_.clear();
     other.offloadManager_.reset();
     other.backend_.reset();
+    other.reservedBytes_ = 0;
+    other.generationCounter_ = 0;
+    other.liveGenerations_.clear();
+    other.recentIdx_ = 0;
+    other.recentCount_ = 0;
 }
 
 UnifiedMemoryPool& UnifiedMemoryPool::operator=(UnifiedMemoryPool&& other) noexcept {
@@ -288,6 +303,15 @@ UnifiedMemoryPool& UnifiedMemoryPool::operator=(UnifiedMemoryPool&& other) noexc
     fnSetDebugName_ = other.fnSetDebugName_;
     offloadManager_ = std::move(other.offloadManager_);
     backend_ = std::move(other.backend_);
+    // Pool state (mirrors the move constructor).
+    reservedBytes_ = other.reservedBytes_;
+    generationCounter_ = other.generationCounter_;
+    liveGenerations_ = std::move(other.liveGenerations_);
+    warnedHighWater_ = other.warnedHighWater_;
+    recentIdx_ = other.recentIdx_;
+    recentCount_ = other.recentCount_;
+    std::copy(std::begin(other.recentSizes_), std::end(other.recentSizes_),
+              std::begin(recentSizes_));
     // mutex_ is not moved - keep our own
     
     other.device_ = VK_NULL_HANDLE;
@@ -297,6 +321,11 @@ UnifiedMemoryPool& UnifiedMemoryPool::operator=(UnifiedMemoryPool&& other) noexc
     other.dedicatedAllocations_.clear();
     other.offloadManager_.reset();
     other.backend_.reset();
+    other.reservedBytes_ = 0;
+    other.generationCounter_ = 0;
+    other.liveGenerations_.clear();
+    other.recentIdx_ = 0;
+    other.recentCount_ = 0;
     return *this;
 }
 
@@ -2011,10 +2040,15 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
     alloc.memoryFlags = 0;
     alloc.hostPtr = nullptr;
     alloc.deviceAddress = deviceAddress;
-    
+
+    // Generation REQUIRED: deallocate() validates against liveGenerations_;
+    // without this, every imported allocation is rejected as "stale" and
+    // leaks its VkDeviceMemory + VkBuffer until teardown.
+    alloc.generation = nextGeneration();
+
     // Track dedicated allocation for cleanup in destructor
     dedicatedAllocations_.push_back(alloc);
-    
+
     return alloc;
 }
 

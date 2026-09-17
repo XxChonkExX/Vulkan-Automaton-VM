@@ -132,6 +132,7 @@ std::unique_ptr<HipMemoryBackend> HipMemoryBackend::create(int deviceIndex) {
     }
     auto backend = std::unique_ptr<HipMemoryBackend>(new HipMemoryBackend());
     backend->totalMem_ = totalBytes;
+    backend->deviceIndex_ = static_cast<int32_t>(idx);
     VVM_LOG_INFO("hip backend: device {} ({} MB), runtime loaded dynamically",
                  idx, static_cast<uint64_t>(totalBytes) / (1024 * 1024));
     return backend;
@@ -178,6 +179,10 @@ BackendMemory HipMemoryBackend::allocate(const BackendAllocRequest& req,
         if (resultError) *resultError = asError(2);
         return 0;
     }
+    // Affinity: hipMalloc targets the calling thread's current device.
+    if (deviceIndex_ >= 0) {
+        (void)api.hipSetDevice(deviceIndex_);
+    }
     void* ptr = nullptr;
     const int rc = api.hipMalloc(&ptr, static_cast<size_t>(req.size));
     if (rc != 0 || !ptr) {
@@ -192,6 +197,10 @@ BackendMemory HipMemoryBackend::allocate(const BackendAllocRequest& req,
 void HipMemoryBackend::free(BackendMemory mem) {
     if (mem == 0) return;
     const HipApi& api = hipApi();
+    // Affinity: hipFree must target the owning device.
+    if (deviceIndex_ >= 0) {
+        (void)api.hipSetDevice(deviceIndex_);
+    }
     if (api.ok) api.hipFree(reinterpret_cast<void*>(mem));
 }
 
@@ -379,6 +388,7 @@ std::unique_ptr<HipMemoryBackend> HipMemoryBackend::create(int deviceIndex) {
     }
     auto backend = std::unique_ptr<HipMemoryBackend>(new HipMemoryBackend());
     backend->totalMem_ = totalBytes;
+    backend->deviceIndex_ = static_cast<int32_t>(idx);
     VVM_LOG_INFO("hip backend: device {} ({} MB), runtime loaded dynamically",
                  idx, static_cast<uint64_t>(totalBytes) / (1024 * 1024));
     return backend;
@@ -425,6 +435,10 @@ BackendMemory HipMemoryBackend::allocate(const BackendAllocRequest& req,
         if (resultError) *resultError = asError(2);
         return 0;
     }
+    // Affinity: hipMalloc targets the calling thread's current device.
+    if (deviceIndex_ >= 0) {
+        (void)api.hipSetDevice(deviceIndex_);
+    }
     void* ptr = nullptr;
     const int rc = api.hipMalloc(&ptr, static_cast<size_t>(req.size));
     if (rc != 0 || !ptr) {
@@ -439,6 +453,9 @@ BackendMemory HipMemoryBackend::allocate(const BackendAllocRequest& req,
 void HipMemoryBackend::free(BackendMemory mem) {
     if (mem == 0) return;
     const HipApi& api = hipApi();
+    if (deviceIndex_ >= 0) {
+        (void)api.hipSetDevice(deviceIndex_);
+    }
     if (api.ok) api.hipFree(reinterpret_cast<void*>(mem));
 }
 
@@ -456,15 +473,14 @@ void HipMemoryBackend::unmap(BackendMemory mem) {
 BackendBuffer HipMemoryBackend::create_buffer(BackendMemory mem, uint64_t offset,
                                               uint64_t size, uint64_t usageBits,
                                               bool exportable, int* resultError) {
-    // A HIP device pointer IS the buffer. Allocations are standalone:
-    // mem must match (no sub-allocation offset form in v1).
+    // A HIP device pointer IS the buffer: sub-allocations are pointer
+    // arithmetic (mirrors the Windows branch; buddy offsets are legal).
     (void)size; (void)usageBits; (void)exportable;
     if (resultError) *resultError = 0;
-    if (mem == 0 || offset != 0) {
-        if (offset != 0 && resultError) *resultError = asError(4);
-        return offset == 0 ? mem : 0;
+    if (mem == 0) {
+        return 0;
     }
-    return mem;
+    return mem + offset;
 }
 
 bool HipMemoryBackend::bind_buffer(BackendBuffer buf, BackendMemory mem) {

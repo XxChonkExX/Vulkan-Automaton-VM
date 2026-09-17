@@ -346,7 +346,10 @@ BackendMemory L0MemoryBackend::allocate(const BackendAllocRequest& req,
         if (resultError) *resultError = asError(1);
         return 0;
     }
-    if (!g_zeApi.ok || !g_zeApi.context) {
+    // Per-backend context (this pool's own), NOT the shared g_zeApi.context:
+    // a second backend instance overwrites the global; allocations must stay
+    // on the context that owns them.
+    if (!g_zeApi.ok || context_ == 0) {
         if (resultError) *resultError = asError(2);
         return 0;
     }
@@ -368,7 +371,7 @@ BackendMemory L0MemoryBackend::allocate(const BackendAllocRequest& req,
     }
     void* ptr = nullptr;
     const ze_result_t rc = g_zeApi.zeMemAllocDevice(
-        g_zeApi.context, &desc, static_cast<size_t>(req.size),
+        reinterpret_cast<ze_context_handle_t>(context_), &desc, static_cast<size_t>(req.size),
         0 /* driver-default alignment */, reinterpret_cast<ze_device_handle_t>(device_),
         &ptr);
     if (rc != kZeSuccess || !ptr) {
@@ -379,8 +382,8 @@ BackendMemory L0MemoryBackend::allocate(const BackendAllocRequest& req,
 }
 
 void L0MemoryBackend::free(BackendMemory mem) {
-    if (mem == 0 || !g_zeApi.context) return;
-    g_zeApi.zeMemFree(g_zeApi.context, reinterpret_cast<void*>(mem));
+    if (mem == 0 || context_ == 0) return;
+    g_zeApi.zeMemFree(reinterpret_cast<ze_context_handle_t>(context_), reinterpret_cast<void*>(mem));
 }
 
 void* L0MemoryBackend::map(BackendMemory mem, bool* ok) {

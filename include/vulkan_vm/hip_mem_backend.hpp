@@ -56,6 +56,9 @@ public:
 private:
     HipMemoryBackend() = default;
     uint64_t totalMem_ = 0;
+    int32_t deviceIndex_ = -1;   // hipMalloc/free act on the CALLING
+                                 // thread's current device - every entry
+                                 // point re-affinitizes to this index.
 };
 
 // Lightweight enumeration (no pool needed). HIP is AMD-only so vendor is
