@@ -164,6 +164,127 @@ std::optional<MultiGPUPoolManager> MultiGPUPoolManager::create(
     return manager;
 }
 
+// ---------------------------------------------------------------------------
+// Shared host arena (VK_EXT_external_memory_host): the zero-copy cross-vendor
+// medium. One pinned host allocation imported as VkDeviceMemory on every
+// instance pool; copyDeviceToDeviceArena moves data in two DMA legs with no
+// CPU memcpy. Probe-validated on XTX<->1080 Ti (3.4 GiB/s, tests/
+// shared_arena_test).
+// ---------------------------------------------------------------------------
+
+bool MultiGPUPoolManager::createSharedArena(void* hostPtr, VkDeviceSize size,
+                                            VkBufferUsageFlags usage) {
+    if (!hostPtr || size == 0 || instances_.empty()) return false;
+    if (hasSharedArena()) {
+        VVM_LOG_WARN("createSharedArena: arena already exists ({} bytes); ignoring",
+                     arenaSize_ / (1024 * 1024));
+        return false;
+    }
+    arena_.clear();
+    arenaPointer_ = hostPtr;
+    arenaSize_ = size;
+    int imported = 0;
+    for (size_t i = 0; i < instances_.size(); ++i) {
+        ArenaDeviceEntry entry{};
+        entry.instanceIndex = static_cast<uint32_t>(i);
+        auto a = instances_[i].pool.importMemoryHostPointer(hostPtr, size, usage);
+        if (a.has_value()) {
+            entry.import = *a;
+            entry.imported = true;
+            ++imported;
+        } else {
+            VVM_LOG_WARN("createSharedArena: instance {} did not import "
+                         "(VK_EXT_external_memory_host enabled?)", i);
+        }
+        arena_.push_back(std::move(entry));
+    }
+    VVM_LOG_INFO("SharedArena created: {} MB imported on {}/{} instance(s)",
+                 size / (1024 * 1024), imported, instances_.size());
+    return imported > 0;
+}
+
+#ifdef _WIN32
+bool MultiGPUPoolManager::createSharedArena(VkDeviceSize size,
+                                            VkBufferUsageFlags usage) {
+    if (hasSharedArena()) return false;
+    // 64 KB-aligned VirtualAlloc (satisfies any sane import alignment).
+    void* arena = VirtualAlloc(nullptr, static_cast<SIZE_T>(size),
+                               MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!arena) {
+        VVM_LOG_ERROR("createSharedArena: VirtualAlloc failed ({} MB)",
+                      size / (1024 * 1024));
+        return false;
+    }
+    if (!createSharedArena(arena, size, usage)) {
+        VirtualFree(arena, 0, MEM_RELEASE);
+        return false;
+    }
+    // Ownership: freed AFTER the pools (declared before instances_ =
+    // reverse-destruction order frees it last).
+    arenaOwner_ = std::shared_ptr<void>(arena, [](void* p) {
+        if (p) VirtualFree(p, 0, MEM_RELEASE);
+    });
+    return true;
+}
+#endif
+
+VkBuffer MultiGPUPoolManager::arenaBuffer(uint32_t instanceIndex) const {
+    const Allocation* a = arenaImport(instanceIndex);
+    return a ? a->buffer : VK_NULL_HANDLE;
+}
+
+const Allocation* MultiGPUPoolManager::arenaImport(uint32_t instanceIndex) const {
+    for (const auto& e : arena_) {
+        if (e.instanceIndex == instanceIndex && e.imported) {
+            return &e.import;
+        }
+    }
+    return nullptr;
+}
+
+bool MultiGPUPoolManager::copyDeviceToDeviceArena(
+    uint32_t srcDeviceIndex, uint32_t dstDeviceIndex,
+    const Allocation& src, const Allocation& dst,
+    VkDeviceSize srcOffset, VkDeviceSize dstOffset, VkDeviceSize size) {
+    if (srcDeviceIndex >= instances_.size() || dstDeviceIndex >= instances_.size() ||
+        srcDeviceIndex == dstDeviceIndex) {
+        VVM_LOG_ERROR("copyDeviceToDeviceArena: invalid device indices");
+        return false;
+    }
+    const Allocation* srcArena = arenaImport(srcDeviceIndex);
+    const Allocation* dstArena = arenaImport(dstDeviceIndex);
+    if (!srcArena || !dstArena) {
+        VVM_LOG_ERROR("copyDeviceToDeviceArena: missing arena import on src or dst");
+        return false;
+    }
+    if (!src.buffer || !dst.buffer) return false;
+
+    auto& srcPool = instances_[srcDeviceIndex].pool;
+    auto& dstPool = instances_[dstDeviceIndex].pool;
+
+    if (size == VK_WHOLE_SIZE) {
+        size = std::min({src.size - srcOffset, dst.size - dstOffset, arenaSize_});
+    }
+    if (srcOffset + size > src.size || dstOffset + size > dst.size ||
+        size > arenaSize_) {
+        VVM_LOG_ERROR("copyDeviceToDeviceArena: range exceeds allocation/arena size");
+        return false;
+    }
+
+    // Two DMA legs through the same physical pages: the src GPU writes its
+    // arena view, the dst GPU reads its own. No CPU memcpy, one sync per
+    // leg (copyBuffer fences internally).
+    if (!srcPool.copyBuffer(src, *srcArena, srcOffset, 0, size)) {
+        VVM_LOG_ERROR("copyDeviceToDeviceArena: src -> arena leg failed");
+        return false;
+    }
+    if (!dstPool.copyBuffer(*dstArena, dst, 0, dstOffset, size)) {
+        VVM_LOG_ERROR("copyDeviceToDeviceArena: arena -> dst leg failed");
+        return false;
+    }
+    return true;
+}
+
 std::vector<std::optional<Allocation>> MultiGPUPoolManager::allocateDistributed(
     VkDeviceSize size, VkBufferUsageFlags usage) {
     

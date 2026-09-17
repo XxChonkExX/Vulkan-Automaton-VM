@@ -451,6 +451,117 @@ int main() {
         }
     }
 
+    // Manager-level integration: MultiGPUPoolManager::createSharedArena
+    // (manager-owned VirtualAlloc) + copyDeviceToDeviceArena (two DMA legs,
+    // no memcpy) + teardown hygiene (imports freed by pool dtors, arena
+    // pages freed last).
+    {
+        // Rebuild DeviceConfigs for the two importing probe devices.
+        std::vector<DeviceConfig> cfgs;
+        for (const auto& d : ar) {
+            for (size_t i = 0; i < devices.size(); ++i) {
+                if (devices[i].props.deviceName == d.name) {
+                    DeviceConfig cfg{};
+                    cfg.physicalDevice = devices[i].device;
+                    cfg.device = d.device;
+                    cfg.graphicsQueueFamily = d.queueFamily;
+                    cfg.computeQueueFamily = d.queueFamily;
+                    cfg.transferQueueFamily = d.queueFamily;
+                    cfg.graphicsQueue = d.queue;
+                    cfg.computeQueue = d.queue;
+                    cfg.transferQueue = d.queue;
+                    cfgs.push_back(cfg);
+                    break;
+                }
+            }
+        }
+        if (cfgs.size() == ar.size() && cfgs.size() >= 2) {
+            PoolConfig pcfg;
+            pcfg.blockSize = 64ull * 1024ull * 1024ull;
+            pcfg.maxBlocks = 4;
+            pcfg.enableHostVisible = true;
+            pcfg.enableExternal = false;
+            auto manager = MultiGPUPoolManager::create(cfgs, pcfg, 0);
+            if (!manager) {
+                std::cerr << "FAIL: manager create for arena test\n";
+                ++failures;
+            } else {
+                // 256 MiB manager-owned arena (VirtualAlloc inside).
+                const VkDeviceSize kMgr = 256ull * 1024 * 1024;
+                if (!manager->createSharedArena(kMgr)) {
+                    std::cerr << "FAIL: manager createSharedArena\n";
+                    ++failures;
+                } else {
+                    std::cout << "manager arena: " << manager->arenaSize() / (1024*1024)
+                              << " MB, pointer " << manager->arenaPointer() << "\n";
+                    int importedCount = 0;
+                    for (size_t i = 0; i < manager->getInstances().size(); ++i) {
+                        if (manager->arenaBuffer((uint32_t)i) != VK_NULL_HANDLE) ++importedCount;
+                    }
+                    std::cout << "  imports on " << importedCount << "/"
+                              << manager->getInstances().size() << " instance(s)\n";
+                    if (importedCount < 2) {
+                        std::cerr << "FAIL: fewer than 2 manager imports\n";
+                        ++failures;
+                    } else {
+                        // Alloc 64 MiB on each device; XTX -> arena -> Ti
+                        // via copyDeviceToDeviceArena, byte verify.
+                        const VkDeviceSize kLeg = 64ull * 1024 * 1024;
+                        const VkBufferUsageFlags kUsage =
+                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                            VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                        auto s0 = manager->getPool(0).allocate(kLeg, kUsage);
+                        auto s1 = manager->getPool(1).allocate(kLeg, kUsage);
+                        auto h0 = manager->getPool(0).allocate(kLeg,
+                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                            VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+                        auto h1 = manager->getPool(1).allocate(kLeg,
+                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                            VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+                        if (!s0 || !s1 || !h0 || !h1 || !h0->hostPtr || !h1->hostPtr) {
+                            std::cerr << "FAIL: manager-path allocs\n";
+                            ++failures;
+                        } else {
+                            std::memcpy(h0->hostPtr, pattern.data(), pattern.size());
+                            if (!manager->getPool(0).copyBuffer(*h0, *s0, 0, 0, kLeg)) {
+                                std::cerr << "FAIL: stage-in\n";
+                                ++failures;
+                            } else {
+                                auto t0 = std::chrono::steady_clock::now();
+                                const bool ok = manager->copyDeviceToDeviceArena(0, 1, *s0, *s1, 0, 0, kLeg);
+                                auto t1 = std::chrono::steady_clock::now();
+                                const double sec = std::chrono::duration<double>(t1 - t0).count();
+                                std::memset(h1->hostPtr, 0, pattern.size());
+                                if (!ok || !manager->getPool(1).copyBuffer(*s1, *h1, 0, 0, kLeg) ||
+                                    std::memcmp(h1->hostPtr, pattern.data(), pattern.size()) != 0) {
+                                    std::cerr << "FAIL: arena copy or verify (ok=" << ok << ")\n";
+                                    ++failures;
+                                } else {
+                                    std::cout << "manager arena copy 0->1: PASS 64 MiB in "
+                                              << sec << " s ("
+                                              << (double)kLeg / (1024.0*1024.0*1024.0) / sec
+                                              << " GiB/s, two DMA legs)\n";
+                                }
+                            }
+                            manager->getPool(1).deallocate(std::move(*h1));
+                            manager->getPool(0).deallocate(std::move(*h0));
+                            manager->getPool(1).deallocate(std::move(*s1));
+                            manager->getPool(0).deallocate(std::move(*s0));
+                        }
+                    }
+                }
+                // Manager dtor: arena pages freed AFTER pool dtors free the
+                // imports (reverse-destruction order). Reset before the
+                // caller destroys its VkDevices (multi_gpu_test contract).
+                manager.reset();
+                std::cout << "manager teardown: clean\n";
+            }
+        }
+    }
+
     std::cout << "\n=== " << (failures == 0 ? "SHARED ARENA PROBE CLEAN" : "SHARED ARENA PROBE FAILURES")
               << " (" << failures << ") ===\n";
     VirtualFree(arena, 0, MEM_RELEASE);
