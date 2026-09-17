@@ -288,6 +288,61 @@ int main() {
         manager->getPool(s).deallocate(std::move(*src));
     }
 
+    // Leg profile: where does staged time go? 64 MiB raw legs (single
+    // dev->host copy, one memcpy, single host->dev copy) per direction,
+    // plus staging placement info. Compares against the 4 MiB-chunked
+    // manager path above.
+    for (int dir = 0; dir < 2; ++dir) {
+        const uint32_t s = dir == 0 ? 0 : 1;
+        const uint32_t d = dir == 0 ? 1 : 0;
+        const char* tag = dir == 0 ? "AMD->NV" : "NV->AMD";
+        const VkDeviceSize kLeg = 64ull * 1024 * 1024;
+        const VkBufferUsageFlags kUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                          VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        auto src = manager->getPool(s).allocate(kLeg, kUsage);
+        auto dst = manager->getPool(d).allocate(kLeg, kUsage);
+        auto stS = manager->getPool(s).allocate(
+            kLeg, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+            VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        auto stD = manager->getPool(d).allocate(
+            kLeg, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+            VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        if (!src || !dst || !stS || !stD || !stS->hostPtr || !stD->hostPtr) {
+            std::cout << "profile " << tag << ": SKIP (staging alloc)\n";
+            if (src) manager->getPool(s).deallocate(std::move(*src));
+            if (dst) manager->getPool(d).deallocate(std::move(*dst));
+            if (stS) manager->getPool(s).deallocate(std::move(*stS));
+            if (stD) manager->getPool(d).deallocate(std::move(*stD));
+            continue;
+        }
+        std::memset(stS->hostPtr, 0x5A, static_cast<size_t>(kLeg));
+        manager->getPool(s).copyBuffer(*stS, *src, 0, 0, kLeg);  // warm
+        auto t0 = std::chrono::steady_clock::now();
+        const bool c1 = manager->getPool(s).copyBuffer(*src, *stS, 0, 0, kLeg);
+        auto t1 = std::chrono::steady_clock::now();
+        std::memcpy(stD->hostPtr, stS->hostPtr, static_cast<size_t>(kLeg));
+        auto t2 = std::chrono::steady_clock::now();
+        const bool c2 = manager->getPool(d).copyBuffer(*stD, *dst, 0, 0, kLeg);
+        auto t3 = std::chrono::steady_clock::now();
+        const double d1 = std::chrono::duration<double>(t1 - t0).count();
+        const double d2 = std::chrono::duration<double>(t2 - t1).count();
+        const double d3 = std::chrono::duration<double>(t3 - t2).count();
+        const double mib = (double)kLeg / (1024.0 * 1024.0);
+        std::cout << "profile " << tag << " 64 MiB legs: dev->host "
+                  << mib / d1 << " MiB/s, memcpy " << mib / d2
+                  << " MiB/s, host->dev " << mib / d3 << " MiB/s"
+                  << " (copies " << (c1 && c2 ? "ok" : "FAIL")
+                  << " stagingFlags src=0x" << std::hex << stS->memoryFlags
+                  << " dst=0x" << stD->memoryFlags << std::dec << ")\n";
+        manager->getPool(s).deallocate(std::move(*stS));
+        manager->getPool(d).deallocate(std::move(*stD));
+        manager->getPool(d).deallocate(std::move(*dst));
+        manager->getPool(s).deallocate(std::move(*src));
+    }
+
     std::cout << "\n=== " << (failures == 0 ? "XN P2P PROBE CLEAN" : "XN P2P PROBE FAILURES")
               << " (" << failures << ") ===\n";
 

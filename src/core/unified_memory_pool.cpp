@@ -1569,9 +1569,16 @@ std::optional<Allocation> UnifiedMemoryPoolImpl::allocateDedicated(
     }
 
     // Step 3: Pick memory type honoring the caller's host-visible preference.
+    // HOST_CACHED requests resolve the full flag set (cached GART over
+    // write-combined ReBAR VRAM for CPU staging); otherwise the init-time
+    // host-visible type applies.
     uint32_t memType = deviceLocalMemoryType_;
     if (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
         memType = (hostVisibleMemoryType_ != UINT32_MAX) ? hostVisibleMemoryType_ : deviceLocalMemoryType_;
+        if ((flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) &&
+            findMemoryType(flags, 0).has_value()) {
+            memType = *findMemoryType(flags, 0);
+        }
     }
     if ((memType >= 32) || ((memReq.memoryTypeBits & (1u << memType)) == 0)) {
         VkMemoryPropertyFlags requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
@@ -1695,6 +1702,7 @@ std::optional<Allocation> UnifiedMemoryPoolImpl::allocate(VkDeviceSize size,
                                                         VkBufferUsageFlags usage,
                                                         VkMemoryPropertyFlags flags) {
     std::lock_guard<std::mutex> lock(mutex_);
+
     
     // Align size
     size = alignUp(size, config_.minAlignment);
@@ -1731,14 +1739,18 @@ std::optional<Allocation> UnifiedMemoryPoolImpl::allocate(VkDeviceSize size,
     // Best-fit block selection within the size class: pick the block with the
     // SMALLEST largest-free that still fits. First-fit scattered allocations
     // across blocks; best-fit packs them tightly and avoids spawning extra
-    // partially-filled blocks.
+    // partially-filled blocks. Cached requests (CPU staging) only match
+    // cached blocks: falling back to a write-combined ReBAR block costs
+    // ~100x on CPU reads (measured 41 MiB/s vs GB/s).
     const bool wantHostVisible = (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+    const bool wantHostCached = (flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0;
     int bestIdx = -1;
     VkDeviceSize bestFree = UINT64_MAX;
     for (uint32_t i = 0; i < blocks_.size(); ++i) {
         const auto& block = blocks_[i];
         if (!block.buddy) continue;
         if (block.isHostVisible != wantHostVisible) continue;
+        if (wantHostCached && !(block.memoryFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) continue;
         if (block.isChunk != wantChunk) continue;
         if (wantChunk && block.chunkTier != tier) continue; // per-tier packing
         const VkDeviceSize lf = block.buddy->getLargestFree();
@@ -1827,10 +1839,21 @@ std::optional<Allocation> UnifiedMemoryPoolImpl::allocate(VkDeviceSize size,
                    : allocateDedicatedBackend(size, usage, flags);
     }
     
-    uint32_t memType = (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) 
+    uint32_t memType = (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
         ? (hostVisibleMemoryType_ != UINT32_MAX ? hostVisibleMemoryType_ : deviceLocalMemoryType_)
         : deviceLocalMemoryType_;
-    
+    // HOST_CACHED requests (CPU staging) resolve the full flag set: the
+    // init-time host-visible type is ReBAR VRAM (write-combined, ~40 MB/s
+    // CPU reads) while cached GART RAM memcpys at GB/s. Falls back to the
+    // init type when no cached type exists.
+    if ((flags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) ==
+        (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) {
+        auto cached = findMemoryType(flags, 0);
+        if (cached.has_value()) {
+            memType = *cached;
+        }
+    }
+
     if (!allocateBlock(blockSize, memType, wantChunk, wantChunk ? tier : 0).has_value()) {
         return std::nullopt;
     }

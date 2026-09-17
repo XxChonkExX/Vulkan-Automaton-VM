@@ -496,8 +496,14 @@ bool MultiGPUPoolManager::copyDeviceToDeviceHostStaged(
 
     const VkBufferUsageFlags kStagingUsage =
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    // Staging must be HOST_CACHED: the CPU reads/writes every chunk via
+    // memcpy, and write-combined VRAM (ReBAR types, which first-match
+    // selection prefers) reads at ~40 MB/s. Cached system RAM (GART)
+    // memcpys at GB/s; the GPU DMA legs are unaffected. Measured 41 MiB/s
+    // -> cached on XTX<->Ti legs (2026-09-17 probe).
     const VkMemoryPropertyFlags kStagingFlags =
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+        VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
 
     // Allocate chunk-sized staging buffers on each device. Using chunk size keeps
     // peak host memory bounded regardless of total transfer size.
