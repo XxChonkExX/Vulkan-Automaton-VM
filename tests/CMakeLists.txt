@@ -223,6 +223,15 @@ target_include_directories(shared_arena_test PRIVATE
     ${TEST_EXTRA_INCLUDES}
 )
 
+# iGPU memory probe: what can the UMA iGPU actually serve (allocation
+# ladders from DEVICE_LOCAL and HOST_VISIBLE types, freed per step)?
+add_executable(igpu_probe_test igpu_probe_test.cpp)
+target_link_libraries(igpu_probe_test PRIVATE vulkan_vm)
+target_include_directories(igpu_probe_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
+
 # Stress test
 # add_executable(stress_test stress_test.cpp)
 # target_link_libraries(stress_test PRIVATE vulkan_vm)
