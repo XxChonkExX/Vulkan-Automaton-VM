@@ -1,6 +1,8 @@
 #pragma once
 
-#include "vulkan_vm/vulkan_vm.hpp"
+// Re-export shim: BuddyAllocator declarations. Includes only what it needs
+// (NOT the vulkan_vm.hpp umbrella - keep individual systems independently
+// includable).
 #include "vulkan_vm/buddy_allocator.hpp"
 
 namespace vvm {
