@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
 
 namespace vvm {
 
@@ -64,6 +65,40 @@ VkDeviceSize totalDeviceVRAM(VkPhysicalDevice physicalDevice) {
         }
     }
     return total;
+}
+
+// Driver single-allocation cap (Vulkan 1.1 maxMemoryAllocationSize).
+// Windows AMD/Intel drivers refuse single vkAllocateMemory at/above ~4 GiB
+// (spec explicitly permits refusing >= 4 GiB), so pool growth must never
+// attempt one backend block above this. No class state (core.hpp is
+// ABI-frozen): per-physical-device cache behind its own lock. Growth path
+// only — never on a hot path. Non-pow2 caps are floored (buddy blocks are
+// always pow2).
+VkDeviceSize driverMaxSingleAlloc(VkPhysicalDevice phys) {
+    static std::mutex mtx;
+    static std::unordered_map<VkPhysicalDevice, VkDeviceSize> cache;
+    if (phys == VK_NULL_HANDLE) return UINT64_MAX;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto it = cache.find(phys);
+        if (it != cache.end()) return it->second;
+    }
+    VkPhysicalDeviceVulkan11Properties props11{};
+    props11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES;
+    VkPhysicalDeviceProperties2 props2{};
+    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    props2.pNext = &props11;
+    vkGetPhysicalDeviceProperties2(phys, &props2);
+    VkDeviceSize cap = props11.maxMemoryAllocationSize;
+    if (cap == 0) cap = UINT64_MAX;  // pre-1.1 driver without the struct
+    while (cap != UINT64_MAX && (cap & (cap - 1)) != 0) {
+        cap &= cap - 1;  // floor to pow2
+    }
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        cache[phys] = cap;
+    }
+    return cap;
 }
 
 PoolConfig PoolConfig::forDevice(VkPhysicalDevice physicalDevice) {
@@ -427,6 +462,15 @@ bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig&
 
     VVM_LOG_INFO("UnifiedMemoryPool initialized successfully (blockSize={} MB, alignment={} KB)",
                  config_.blockSize / (1024*1024), config_.minAlignment / 1024);
+    if (isVulkan && deviceConfig_.physicalDevice != VK_NULL_HANDLE) {
+        const VkDeviceSize cap = driverMaxSingleAlloc(deviceConfig_.physicalDevice);
+        if (cap == UINT64_MAX) {
+            VVM_LOG_INFO("driver maxMemoryAllocationSize: unknown (pool blocks unclamped)");
+        } else {
+            VVM_LOG_INFO("driver maxMemoryAllocationSize: {} MB (pool blocks never exceed it)",
+                         cap / (1024*1024));
+        }
+    }
     return true;
 }
 
@@ -981,13 +1025,24 @@ std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
     // instead.
 
     int err = 0;
-    const BackendMemory mem = backend_->allocate(
-        {static_cast<uint64_t>(size), memoryTypeIndex,
-         /*exportable=*/false,
-         /*deviceAddress=*/config_.enableDeviceAddress,
-         /*priority=*/config_.memoryPriority,
-         /*dedicatedFor=*/0},
-        &err);
+    BackendAllocRequest req{
+        static_cast<uint64_t>(size), memoryTypeIndex,
+        /*exportable=*/false,
+        /*deviceAddress=*/config_.enableDeviceAddress,
+        /*priority=*/config_.memoryPriority,
+        /*dedicatedFor=*/0};
+    BackendMemory mem = backend_->allocate(req, &err);
+    if (mem == 0 && req.priority > 0.0f) {
+        // Driver-quirk retry: priority is a pure scheduling hint, but some
+        // Windows drivers are finicky about the priority pNext chain on
+        // large allocations. deviceAddress is load-bearing (ggml adds
+        // SHADER_DEVICE_ADDRESS usage) and stays; retry once without
+        // priority before giving up.
+        VVM_LOG_INFO("backend allocate failed at priority {}; retrying without priority pNext "
+                     "(size={}, type={})", req.priority, size, memoryTypeIndex);
+        req.priority = 0.0f;
+        mem = backend_->allocate(req, &err);
+    }
     if (mem == 0) {
         int native = 0;
         const bool known = decode_backend_error(err, &native);
@@ -1630,6 +1685,28 @@ std::optional<Allocation> UnifiedMemoryPool::allocate(VkDeviceSize size,
     }
     if (!wantChunk && config_.adaptiveBlockSize) {
         blockSize = adaptiveBlockSizeFor(size, blockSize);
+    }
+
+    // Driver single-allocation cap (maxMemoryAllocationSize): Windows AMD /
+    // Intel drivers refuse single vkAllocateMemory at/above ~4 GiB, and a
+    // pool block above the cap can never be created (one block == one
+    // backend allocation; VkBuffers cannot span blocks). A request the
+    // driver cannot serve as one allocation cannot live in the pool either:
+    // decline early so the caller (ggml fail-soft) routes it to native
+    // memory instead of tripping a driver ERROR. Clamp adaptive overshoot
+    // (pair-packing can exceed the request) to the cap. HIP/L0 backends
+    // have no VkPhysicalDevice: unclamped.
+    if (!wantChunk && deviceConfig_.physicalDevice != VK_NULL_HANDLE) {
+        const VkDeviceSize cap = driverMaxSingleAlloc(deviceConfig_.physicalDevice);
+        if (size > cap) {
+            VVM_LOG_WARN("pool: request {} MB exceeds driver single-allocation max {} MB; "
+                         "declining to pool (caller fail-soft applies)",
+                         size / (1024*1024), cap / (1024*1024));
+            return std::nullopt;
+        }
+        if (blockSize > cap) {
+            blockSize = cap;
+        }
     }
     
     // Budget check: fail soft instead of stealing VRAM past the configured cap.

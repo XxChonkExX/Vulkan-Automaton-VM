@@ -42,9 +42,13 @@ using BackendBuffer = uint64_t;   // 0 == null
 
 // Error-code convention: backends return their native error code packed so
 // it can never collide with success (0). Vulkan backend packs VkResult.
+// NOTE: encoded values are ALWAYS negative (encode maps any int N to
+// -1000000-N), including for negative native codes: VK_ERROR_OOM (-2)
+// encodes to -999998, not below -1000000. Decode must accept every
+// negative int (found 2026-09: every driver error logged "unknown").
 inline int encode_backend_error(int nativeCode) { return -1000000 - nativeCode; }
 inline bool decode_backend_error(int code, int* nativeOut) {
-    if (code <= -1000000) { *nativeOut = -1000000 - code; return true; }
+    if (code < 0) { *nativeOut = -1000000 - code; return true; }
     return false;
 }
 
