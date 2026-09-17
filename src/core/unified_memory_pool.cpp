@@ -142,6 +142,9 @@ struct UnifiedMemoryPoolImpl {
     std::optional<MigrationOperation> offloadToHost(Allocation& alloc);
     std::optional<MigrationOperation> reloadToDevice(Allocation& alloc);
     void waitMigration(const MigrationOperation& op);
+    std::optional<Allocation> importMemoryHostPointer(void* hostPtr,
+                                                      VkDeviceSize size,
+                                                      VkBufferUsageFlags usage);
     bool copyBuffer(const Allocation& src, const Allocation& dst,
                     VkDeviceSize srcOffset, VkDeviceSize dstOffset,
                     VkDeviceSize size, VkFence fence = VK_NULL_HANDLE);
@@ -433,6 +436,7 @@ void UnifiedMemoryPool::waitMigration(const MigrationOperation& op) { impl_->wai
 bool UnifiedMemoryPool::copyBuffer(const Allocation& src, const Allocation& dst, VkDeviceSize srcOffset, VkDeviceSize dstOffset, VkDeviceSize size, VkFence fence) { return impl_->copyBuffer(src, dst, srcOffset, dstOffset, size, fence); }
 PoolStats UnifiedMemoryPool::getStats() const { return impl_->getStats(); }
 DeviceMemoryInfo UnifiedMemoryPool::getDeviceMemoryInfo() const { return impl_->getDeviceMemoryInfo(); }
+std::optional<Allocation> UnifiedMemoryPool::importMemoryHostPointer(void* hostPtr, VkDeviceSize size, VkBufferUsageFlags usage) { return impl_->importMemoryHostPointer(hostPtr, size, usage); }
 const PoolConfig& UnifiedMemoryPool::getConfig() const { return impl_->config_; }
 const DeviceConfig& UnifiedMemoryPool::getDeviceConfig() const { return impl_->deviceConfig_; }
 VkDevice UnifiedMemoryPool::getDevice() const { return impl_->device_; }
@@ -1923,6 +1927,97 @@ void UnifiedMemoryPoolImpl::deallocate(UniqueAllocation&& alloc) {
     // Extract the raw allocation and deallocate
     Allocation rawAlloc = alloc.release();
     deallocate(std::move(rawAlloc));
+}
+
+std::optional<Allocation> UnifiedMemoryPoolImpl::importMemoryHostPointer(
+    void* hostPtr, VkDeviceSize size, VkBufferUsageFlags usage) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!hostPtr || size == 0 || device_ == VK_NULL_HANDLE) {
+        return std::nullopt;
+    }
+    // Resolved dynamically (loader import libs may lack extension exports;
+    // device proc addr dispatches device-level extension commands on 1.1+
+    // loaders regardless).
+    auto getProps = (PFN_vkGetMemoryHostPointerPropertiesEXT)
+        vkGetDeviceProcAddr(device_, "vkGetMemoryHostPointerPropertiesEXT");
+    if (!getProps) {
+        VVM_LOG_ERROR("importHostPointer: loader lacks vkGetMemoryHostPointerPropertiesEXT");
+        return std::nullopt;
+    }
+    VkMemoryHostPointerPropertiesEXT mpp{};
+    mpp.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;
+    if (getProps(device_, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                 hostPtr, &mpp) != VK_SUCCESS || mpp.memoryTypeBits == 0) {
+        VVM_LOG_ERROR("importHostPointer: host pointer properties refused "
+                      "(VK_EXT_external_memory_host enabled on the device?)");
+        return std::nullopt;
+    }
+    uint32_t mt = UINT32_MAX;
+    for (uint32_t i = 0; i < 32; ++i) {
+        if (mpp.memoryTypeBits & (1u << i)) { mt = i; break; }
+    }
+    if (mt == UINT32_MAX) {
+        VVM_LOG_ERROR("importHostPointer: no importable memory type in pointer properties");
+        return std::nullopt;
+    }
+
+    VkImportMemoryHostPointerInfoEXT imp{};
+    imp.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;
+    imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+    imp.pHostPointer = hostPtr;
+    VkMemoryAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ai.pNext = &imp;
+    ai.allocationSize = size;
+    ai.memoryTypeIndex = mt;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (vkAllocateMemory(device_, &ai, nullptr, &mem) != VK_SUCCESS) {
+        VVM_LOG_ERROR("importHostPointer: vkAllocateMemory(import) failed");
+        return std::nullopt;
+    }
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkBufferCreateInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bi.size = size;
+    bi.usage = usage;
+    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(device_, &bi, nullptr, &buffer) != VK_SUCCESS) {
+        vkFreeMemory(device_, mem, nullptr);
+        VVM_LOG_ERROR("importHostPointer: vkCreateBuffer failed");
+        return std::nullopt;
+    }
+    if (vkBindBufferMemory(device_, buffer, mem, 0) != VK_SUCCESS) {
+        vkDestroyBuffer(device_, buffer, nullptr);
+        vkFreeMemory(device_, mem, nullptr);
+        VVM_LOG_ERROR("importHostPointer: vkBindBufferMemory failed");
+        return std::nullopt;
+    }
+
+    Allocation alloc{};
+    alloc.buffer = buffer;
+    alloc.memory = mem;
+    alloc.offset = 0;
+    alloc.size = size;
+    alloc.deviceAddress = 0;
+    // hostPtr stays NULL: the caller owns the arena pointer; a null keeps
+    // dealloc/dtor from vkUnmapMemory on memory the pool never mapped.
+    alloc.hostPtr = nullptr;
+    alloc.blockIndex = UINT32_MAX;   // dedicated-style tracking
+    alloc.isHostVisible = true;
+    alloc.isExternal = true;
+    {
+        VkPhysicalDeviceMemoryProperties mp{};
+        vkGetPhysicalDeviceMemoryProperties(deviceConfig_.physicalDevice, &mp);
+        if (mt < mp.memoryTypeCount) {
+            alloc.memoryFlags = mp.memoryTypes[mt].propertyFlags;
+            alloc.isCoherent = (alloc.memoryFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+        }
+    }
+    alloc.generation = nextGeneration();
+    dedicatedAllocations_.push_back(alloc);
+    VVM_LOG_INFO("importHostPointer: imported {} MB (type {}, buffer bound)",
+                 size / (1024*1024), mt);
+    return alloc;
 }
 
 std::optional<ExternalMemoryInfo> UnifiedMemoryPoolImpl::exportMemory(

@@ -213,6 +213,16 @@ target_include_directories(p2p_xn_test PRIVATE
     ${TEST_EXTRA_INCLUDES}
 )
 
+# Shared host arena probe (VK_EXT_external_memory_host): one VirtualAlloc'd
+# arena imported on every discrete GPU - the zero-copy cross-vendor
+# candidate. No D3D12 stack, no kernel code.
+add_executable(shared_arena_test shared_arena_test.cpp)
+target_link_libraries(shared_arena_test PRIVATE vulkan_vm)
+target_include_directories(shared_arena_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
+
 # Stress test
 # add_executable(stress_test stress_test.cpp)
 # target_link_libraries(stress_test PRIVATE vulkan_vm)

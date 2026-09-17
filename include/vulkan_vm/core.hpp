@@ -456,6 +456,20 @@ public:
     std::optional<MigrationOperation> reloadToDevice(Allocation& alloc);
     void waitMigration(const MigrationOperation& op);
 
+    // Host-pointer import (VK_EXT_external_memory_host): import a pinned
+    // host allocation (e.g. a VirtualAlloc'd shared arena) as VkDeviceMemory.
+    // The returned Allocation is a dedicated-style import (tracked until
+    // dealloc/pool dtor); its hostPtr stays NULL - the caller already owns
+    // the host pointer, and a null keeps teardown from unmapping memory the
+    // pool never mapped. Requires VK_EXT_external_memory_host enabled on the
+    // device at creation. The SAME host pointer may be imported into
+    // multiple DIFFERENT devices (the cross-GPU zero-copy path: every GPU
+    // DMAes into the same RAM); importing twice into ONE device is not
+    // guaranteed by the spec.
+    std::optional<Allocation> importMemoryHostPointer(void* hostPtr,
+                                                      VkDeviceSize size,
+                                                      VkBufferUsageFlags usage);
+
     // One-shot copy between two allocations on the same device via transfer
     // queue. Creates a transient command pool/buffer, submits, waits, destroys.
     bool copyBuffer(const Allocation& src, const Allocation& dst,
