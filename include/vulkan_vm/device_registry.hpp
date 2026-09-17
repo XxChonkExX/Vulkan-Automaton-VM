@@ -153,4 +153,29 @@ VVM_API PlacementPlan auto_place_experts_ex(
     uint64_t hostCacheBytes,
     float maxFraction = 0.90f);
 
+// ============================================================================
+// Plan-driven routing: the --n-cpu-moe replacement's second half.
+//
+// auto_place_experts() decides placement; the llama hooks used to resolve
+// it per tensor via their own pick_from_plan copy. route_plan() is the
+// single registry-side choke point with identical semantics, so pool
+// selection (which UnifiedPoolSet pool serves an allocation) and hook
+// tensor routing can never drift apart again:
+//   - LookupTable (PLE)                    -> CPU, always
+//   - Expert, layer inside plan            -> plan entry (CPU or device)
+//   - Expert, layer outside plan           -> CPU (safe direction)
+//   - Dense/Attention/Other                -> plan dense device
+//   - anything, missing device (index < 0) -> CPU
+// wantCpu=true means mmap/CPU: the caller keeps its legacy path
+// (budget auto_pick on Vulkan, nullptr on HIP). Pure compute, no device
+// needed — trivially unit-testable.
+// ============================================================================
+struct PoolRoute {
+    bool wantCpu = true;
+    MemBackendKind kind = MemBackendKind::Vulkan;
+    int32_t vendorIndex = -1;
+};
+
+VVM_API PoolRoute route_plan(const PlacementPlan& plan, TensorClass cls, int32_t layer);
+
 } // namespace vvm

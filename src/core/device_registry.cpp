@@ -223,6 +223,33 @@ const char* UnifiedPoolSet::aggregate_stats_json() {
 }
 
 // ---------------------------------------------------------------------------
+// Plan-driven routing (mirrors the llama hooks' pick_from_plan exactly;
+// both must resolve identically — keep in sync by construction: same
+// positional expert indexing, same CPU-safe defaults).
+// ---------------------------------------------------------------------------
+
+PoolRoute route_plan(const PlacementPlan& plan, TensorClass cls, int32_t layer) {
+    PoolRoute out;  // wantCpu=true default: unknown routes to CPU/mmap
+    if (cls == TensorClass::LookupTable) {
+        return out;  // PLE always CPU
+    }
+    if (cls == TensorClass::Expert) {
+        if (layer < 0 || static_cast<size_t>(layer) >= plan.experts.size()) {
+            return out;  // outside the plan: safe direction is CPU
+        }
+        const ExpertPlacement& ep = plan.experts[static_cast<size_t>(layer)];
+        out.wantCpu = ep.onCpu || ep.deviceIndex < 0;
+        out.kind = ep.backend;
+        out.vendorIndex = ep.deviceIndex;
+        return out;
+    }
+    out.wantCpu = plan.denseDeviceIndex < 0;
+    out.kind = plan.denseBackend;
+    out.vendorIndex = plan.denseDeviceIndex;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // Auto tensor placement
 // ---------------------------------------------------------------------------
 

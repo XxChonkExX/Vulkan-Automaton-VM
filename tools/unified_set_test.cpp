@@ -72,6 +72,45 @@ int main() {
 
     std::printf("aggregate: %s\n", set->aggregate_stats_json());
 
+    // Plan-driven routing: synthetic plan, no device needed. Mirrors the
+    // llama pick_from_plan contract (positional expert indexing).
+    {
+        PlacementPlan plan;
+        plan.denseBackend = MemBackendKind::Hip;
+        plan.denseDeviceIndex = 1;
+        plan.experts.resize(4);
+        for (int i = 0; i < 4; ++i) {
+            plan.experts[i].layer = i;
+            plan.experts[i].onCpu = (i >= 2);
+            plan.experts[i].backend = MemBackendKind::Hip;
+            plan.experts[i].deviceIndex = 1;
+        }
+        auto r = route_plan(plan, TensorClass::LookupTable, -1);
+        if (!r.wantCpu) { std::printf("FAIL: PLE must route CPU\n"); ++failures; }
+        r = route_plan(plan, TensorClass::Expert, 0);
+        if (r.wantCpu || r.kind != MemBackendKind::Hip || r.vendorIndex != 1) {
+            std::printf("FAIL: GPU expert misrouted\n"); ++failures;
+        }
+        r = route_plan(plan, TensorClass::Expert, 3);
+        if (!r.wantCpu) { std::printf("FAIL: CPU expert must route CPU\n"); ++failures; }
+        r = route_plan(plan, TensorClass::Expert, 9);
+        if (!r.wantCpu) { std::printf("FAIL: out-of-plan expert must route CPU\n"); ++failures; }
+        r = route_plan(plan, TensorClass::Expert, -1);
+        if (!r.wantCpu) { std::printf("FAIL: layerless expert must route CPU\n"); ++failures; }
+        r = route_plan(plan, TensorClass::Dense, -1);
+        if (r.wantCpu || r.kind != MemBackendKind::Hip || r.vendorIndex != 1) {
+            std::printf("FAIL: dense misrouted\n"); ++failures;
+        }
+        r = route_plan(plan, TensorClass::Attention, -1);
+        if (r.wantCpu || r.vendorIndex != 1) {
+            std::printf("FAIL: attention must follow dense\n"); ++failures;
+        }
+        PlacementPlan empty;
+        r = route_plan(empty, TensorClass::Dense, -1);
+        if (!r.wantCpu) { std::printf("FAIL: missing dense must route CPU\n"); ++failures; }
+        std::printf("route_plan: synthetic checks done\n");
+    }
+
     if (failures == 0) {
         std::printf("ALL UNIFIED SET TESTS PASSED\n");
         return 0;
