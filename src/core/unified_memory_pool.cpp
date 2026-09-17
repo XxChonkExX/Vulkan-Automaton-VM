@@ -18,6 +18,140 @@ void OffloadManagerDeleter::operator()(OffloadManager* p) const {
 }
 
 // ============================================================================
+// Pimpl state: every private member + private method of UnifiedMemoryPool.
+// The public façade (core.hpp) is exactly one unique_ptr: it never changes
+// size, so std::optional<UnifiedMemoryPool> crossing the DLL boundary stays
+// valid across library updates. Nothing in this struct is visible to
+// consumers; it can grow freely. All method bodies below (renamed from
+// UnifiedMemoryPool:: to UnifiedMemoryPoolImpl::) are unchanged.
+// ============================================================================
+struct UnifiedMemoryPoolImpl {
+    // Back-pointer for Impl-internal users of the outer object
+    // (OffloadManager takes UnifiedMemoryPool*). Repointed on move.
+    UnifiedMemoryPool* outer_ = nullptr;
+
+    // Vendor seam (mem_backend.hpp): the memory plane behind the pool's
+    // allocation policy. Created in initialize(), destroyed with the Impl.
+    std::unique_ptr<IDeviceMemoryBackend> backend_;
+
+    // Thread safety: all methods are guarded by this mutex
+    mutable std::mutex mutex_;
+
+    DeviceConfig deviceConfig_;
+    PoolConfig config_;
+    VkDevice device_ = VK_NULL_HANDLE;
+    std::vector<BlockInfo> blocks_;
+    // Dedicated allocations (exportable/imported) tracked separately
+    std::vector<Allocation> dedicatedAllocations_;
+    // Budget held via reserve(): counts as committed in wouldExceedBudget
+    // until unreserve()d. Guarded by mutex_ like everything else.
+    VkDeviceSize reservedBytes_ = 0;
+    uint32_t deviceLocalMemoryType_ = UINT32_MAX;
+    uint32_t hostVisibleMemoryType_ = UINT32_MAX;
+    uint32_t deviceLocalHeapIndex_ = UINT32_MAX;
+    bool memoryBudgetAvailable_ = false;
+    VkCommandPool transferCmdPool_ = VK_NULL_HANDLE;
+    bool debugUtilsEnabled_ = false;
+    PFN_vkSetDebugUtilsObjectNameEXT fnSetDebugName_ = nullptr;
+
+    // Offload manager for host swap
+    std::unique_ptr<OffloadManager, OffloadManagerDeleter> offloadManager_;
+
+    // VRAM high-water warning fired? (see VRAM_OVERFLOW_FINDINGS.md)
+    bool warnedHighWater_ = false;
+    // Generation counter for handle validation (prevents stale handle use).
+    // Validity is tracked via the LIVE SET, not the counter (comparing
+    // against the counter only matches the most-recent allocation, so
+    // out-of-order frees were wrongly rejected and leaked memory).
+    uint64_t generationCounter_ = 0;
+    std::unordered_set<uint64_t> liveGenerations_;
+
+    // Adaptive sizing history: ring of recent buddy-path request sizes.
+    static constexpr uint32_t kSizeHistory = 8;
+    VkDeviceSize recentSizes_[kSizeHistory] = {};
+    uint32_t recentIdx_ = 0;
+    uint32_t recentCount_ = 0;
+
+    ~UnifiedMemoryPoolImpl();
+
+    bool initialize(const DeviceConfig& device, const PoolConfig& config);
+    bool isVulkanBackend() const;
+    bool validateConfig() const;
+    bool selectMemoryTypes();
+    bool initTransferPool();
+    bool bootstrapFirstBlock();
+    bool validateDeviceCapabilities() const;
+
+    uint64_t nextGeneration() {
+        uint64_t g = ++generationCounter_;
+        liveGenerations_.insert(g);
+        return g;
+    }
+    uint64_t getCurrentGeneration() const { return generationCounter_; }
+    bool isValidGeneration(uint64_t generation) const {
+        return liveGenerations_.count(generation) != 0;
+    }
+    void retireGeneration(uint64_t generation) {
+        liveGenerations_.erase(generation);
+    }
+
+    std::optional<uint32_t> findMemoryType(VkMemoryPropertyFlags required,
+                                           VkMemoryPropertyFlags preferred);
+    std::optional<VkDeviceMemory> allocateBlock(VkDeviceSize size,
+                                                uint32_t memoryTypeIndex,
+                                                bool isChunk = false,
+                                                uint32_t chunkTier = 0);
+    std::optional<Allocation> subAllocate(VkDeviceSize size,
+                                          VkDeviceSize alignment,
+                                          uint32_t blockIndex,
+                                          VkBufferUsageFlags usage);
+    void subDeallocate(Allocation&& alloc);
+    VkDeviceSize alignUp(VkDeviceSize value, VkDeviceSize alignment);
+    VkMemoryPropertyFlags usageToFlags(MemoryUsage usage) const;
+    bool wouldExceedBudget(VkDeviceSize additionalBytes) const;
+    VkDeviceSize heapSizeBytes() const;
+    void setDebugName(VkObjectType objectType, uint64_t objectHandle,
+                      const char* name) const;
+    VkDeviceSize adaptiveBlockSizeFor(VkDeviceSize requestSize, VkDeviceSize staticPick);
+
+    // Former public-API bodies, now one hop behind the façade forwarders.
+    std::optional<Allocation> allocate(VkDeviceSize size,
+                                       VkBufferUsageFlags usage,
+                                       VkMemoryPropertyFlags flags = 0);
+    std::optional<Allocation> allocate(const AllocDesc& desc);
+    std::optional<Allocation> allocateDedicatedExportable(
+        VkDeviceSize size, VkBufferUsageFlags usage,
+        VkMemoryPropertyFlags flags = 0);
+    std::optional<Allocation> allocateDedicated(
+        VkDeviceSize size, VkBufferUsageFlags usage,
+        VkMemoryPropertyFlags flags = 0);
+    std::optional<Allocation> allocateDedicatedBackend(
+        VkDeviceSize size, VkBufferUsageFlags usage,
+        VkMemoryPropertyFlags flags = 0);
+    std::optional<Allocation> allocateTensor(VkDeviceSize size,
+                                             VkBufferUsageFlags usage);
+    void deallocate(Allocation&& alloc);
+    void deallocate(UniqueAllocation&& alloc);
+    bool reserve(VkDeviceSize bytes);
+    void unreserve(VkDeviceSize bytes);
+    VkDeviceSize reservedBytes() const;
+    [[nodiscard]] std::optional<ExternalMemoryInfo> exportMemory(const Allocation& alloc,
+                                                        ExternalHandleType type);
+    [[nodiscard]] std::optional<Allocation> importMemory(ExternalMemoryInfo&& info,
+                                                VkBufferUsageFlags usage);
+    std::optional<MigrationOperation> offloadToHost(Allocation& alloc);
+    std::optional<MigrationOperation> reloadToDevice(Allocation& alloc);
+    void waitMigration(const MigrationOperation& op);
+    bool copyBuffer(const Allocation& src, const Allocation& dst,
+                    VkDeviceSize srcOffset, VkDeviceSize dstOffset,
+                    VkDeviceSize size, VkFence fence = VK_NULL_HANDLE);
+    PoolStats getStats() const;
+    DeviceMemoryInfo getDeviceMemoryInfo() const;
+    void defragment();
+    void trim();
+};
+
+// ============================================================================
 // UnifiedMemoryPool Implementation
 // ============================================================================
 
@@ -242,129 +376,67 @@ PoolConfig PoolConfig::forHighVRAM(VkPhysicalDevice physicalDevice) {
 
 std::optional<UnifiedMemoryPool> UnifiedMemoryPool::create(
     const DeviceConfig& device, const PoolConfig& config) {
-    
     UnifiedMemoryPool pool;
-    if (pool.initialize(device, config)) {
+    pool.impl_ = std::make_unique<UnifiedMemoryPoolImpl>();
+    pool.impl_->outer_ = &pool;
+    if (pool.impl_->initialize(device, config)) {
         return pool;
     }
     return std::nullopt;
 }
 
-UnifiedMemoryPool::UnifiedMemoryPool(UnifiedMemoryPool&& other) noexcept
-    : mutex_() {
-    
-    // Lock source mutex FIRST before any member access
-    std::lock_guard<std::mutex> lock(other.mutex_);
-    
-    deviceConfig_ = std::move(other.deviceConfig_);
-    config_ = std::move(other.config_);
-    device_ = other.device_;
-    blocks_ = std::move(other.blocks_);
-    dedicatedAllocations_ = std::move(other.dedicatedAllocations_);
-    deviceLocalMemoryType_ = other.deviceLocalMemoryType_;
-    hostVisibleMemoryType_ = other.hostVisibleMemoryType_;
-    deviceLocalHeapIndex_ = other.deviceLocalHeapIndex_;
-    memoryBudgetAvailable_ = other.memoryBudgetAvailable_;
-    transferCmdPool_ = other.transferCmdPool_;
-    debugUtilsEnabled_ = other.debugUtilsEnabled_;
-    fnSetDebugName_ = other.fnSetDebugName_;
-    offloadManager_ = std::move(other.offloadManager_);
-    backend_ = std::move(other.backend_);
-    // Pool state that deallocate()/budget paths depend on (audit: dropping
-    // these orphaned every pre-move allocation's generation -> leak).
-    reservedBytes_ = other.reservedBytes_;
-    generationCounter_ = other.generationCounter_;
-    liveGenerations_ = std::move(other.liveGenerations_);
-    warnedHighWater_ = other.warnedHighWater_;
-    recentIdx_ = other.recentIdx_;
-    recentCount_ = other.recentCount_;
-    std::copy(std::begin(other.recentSizes_), std::end(other.recentSizes_),
-              std::begin(recentSizes_));
+// ---------------------------------------------------------------------------
+// Pimpl forwarders: the entire public API is one pointer hop into Impl.
+// Nothing here touches state, so this TU is the only one that must rebuild
+// when private members change.
+// ---------------------------------------------------------------------------
+std::optional<Allocation> UnifiedMemoryPool::allocate(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags flags) { return impl_->allocate(size, usage, flags); }
+std::optional<Allocation> UnifiedMemoryPool::allocate(const AllocDesc& desc) { return impl_->allocate(desc); }
+std::optional<Allocation> UnifiedMemoryPool::allocateDedicatedExportable(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags flags) { return impl_->allocateDedicatedExportable(size, usage, flags); }
+std::optional<Allocation> UnifiedMemoryPool::allocateDedicated(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags flags) { return impl_->allocateDedicated(size, usage, flags); }
+std::optional<Allocation> UnifiedMemoryPool::allocateDedicatedBackend(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags flags) { return impl_->allocateDedicatedBackend(size, usage, flags); }
+std::optional<Allocation> UnifiedMemoryPool::allocateTensor(VkDeviceSize size, VkBufferUsageFlags usage) { return impl_->allocateTensor(size, usage); }
+void UnifiedMemoryPool::deallocate(Allocation&& alloc) { impl_->deallocate(std::move(alloc)); }
+void UnifiedMemoryPool::deallocate(UniqueAllocation&& alloc) { impl_->deallocate(std::move(alloc)); }
+bool UnifiedMemoryPool::reserve(VkDeviceSize bytes) { return impl_->reserve(bytes); }
+void UnifiedMemoryPool::unreserve(VkDeviceSize bytes) { impl_->unreserve(bytes); }
+VkDeviceSize UnifiedMemoryPool::reservedBytes() const { return impl_->reservedBytes(); }
+std::optional<ExternalMemoryInfo> UnifiedMemoryPool::exportMemory(const Allocation& alloc, ExternalHandleType type) { return impl_->exportMemory(alloc, type); }
+std::optional<Allocation> UnifiedMemoryPool::importMemory(ExternalMemoryInfo&& info, VkBufferUsageFlags usage) { return impl_->importMemory(std::move(info), usage); }
+std::optional<MigrationOperation> UnifiedMemoryPool::offloadToHost(Allocation& alloc) { return impl_->offloadToHost(alloc); }
+std::optional<MigrationOperation> UnifiedMemoryPool::reloadToDevice(Allocation& alloc) { return impl_->reloadToDevice(alloc); }
+void UnifiedMemoryPool::waitMigration(const MigrationOperation& op) { impl_->waitMigration(op); }
+bool UnifiedMemoryPool::copyBuffer(const Allocation& src, const Allocation& dst, VkDeviceSize srcOffset, VkDeviceSize dstOffset, VkDeviceSize size, VkFence fence) { return impl_->copyBuffer(src, dst, srcOffset, dstOffset, size, fence); }
+PoolStats UnifiedMemoryPool::getStats() const { return impl_->getStats(); }
+DeviceMemoryInfo UnifiedMemoryPool::getDeviceMemoryInfo() const { return impl_->getDeviceMemoryInfo(); }
+const PoolConfig& UnifiedMemoryPool::getConfig() const { return impl_->config_; }
+const DeviceConfig& UnifiedMemoryPool::getDeviceConfig() const { return impl_->deviceConfig_; }
+VkDevice UnifiedMemoryPool::getDevice() const { return impl_->device_; }
+VkPhysicalDevice UnifiedMemoryPool::getPhysicalDevice() const { return impl_->deviceConfig_.physicalDevice; }
+void UnifiedMemoryPool::defragment() { impl_->defragment(); }
+void UnifiedMemoryPool::trim() { impl_->trim(); }
 
-    // Invalidate source
-    other.device_ = VK_NULL_HANDLE;
-    other.transferCmdPool_ = VK_NULL_HANDLE;
-    other.fnSetDebugName_ = nullptr;
-    other.blocks_.clear();
-    other.dedicatedAllocations_.clear();
-    other.offloadManager_.reset();
-    other.backend_.reset();
-    other.reservedBytes_ = 0;
-    other.generationCounter_ = 0;
-    other.liveGenerations_.clear();
-    other.recentIdx_ = 0;
-    other.recentCount_ = 0;
+UnifiedMemoryPool::UnifiedMemoryPool(UnifiedMemoryPool&& other) noexcept
+    : impl_(std::move(other.impl_)) {
+    // Pointer transfer: no partial state exists to audit (the whole pool
+    // moves as one). Repoint the back-pointer so Impl-internal users of the
+    // outer object (OffloadManager) stay valid.
+    if (impl_) impl_->outer_ = this;
 }
 
 UnifiedMemoryPool& UnifiedMemoryPool::operator=(UnifiedMemoryPool&& other) noexcept {
-    if (this == &other) {
-        return *this;
+    if (this != &other) {
+        // unique_ptr assignment destroys our current Impl (its destructor
+        // performs the device-resource cleanup the old hand-rolled move did).
+        impl_ = std::move(other.impl_);
+        if (impl_) impl_->outer_ = this;
     }
-    
-    // Lock both mutexes to avoid deadlock (self-assignment already handled above)
-    std::lock(mutex_, other.mutex_);
-    std::lock_guard<std::mutex> lock_this(mutex_, std::adopt_lock);
-    std::lock_guard<std::mutex> lock_other(other.mutex_, std::adopt_lock);
-    
-    // Cleanup current
-    if (device_ && backend_) {
-        for (auto& alloc : dedicatedAllocations_) {
-            if (alloc.buffer) backend_->destroy_buffer(reinterpret_cast<uint64_t>(alloc.buffer));
-            if (alloc.memory) backend_->free(reinterpret_cast<uint64_t>(alloc.memory));
-        }
-        dedicatedAllocations_.clear();
-
-        for (auto& block : blocks_) {
-            if (block.memory) {
-                backend_->free(reinterpret_cast<uint64_t>(block.memory));
-            }
-        }
-        if (transferCmdPool_) {
-            vkDestroyCommandPool(device_, transferCmdPool_, nullptr);
-        }
-    }
-    
-    deviceConfig_ = std::move(other.deviceConfig_);
-    config_ = std::move(other.config_);
-    device_ = other.device_;
-    blocks_ = std::move(other.blocks_);
-    dedicatedAllocations_ = std::move(other.dedicatedAllocations_);
-    deviceLocalMemoryType_ = other.deviceLocalMemoryType_;
-    hostVisibleMemoryType_ = other.hostVisibleMemoryType_;
-    deviceLocalHeapIndex_ = other.deviceLocalHeapIndex_;
-    memoryBudgetAvailable_ = other.memoryBudgetAvailable_;
-    transferCmdPool_ = other.transferCmdPool_;
-    debugUtilsEnabled_ = other.debugUtilsEnabled_;
-    fnSetDebugName_ = other.fnSetDebugName_;
-    offloadManager_ = std::move(other.offloadManager_);
-    backend_ = std::move(other.backend_);
-    // Pool state (mirrors the move constructor).
-    reservedBytes_ = other.reservedBytes_;
-    generationCounter_ = other.generationCounter_;
-    liveGenerations_ = std::move(other.liveGenerations_);
-    warnedHighWater_ = other.warnedHighWater_;
-    recentIdx_ = other.recentIdx_;
-    recentCount_ = other.recentCount_;
-    std::copy(std::begin(other.recentSizes_), std::end(other.recentSizes_),
-              std::begin(recentSizes_));
-    // mutex_ is not moved - keep our own
-    
-    other.device_ = VK_NULL_HANDLE;
-    other.transferCmdPool_ = VK_NULL_HANDLE;
-    other.fnSetDebugName_ = nullptr;
-    other.blocks_.clear();
-    other.dedicatedAllocations_.clear();
-    other.offloadManager_.reset();
-    other.backend_.reset();
-    other.reservedBytes_ = 0;
-    other.generationCounter_ = 0;
-    other.liveGenerations_.clear();
-    other.recentIdx_ = 0;
-    other.recentCount_ = 0;
     return *this;
 }
 
-UnifiedMemoryPool::~UnifiedMemoryPool() {
+UnifiedMemoryPool::~UnifiedMemoryPool() = default;
+
+UnifiedMemoryPoolImpl::~UnifiedMemoryPoolImpl() {
     // Lock so a concurrent allocate/deallocate on another thread cannot race
     // teardown (blocks_/dedicatedAllocations_ are mutated under mutex_).
     std::lock_guard<std::mutex> lock(mutex_);
@@ -401,7 +473,7 @@ UnifiedMemoryPool::~UnifiedMemoryPool() {
     }
 }
 
-bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig& config) {
+bool UnifiedMemoryPoolImpl::initialize(const DeviceConfig& device, const PoolConfig& config) {
     deviceConfig_ = device;
     config_ = config;
     device_ = device.device;
@@ -455,7 +527,7 @@ bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig&
             : deviceConfig_.graphicsQueueFamily;
 
         offloadManager_ = std::unique_ptr<OffloadManager, OffloadManagerDeleter>(
-            new OffloadManager(this, offloadConfig));
+            new OffloadManager(outer_, offloadConfig));
         VVM_LOG_INFO("OffloadManager created with host shadow size: {} MB",
                      offloadConfig.hostShadowSize / (1024*1024));
     }
@@ -478,7 +550,7 @@ bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig&
 // initialize() stages
 // ---------------------------------------------------------------------------
 
-bool UnifiedMemoryPool::isVulkanBackend() const {
+bool UnifiedMemoryPoolImpl::isVulkanBackend() const {
     const MemBackendKind explicitKind =
         static_cast<MemBackendKind>(deviceConfig_.memBackendKind);
     return (explicitKind == MemBackendKind::Vulkan) ||
@@ -486,7 +558,7 @@ bool UnifiedMemoryPool::isVulkanBackend() const {
             deviceConfig_.physicalDevice != VK_NULL_HANDLE);
 }
 
-bool UnifiedMemoryPool::validateConfig() const {
+bool UnifiedMemoryPoolImpl::validateConfig() const {
     // Chonk Chunks validation: both knobs must be set together, sizes must be
     // powers of two, and a chunk must hold at least one min-aligned allocation.
     auto pow2 = [](VkDeviceSize v) { return v != 0 && (v & (v - 1)) == 0; };
@@ -526,7 +598,7 @@ bool UnifiedMemoryPool::validateConfig() const {
     return true;
 }
 
-bool UnifiedMemoryPool::selectMemoryTypes() {
+bool UnifiedMemoryPoolImpl::selectMemoryTypes() {
     // Discovery dispatch: the Vulkan path is byte-identical to the historical
     // behavior; the else-branch drives discovery through the backend seam
     // (HIP today).
@@ -664,7 +736,7 @@ VVM_LOG_INFO("Selected HOST_VISIBLE memory type {} (heap budget: {} MB)",
     return true;
 }
 
-bool UnifiedMemoryPool::initTransferPool() {
+bool UnifiedMemoryPoolImpl::initTransferPool() {
     // Vulkan only: the HIP memory plane has no Vulkan queuing; the
     // copyBuffer path is a Vulkan-direct v1 API.
     // Bisect knobs (GGML_VVM_NO_CMDPOOL / GGML_VVM_NO_INITBLOCK via env are
@@ -687,7 +759,7 @@ bool UnifiedMemoryPool::initTransferPool() {
     return true;
 }
 
-bool UnifiedMemoryPool::bootstrapFirstBlock() {
+bool UnifiedMemoryPoolImpl::bootstrapFirstBlock() {
     // First block: best-fit, not config-size. On a device whose heap is already
     // mostly committed (context-init pools created after layer-split weight
     // placement), a blind 1 GiB initial block can OOM where a smaller first
@@ -737,7 +809,7 @@ bool UnifiedMemoryPool::bootstrapFirstBlock() {
 //      than a few huge ones (with a 256 MiB floor so the block stays useful).
 // The result is snapped up to a power of two (buddy requirement) and never
 // below the request itself. Static pick wins when adaptive is disabled.
-VkDeviceSize UnifiedMemoryPool::adaptiveBlockSizeFor(VkDeviceSize requestSize,
+VkDeviceSize UnifiedMemoryPoolImpl::adaptiveBlockSizeFor(VkDeviceSize requestSize,
                                                      VkDeviceSize staticPick) {
     // File-local pow2 helpers (buddy's own are private to the audited core).
     auto ceilPow2 = [](VkDeviceSize v) -> VkDeviceSize {
@@ -799,13 +871,13 @@ VkDeviceSize UnifiedMemoryPool::adaptiveBlockSizeFor(VkDeviceSize requestSize,
     return pick;
 }
 
-std::optional<uint32_t> UnifiedMemoryPool::findMemoryType(
+std::optional<uint32_t> UnifiedMemoryPoolImpl::findMemoryType(
     VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred) {
     
     return findMemoryTypeIndex(getDeviceMemoryInfo().memProps, required, preferred);
 }
 
-VkMemoryPropertyFlags UnifiedMemoryPool::usageToFlags(MemoryUsage usage) const {
+VkMemoryPropertyFlags UnifiedMemoryPoolImpl::usageToFlags(MemoryUsage usage) const {
     switch (usage) {
         case MemoryUsage::GpuOnly:
             return VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
@@ -821,7 +893,7 @@ VkMemoryPropertyFlags UnifiedMemoryPool::usageToFlags(MemoryUsage usage) const {
     }
 }
 
-bool UnifiedMemoryPool::reserve(VkDeviceSize bytes) {
+bool UnifiedMemoryPoolImpl::reserve(VkDeviceSize bytes) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (bytes == 0) return true;
     // Sanity ceiling independent of fraction settings: a hold larger than
@@ -843,7 +915,7 @@ bool UnifiedMemoryPool::reserve(VkDeviceSize bytes) {
     return true;
 }
 
-void UnifiedMemoryPool::unreserve(VkDeviceSize bytes) {
+void UnifiedMemoryPoolImpl::unreserve(VkDeviceSize bytes) {
     std::lock_guard<std::mutex> lock(mutex_);
     const VkDeviceSize before = reservedBytes_;
     reservedBytes_ = (bytes >= reservedBytes_) ? 0 : reservedBytes_ - bytes;
@@ -852,14 +924,14 @@ void UnifiedMemoryPool::unreserve(VkDeviceSize bytes) {
                  before / (1024 * 1024), reservedBytes_ / (1024 * 1024));
 }
 
-VkDeviceSize UnifiedMemoryPool::reservedBytes() const {
+VkDeviceSize UnifiedMemoryPoolImpl::reservedBytes() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return reservedBytes_;
 }
 
 // Static heap size on either path (Vulkan physical device or standalone
 // backend). Caller must hold mutex_. Returns 0 when unknown.
-VkDeviceSize UnifiedMemoryPool::heapSizeBytes() const {
+VkDeviceSize UnifiedMemoryPoolImpl::heapSizeBytes() const {
     if (deviceConfig_.physicalDevice != VK_NULL_HANDLE) {
         const auto info = getDeviceMemoryInfo();
         if (deviceLocalHeapIndex_ < info.heapSizes.size()) {
@@ -876,7 +948,7 @@ VkDeviceSize UnifiedMemoryPool::heapSizeBytes() const {
     return 0;
 }
 
-bool UnifiedMemoryPool::wouldExceedBudget(VkDeviceSize additionalBytes) const {
+bool UnifiedMemoryPoolImpl::wouldExceedBudget(VkDeviceSize additionalBytes) const {
     // Note: caller must hold mutex_ if called from within another locked method
     VkDeviceSize currentPool = reservedBytes_;
     for (const auto& block : blocks_) currentPool += block.size;
@@ -944,7 +1016,7 @@ bool UnifiedMemoryPool::wouldExceedBudget(VkDeviceSize additionalBytes) const {
     return false;
 }
 
-void UnifiedMemoryPool::setDebugName(VkObjectType objectType, uint64_t objectHandle,
+void UnifiedMemoryPoolImpl::setDebugName(VkObjectType objectType, uint64_t objectHandle,
                                      const char* name) const {
     if (!debugUtilsEnabled_ || !fnSetDebugName_ || !name || objectHandle == 0) return;
     VkDebugUtilsObjectNameInfoEXT info{};
@@ -955,7 +1027,7 @@ void UnifiedMemoryPool::setDebugName(VkObjectType objectType, uint64_t objectHan
     fnSetDebugName_(device_, &info);
 }
 
-bool UnifiedMemoryPool::validateDeviceCapabilities() const {
+bool UnifiedMemoryPoolImpl::validateDeviceCapabilities() const {
     bool ok = true;
 
     // Query 1.2 features (bufferDeviceAddress + timelineSemaphore live here,
@@ -1011,7 +1083,7 @@ bool UnifiedMemoryPool::validateDeviceCapabilities() const {
     return ok;
 }
 
-std::optional<VkDeviceMemory> UnifiedMemoryPool::allocateBlock(
+std::optional<VkDeviceMemory> UnifiedMemoryPoolImpl::allocateBlock(
     VkDeviceSize size, uint32_t memoryTypeIndex, bool isChunk, uint32_t chunkTier) {
 
     // Pool blocks are strictly NON-exportable. Cross-GPU sharing must use
@@ -1183,7 +1255,7 @@ static VkExternalMemoryHandleTypeFlags filterExportableBits(
 // IDeviceMemoryBackend when the HIP/L0 adapters land.
 // ---------------------------------------------------------------------------
 
-std::optional<Allocation> UnifiedMemoryPool::allocateDedicatedExportable(
+std::optional<Allocation> UnifiedMemoryPoolImpl::allocateDedicatedExportable(
         VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags flags) {
         
         VVM_LOG_INFO("allocateDedicatedExportable: size={}, usage={}, flags={}", size, usage, flags);
@@ -1371,7 +1443,7 @@ VVM_LOG_INFO("allocateDedicatedExportable: bind succeeded");
     return alloc;
 }
 
-std::optional<Allocation> UnifiedMemoryPool::allocateDedicatedBackend(
+std::optional<Allocation> UnifiedMemoryPoolImpl::allocateDedicatedBackend(
     VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags flags) {
     // Standalone backend allocation for non-Vulkan pools (HIP today):
     // the backend's dedicated equivalent is a plain hipMalloc - there is no
@@ -1429,7 +1501,7 @@ std::optional<Allocation> UnifiedMemoryPool::allocateDedicatedBackend(
     return alloc;
 }
 
-std::optional<Allocation> UnifiedMemoryPool::allocateDedicated(
+std::optional<Allocation> UnifiedMemoryPoolImpl::allocateDedicated(
     VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags flags) {
     // NOTE: caller (allocate) holds mutex_ -- do NOT lock here or we deadlock.
 
@@ -1586,7 +1658,7 @@ std::optional<Allocation> UnifiedMemoryPool::allocateDedicated(
     return alloc;
 }
 
-std::optional<Allocation> UnifiedMemoryPool::allocate(VkDeviceSize size,
+std::optional<Allocation> UnifiedMemoryPoolImpl::allocate(VkDeviceSize size,
                                                         VkBufferUsageFlags usage,
                                                         VkMemoryPropertyFlags flags) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1738,7 +1810,7 @@ std::optional<Allocation> UnifiedMemoryPool::allocate(VkDeviceSize size,
     return allocateDedicated(size, usage, flags);
 }
 
-std::optional<Allocation> UnifiedMemoryPool::allocate(const AllocDesc& desc) {
+std::optional<Allocation> UnifiedMemoryPoolImpl::allocate(const AllocDesc& desc) {
     if (desc.exportable) {
         auto alloc = allocateDedicatedExportable(desc.size, desc.usage,
                                                  usageToFlags(desc.memoryUsage));
@@ -1755,12 +1827,12 @@ std::optional<Allocation> UnifiedMemoryPool::allocate(const AllocDesc& desc) {
     return alloc;
 }
 
-std::optional<Allocation> UnifiedMemoryPool::allocateTensor(VkDeviceSize size,
+std::optional<Allocation> UnifiedMemoryPoolImpl::allocateTensor(VkDeviceSize size,
                                                              VkBufferUsageFlags usage) {
     return allocate(size, usage | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
 }
 
-void UnifiedMemoryPool::deallocate(Allocation&& alloc) {
+void UnifiedMemoryPoolImpl::deallocate(Allocation&& alloc) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     // Validate generation counter to prevent stale handle use
@@ -1789,7 +1861,7 @@ void UnifiedMemoryPool::deallocate(Allocation&& alloc) {
     }
 }
 
-void UnifiedMemoryPool::deallocate(UniqueAllocation&& alloc) {
+void UnifiedMemoryPoolImpl::deallocate(UniqueAllocation&& alloc) {
     if (!alloc) return;
     
     // Extract the raw allocation and deallocate
@@ -1797,7 +1869,7 @@ void UnifiedMemoryPool::deallocate(UniqueAllocation&& alloc) {
     deallocate(std::move(rawAlloc));
 }
 
-std::optional<ExternalMemoryInfo> UnifiedMemoryPool::exportMemory(
+std::optional<ExternalMemoryInfo> UnifiedMemoryPoolImpl::exportMemory(
     const Allocation& alloc, ExternalHandleType type) {
     
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1907,7 +1979,7 @@ std::optional<ExternalMemoryInfo> UnifiedMemoryPool::exportMemory(
     return std::nullopt;
 }
 
-std::optional<Allocation> UnifiedMemoryPool::importMemory(
+std::optional<Allocation> UnifiedMemoryPoolImpl::importMemory(
     ExternalMemoryInfo&& info, VkBufferUsageFlags usage) {
     
     std::lock_guard<std::mutex> lock(mutex_);
@@ -2129,7 +2201,7 @@ std::optional<Allocation> UnifiedMemoryPool::importMemory(
     return alloc;
 }
 
-bool UnifiedMemoryPool::copyBuffer(const Allocation& src, const Allocation& dst,
+bool UnifiedMemoryPoolImpl::copyBuffer(const Allocation& src, const Allocation& dst,
                                    VkDeviceSize srcOffset, VkDeviceSize dstOffset,
                                    VkDeviceSize size, VkFence fence) {
     if (!device_ || src.buffer == VK_NULL_HANDLE || dst.buffer == VK_NULL_HANDLE ||
@@ -2204,7 +2276,7 @@ bool UnifiedMemoryPool::copyBuffer(const Allocation& src, const Allocation& dst,
     return rc == VK_SUCCESS;
 }
 
-std::optional<MigrationOperation> UnifiedMemoryPool::offloadToHost(Allocation& alloc) {
+std::optional<MigrationOperation> UnifiedMemoryPoolImpl::offloadToHost(Allocation& alloc) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!offloadManager_) {
         VVM_LOG_WARN("offloadToHost called but OffloadManager not initialized");
@@ -2213,7 +2285,7 @@ std::optional<MigrationOperation> UnifiedMemoryPool::offloadToHost(Allocation& a
     return offloadManager_->offload(alloc);
 }
 
-std::optional<MigrationOperation> UnifiedMemoryPool::reloadToDevice(Allocation& alloc) {
+std::optional<MigrationOperation> UnifiedMemoryPoolImpl::reloadToDevice(Allocation& alloc) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!offloadManager_) {
         VVM_LOG_WARN("reloadToDevice called but OffloadManager not initialized");
@@ -2222,14 +2294,14 @@ std::optional<MigrationOperation> UnifiedMemoryPool::reloadToDevice(Allocation& 
     return offloadManager_->reload(alloc);
 }
 
-void UnifiedMemoryPool::waitMigration(const MigrationOperation& op) {
+void UnifiedMemoryPoolImpl::waitMigration(const MigrationOperation& op) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (op.completionFence) {
         vkWaitForFences(device_, 1, &op.completionFence, VK_TRUE, UINT64_MAX);
     }
 }
 
-PoolStats UnifiedMemoryPool::getStats() const {
+PoolStats UnifiedMemoryPoolImpl::getStats() const {
     std::lock_guard<std::mutex> lock(mutex_);
     PoolStats stats;
     stats.dedicatedCount = static_cast<uint32_t>(dedicatedAllocations_.size());
@@ -2265,7 +2337,7 @@ PoolStats UnifiedMemoryPool::getStats() const {
     return stats;
 }
 
-DeviceMemoryInfo UnifiedMemoryPool::getDeviceMemoryInfo() const {
+DeviceMemoryInfo UnifiedMemoryPoolImpl::getDeviceMemoryInfo() const {
     // Note: caller must hold mutex_ if called from within a locked method
     DeviceMemoryInfo info;
     vkGetPhysicalDeviceMemoryProperties(deviceConfig_.physicalDevice, &info.memProps);
@@ -2291,7 +2363,7 @@ DeviceMemoryInfo UnifiedMemoryPool::getDeviceMemoryInfo() const {
     return info;
 }
 
-void UnifiedMemoryPool::defragment() {
+void UnifiedMemoryPoolImpl::defragment() {
     std::lock_guard<std::mutex> lock(mutex_);
     // The buddy allocator already coalesces adjacent free ranges on every
     // deallocate, and the pool has no registry of user-owned VkBuffer handles
@@ -2314,7 +2386,7 @@ void UnifiedMemoryPool::defragment() {
                  blocks_.size());
 }
 
-void UnifiedMemoryPool::trim() {
+void UnifiedMemoryPoolImpl::trim() {
     std::lock_guard<std::mutex> lock(mutex_);
     // Release empty blocks back to the driver, keeping at least one block alive.
     for (int i = static_cast<int>(blocks_.size()) - 1; i >= 0; --i) {
@@ -2335,7 +2407,7 @@ void UnifiedMemoryPool::trim() {
 // Private Helpers
 // ============================================================================
 
-std::optional<Allocation> UnifiedMemoryPool::subAllocate(VkDeviceSize size,
+std::optional<Allocation> UnifiedMemoryPoolImpl::subAllocate(VkDeviceSize size,
                                                           VkDeviceSize alignment,
                                                           uint32_t blockIndex,
                                                           VkBufferUsageFlags usage) {
@@ -2413,7 +2485,7 @@ std::optional<Allocation> UnifiedMemoryPool::subAllocate(VkDeviceSize size,
     return alloc;
 }
 
-void UnifiedMemoryPool::subDeallocate(Allocation&& alloc) {
+void UnifiedMemoryPoolImpl::subDeallocate(Allocation&& alloc) {
     // Dedicated allocations (blockIndex == UINT32_MAX) have their own VkDeviceMemory
     // and VkBuffer - destroy both directly and remove from tracking
     if (alloc.blockIndex == UINT32_MAX) {
@@ -2470,7 +2542,7 @@ void UnifiedMemoryPool::subDeallocate(Allocation&& alloc) {
     alloc.hostPtr = nullptr;
 }
 
-VkDeviceSize UnifiedMemoryPool::alignUp(VkDeviceSize value, VkDeviceSize alignment) {
+VkDeviceSize UnifiedMemoryPoolImpl::alignUp(VkDeviceSize value, VkDeviceSize alignment) {
     // Validate power-of-2 alignment (required for bitwise rounding)
     if (alignment == 0) return value;
     if ((alignment & (alignment - 1)) != 0) {

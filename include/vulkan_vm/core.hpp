@@ -366,10 +366,15 @@ class UniqueAllocation;  // forward declaration for deallocate(UniqueAllocation&
 
 class IDeviceMemoryBackend;  // vendor seam (mem_backend.hpp); member below
 
+// Pimpl state for UnifiedMemoryPool (complete type in
+// unified_memory_pool.cpp). The pool's public footprint is one pointer,
+// forever — see the private section below.
+struct UnifiedMemoryPoolImpl;
+
 class VVM_API UnifiedMemoryPool {
 public:
     // Factory
-    static std::optional<UnifiedMemoryPool> create(const DeviceConfig& device, 
+    static std::optional<UnifiedMemoryPool> create(const DeviceConfig& device,
                                                     const PoolConfig& config);
     
     // Non-copyable, movable
@@ -460,10 +465,10 @@ public:
     // Stats & Info
     PoolStats getStats() const;
     DeviceMemoryInfo getDeviceMemoryInfo() const;
-    const PoolConfig& getConfig() const { return config_; }
-    const DeviceConfig& getDeviceConfig() const { return deviceConfig_; }
-    VkDevice getDevice() const { return device_; }
-    VkPhysicalDevice getPhysicalDevice() const { return deviceConfig_.physicalDevice; }
+    const PoolConfig& getConfig() const;
+    const DeviceConfig& getDeviceConfig() const;
+    VkDevice getDevice() const;
+    VkPhysicalDevice getPhysicalDevice() const;
 
     // Maintenance
     // NOTE: buddy coalescing already merges adjacent free ranges on
@@ -473,118 +478,21 @@ public:
     void trim();        // release empty blocks back to OS (optional)
 
 private:
+    // In-repo privileged users (construct pools via the private default
+    // ctor inside create() flows; same friends as before pimpl).
     friend class MultiGPUPoolManager;
     friend struct GPUInstance;
-    // Out-of-line (defined in unified_memory_pool.cpp): the inline-defaulted
-    // form generated member-destruction code in every including TU, which
-    // requires IDeviceMemoryBackend to be complete there.
+    // ABI stability (pimpl): the class footprint is exactly one pointer,
+    // forever. All state, generation tracking, and private methods live in
+    // UnifiedMemoryPool::Impl (unified_memory_pool.cpp). Member changes no
+    // longer alter sizeof(UnifiedMemoryPool), so std::optional<Pool>
+    // crossing the DLL boundary stays valid across library updates —
+    // consumers relink only when PUBLIC signatures change. Moved-from pools
+    // transfer the pointer (no partial state exists to audit).
+    std::unique_ptr<UnifiedMemoryPoolImpl> impl_;
+
+    // Out-of-line (defined in unified_memory_pool.cpp).
     UnifiedMemoryPool();
-    bool initialize(const DeviceConfig& device, const PoolConfig& config);
-
-    // initialize() stages (split for readability; each returns false on
-    // failure and operates on deviceConfig_/config_/backend_ already set):
-    //   isVulkanBackend    - vendor predicate (explicit kind wins; Auto ->
-    //                        Vulkan when a physical device is present)
-    //   validateConfig     - pure PoolConfig invariant checks (chunk ladder,
-    //                        alignment, pow2 rules)
-    //   selectMemoryTypes  - discovery: device-local + host-visible type and
-    //                        heap selection (Vulkan queries or backend-driven)
-    //   initTransferPool   - Vulkan-only transfer command pool
-    //   bootstrapFirstBlock- best-fit initial block via the ladder
-    bool isVulkanBackend() const;
-    bool validateConfig() const;
-    bool selectMemoryTypes();
-    bool initTransferPool();
-    bool bootstrapFirstBlock();
-
-    // Vendor seam (mem_backend.hpp): the memory plane behind the pool's
-    // allocation policy. Vulkan today; HIP/L0 adapters follow the same
-    // interface. Created in initialize(), destroyed with the pool (out-of-line
-    // destructor keeps the incomplete type legal here).
-    std::unique_ptr<IDeviceMemoryBackend> backend_;
-    
-    // Verify required Vulkan features/extensions were enabled at device creation.
-    bool validateDeviceCapabilities() const;
-    
-    // Generation tracking for handle validation.
-    //
-    // Generations are monotonic, but validity is tracked via a LIVE SET, not
-    // by comparing against the current counter. Comparing against the counter
-    // only ever matches the most-recently-created allocation, so freeing an
-    // older allocation (out of order) was wrongly rejected and leaked memory.
-    uint64_t nextGeneration() {
-        uint64_t g = ++generationCounter_;
-        liveGenerations_.insert(g);
-        return g;
-    }
-    uint64_t getCurrentGeneration() const { return generationCounter_; }
-    bool isValidGeneration(uint64_t generation) const {
-        return liveGenerations_.count(generation) != 0;
-    }
-    void retireGeneration(uint64_t generation) {
-        liveGenerations_.erase(generation);
-    }
-    
-    std::optional<uint32_t> findMemoryType(VkMemoryPropertyFlags required,
-                                           VkMemoryPropertyFlags preferred);
-    std::optional<VkDeviceMemory> allocateBlock(VkDeviceSize size,
-                                                 uint32_t memoryTypeIndex,
-                                                 bool isChunk = false,
-                                                 uint32_t chunkTier = 0);
-    std::optional<Allocation> subAllocate(VkDeviceSize size,
-                                          VkDeviceSize alignment,
-                                          uint32_t blockIndex,
-                                          VkBufferUsageFlags usage);
-    void subDeallocate(Allocation&& alloc);
-    
-    // Buddy allocator helpers
-    VkDeviceSize alignUp(VkDeviceSize value, VkDeviceSize alignment);
-    
-    // Mapping/wiring helpers
-    VkMemoryPropertyFlags usageToFlags(MemoryUsage usage) const;
-    bool wouldExceedBudget(VkDeviceSize additionalBytes) const;
-    VkDeviceSize heapSizeBytes() const;
-    void setDebugName(VkObjectType objectType, uint64_t objectHandle,
-                      const char* name) const;
-    
-    // Thread safety: all public methods are guarded by this mutex
-    mutable std::mutex mutex_;
-    
-    DeviceConfig deviceConfig_;
-    PoolConfig config_;
-    VkDevice device_ = VK_NULL_HANDLE;
-    std::vector<BlockInfo> blocks_;
-    // Dedicated allocations (exportable/imported) tracked separately from blocks
-    std::vector<Allocation> dedicatedAllocations_;
-    // Budget held via reserve(): counts as committed in wouldExceedBudget
-    // until unreserve()d. Guarded by mutex_ like everything else.
-    VkDeviceSize reservedBytes_ = 0;
-    uint32_t deviceLocalMemoryType_ = UINT32_MAX;
-    uint32_t hostVisibleMemoryType_ = UINT32_MAX;
-    uint32_t deviceLocalHeapIndex_ = UINT32_MAX;
-    bool memoryBudgetAvailable_ = false;
-    VkCommandPool transferCmdPool_ = VK_NULL_HANDLE;
-    bool debugUtilsEnabled_ = false;
-    PFN_vkSetDebugUtilsObjectNameEXT fnSetDebugName_ = nullptr;
-    
-    // Offload manager for host swap (created lazily by initializeOffload)
-    std::unique_ptr<OffloadManager, OffloadManagerDeleter> offloadManager_;
-    
-    // VRAM high-water warning fired? (see VRAM_OVERFLOW_FINDINGS.md)
-    bool warnedHighWater_ = false;
-    // Generation counter for handle validation (prevents stale handle use)
-    uint64_t generationCounter_ = 0;
-    // Live (not-yet-freed) generations. An allocation's generation is valid
-    // iff it is present here; deallocate() retires it.
-    std::unordered_set<uint64_t> liveGenerations_;
-
-    // Adaptive sizing history: ring of recent buddy-path request sizes.
-    // Drives adaptiveBlockSize(); guarded by mutex_ like everything else.
-    static constexpr uint32_t kSizeHistory = 8;
-    VkDeviceSize recentSizes_[kSizeHistory] = {};
-    uint32_t recentIdx_ = 0;
-    uint32_t recentCount_ = 0;
-    VkDeviceSize adaptiveBlockSizeFor(VkDeviceSize requestSize, VkDeviceSize staticPick);
 };
 
 // ============================================================================
