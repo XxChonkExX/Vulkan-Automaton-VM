@@ -481,6 +481,22 @@ private:
     UnifiedMemoryPool();
     bool initialize(const DeviceConfig& device, const PoolConfig& config);
 
+    // initialize() stages (split for readability; each returns false on
+    // failure and operates on deviceConfig_/config_/backend_ already set):
+    //   isVulkanBackend    - vendor predicate (explicit kind wins; Auto ->
+    //                        Vulkan when a physical device is present)
+    //   validateConfig     - pure PoolConfig invariant checks (chunk ladder,
+    //                        alignment, pow2 rules)
+    //   selectMemoryTypes  - discovery: device-local + host-visible type and
+    //                        heap selection (Vulkan queries or backend-driven)
+    //   initTransferPool   - Vulkan-only transfer command pool
+    //   bootstrapFirstBlock- best-fit initial block via the ladder
+    bool isVulkanBackend() const;
+    bool validateConfig() const;
+    bool selectMemoryTypes();
+    bool initTransferPool();
+    bool bootstrapFirstBlock();
+
     // Vendor seam (mem_backend.hpp): the memory plane behind the pool's
     // allocation policy. Vulkan today; HIP/L0 adapters follow the same
     // interface. Created in initialize(), destroyed with the pool (out-of-line

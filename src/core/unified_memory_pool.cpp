@@ -342,17 +342,12 @@ bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig&
     config_ = config;
     device_ = device.device;
 
-    // Vendor seam: dispatch on what the DeviceConfig carries. Explicit kind
-    // wins; Auto means Vulkan when a physical device is present, HIP
-    // otherwise (Level0 has no implicit signal and needs an explicit value).
-    const MemBackendKind explicitKind =
-        static_cast<MemBackendKind>(deviceConfig_.memBackendKind);
-    const bool isVulkan = (explicitKind == MemBackendKind::Vulkan) ||
-        (explicitKind == MemBackendKind::Auto &&
-         deviceConfig_.physicalDevice != VK_NULL_HANDLE);
+    // Vendor seam: dispatch on what the DeviceConfig carries (see
+    // isVulkanBackend for the predicate; Level0 requires an explicit kind).
+    const bool isVulkan = isVulkanBackend();
     const MemBackendKind kind = isVulkan ? MemBackendKind::Vulkan
-        : (explicitKind == MemBackendKind::Level0 ? MemBackendKind::Level0
-                                                 : MemBackendKind::Hip);
+        : (static_cast<MemBackendKind>(deviceConfig_.memBackendKind) == MemBackendKind::Level0
+               ? MemBackendKind::Level0 : MemBackendKind::Hip);
     backend_ = create_memory_backend(kind, deviceConfig_);
     if (!backend_) {
         VVM_LOG_ERROR("failed to create the {} memory backend",
@@ -364,7 +359,61 @@ bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig&
     if (isVulkan && !validateDeviceCapabilities()) {
         return false;
     }
+    if (!validateConfig()) {
+        return false;
+    }
+    if (!selectMemoryTypes()) {
+        return false;
+    }
+    if (isVulkan && !initTransferPool()) {
+        return false;
+    }
+    if (!bootstrapFirstBlock()) {
+        return false;
+    }
 
+    // Create OffloadManager if offload is enabled (Vulkan only in v1; the
+    // discovery stage above already warned for non-Vulkan configs).
+    if (isVulkan && config_.enableHostVisible) {
+        OffloadConfig offloadConfig;
+        VkDeviceSize shadow = static_cast<VkDeviceSize>(config_.blockSize * config_.hostShadowMultiplier);
+        if (config_.maxHostShadowBytes > 0) {
+            shadow = std::min(shadow, config_.maxHostShadowBytes);
+        }
+        offloadConfig.hostShadowSize = shadow;
+        // madvise/mprotect on vkMapMemory regions is unsafe (see OffloadConfig
+        // docs); these MUST stay disabled by default.
+        offloadConfig.useMadvise = false;
+        offloadConfig.useMprotect = false;
+        offloadConfig.transferQueue = deviceConfig_.transferQueue;
+        offloadConfig.transferQueueFamily = deviceConfig_.transferQueueFamily != UINT32_MAX
+            ? deviceConfig_.transferQueueFamily
+            : deviceConfig_.graphicsQueueFamily;
+
+        offloadManager_ = std::unique_ptr<OffloadManager, OffloadManagerDeleter>(
+            new OffloadManager(this, offloadConfig));
+        VVM_LOG_INFO("OffloadManager created with host shadow size: {} MB",
+                     offloadConfig.hostShadowSize / (1024*1024));
+    }
+
+    VVM_LOG_INFO("UnifiedMemoryPool initialized successfully (blockSize={} MB, alignment={} KB)",
+                 config_.blockSize / (1024*1024), config_.minAlignment / 1024);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// initialize() stages
+// ---------------------------------------------------------------------------
+
+bool UnifiedMemoryPool::isVulkanBackend() const {
+    const MemBackendKind explicitKind =
+        static_cast<MemBackendKind>(deviceConfig_.memBackendKind);
+    return (explicitKind == MemBackendKind::Vulkan) ||
+           (explicitKind == MemBackendKind::Auto &&
+            deviceConfig_.physicalDevice != VK_NULL_HANDLE);
+}
+
+bool UnifiedMemoryPool::validateConfig() const {
     // Chonk Chunks validation: both knobs must be set together, sizes must be
     // powers of two, and a chunk must hold at least one min-aligned allocation.
     auto pow2 = [](VkDeviceSize v) { return v != 0 && (v & (v - 1)) == 0; };
@@ -401,17 +450,20 @@ bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig&
                       config_.allocationAlignment, config_.minAlignment);
         return false;
     }
+    return true;
+}
 
-    // Discovery dispatch: the Vulkan path below is byte-identical to the
-    // historical behavior; the else-branch drives discovery through the
-    // backend seam (HIP today).
-    if (isVulkan) {
+bool UnifiedMemoryPool::selectMemoryTypes() {
+    // Discovery dispatch: the Vulkan path is byte-identical to the historical
+    // behavior; the else-branch drives discovery through the backend seam
+    // (HIP today).
+    if (isVulkanBackend()) {
     // Use MemoryTypeSelector for optimal memory type selection.
     // NOTE: type selection is decoupled from capacity here (minHeapBudget=0).
     // Demanding a full blockSize of *free budget* at type-selection time would
     // refuse to create pools on heaps that are merely nearly full (e.g. a
     // context-init pool created after layer-split weight placement committed
-    // ~97% of the heap) — even though the best-fit first-block ladder below
+    // ~97% of the heap) - even though the best-fit first-block ladder below
     // can bootstrap from a small block. Capacity is enforced per-allocation
     // by wouldExceedBudget + vkAllocateMemory, where it belongs.
     MemoryTypeSelector selector(deviceConfig_.physicalDevice);
@@ -448,7 +500,7 @@ bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig&
                  deviceLocalMemoryType_,
                  devLocalResult.heapBudget / (1024*1024),
                  devLocalResult.heapUtilization * 100.0f);
-    
+
     // Remember which heap the device-local type lives on (for budget checks).
     {
         auto memProps = getDeviceMemoryInfo().memProps;
@@ -456,14 +508,14 @@ bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig&
             deviceLocalHeapIndex_ = memProps.memoryTypes[deviceLocalMemoryType_].heapIndex;
         }
     }
-    
+
     // Detect VK_EXT_memory_budget for live budget checks.
     memoryBudgetAvailable_ = checkDeviceExtensionSupport(
         deviceConfig_.physicalDevice, {VK_EXT_MEMORY_BUDGET_EXTENSION_NAME});
     if (memoryBudgetAvailable_) {
         VVM_LOG_INFO("VK_EXT_memory_budget available; budget-aware pool growth enabled");
     }
-    
+
     // VK_EXT_debug_utils: name buffers/memory for RenderDoc/validation.
     debugUtilsEnabled_ = checkDeviceExtensionSupport(
         deviceConfig_.physicalDevice, {VK_EXT_DEBUG_UTILS_EXTENSION_NAME});
@@ -472,7 +524,7 @@ bool UnifiedMemoryPool::initialize(const DeviceConfig& device, const PoolConfig&
             device_, "vkSetDebugUtilsObjectNameEXT");
         if (!fnSetDebugName_) debugUtilsEnabled_ = false;
     }
-    
+
     // Host-visible for shadow/offload
     if (config_.enableHostVisible) {
         auto hostVisibleResult = selector.select(
@@ -536,33 +588,42 @@ VVM_LOG_INFO("Selected HOST_VISIBLE memory type {} (heap budget: {} MB)",
             VVM_LOG_WARN("enableHostVisible is not supported by non-Vulkan backends yet - ignored");
         }
     }
+    return true;
+}
 
-    // Create transfer command pool (Vulkan only: the HIP memory plane has no
-    // Vulkan queuing; the copyBuffer path is a Vulkan-direct v1 API).
+bool UnifiedMemoryPool::initTransferPool() {
+    // Vulkan only: the HIP memory plane has no Vulkan queuing; the
+    // copyBuffer path is a Vulkan-direct v1 API.
     // Bisect knobs (GGML_VVM_NO_CMDPOOL / GGML_VVM_NO_INITBLOCK via env are
     // handled by the integration layer flipping these config-adjacent statics;
     // here we only honor the internal skip flags).
-    if (isVulkan && !getenv("VVM_SKIP_CMDPOOL")) {
+    if (getenv("VVM_SKIP_CMDPOOL")) {
+        return true;
+    }
     VkCommandPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    poolInfo.queueFamilyIndex = deviceConfig_.transferQueueFamily != UINT32_MAX 
-        ? deviceConfig_.transferQueueFamily 
+    poolInfo.queueFamilyIndex = deviceConfig_.transferQueueFamily != UINT32_MAX
+        ? deviceConfig_.transferQueueFamily
         : deviceConfig_.graphicsQueueFamily;
     poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    
+
     if (vkCreateCommandPool(device_, &poolInfo, nullptr, &transferCmdPool_) != VK_SUCCESS) {
         VVM_LOG_ERROR("Failed to create transfer command pool");
         return false;
     }
-    }
-    
+    return true;
+}
+
+bool UnifiedMemoryPool::bootstrapFirstBlock() {
     // First block: best-fit, not config-size. On a device whose heap is already
     // mostly committed (context-init pools created after layer-split weight
     // placement), a blind 1 GiB initial block can OOM where a smaller first
     // block leaves enough budget for the pool to bootstrap and grow on demand.
     // Order: device-resident config ladder (smallest >= minAllocation),
     // then fall back to the configured block size, then to 256 MiB chunks.
-    if (!getenv("VVM_SKIP_INITBLOCK")) {
+    if (getenv("VVM_SKIP_INITBLOCK")) {
+        return true;
+    }
     VkDeviceSize firstBlock = 0;
     {
         VkDeviceSize smallestLadder = 0;
@@ -581,7 +642,7 @@ VVM_LOG_INFO("Selected HOST_VISIBLE memory type {} (heap budget: {} MB)",
             if (!wouldExceedBudget(c)) { firstBlock = c; break; }
         }
         if (firstBlock == 0) {
-            // Even 256 MiB exceeds the configured cap — the budget check is
+            // Even 256 MiB exceeds the configured cap - the budget check is
             // advisory here (growth checks still apply); try 256 MiB once and
             // let vkAllocateMemory decide.
             firstBlock = 256ull * 1024ull * 1024ull;
@@ -591,37 +652,8 @@ VVM_LOG_INFO("Selected HOST_VISIBLE memory type {} (heap budget: {} MB)",
         VVM_LOG_ERROR("Failed to allocate initial memory block ({} MB)", firstBlock / (1024 * 1024));
         return false;
     }
-    }
-    
-    // Create OffloadManager if offload is enabled (Vulkan only in v1; the
-    // discovery branch above already warned for non-Vulkan configs).
-    if (isVulkan && config_.enableHostVisible) {
-        OffloadConfig offloadConfig;
-        VkDeviceSize shadow = static_cast<VkDeviceSize>(config_.blockSize * config_.hostShadowMultiplier);
-        if (config_.maxHostShadowBytes > 0) {
-            shadow = std::min(shadow, config_.maxHostShadowBytes);
-        }
-        offloadConfig.hostShadowSize = shadow;
-        // madvise/mprotect on vkMapMemory regions is unsafe (see OffloadConfig
-        // docs); these MUST stay disabled by default.
-        offloadConfig.useMadvise = false;
-        offloadConfig.useMprotect = false;
-        offloadConfig.transferQueue = deviceConfig_.transferQueue;
-        offloadConfig.transferQueueFamily = deviceConfig_.transferQueueFamily != UINT32_MAX 
-            ? deviceConfig_.transferQueueFamily 
-            : deviceConfig_.graphicsQueueFamily;
-        
-        offloadManager_ = std::unique_ptr<OffloadManager, OffloadManagerDeleter>(
-            new OffloadManager(this, offloadConfig));
-        VVM_LOG_INFO("OffloadManager created with host shadow size: {} MB", 
-                     offloadConfig.hostShadowSize / (1024*1024));
-    }
-    
-    VVM_LOG_INFO("UnifiedMemoryPool initialized successfully (blockSize={} MB, alignment={} KB)",
-                 config_.blockSize / (1024*1024), config_.minAlignment / 1024);
     return true;
 }
-
 // Adaptive block sizing: size new buddy blocks to the observed request
 // pattern instead of the static pick. Two rules, both cheap and local:
 //   1. Pair-packing: if recent requests cluster around the current size,
