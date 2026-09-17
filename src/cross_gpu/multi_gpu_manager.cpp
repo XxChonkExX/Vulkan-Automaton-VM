@@ -2,8 +2,8 @@
 #include "vulkan_vm/buddy_allocator.hpp"
 #include "vulkan_vm/utils.hpp"
 #include "vulkan_vm/cross_gpu/external_memory.hpp"
-
 #include <algorithm>
+#include <cstdlib>
 
 namespace vvm {
 
@@ -468,7 +468,20 @@ bool MultiGPUPoolManager::copyDeviceToDevice(
 // is the "Spark shuffle" path when unified pooling is unavailable.
 
 namespace {
-constexpr VkDeviceSize kHostStagedChunkSize = 4ull * 1024 * 1024;  // 4 MiB
+// Staging chunk size: each chunk costs two full submit+wait round trips
+// (copyBuffer is transient per call), so small chunks cap large transfers
+// (measured XN: 4 MiB -> 1.9, 16 MiB -> 2.8, 64 MiB -> 3.3 GiB/s).
+// Default 16 MiB (32 MiB peak host); override via VVM_STAGED_CHUNK_MB.
+VkDeviceSize stagedChunkSize() {
+    static const VkDeviceSize v = [] {
+        if (const char* e = std::getenv("VVM_STAGED_CHUNK_MB")) {
+            const unsigned long long mb = std::strtoull(e, nullptr, 0);
+            if (mb >= 1 && mb <= 1024) return static_cast<VkDeviceSize>(mb) << 20;
+        }
+        return 16ull * 1024 * 1024;
+    }();
+    return v;
+}
 }  // namespace
 
 bool MultiGPUPoolManager::copyDeviceToDeviceHostStaged(
@@ -507,7 +520,7 @@ bool MultiGPUPoolManager::copyDeviceToDeviceHostStaged(
 
     // Allocate chunk-sized staging buffers on each device. Using chunk size keeps
     // peak host memory bounded regardless of total transfer size.
-    const VkDeviceSize chunkSize = std::min(size, kHostStagedChunkSize);
+    const VkDeviceSize chunkSize = std::min(size, stagedChunkSize());
 
     auto srcStage = srcPool.allocate(chunkSize, kStagingUsage, kStagingFlags);
     auto dstStage = dstPool.allocate(chunkSize, kStagingUsage, kStagingFlags);
