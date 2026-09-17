@@ -685,8 +685,15 @@ MemoryTypeSelector::SelectionResult MemoryTypeSelector::select(
         float utilization = (heapBudget > 0) ? 
             static_cast<float>(heapUsage) / static_cast<float>(heapBudget) : 0.0f;
         
-        // Score: prefer lower utilization, preferred flags match, device-local
+        // Score: prefer lower utilization, preferred flags match, device-local.
+        // Capacity term: a nearly-empty small heap must never outrank the
+        // big heap (seen: a 0%-utilized 256 MB type beating the 11 GB heap
+        // on NVIDIA because 0% utilization outscored 9% - the pool then
+        // OOMed its first block). +1.0 per 8 GiB of heap budget dominates
+        // the <=1.0 utilization/flag terms for any real VRAM heap while
+        // leaving single-heap (UMA) selection unchanged.
         float score = 1.0f - utilization;
+        score += static_cast<float>(heapBudget) / (8.0f * 1024.0f * 1024.0f * 1024.0f);
         
         if ((type.propertyFlags & preferred) == preferred) score += 0.5f;
         if (type.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) score += 0.3f;

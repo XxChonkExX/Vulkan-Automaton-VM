@@ -201,6 +201,30 @@ VkDeviceSize totalDeviceVRAM(VkPhysicalDevice physicalDevice) {
     return total;
 }
 
+// Largest-heap pure DEVICE_LOCAL type. findMemoryTypeIndex returns the
+// FIRST match, which is wrong on NVIDIA: early pure types can sit on small
+// heaps (a 1080 Ti pool landed on a 256 MB heap and OOMed its first block).
+// Used by the preferPureDeviceLocal swap; the initial MemoryTypeSelector
+// pass is score-based and unaffected.
+static std::optional<uint32_t> findLargestHeapPureDeviceLocal(
+    const VkPhysicalDeviceMemoryProperties& memProps) {
+    std::optional<uint32_t> best;
+    uint64_t bestHeap = 0;
+    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+        const VkMemoryPropertyFlags f = memProps.memoryTypes[i].propertyFlags;
+        if ((f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) continue;
+        if (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) continue;
+        const uint32_t h = memProps.memoryTypes[i].heapIndex;
+        if (h >= memProps.memoryHeapCount) continue;
+        const uint64_t hs = memProps.memoryHeaps[h].size;
+        if (!best.has_value() || hs > bestHeap) {
+            best = i;
+            bestHeap = hs;
+        }
+    }
+    return best;
+}
+
 // Driver single-allocation cap (Vulkan 1.1 maxMemoryAllocationSize).
 // Windows AMD/Intel drivers refuse single vkAllocateMemory at/above ~4 GiB
 // (spec explicitly permits refusing >= 4 GiB), so pool growth must never
@@ -630,18 +654,22 @@ bool UnifiedMemoryPoolImpl::selectMemoryTypes() {
 
     // Experiment knob: some drivers place/map ReBAR-mapped VRAM (types with
     // DEVICE_LOCAL|HOST_VISIBLE) differently from pure DEVICE_LOCAL. When
-    // requested, swap to the first pure DEVICE_LOCAL type.
+    // requested, swap to the pure DEVICE_LOCAL type on the LARGEST heap
+    // (first-match is wrong on NVIDIA: early pure types can sit on small
+    // heaps - seen 256 MB OOM on a 1080 Ti).
     if (config_.preferPureDeviceLocal) {
         auto memPropsEarly = getDeviceMemoryInfo().memProps;
         VkMemoryPropertyFlags selFlags{};
         getMemoryTypeProperties(deviceLocalMemoryType_, selFlags, memPropsEarly);
         if (selFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
-            auto pure = findMemoryTypeIndex(memPropsEarly,
-                                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            auto pure = findLargestHeapPureDeviceLocal(memPropsEarly);
             if (pure.has_value()) {
                 deviceLocalMemoryType_ = *pure;
-                VVM_LOG_INFO("preferPureDeviceLocal: switched to memory type {}", *pure);
+                const uint32_t h = memPropsEarly.memoryTypes[*pure].heapIndex;
+                const uint64_t hs = h < memPropsEarly.memoryHeapCount
+                    ? memPropsEarly.memoryHeaps[h].size : 0;
+                VVM_LOG_INFO("preferPureDeviceLocal: switched to memory type {} ({} MB heap)",
+                             *pure, hs / (1024*1024));
             }
         }
     }

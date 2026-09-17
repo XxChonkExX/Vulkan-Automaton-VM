@@ -204,6 +204,15 @@ target_include_directories(multi_gpu_test PRIVATE
     ${TEST_EXTRA_INCLUDES}
 )
 
+# Cross-vendor P2P probe (AMD discrete <-> NVIDIA discrete; reports driver
+# verdicts, verifies host-staged fallback, measures staged bandwidth)
+add_executable(p2p_xn_test p2p_xn_test.cpp)
+target_link_libraries(p2p_xn_test PRIVATE vulkan_vm)
+target_include_directories(p2p_xn_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
+
 # Stress test
 # add_executable(stress_test stress_test.cpp)
 # target_link_libraries(stress_test PRIVATE vulkan_vm)

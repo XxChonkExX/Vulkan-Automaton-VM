@@ -279,13 +279,14 @@ vvm::PeerAccessInfo MultiGPUPoolManager::queryPeerAccess(
 #endif
 
     info.recommendedType = pair.recommendedType;
-    info.canDirectCopy = info.externalMemorySupported &&
-                         pair.recommendedType != ExternalHandleType::OpaqueFd;
-    // Do not hard-require a specific type; fall back to OpaqueFd->OpaqueWin32
-    // mapping handled by exportMemory. "canDirectCopy" means we have a viable
-    // handle type for both sides.
-    info.canDirectCopy = info.canDirectCopy || (info.externalMemorySupported &&
-                                                pair.sameVendor);
+    // Opaque external handles are driver-private memory: a cross-vendor
+    // import is refused by the destination driver (measured on Windows:
+    // AMD->NVIDIA import OOMs, NVIDIA reports no exportable type for the
+    // same usage). Gate the fast path on same-vendor; the copy entry point
+    // still falls back to host-staged automatically. (No handle-type
+    // hard requirement beyond that; OpaqueFd->OpaqueWin32 mapping is
+    // handled by exportMemory.)
+    info.canDirectCopy = info.externalMemorySupported && pair.sameVendor;
     info.notes = info.canDirectCopy
             ? "direct GPU->GPU copy path available (external memory + device copy)"
             : "external memory not sufficient for direct copy on this pair";
