@@ -7,6 +7,7 @@
 #include "vulkan_vm/device_registry.hpp"
 #include "vulkan_vm/hip_mem_backend.hpp"
 #include "vulkan_vm/l0_mem_backend.hpp"
+#include "vulkan_vm/cuda_mem_backend.hpp"
 #include "vulkan_vm/utils.hpp"
 
 #include <vulkan/vulkan.h>
@@ -21,6 +22,7 @@ const char* backend_kind_name(MemBackendKind kind) {
         case MemBackendKind::Vulkan: return "vulkan";
         case MemBackendKind::Hip:    return "hip";
         case MemBackendKind::Level0: return "level0";
+        case MemBackendKind::Cuda:   return "cuda";
         case MemBackendKind::Auto:   return "auto";
     }
     return "unknown";
@@ -34,6 +36,10 @@ MemBackendKind best_backend_for(const BackendDeviceInfo& dev) {
             return dev.integrated ? MemBackendKind::Vulkan : MemBackendKind::Hip;
         case DeviceSource::Level0:
             return dev.integrated ? MemBackendKind::Vulkan : MemBackendKind::Level0;
+        case DeviceSource::Cuda:
+            // NVIDIA discrete gets the native CUDA path (mature kernels);
+            // Tegra-style integrated stays on Vulkan (UMA fits).
+            return dev.integrated ? MemBackendKind::Vulkan : MemBackendKind::Cuda;
         case DeviceSource::Vulkan:
         default:
             return MemBackendKind::Vulkan;
@@ -92,6 +98,28 @@ std::vector<BackendDeviceInfo> enumerate_all_devices() {
             d.integrated = integrated;
             d.vendorIndex = i;
             d.source = DeviceSource::Level0;
+            d.preferred = best_backend_for(d);
+            out.push_back(d);
+        }
+    }
+
+    // ---- CUDA (NVIDIA; vendor implied 0x10DE) ----
+    if (cuda_runtime_present()) {
+        const int n = cuda_enumerate_count();
+        for (int i = 0; i < n; ++i) {
+            char name[256] = {};
+            uint64_t total = 0;
+            bool integrated = false;
+            if (!cuda_enumerate_device(i, name, sizeof(name), &total, &integrated)) {
+                continue;
+            }
+            BackendDeviceInfo d{};
+            set_name(d.name, name);
+            d.totalMem = total;
+            d.vendorId = 0x10DE;
+            d.integrated = integrated;
+            d.vendorIndex = i;
+            d.source = DeviceSource::Cuda;
             d.preferred = best_backend_for(d);
             out.push_back(d);
         }
@@ -327,7 +355,8 @@ PlacementPlan auto_place_experts_ex(
     }
 
     // Candidate GPU sinks. Expert fill order (measured):
-    //   rank 0: HIP discrete (fast kernels, +0.22 t/s/layer on gfx1100)
+    //   rank 0: HIP/CUDA discrete (fast kernels: +0.22 t/s/layer on gfx1100
+    //           HIP; CUDA kernels are the mature reference path)
     //   rank 1: CPU RAM cache (unbounded mmap sink; degrades gracefully -
     //           measured working at 1.3x RAM oversubscription)
     //   rank 2: L0 discrete (unmeasured kernels: overflow only, and only
@@ -345,8 +374,9 @@ PlacementPlan auto_place_experts_ex(
     };
     std::vector<Sink> sinks;
     for (const auto& d : devices) {
-        if (d.preferred == MemBackendKind::Hip && !d.integrated) {
-            sinks.push_back({MemBackendKind::Hip, d.vendorIndex,
+        if ((d.preferred == MemBackendKind::Hip ||
+             d.preferred == MemBackendKind::Cuda) && !d.integrated) {
+            sinks.push_back({d.preferred, d.vendorIndex,
                              static_cast<uint64_t>(d.totalMem * maxFraction), 0, 0});
         } else if (d.preferred == MemBackendKind::Level0 && !d.integrated) {
             sinks.push_back({MemBackendKind::Level0, d.vendorIndex,
@@ -357,6 +387,8 @@ PlacementPlan auto_place_experts_ex(
     sinks.push_back({MemBackendKind::Vulkan, -1, hostCacheBytes, 0, 1, false, true});
     // Vulkan-discrete last resort: enumerated, not pooled (the app's VkDevice
     // would be needed; llama's tensor split handles it). Listed for the map.
+    // AMD/Intel only: NVIDIA serves through the CUDA backend (rank 0), so a
+    // Vulkan sink for the same card would double-count its heap.
     for (const auto& d : devices) {
         if (d.source == DeviceSource::Vulkan && !d.integrated &&
             (d.vendorId == 0x1002 || d.vendorId == 0x8086)) {
@@ -364,8 +396,8 @@ PlacementPlan auto_place_experts_ex(
                              static_cast<uint64_t>(d.totalMem * maxFraction), 0, 3, true});
         }
     }
-    // Dense target: co-locate with experts on the biggest rank-0 (HIP) sink;
-    // without one, the biggest discrete sink; without any, CPU.
+    // Dense target: co-locate with experts on the biggest rank-0 (HIP/CUDA)
+    // sink; without one, the biggest discrete sink; without any, CPU.
     Sink* denseSink = nullptr;
     for (auto& s : sinks) {
         if (s.isCpu || s.overflowOnly || s.rank != 0) continue;

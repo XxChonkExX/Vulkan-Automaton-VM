@@ -10,9 +10,9 @@ target_include_directories(vvm_daemon PRIVATE
     ${Vulkan_INCLUDE_DIRS}
 )
 
-# Backend smoke tests (HIP / Level Zero / unified registry) - the backends
-# load their runtimes dynamically, so these need no extra link deps.
-foreach(t hip_backend_test l0_backend_test unified_set_test auto_place_test)
+# Backend smoke tests (HIP / Level Zero / CUDA / unified registry) - the
+# backends load their runtimes dynamically, so these need no extra link deps.
+foreach(t hip_backend_test l0_backend_test cuda_backend_test unified_set_test auto_place_test)
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${t}.cpp)
         add_executable(${t} ${t}.cpp)
         target_link_libraries(${t} PRIVATE vulkan_vm ${CMAKE_DL_LIBS})

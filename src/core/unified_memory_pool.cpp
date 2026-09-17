@@ -479,15 +479,20 @@ bool UnifiedMemoryPoolImpl::initialize(const DeviceConfig& device, const PoolCon
     device_ = device.device;
 
     // Vendor seam: dispatch on what the DeviceConfig carries (see
-    // isVulkanBackend for the predicate; Level0 requires an explicit kind).
+    // isVulkanBackend for the predicate; Level0/Cuda require explicit kind).
     const bool isVulkan = isVulkanBackend();
+    const MemBackendKind explicitKind =
+        static_cast<MemBackendKind>(deviceConfig_.memBackendKind);
     const MemBackendKind kind = isVulkan ? MemBackendKind::Vulkan
-        : (static_cast<MemBackendKind>(deviceConfig_.memBackendKind) == MemBackendKind::Level0
-               ? MemBackendKind::Level0 : MemBackendKind::Hip);
+        : (explicitKind == MemBackendKind::Level0 ? MemBackendKind::Level0
+        : (explicitKind == MemBackendKind::Cuda  ? MemBackendKind::Cuda
+                                                 : MemBackendKind::Hip));
     backend_ = create_memory_backend(kind, deviceConfig_);
     if (!backend_) {
         VVM_LOG_ERROR("failed to create the {} memory backend",
-                      isVulkan ? "Vulkan" : "HIP");
+                      isVulkan ? "Vulkan"
+                               : (kind == MemBackendKind::Cuda ? "CUDA"
+                                                              : (kind == MemBackendKind::Level0 ? "L0" : "HIP")));
         return false;
     }
 

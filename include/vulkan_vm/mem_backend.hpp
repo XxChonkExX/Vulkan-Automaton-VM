@@ -134,7 +134,9 @@ public:
 // Factory. kind selects the vendor implementation; returns nullptr for kinds
 // whose adapter is not linked into this build. DeviceConfig::memBackendKind
 // carries one of these values (-1 = Auto, resolved by the pool).
-enum class MemBackendKind : int32_t { Auto = -1, Vulkan = 0, Hip = 1, Level0 = 2 };
+// ABI note: append-only. Existing values never change, so adding Cuda does
+// not disturb laid-out consumers (no class layout involved).
+enum class MemBackendKind : int32_t { Auto = -1, Vulkan = 0, Hip = 1, Level0 = 2, Cuda = 3 };
 
 VVM_API std::unique_ptr<IDeviceMemoryBackend> create_memory_backend(MemBackendKind kind,
                                                                      const DeviceConfig& cfg);

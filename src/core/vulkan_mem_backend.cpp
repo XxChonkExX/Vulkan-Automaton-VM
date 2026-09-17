@@ -15,7 +15,7 @@
 #include "vulkan_vm/vulkan_mem_backend.hpp"
 #include "vulkan_vm/hip_mem_backend.hpp"
 #include "vulkan_vm/l0_mem_backend.hpp"
-
+#include "vulkan_vm/cuda_mem_backend.hpp"
 #include <cstring>
 
 namespace vvm {
@@ -277,6 +277,10 @@ std::unique_ptr<IDeviceMemoryBackend> create_memory_backend(MemBackendKind kind,
             // Dynamic ze_loader (ships with Intel GPU drivers); nullptr when
             // Level Zero is absent. backendDeviceIndex selects the device.
             return L0MemoryBackend::create(cfg.backendDeviceIndex);
+        case MemBackendKind::Cuda:
+            // Dynamic nvcuda (ships with every NVIDIA driver); nullptr when
+            // NVIDIA is absent. backendDeviceIndex selects the device.
+            return CudaMemoryBackend::create(cfg.backendDeviceIndex);
     }
     return nullptr;
 }

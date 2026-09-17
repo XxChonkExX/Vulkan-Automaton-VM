@@ -172,6 +172,7 @@ if(VVM_BUILD_SHARED)
         src/core/vulkan_mem_backend.cpp
         src/core/hip_mem_backend.cpp
         src/core/l0_mem_backend.cpp
+        src/core/cuda_mem_backend.cpp
         src/core/device_registry.cpp
         src/core/gguf_inventory.cpp
         src/core/sparse_memory.cpp
@@ -204,6 +205,7 @@ else()
         src/core/vulkan_mem_backend.cpp
         src/core/hip_mem_backend.cpp
         src/core/l0_mem_backend.cpp
+        src/core/cuda_mem_backend.cpp
         src/core/device_registry.cpp
         src/core/gguf_inventory.cpp
         src/core/sparse_memory.cpp

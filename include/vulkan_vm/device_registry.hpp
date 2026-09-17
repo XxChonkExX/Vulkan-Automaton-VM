@@ -31,8 +31,8 @@
 
 namespace vvm {
 
-// Which runtime enumerated this device.
-enum class DeviceSource : int32_t { Hip = 0, Level0 = 1, Vulkan = 2 };
+// Which runtime enumerated this device. Append-only (persisted in logs).
+enum class DeviceSource : int32_t { Hip = 0, Level0 = 1, Vulkan = 2, Cuda = 3 };
 
 struct BackendDeviceInfo {
     char     name[256] = {};
