@@ -411,3 +411,13 @@ target_include_directories(completion_token_test PRIVATE
     ${TEST_EXTRA_INCLUDES}
 )
 add_test(NAME completion_token_test COMMAND completion_token_test)
+
+# MigrationEngine completion tokens (device-gated; skips without one).
+# Submits real copies and checks the op token + poll/token agreement.
+add_executable(migration_token_test migration_token_test.cpp)
+target_link_libraries(migration_token_test PRIVATE vulkan_vm)
+target_include_directories(migration_token_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
+add_test(NAME migration_token_test COMMAND migration_token_test)

@@ -296,6 +296,13 @@ struct VVM_API MigrationOperation {
     VkSemaphore waitSemaphore = VK_NULL_HANDLE;
     VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkPipelineStageFlags signalStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    // Completion token for this op, populated by submitMigration from the
+    // engine's signal timeline (value signaled by this submit). Feed it to
+    // pool.retire() to gate teardown on migration completion, or consult it
+    // with isTokenComplete() - pollMigration() does exactly that.
+    // Default-constructed ops carry a Ready token; only trust tokens from
+    // a submitted op.
+    CompletionToken completionToken;
     // Opaque pointer to the owning MigrationContext. The engine releases this
     // context back to the pool when waitMigration/pollMigration observes the
     // fence signaled. Kept opaque here to avoid a circular include with

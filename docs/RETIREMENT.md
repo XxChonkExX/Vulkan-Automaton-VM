@@ -60,9 +60,13 @@ the next `collect()` with no device at all, `Foreign` consults a
 caller-supplied non-blocking callback (the hook a HIP/CUDA/L0 event poll
 plugs into - must never block, it runs under the pool mutex), and
 `VulkanTimeline` is the classic path. `retireToken()` is the token form
-of `retireTicket()`. The offload/migration engine keeps its fence waits
-for now - porting it onto retirement is future work, as are pipelined
-staging and temporary-import policy for binary hand-off to foreign APIs.
+of `retireTicket()`. The migration engine speaks the same language: every
+`MigrationOperation` carries its submit's timeline as a token
+(`op.completionToken` - feed it straight to `pool.retire()`), and
+`pollMigration()` consults the token instead of the fence, so fence waits
+remain only on the blocking path and context reuse. Still future work:
+retiring migration staging/teardown through the pool, pipelined staging,
+and temporary-import policy for binary hand-off to foreign APIs.
 External semaphores shipped separately (`docs/EXTERNAL_SEMAPHORES.md`).
 
 ## Tests

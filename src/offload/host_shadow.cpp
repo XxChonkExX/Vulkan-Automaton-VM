@@ -488,6 +488,11 @@ std::optional<MigrationOperation> MigrationEngine::submitMigration(const Migrati
     op.signalSemaphore = timelineSemaphore_;
     op.waitSemaphore = ctx->waitSemaphore;
     op.owningContext = ctx;
+    // Every submit signals (timelineSemaphore_, ctx->timelineValue): expose
+    // it as the op's completion token so callers can retire against it or
+    // consult it without touching the fence.
+    op.completionToken =
+        CompletionToken::vulkanTimeline(timelineSemaphore_, ctx->timelineValue, device_);
 
     {
         std::lock_guard<std::mutex> lock(pendingOpsMutex_);
@@ -507,7 +512,21 @@ bool MigrationEngine::pollMigration(const MigrationOperation& op) {
     if (!op.completionFence) {
         return completeOp(op);
     }
-    if (vkGetFenceStatus(device_, op.completionFence) == VK_SUCCESS) {
+    // One sync language: consult the signaled timeline value (the same
+    // submit that raises the fence signals it). The fence stays for the
+    // blocking wait path and context reuse below. Hand-built ops without
+    // a token fall back to the fence status.
+    bool done = false;
+    if (op.completionToken.kind == CompletionToken::Kind::VulkanTimeline &&
+        op.completionToken.timeline != VK_NULL_HANDLE) {
+        uint64_t cur = 0;
+        done = vkGetSemaphoreCounterValue(device_, op.completionToken.timeline,
+                                          &cur) == VK_SUCCESS &&
+               cur >= op.completionToken.value;
+    } else {
+        done = vkGetFenceStatus(device_, op.completionFence) == VK_SUCCESS;
+    }
+    if (done) {
         return completeOp(op);
     }
     return false;

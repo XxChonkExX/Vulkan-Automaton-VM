@@ -17,6 +17,13 @@
   (caller-supplied non-blocking consult, e.g. a hipEventQuery poll).
   Plus `retireToken()`, a CPU-only `completion_token_test`, and 14 new
   token checks in `retirement_test` (39 total, green on B70).
+- **Migration engine on tokens**: every `MigrationOperation` carries its
+  submit's timeline as `op.completionToken` (retire against it directly);
+  `pollMigration()` consults the token instead of the fence, leaving
+  fence waits only on the blocking path and context reuse. New
+  `migration_token_test` (device-gated): token presence, poll/consult
+  agreement, and a host->device->host pattern round-trip - green on
+  hardware, 0 failures.
 
 ## v0.4.0 (2026-09-18)
 
