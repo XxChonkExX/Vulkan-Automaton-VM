@@ -5,6 +5,7 @@
 
 #include "vulkan_vm/core.hpp"
 #include "vulkan_vm/utils.hpp"
+#include "vulkan_vm/cross_gpu/external_semaphore.hpp"
 
 namespace vvm {
 

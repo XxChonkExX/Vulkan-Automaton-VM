@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.5.0 (in progress)
+
+### Semaphores & completion (Pillar 1)
+
+- **External semaphores** (`vulkan_vm/cross_gpu/external_semaphore.hpp`):
+  export/import `VkSemaphore` payloads as OS handles (`OPAQUE_FD` /
+  `OPAQUE_WIN32`) for cross-device and cross-process GPU sync. Timeline
+  CPU signal/wait, binary queue round-trip, R4 consume-on-import
+  ownership. Verified live on XTX+B70 (both kinds PASS);
+  `tests/external_semaphore_test.cpp` skips cleanly without a capable
+  device. (`docs/EXTERNAL_SEMAPHORES.md`)
+
 ## v0.4.0 (2026-09-18)
 
 Memory-lifetime correctness, cross-vendor hardening on the returned B70,

@@ -92,6 +92,16 @@ target_include_directories(external_handle_test PRIVATE
 )
 add_test(NAME external_handle_test COMMAND external_handle_test)
 
+# External semaphore export/import round-trip (timeline + binary).
+# Skips cleanly with no device or no external-semaphore extensions.
+add_executable(external_semaphore_test external_semaphore_test.cpp)
+target_link_libraries(external_semaphore_test PRIVATE vulkan_vm)
+target_include_directories(external_semaphore_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
+add_test(NAME external_semaphore_test COMMAND external_semaphore_test)
+
 # CPU-only MoE pack + registry tests (no GPU needed; GPU streamer gated)
 add_executable(storage_stream_test storage_stream_test.cpp)
 target_link_libraries(storage_stream_test PRIVATE vulkan_vm)

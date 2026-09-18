@@ -178,6 +178,7 @@ if(VVM_BUILD_SHARED)
         src/core/sparse_memory.cpp
         src/allocator/buddy_allocator.cpp
         src/cross_gpu/external_memory.cpp
+        src/cross_gpu/external_semaphore.cpp
         src/cross_gpu/multi_gpu_manager.cpp
         src/offload/host_shadow.cpp
         src/offload/storage_stream.cpp
@@ -211,6 +212,7 @@ else()
         src/core/sparse_memory.cpp
         src/allocator/buddy_allocator.cpp
         src/cross_gpu/external_memory.cpp
+        src/cross_gpu/external_semaphore.cpp
         src/cross_gpu/multi_gpu_manager.cpp
         src/offload/host_shadow.cpp
         src/offload/storage_stream.cpp
