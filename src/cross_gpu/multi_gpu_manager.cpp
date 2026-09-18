@@ -4,6 +4,7 @@
 #include "vulkan_vm/cross_gpu/external_memory.hpp"
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 
 namespace vvm {
 
@@ -292,9 +293,12 @@ std::vector<std::optional<Allocation>> MultiGPUPoolManager::allocateDistributed(
     
     if (instances_.empty()) return results;
     
-    // 1. Allocate on master
+    // 1. Allocate on master. This MUST be a dedicated exportable
+    // allocation: exportMemory() rejects sub-allocated blocks (only whole
+    // dedicated VkDeviceMemory can cross devices), so a plain sub-alloc here
+    // would make every peer import fail by construction.
     auto& master = instances_[0];
-    auto masterAlloc = master.pool.allocate(size, usage);
+    auto masterAlloc = master.pool.allocateDedicatedExportable(size, usage);
     if (!masterAlloc) return results;
     
     results[0] = masterAlloc;
@@ -475,6 +479,23 @@ bool MultiGPUPoolManager::copyDeviceToDevice(
     }
 
 #if defined(VVM_PLATFORM_WINDOWS)
+    // P2P policy override for driver bring-up (default: auto):
+    //   VVM_P2P_POLICY=host          - always host-staged, never attempt direct
+    //   VVM_P2P_POLICY=force-direct  - attempt direct import cross-vendor too
+    //                                  (refused drivers may crash; test use only)
+    bool forceDirect = false;
+    if (const char* pol = std::getenv("VVM_P2P_POLICY")) {
+        if (std::strcmp(pol, "host") == 0) {
+            VVM_LOG_INFO("copyDeviceToDevice: VVM_P2P_POLICY=host, using host-staged");
+            return copyDeviceToDeviceHostStaged(srcDeviceIndex, dstDeviceIndex,
+                                                src, dst, srcOffset, dstOffset, size, fence);
+        }
+        if (std::strcmp(pol, "force-direct") == 0) {
+            forceDirect = true;
+        } else {
+            VVM_LOG_WARN("copyDeviceToDevice: unknown VVM_P2P_POLICY='{}', using auto", pol);
+        }
+    }
     // Cross-vendor opaque-handle import is refused on Windows: gracefully by
     // some drivers (AMD->NVIDIA returns VkResult -13), by a driver CRASH on
     // others (AMD->Intel AVs inside vkAllocateMemory - found via p2p_xn_test
@@ -482,11 +503,15 @@ bool MultiGPUPoolManager::copyDeviceToDevice(
     // copies and the shared host arena; direct import stays same-vendor on
     // Windows. Linux dma-buf cross-vendor is real and unaffected
     // (docs/LINUX_TEST_RESULTS_2026-08-25.md).
-    if (srcVendorProps.vendorID != dstVendorProps.vendorID) {
+    if (!forceDirect && srcVendorProps.vendorID != dstVendorProps.vendorID) {
         VVM_LOG_INFO("copyDeviceToDevice: cross-vendor direct import unsupported "
                      "on Windows, using host-staged");
         return copyDeviceToDeviceHostStaged(srcDeviceIndex, dstDeviceIndex,
                                             src, dst, srcOffset, dstOffset, size, fence);
+    }
+    if (forceDirect && srcVendorProps.vendorID != dstVendorProps.vendorID) {
+        VVM_LOG_WARN("copyDeviceToDevice: VVM_P2P_POLICY=force-direct, attempting "
+                     "cross-vendor import (driver may refuse or crash)");
     }
 #endif
 
