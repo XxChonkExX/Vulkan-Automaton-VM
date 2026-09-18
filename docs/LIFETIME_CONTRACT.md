@@ -17,6 +17,8 @@ Device (VkInstance/VkDevice - owned by the EMBEDDER)
         ├── Block(s)               (VkDeviceMemory + buddy allocator, private)
         │     └── Allocation(s)    (sub-allocated VkBuffer + offset/size)
         ├── Dedicated Allocation(s)(own VkDeviceMemory, exportable/imported)
+        ├── Retired Allocation(s)  (owned by the pool until collect() observes
+        │                           their timeline value; see R11)
         └── OffloadManager         (optional; host shadow + migration engine)
               └── MigrationOperation(s)
 
@@ -39,7 +41,8 @@ Allocation --(Linux)--> dma-buf fd --HIP import--> HIP external memory
 | R7 | **Sub-allocated (non-dedicated) allocations are NOT exportable.** Cross-GPU export requires `allocateDedicatedExportable` — Vulkan external import requires dedicated allocations for reliable cross-device import. |
 | R8 | **Offloaded allocations must be reloaded before use.** After `offloadToHost`, the device-side contents are undefined until `reloadToDevice` completes (`waitMigration`). Accessing a device pointer while offloaded is UB. Offload does NOT release the Vulkan allocation — the alias rule (R5) is unaffected by offload state. |
 | R9 | **Thread safety.** All public `UnifiedMemoryPool` methods are mutex-guarded. `Allocation` handles are not — do not share a single handle across threads without external synchronization. Move, don't copy. |
-| R10 | **Generation guard.** Every allocation carries a generation counter; using a stale handle after `deallocate` is rejected (`deallocate: stale allocation handle` warning), not UB. |
+| R10 | **Generation guard.** Every allocation carries a generation id registered in the pool's live-set; using a stale handle after `deallocate` is rejected (`deallocate: stale allocation handle` warning), not UB. |
+| R11 | **Retired allocations stay live until GPU completion.** `retire()` transfers ownership to the pool's retirement queue; the memory is not reusable until `collect()` observes the timeline value signaled. The timeline stays caller-owned (the pool never destroys it; use `retireTicket()` for a pool-owned one). CPU object lifetime is not GPU lifetime — any handoff of GPU-touched memory across a queue submit must go through `retire()`/`collect()`, never bare `deallocate()`. Uncollected items are freed at pool destruction. |
 
 ## 3. The PyTorch integration contract (H3)
 

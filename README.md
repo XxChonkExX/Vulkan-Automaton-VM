@@ -144,6 +144,7 @@ Storage-stream architecture + backend-selection research:
 
 | Doc | Contents |
 |---|---|
+| [docs/RETIREMENT.md](docs/RETIREMENT.md) | GPU-lifetime-safe reclamation: retire/collect/ticket API + async copy contract |
 | [docs/LIFETIME_CONTRACT.md](docs/LIFETIME_CONTRACT.md) | **Normative** ownership/lifetime rules (pool, allocations, external handles, PyTorch contract) |
 | [docs/HARDWARE_SUPPORT.md](docs/HARDWARE_SUPPORT.md) | Tiered hardware/platform support matrix |
 | [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) | Network trust model, defenses, hardening roadmap |

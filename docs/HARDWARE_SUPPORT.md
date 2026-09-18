@@ -64,7 +64,12 @@ Status tiers (be honest — this table is a promise):
 | `placement_test` | any CPU | pure logic, no GPU |
 | `basic_test` / `minimal_test` / `external_handle_test` | Vulkan device | **1 — Verified** on RADV NAVI31, ANV Battlemage G31, lavapipe (native Ubuntu, same doc) |
 | `sparse_test` (bind/unbind/readback/zero-page) | Vulkan sparse device | **1 — Verified** (RADV NAVI31 + ANV Battlemage G31, after queue-family fix, same doc) |
-| `multi_gpu_test` cross-vendor P2P | 2x dGPU | **1 — Verified** (RADV <-> ANV DMA-BUF zero-copy + host-staged fallback paths, native Ubuntu) |
+| `multi_gpu_test` cross-vendor P2P | 2x dGPU | **1 — Verified** (RADV <-> ANV DMA-BUF zero-copy + host-staged fallback paths, native Ubuntu; Windows XTX <-> B70 refused-direct + host-staged verified) |
+| `p2p_xn_test` staged XN | 2x dGPU | **1 — Verified** (Windows XTX <-> B70, 3.5 GiB/s symmetric; Intel pairs supported from 2026-09-17) |
+| `shared_arena_test` host arena | 2x dGPU | **1 — Verified** (Windows XTX <-> B70 zero-copy 5.2 GiB/s, manager arena 6.1 GiB/s) |
+| `l0_backend_test` Level Zero | Intel dGPU | **1 — Verified** (Arc Pro B70: discovery, alloc plane, full pool over L0) |
+| `retirement_test` GPU reclamation | Vulkan device | **1 — Verified** (XTX + B70: pre-signal no-reclaim, post-signal exact reclaim, async copy proof) |
+| `udp_verb_test` reliable transfer | loopback | **1 — Verified** (Windows; fixed 2026-09-17: missing WSAStartup + WRITE contiguity off-by-one, 10/10 runs) |
 | `multi_vendor_rdma_test` (verbs) | rxe / RoCE | **1 — Verified** same-host loopback (native Ubuntu kernel 7.0; requires event-driven rdma_cm) |
 | `network_test` two-node cluster | CPU/loopback | **1 — Verified** all functional checks incl. 16 MiB migration (native Ubuntu; teardown-join hang tracked in same doc) |
 | `tensor_collective_test` | Vulkan device | collectives verified running (allReduce/allGather/reduceScatter/broadcast); shutdown hang tracked |
