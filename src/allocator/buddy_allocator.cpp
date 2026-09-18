@@ -182,7 +182,7 @@ std::optional<VkDeviceSize> BuddyAllocator::allocateAligned(VkDeviceSize size, V
             pushFreeRange(tailStart, tailLen);              // trailing tail
         }
 
-        allocated_[aligned] = {order, granted, granted};
+        allocated_[aligned] = {order, granted, size};
         return aligned;
     });
 }

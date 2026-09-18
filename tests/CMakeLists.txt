@@ -262,6 +262,10 @@ add_executable(tensor_collective_test tensor_collective_test.cpp)
 target_link_libraries(tensor_collective_test PRIVATE vulkan_vm vulkan_vm_tensor)
 target_include_directories(tensor_collective_test PRIVATE ${CMAKE_SOURCE_DIR}/include ${TEST_EXTRA_INCLUDES})
 add_test(NAME tensor_collective_test COMMAND tensor_collective_test)
+# Leaked TensorHandles abort under CTest: lifetime violations are loud in CI
+# instead of warn-and-continue (prod default unchanged - opt-in via env).
+set_tests_properties(tensor_collective_test PROPERTIES
+    ENVIRONMENT "VVM_TENSOR_LEAK_ABORT=1")
 endif()
 
 # Dtype conversion tests (CPU-only, but uses tensor-layer utilities from the

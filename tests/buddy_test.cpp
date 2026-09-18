@@ -143,12 +143,19 @@ int main() {
         CHECK(stress.checkInvariants());
     }
 
-    // --- 11b. Concurrent allocate/free stress (threadSafe=true)
+    // --- 11b. Concurrent allocate/free fuzz (threadSafe=true).
+    // Random sizes (odd sizes hit exact-fit), random alignments (hits the
+    // allocateAligned reshape path), periodic invariant checks mid-run.
+    // Scale via VVM_BUDDY_FUZZ_ITERS (default: CI-fast; crank for nightlies).
     {
         BuddyAllocator conc(kBlock, kMin, /*threadSafe=*/true);
-        constexpr int kThreads = 4;
-        constexpr int kIters = 2000;
-        std::atomic<int> ok{1};
+        constexpr int kThreads = 8;
+        int kIters = 5000;
+        if (const char* e = std::getenv("VVM_BUDDY_FUZZ_ITERS")) {
+            const long v = std::strtol(e, nullptr, 0);
+            if (v > 0 && v <= 10000000) kIters = static_cast<int>(v);
+        }
+        std::atomic<int> bad{0};
         std::vector<std::thread> threads;
         for (int t = 0; t < kThreads; ++t) {
             threads.emplace_back([&, t] {
@@ -157,21 +164,32 @@ int main() {
                 for (int i = 0; i < kIters; ++i) {
                     if (!local.empty() && (rng() % 2)) {
                         size_t idx = rng() % local.size();
-                        conc.deallocate(local[idx].first, local[idx].second);
+                        // size 0 = free by recorded grant (pool convention).
+                        conc.deallocate(local[idx].first, 0);
                         local.erase(local.begin() + idx);
                     } else {
-                        VkDeviceSize sz = 256 * 1024 * (1 + (rng() % 4));
-                        auto opt = conc.allocate(sz);
+                        // Odd sizes defeat power-of-two Borg assimilation.
+                        VkDeviceSize sz = 1 + (rng() % (kBlock / 4));
+                        std::optional<VkDeviceSize> opt;
+                        if ((rng() % 4) == 0) {
+                            const VkDeviceSize al = VkDeviceSize(1)
+                                << (8 + (rng() % 13));  // 256 B .. 1 MiB
+                            opt = conc.allocateAligned(sz, al);
+                        } else {
+                            opt = conc.allocate(sz);
+                        }
                         if (opt) local.push_back({*opt, sz});
                     }
+                    if ((i % 64) == 0 && !conc.checkInvariants()) bad.fetch_add(1);
                 }
-                for (auto& p : local) conc.deallocate(p.first, p.second);
+                for (auto& p : local) conc.deallocate(p.first, 0);
             });
         }
         for (auto& th : threads) th.join();
-        CHECK(conc.checkInvariants());
-        CHECK(conc.getLargestFree() == kBlock);
-        CHECK(ok.load() == 1);
+        CHECK(bad.load() == 0, "no mid-run invariant violations");
+        CHECK(conc.checkInvariants(), "invariants hold after join");
+        CHECK(conc.getLargestFree() == kBlock, "full coalescing recovery");
+        CHECK(conc.internalWasteBytes() == 0, "no waste after full drain");
     }
 
     // --- 12. Exact-fit grants (llama.cpp pattern: few large, odd-sized buffers) ---
