@@ -22,17 +22,49 @@
 
 #include <thread>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 using namespace vvm::storage;
 using namespace vvm::storage::pack;
 using namespace vvm::storage::queue;
 using namespace vvm::storage::backend;
 
 int main(int argc, char** argv) {
+    // Self-contained mode: no pack given -> generate a small deterministic
+    // one (also exercises PackWriter), run, then clean up. CI-friendly.
+    std::string packPath;
+    bool selfGenerated = false;
     if (argc < 2) {
-        std::cerr << "usage: storage_e2e_stream_test <pack.vmex> [passes]\n";
-        return 1;
+        char tmpPath[MAX_PATH];
+        if (GetTempPathA(MAX_PATH, tmpPath) == 0) {
+            std::cerr << "FAIL: no pack given and GetTempPath failed\n";
+            return 1;
+        }
+        packPath = std::string(tmpPath) + "vvm_e2e_selftest.vmex";
+        selfGenerated = true;
+
+        PackWriter<PackTraits> writer;
+        constexpr uint32_t kShards = 8;
+        constexpr size_t kShardBytes = 1024 * 1024; // 1 MiB (<= 4 MiB slot)
+        std::vector<uint8_t> blob(kShardBytes);
+        uint64_t seed = 0x9E3779B97F4A7C15ull;
+        for (uint32_t s = 0; s < kShards; ++s) {
+            for (size_t i = 0; i < kShardBytes; i += 8) {
+                seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+                std::memcpy(blob.data() + i, &seed, 8);
+            }
+            writer.addShard(1000 + s, blob.data(), blob.size());
+        }
+        if (!writer.write(packPath)) {
+            std::cerr << "FAIL: self-generated pack write\n";
+            return 1;
+        }
+        std::cout << "self-generated pack: " << packPath << "\n";
+    } else {
+        packPath = argv[1];
     }
-    const std::string packPath = argv[1];
     const int passes = argc > 2 ? std::atoi(argv[2]) : 1;
 
     // ---- L0: read the pack table ----
@@ -147,5 +179,6 @@ int main(int argc, char** argv) {
     }
 
     std::cout << (failures == 0 ? "E2E streaming OK\n" : "E2E streaming FAILED\n");
+    if (selfGenerated) std::remove(packPath.c_str());
     return failures == 0 ? 0 : 1;
 }
