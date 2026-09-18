@@ -360,6 +360,63 @@ void setTimeouts(SocketType s, int32_t timeoutMs) {
 #endif
 }
 
+// Scoped receive-timeout override (THREAT_MODEL §5 slow-loris bound):
+// tightens SO_RCVTIMEO for a header read, then restores the previous value.
+// Without this, a peer dribbling the 32-byte header one byte per socket-
+// timeout holds a worker for headerLen * timeout (16 min at 30 s). The
+// previous timeout is queried (not assumed) so accept/connect paths with
+// different defaults both restore correctly. Applies to the TLS path too:
+// OpenSSL honors socket timeouts on blocking BIOs.
+class ScopedRecvTimeout {
+public:
+    ScopedRecvTimeout(SocketType s, int32_t tempMs) : sock_(s), valid_(false) {
+#ifdef VVM_PLATFORM_WINDOWS
+        DWORD prev = 0;
+        int len = sizeof(prev);
+        if (getsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+                       reinterpret_cast<char*>(&prev), &len) == 0) {
+            prev_ = static_cast<int32_t>(prev);
+            valid_ = true;
+        }
+        DWORD t = static_cast<DWORD>(tempMs);
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char*>(&t), sizeof(t));
+#else
+        timeval prev{};
+        socklen_t len = sizeof(prev);
+        if (getsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &prev, &len) == 0) {
+            prev_ = static_cast<int32_t>(prev.tv_sec) * 1000 +
+                    static_cast<int32_t>(prev.tv_usec) / 1000;
+            valid_ = true;
+        }
+        timeval tv{};
+        tv.tv_sec = tempMs / 1000;
+        tv.tv_usec = (tempMs % 1000) * 1000;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+    }
+    ~ScopedRecvTimeout() {
+        if (!valid_) return;
+        // Restore ONLY the receive timeout (send timeout untouched).
+#ifdef VVM_PLATFORM_WINDOWS
+        DWORD t = static_cast<DWORD>(prev_);
+        setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char*>(&t), sizeof(t));
+#else
+        timeval tv{};
+        tv.tv_sec = prev_ / 1000;
+        tv.tv_usec = (prev_ % 1000) * 1000;
+        setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+    }
+    ScopedRecvTimeout(const ScopedRecvTimeout&) = delete;
+    ScopedRecvTimeout& operator=(const ScopedRecvTimeout&) = delete;
+private:
+    SocketType sock_;
+    int32_t prev_ = 0;
+    bool valid_;
+};
+
 bool readAll(SocketType s, void* buf, size_t len) {
     char* p = static_cast<char*>(buf);
     while (len > 0) {
@@ -1436,7 +1493,17 @@ void TcpTransport::serveConnection(uint64_t connId, uintptr_t sRaw) {
             }
         }
 
-        if (!impl_->readAllTls(s, header.data(), header.size(), tlsConn.get())) break;
+        // Tight temporary bound for the 32-byte header (THREAT_MODEL §5
+        // slow-loris): without this a peer dribbling one byte per socket
+        // timeout holds this worker for headerLen * timeout. Restored by
+        // the scoped guard before body reads (which keep the generous
+        // connection timeout for large legitimate transfers).
+        bool headerOk = false;
+        {
+            ScopedRecvTimeout hdrTight(s, impl_->netConfig.headerTimeoutMs);
+            headerOk = impl_->readAllTls(s, header.data(), header.size(), tlsConn.get());
+        }
+        if (!headerOk) break;
 
         NetHeader nh{};
         if (!decodeHeader(header.data(), header.size(), nh)) break;
@@ -1724,7 +1791,14 @@ std::optional<TcpMessage> TcpTransport::request(ConnId id, const TcpMessage& req
     }
 
     std::vector<uint8_t> header(kHeaderSize);
-    if (!impl_->readAllTls(s, header.data(), header.size(), tlsConn)) {
+    bool headerOk = false;
+    {
+        // Same slow-loris bound as the server path: tight temporary timeout
+        // for the 32-byte header, restored before body/stream reads.
+        ScopedRecvTimeout hdrTight(s, impl_->netConfig.headerTimeoutMs);
+        headerOk = impl_->readAllTls(s, header.data(), header.size(), tlsConn);
+    }
+    if (!headerOk) {
         disconnect(id);
         return std::nullopt;
     }
@@ -1744,8 +1818,25 @@ std::optional<TcpMessage> TcpTransport::request(ConnId id, const TcpMessage& req
     resp.flags = nh.flags;
     resp.seq = nh.seq;
     if (nh.bodyLen > 0) {
-        resp.body.resize(nh.bodyLen);
-        if (!impl_->readAllTls(s, resp.body.data(), nh.bodyLen, tlsConn)) {
+        // Chunked growth (same THREAT_MODEL §5 rationale as serveConnection):
+        // a declared-but-dry body costs one slice, not the full declaration.
+        const size_t slice = impl_->netConfig.bodyReadSliceSize > 0
+                                 ? impl_->netConfig.bodyReadSliceSize
+                                 : 4 * 1024 * 1024;
+        resp.body.reserve(static_cast<size_t>(std::min<uint64_t>(nh.bodyLen, 4 * slice)));
+        size_t received = 0;
+        bool failed = false;
+        while (received < static_cast<size_t>(nh.bodyLen)) {
+            const size_t chunk =
+                std::min<size_t>(slice, static_cast<size_t>(nh.bodyLen) - received);
+            resp.body.resize(received + chunk);
+            if (!impl_->readAllTls(s, resp.body.data() + received, chunk, tlsConn)) {
+                failed = true;
+                break;
+            }
+            received += chunk;
+        }
+        if (failed) {
             disconnect(id);
             return std::nullopt;
         }
@@ -1766,8 +1857,26 @@ std::optional<TcpMessage> TcpTransport::request(ConnId id, const TcpMessage& req
             }
             resp.streamLen = nh.streamLen;
         } else {
-            resp.stream.resize(nh.streamLen);
-            if (!impl_->readAllTls(s, resp.stream.data(), resp.stream.size(), tlsConn)) {
+            // Fallback without caller buffers: grow incrementally (same
+            // declared-but-dry rationale as above).
+            const size_t slice = impl_->netConfig.bodyReadSliceSize > 0
+                                     ? impl_->netConfig.bodyReadSliceSize
+                                     : 4 * 1024 * 1024;
+            resp.stream.reserve(
+                static_cast<size_t>(std::min<uint64_t>(nh.streamLen, 4 * slice)));
+            size_t received = 0;
+            bool failed = false;
+            while (received < static_cast<size_t>(nh.streamLen)) {
+                const size_t chunk =
+                    std::min<size_t>(slice, static_cast<size_t>(nh.streamLen) - received);
+                resp.stream.resize(received + chunk);
+                if (!impl_->readAllTls(s, resp.stream.data() + received, chunk, tlsConn)) {
+                    failed = true;
+                    break;
+                }
+                received += chunk;
+            }
+            if (failed) {
                 disconnect(id);
                 return std::nullopt;
             }

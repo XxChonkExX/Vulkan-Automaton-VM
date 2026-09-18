@@ -67,6 +67,11 @@ struct NetworkConfig {
     // bodyLen cannot force an up-front host allocation).
     size_t maxConnections = 64;
     size_t bodyReadSliceSize = 4 * 1024 * 1024;  // 4 MiB
+    // Header-read bound (THREAT_MODEL §5 slow-loris): the 32-byte header gets
+    // a tight temporary receive timeout (ScopedRecvTimeout) so a dribbled
+    // header cannot hold a worker for headerLen * socketTimeout. Generous
+    // for any healthy peer (headers arrive in ms on lab networks).
+    int32_t headerTimeoutMs = 5000;
     
     // Security (optional)
     bool useTls = false;

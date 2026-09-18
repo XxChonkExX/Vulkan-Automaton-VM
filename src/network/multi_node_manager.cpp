@@ -112,22 +112,18 @@ struct PendingExport {
 std::unordered_map<std::string, PendingExport> g_pendingExports;
 std::mutex g_pendingExportsMutex;
 
-// Same-process zero-copy policy. Cross-vendor ZC is disabled by default on
-// Linux: Mesa 26.0.3 ANV segfaults inside vkAllocateMemory when importing
+// Same-process zero-copy policy. Cross-vendor ZC is disabled by default:
+// on Linux, Mesa 26.0.3 ANV segfaults inside vkAllocateMemory when importing
 // another driver's external heap (RADV->RADV is fine) - see
-// docs/LINUX_TEST_RESULTS_2026-08-25.md Phase 4. A segfault cannot be caught,
-// so the policy must refuse BEFORE the driver call. Set
-// VVM_ALLOW_CROSSVENDOR_ZC=1 to override (e.g. to re-test after a Mesa fix).
+// docs/LINUX_TEST_RESULTS_2026-08-25.md Phase 4; on Windows, Intel Arc
+// AVs inside vkAllocateMemory importing AMD memory (AMD->NVIDIA returns a
+// graceful VkResult instead). A segfault cannot be caught, so the policy
+// must refuse BEFORE the driver call. Set VVM_ALLOW_CROSSVENDOR_ZC=1 to
+// override (e.g. to re-test after a driver fix).
 bool zcAllowedForPair(uint32_t srcVendorId, uint32_t dstVendorId) {
-#if defined(VVM_PLATFORM_LINUX)
     if (srcVendorId == dstVendorId) return true;
     static const bool force = std::getenv("VVM_ALLOW_CROSSVENDOR_ZC") != nullptr;
     return force;
-#else
-    (void)srcVendorId;
-    (void)dstVendorId;
-    return true;
-#endif
 }
 
 }  // namespace
@@ -675,6 +671,18 @@ std::optional<RemoteAllocationDesc> MultiNodePoolManager::exportForRemote(
                 alloc.size,
                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                 alloc.memoryFlags);
+            if (!promoted) {
+                // Some drivers refuse host-visible+exportable combinations
+                // (measured: Intel Arc Pro B70 returns VK_ERROR_UNKNOWN while
+                // the same exportable alloc as pure device-local succeeds).
+                // Retry device-local: the runCopy path below moves the data.
+                VVM_LOG_WARN("exportForRemote: host-visible promotion refused, "
+                             "retrying device-local");
+                promoted = localPools_[0].allocateDedicatedExportable(
+                    alloc.size,
+                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                    0);
+            }
             if (!promoted) {
                 VVM_LOG_ERROR("exportForRemote: failed to promote sub-allocated allocation to dedicated");
                 return std::nullopt;
