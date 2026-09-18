@@ -705,10 +705,13 @@ bool MultiGPUPoolManager::copyDeviceToDevice(
 // is the "Spark shuffle" path when unified pooling is unavailable.
 
 namespace {
-// Staging chunk size: each chunk costs two full submit+wait round trips
-// (copyBuffer is transient per call), so small chunks cap large transfers
-// (measured XN: 4 MiB -> 1.9, 16 MiB -> 2.8, 64 MiB -> 3.3 GiB/s).
-// Default 16 MiB (32 MiB peak host); override via VVM_STAGED_CHUNK_MB.
+// Pipelined host-staged transfer: double-buffered chunk slots overlap the
+// dst DMA leg of chunk N with the src DMA leg + memcpy of chunk N+1 (the
+// two legs run on different devices/queues). Single-chunk transfers use
+// one slot and behave exactly like the old sequential loop.
+// (measured XN sequential: 4 MiB -> 1.9, 16 MiB -> 2.8, 64 MiB -> 3.3 GiB/s).
+// Default 16 MiB chunks (32 MiB peak host single-slot, 64 MiB pipelined);
+// override via VVM_STAGED_CHUNK_MB, disable overlap via VVM_STAGED_PIPELINE=0.
 VkDeviceSize stagedChunkSize() {
     static const VkDeviceSize v = []() -> VkDeviceSize {
         if (const char* e = std::getenv("VVM_STAGED_CHUNK_MB")) {
@@ -718,6 +721,54 @@ VkDeviceSize stagedChunkSize() {
         return static_cast<VkDeviceSize>(16) * 1024 * 1024;
     }();
     return v;
+}
+
+bool stagedPipelineEnabled() {
+    static const bool v = [] {
+        if (const char* e = std::getenv("VVM_STAGED_PIPELINE")) {
+            return std::strcmp(e, "0") != 0;
+        }
+        return true;
+    }();
+    return v;
+}
+
+// One pipeline slot: chunk-sized staging + its own command pool/buffer and
+// completion fence, so chunk N+1 can submit while chunk N still flies.
+struct StageSlot {
+    std::optional<Allocation> staging;
+    VkCommandPool cmdPool = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    bool busy = false;  // fence armed by an outstanding submit
+};
+
+bool recordChunkCopy(VkCommandBuffer cmd, VkBuffer srcBuf,
+                     VkBuffer dstBuf, VkDeviceSize srcOff, VkDeviceSize dstOff,
+                     VkDeviceSize size) {
+    if (vkResetCommandBuffer(cmd, 0) != VK_SUCCESS) return false;
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VkBufferCopy region{};
+    region.srcOffset = srcOff;
+    region.dstOffset = dstOff;
+    region.size = size;
+    if (vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS) return false;
+    vkCmdCopyBuffer(cmd, srcBuf, dstBuf, 1, &region);
+    return vkEndCommandBuffer(cmd) == VK_SUCCESS;
+}
+
+VkResult submitChunkCopy(VkQueue queue, VkCommandBuffer cmd, VkFence fence) {
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    return vkQueueSubmit(queue, 1, &si, fence);
+}
+
+bool waitSlotFence(VkDevice device, VkFence fence) {
+    return vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
 }
 }  // namespace
 
@@ -755,29 +806,115 @@ bool MultiGPUPoolManager::copyDeviceToDeviceHostStaged(
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
         VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
 
-    // Allocate chunk-sized staging buffers on each device. Using chunk size keeps
-    // peak host memory bounded regardless of total transfer size.
+    // Allocate chunk-sized staging buffers on each device. Two slots when
+    // pipelining pays (multi-chunk transfer): peak host stays bounded at
+    // 2 slots x 2 sides x chunk size regardless of total transfer size.
     const VkDeviceSize chunkSize = std::min(size, stagedChunkSize());
+    const int kSlots = (size > chunkSize && stagedPipelineEnabled()) ? 2 : 1;
 
-    auto srcStage = srcPool.allocate(chunkSize, kStagingUsage, kStagingFlags);
-    auto dstStage = dstPool.allocate(chunkSize, kStagingUsage, kStagingFlags);
-    if (!srcStage || !srcStage->hostPtr || !dstStage || !dstStage->hostPtr) {
-        VVM_LOG_ERROR("copyDeviceToDeviceHostStaged: failed to allocate host-visible staging buffers");
-        if (srcStage) srcPool.deallocate(std::move(*srcStage));
-        if (dstStage) dstPool.deallocate(std::move(*dstStage));
+    // Slot-local submit resources: per-side device/queue from the pools'
+    // configs (same selection copyBuffer uses).
+    const VkDevice srcDev = srcPool.getDevice();
+    const VkDevice dstDev = dstPool.getDevice();
+    const DeviceConfig& srcCfg = srcPool.getDeviceConfig();
+    const DeviceConfig& dstCfg = dstPool.getDeviceConfig();
+    VkQueue srcQueue = srcCfg.transferQueue != VK_NULL_HANDLE
+                           ? srcCfg.transferQueue
+                           : srcCfg.graphicsQueue;
+    VkQueue dstQueue = dstCfg.transferQueue != VK_NULL_HANDLE
+                           ? dstCfg.transferQueue
+                           : dstCfg.graphicsQueue;
+    uint32_t srcFamily = srcCfg.transferQueueFamily != UINT32_MAX
+                             ? srcCfg.transferQueueFamily
+                             : srcCfg.graphicsQueueFamily;
+    uint32_t dstFamily = dstCfg.transferQueueFamily != UINT32_MAX
+                             ? dstCfg.transferQueueFamily
+                             : dstCfg.graphicsQueueFamily;
+    if (srcDev == VK_NULL_HANDLE || dstDev == VK_NULL_HANDLE ||
+        srcQueue == VK_NULL_HANDLE || dstQueue == VK_NULL_HANDLE) {
+        VVM_LOG_ERROR("copyDeviceToDeviceHostStaged: no transfer queue on one side");
         return false;
     }
 
+    struct SideSlots {
+        UnifiedMemoryPool* pool = nullptr;
+        VkDevice device = VK_NULL_HANDLE;
+        VkQueue queue = VK_NULL_HANDLE;
+        uint32_t family = 0;
+        StageSlot slot[2];
+    };
+    SideSlots sides[2] = {};
+    sides[0].pool = &srcPool;
+    sides[0].device = srcDev;
+    sides[0].queue = srcQueue;
+    sides[0].family = srcFamily;
+    sides[1].pool = &dstPool;
+    sides[1].device = dstDev;
+    sides[1].queue = dstQueue;
+    sides[1].family = dstFamily;
+
     bool ok = true;
+    // Build slots: staging alloc + resettable cmd pool/buffer + fence.
+    for (int side = 0; side < 2 && ok; ++side) {
+        for (int s = 0; s < kSlots && ok; ++s) {
+            StageSlot& sl = sides[side].slot[s];
+            auto staging = sides[side].pool->allocate(chunkSize, kStagingUsage, kStagingFlags);
+            if (!staging || !staging->hostPtr) {
+                VVM_LOG_ERROR("copyDeviceToDeviceHostStaged: staging alloc failed");
+                ok = false;
+                break;
+            }
+            sl.staging = std::move(*staging);
+            VkCommandPoolCreateInfo cp{};
+            cp.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+            cp.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT |
+                       VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+            cp.queueFamilyIndex = sides[side].family;
+            VkCommandBufferAllocateInfo cba{};
+            cba.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            cba.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cba.commandBufferCount = 1;
+            VkFenceCreateInfo fi{};
+            fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            if (vkCreateCommandPool(sides[side].device, &cp, nullptr, &sl.cmdPool) != VK_SUCCESS ||
+                (cba.commandPool = sl.cmdPool,
+                 vkAllocateCommandBuffers(sides[side].device, &cba, &sl.cmd) != VK_SUCCESS) ||
+                vkCreateFence(sides[side].device, &fi, nullptr, &sl.fence) != VK_SUCCESS) {
+                VVM_LOG_ERROR("copyDeviceToDeviceHostStaged: slot submit resources failed");
+                ok = false;
+            }
+        }
+    }
+
     VkDeviceSize remaining = size;
     VkDeviceSize srcOff = srcOffset;
     VkDeviceSize dstOff = dstOffset;
+    int chunk = 0;
 
     while (remaining > 0 && ok) {
         const VkDeviceSize thisChunk = std::min(remaining, chunkSize);
+        const int s = chunk % kSlots;
+        StageSlot& srcSl = sides[0].slot[s];
+        StageSlot& dstSl = sides[1].slot[s];
 
-        // 1. Copy device->host on the source device (src alloc -> src staging).
-        if (!srcPool.copyBuffer(src, *srcStage, srcOff, 0, thisChunk, VK_NULL_HANDLE)) {
+        // Slot reuse: the dst fence gates BOTH sides (the src staging was
+        // consumed by this slot's memcpy before its dst submit).
+        if (dstSl.busy) {
+            if (!waitSlotFence(dstDev, dstSl.fence) ||
+                vkResetFences(dstDev, 1, &dstSl.fence) != VK_SUCCESS) {
+                VVM_LOG_ERROR("copyDeviceToDeviceHostStaged: slot wait/reset failed");
+                ok = false;
+                break;
+            }
+            dstSl.busy = false;
+        }
+
+        // 1. device->host on the source side, then wait (memcpy needs it).
+        if (!recordChunkCopy(srcSl.cmd, src.buffer, srcSl.staging->buffer,
+                             srcOff, 0, thisChunk) ||
+            submitChunkCopy(srcQueue, srcSl.cmd, srcSl.fence) != VK_SUCCESS ||
+            !waitSlotFence(srcDev, srcSl.fence) ||
+            vkResetFences(srcDev, 1, &srcSl.fence) != VK_SUCCESS) {
             VVM_LOG_ERROR("copyDeviceToDeviceHostStaged: src device->host copy failed at offset {}",
                           static_cast<unsigned long long>(srcOff));
             ok = false;
@@ -785,23 +922,50 @@ bool MultiGPUPoolManager::copyDeviceToDeviceHostStaged(
         }
 
         // 2. memcpy host buffer -> host buffer (cross-process-safe "TCP" pivot).
-        std::memcpy(dstStage->hostPtr, srcStage->hostPtr, static_cast<size_t>(thisChunk));
+        std::memcpy(dstSl.staging->hostPtr, srcSl.staging->hostPtr,
+                    static_cast<size_t>(thisChunk));
 
-        // 3. Copy host->device on the destination device (dst staging -> dst alloc).
-        if (!dstPool.copyBuffer(*dstStage, dst, 0, dstOff, thisChunk, fence)) {
+        // 3. host->device on the destination side, submitted WITHOUT waiting:
+        // chunk N+1's src leg + memcpy overlap this DMA. The caller fence
+        // rides the FINAL chunk only (one submit per fence, always valid).
+        if (!recordChunkCopy(dstSl.cmd, dstSl.staging->buffer, dst.buffer,
+                             0, dstOff, thisChunk)) {
+            VVM_LOG_ERROR("copyDeviceToDeviceHostStaged: host->dst record failed at offset {}",
+                          static_cast<unsigned long long>(dstOff));
+            ok = false;
+            break;
+        }
+        const bool last = (remaining == thisChunk);
+        VkFence done = (last && fence != VK_NULL_HANDLE) ? fence : dstSl.fence;
+        if (submitChunkCopy(dstQueue, dstSl.cmd, done) != VK_SUCCESS) {
             VVM_LOG_ERROR("copyDeviceToDeviceHostStaged: host->dst device copy failed at offset {}",
                           static_cast<unsigned long long>(dstOff));
             ok = false;
             break;
         }
+        dstSl.busy = (done == dstSl.fence);
 
         srcOff += thisChunk;
         dstOff += thisChunk;
         remaining -= thisChunk;
+        ++chunk;
     }
 
-    srcPool.deallocate(std::move(*srcStage));
-    dstPool.deallocate(std::move(*dstStage));
+    // Drain outstanding dst legs, then tear everything down.
+    for (int s = 0; s < kSlots; ++s) {
+        if (sides[1].slot[s].busy) {
+            if (!waitSlotFence(dstDev, sides[1].slot[s].fence)) ok = false;
+            sides[1].slot[s].busy = false;
+        }
+    }
+    for (int side = 0; side < 2; ++side) {
+        for (int s = 0; s < kSlots; ++s) {
+            StageSlot& sl = sides[side].slot[s];
+            if (sl.fence != VK_NULL_HANDLE) vkDestroyFence(sides[side].device, sl.fence, nullptr);
+            if (sl.cmdPool != VK_NULL_HANDLE) vkDestroyCommandPool(sides[side].device, sl.cmdPool, nullptr);
+            if (sl.staging) sides[side].pool->deallocate(std::move(*sl.staging));
+        }
+    }
 
     if (ok) {
         VVM_LOG_INFO("copyDeviceToDeviceHostStaged: transferred {} bytes via host staging (chunk={})",

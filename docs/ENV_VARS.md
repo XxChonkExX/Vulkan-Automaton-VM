@@ -17,6 +17,7 @@ UPGRADING note.
 |---|---|---|
 | `VVM_DEVICE_INDEX` | auto | Pin device selection to one Vulkan device index. |
 | `VVM_STAGED_CHUNK_MB` | `16` | Host-staged copy chunk size in MiB (1..1024). Larger = fewer sync round-trips. |
+| `VVM_STAGED_PIPELINE` | `1` | `0` = sequential chunk loop (legacy); default overlaps the dst DMA leg with the next chunk's src leg (double-buffered slots). |
 | `VVM_P2P_POLICY` | `auto` | `host` = always host-staged, never attempt direct import. `force-direct` = attempt direct import even cross-vendor (refused drivers may crash; bring-up only). |
 | `VVM_ALLOW_CROSSVENDOR_ZC` | off | Force same-process zero-copy import cross-vendor (same crash caveat as `force-direct`). |
 | `VVM_SKIP_CMDPOOL` | off | Skip transfer command-pool creation (init-path bisect). |

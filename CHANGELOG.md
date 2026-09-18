@@ -24,6 +24,13 @@
   `migration_token_test` (device-gated): token presence, poll/consult
   agreement, and a host->device->host pattern round-trip - green on
   hardware, 0 failures.
+- **Pipelined host-staged transfers**: `copyDeviceToDeviceHostStaged`
+  double-buffers chunk slots (slot-local cmd pools/fences) so the dst
+  DMA leg overlaps the next chunk's src leg + memcpy; caller fence now
+  rides the final chunk only (was submitted per-chunk). Measured
+  B70<->XTX 256 MiB: 3.75 -> 8.61 GiB/s (2.3x) and 3.89 -> 7.19 GiB/s
+  reverse, data verified, zero validation errors. Opt out with
+  `VVM_STAGED_PIPELINE=0`.
 
 ## v0.4.0 (2026-09-18)
 
