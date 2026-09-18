@@ -10,12 +10,12 @@ explained it to me.*
 | One GPU, zero fragmentation, no penalty laps | Core: Chonk Buffer |
 | PyTorch training with everything in GPU memory | Core + PyTorch integration |
 | Two GPUs, different vendors, one model | Multi-GPU lanes + exchange zone |
-| 90 GB model on a 24 GB card | The coach + the crate + the supply van |
+| 90 GB model on a 24 GB card | The coach + the crate + the supply van/Slicer, Storage |
 | Two computers, one relay team | + Transport: TCP/RDMA/UCX |
 | Tensor math without leaving the track | + Compute layer |
 | All of it on your phone | Core: Android AHardwareBuffer |
 | To hear the race | `vvm-info`, `GET /vvm/stats`, `VVM_LOG_LEVEL=warn` |
-| To finish every lap without collisions | The baton-return official (R11) |
+| To finish every lap without collisions | The baton-return official (R11)/Retirement |
 
 The race is the same. The track is finally connected.
 ---
