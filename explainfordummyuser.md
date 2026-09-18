@@ -19,7 +19,7 @@ GPU memory  →  copy to staging  →  system RAM  →  copy again  →  next ru
 ```
 
 Each copy is a **penalty lap**. Your GPU — the fastest runner you own — stands
-at the fence waiting while the baton gets photocopyed, notarized, and carried
+at the fence waiting while the baton gets photocopied, notarized, and carried
 over by hand. Do that every layer, every token, every step, and your monster
 GPU spends its life waiting at fences.
 
@@ -76,52 +76,83 @@ tag. That's why the docs keep saying things like "zero-copy" and
 "single-copy" — and why [docs/LIFETIME_CONTRACT.md](docs/LIFETIME_CONTRACT.md)
 is very strict about who owns the baton at every moment.
 
+## The coach: who carries which baton
+
+A modern model isn't one race — it's forty races at once with wildly different
+batons: attention, dense weights, 48×512 experts, the KV cache, one giant
+embedding table. Somebody has to decide which runner carries which baton, and
+"give the GPU everything" is the wrong answer more often than you'd think.
+
+The **auto-placement planner** is the coach. Before the race starts it reads
+the model file, weighs every baton, checks every runner's hands (VRAM, RAM,
+bandwidth), and hands out assignments. On the flagship workload it
+rediscovered — from first principles, zero hand-tuning — the exact expert
+split a human had previously tuned by trial and error. One flag:
+
+```bash
+--vvm-split 'ffn_.*_exps.=auto,per_layer_token_embd=CPU'
+```
+
+No plan is ever a guess about your machine; it's computed from your model and
+your hardware, every load.
+
 ## Multi-GPU: same track, next lane
 
-Got a second GPU from a *different vendor*? In most stacks, cross-vendor means
-"copy through system RAM and pray." Here, each GPU gets its own Chonk Buffer
-pool and the pools talk:
+A second GPU gets its own Chonk Buffer pool — same surface, next lane. When
+runner A needs runner B's baton, there are three ways to pass it, and the
+system always tells you which one you got:
 
-- **Direct path**: export a block from GPU A, import into GPU B — one DMA when
-  the drivers allow it.
-- **Staged path**: when they don't, the transport layer moves the bytes
-  efficiently and tells you honestly that it did.
+- **The handoff** — GPU A exports the memory, GPU B imports it directly. One
+  DMA, zero copies, the way the vendors intended. Works whenever the drivers
+  allow it: same-vendor always, cross-vendor on Linux via DMA-BUF.
+- **The exchange zone** — Windows drivers refuse cross-vendor handoffs (AMD →
+  Intel doesn't just fail, it *crashes the machine* — measured, not rumored).
+  So both runners pass the baton through a marked stretch of shared ground:
+  one allocation in system RAM that *both* GPUs map into their own address
+  space. GPU A DMAs the baton into the zone, GPU B DMAs it out. Zero CPU
+  copies, 5–6 GiB/s, byte-verified in both directions. The Vulkan extension
+  is even literally named for this — `VK_EXT_external_memory_host`.
+- **The courier** — when nothing else is possible, an official ferries the
+  baton through RAM in honest chunks. Portable, works everywhere, 3.5 GiB/s,
+  and never pretends to be something faster. (`vvm-info` prints the policy;
+  `VVM_P2P_POLICY=host` forces it.)
 
-The llama.cpp integration serves a 90 GB MoE model on a single 24 GB card:
-dense layers and KV cache live in VRAM while 48×512 experts stream from RAM
-at ~17 GB/s — no hand-tuning, because the auto-placement planner reads the
-model file and puts every tensor class where it runs fastest. Different
-vendors, one model, verified at parity with stock
-([docs/inference_benchmarks.md](docs/inference_benchmarks.md)) — and a live
-`GET /vvm/stats` endpoint shows every pool's fill level while it serves.
+## The supply van: races bigger than your pockets
 
-## Finishing the lap safely: the retirement queue
+Here's the party trick: serving a **90 GB model on a single 24 GB card**.
+That race has more batons than any runner can hold, so the team recruits
+equipment:
 
-Here is the mistake every young memory system makes: the CPU frees a buffer
-the microsecond *it* is done with it — while the GPU is still mid-stride on
-that same memory. The next allocation reuses the bytes, and now two runners
-are sprinting on the same lane. Corruption that looks like bad luck.
+- **The crate by the track** — system RAM. The OS page cache holds the hot
+  experts and serves them at ~17 GB/s. The surprise finding of the whole
+  campaign: on this box, the *CPU* runner pulling batons from the crate beat
+  both GPUs at expert math. Measured twice. The coach noticed.
+- **The supply van** — NVMe. The storage stream (five layers: pack format →
+  software cache → request queue → IoRing backend → tiering scheduler) keeps
+  the crate stocked at 3.3–3.5 GB/s — 96% of what the disk's own benchmark
+  says the wire can physically deliver.
 
-Version 0.4's big idea: **CPU lifetime is not GPU lifetime.** When you hand
-memory back now, you also hand over a timeline ticket — "I'm done with this
-after signal 42." The pool files it in the retirement queue and only truly
-frees it once the GPU passes signal 42. Nobody waits; everybody is safe.
-The cross-GPU copy path uses the same trick to become genuinely asynchronous
-instead of stop-and-wait. See [docs/RETIREMENT.md](docs/RETIREMENT.md) for
-the full contract (rule R11 in
-[docs/LIFETIME_CONTRACT.md](docs/LIFETIME_CONTRACT.md)).
+So: dense layers and KV cache live in VRAM, all 24,576 experts stream from
+the crate, and the race runs at 16–17 tokens/s — still holding ~12–13
+tokens/s at the full 262K native context. Full story:
+[docs/inference_benchmarks.md](docs/inference_benchmarks.md) and
+[docs/STORAGE_STREAM_ARCHITECTURE.md](docs/STORAGE_STREAM_ARCHITECTURE.md).
 
-## The shared arena: one whiteboard, two runners
+## No collisions: the baton-return official
 
-Cross-vendor GPUs can't import each other's memory on Windows — the drivers
-just refuse (one returns an error, Intel *crashes*). So instead of handing
-the baton directly, both GPUs agree to use **one whiteboard in system RAM**:
-a single allocation that the XTX *and* the B70 both map into their own
-memory space. GPU A DMAs its bytes onto the whiteboard, GPU B DMAs them off
-— zero CPU copies, 5–6 GiB/s, byte-verified both directions. When even that
-isn't available, the staged path copies through RAM the honest way (3.5
-GiB/s) and tells you that's what happened — check the P2P policy matrix in
-`vvm-info` output.
+Every young memory system makes the same mistake: the CPU hands back a buffer
+the microsecond *it* is done — while the GPU runner is still mid-stride on
+that same memory. The next allocation grabs the identical bytes, two runners
+sprint through one lane, and you get corruption that looks like bad luck.
+
+Version 0.4 hired a **baton-return official**. Handing memory back now means
+handing it over with a lap number attached — "this baton is dead after lap
+42." The official files it in the retirement queue and returns it to the bin
+only once the GPU certifies lap 42 complete. Nobody waits. Nobody collides.
+The cross-GPU copy path uses the same official to become genuinely
+asynchronous: pass the baton, keep running, it re-enters circulation only
+when safe. The fine print is contract rule R11:
+[docs/RETIREMENT.md](docs/RETIREMENT.md).
 
 ## The network: recruiting the next team
 
@@ -132,11 +163,17 @@ into the relay — same track, next building:
 - **RDMA** when the NIC can DMA straight out of your pool
 - **UCX** when you have opinions about your fabric
 
-The [ModelHub](README.md) and placement planner decide which shards live
-where, by capacity and bandwidth — the same way the pool decides which block
-holds which tensor, one level up.
+The placement planner decides which shards live at which building — the same
+way the coach assigns batons, one level up.
 
-## Compute: teaching the runners new moves
+## The announcer booth
+
+You can hear everything. `vvm-info` reads out every runner's hands and the
+exchange-zone policy before the race starts. `GET /vvm/stats` streams every
+pool's fill level live, mid-race. `VVM_LOG_LEVEL=warn` turns down the crowd
+noise when you're trying to think.
+
+## Compute: new moves, same track
 
 The compute layer adds tensor operations, collectives, and layout conversion
 as Vulkan compute shaders — so data that's already on the track gets processed
@@ -150,6 +187,8 @@ The whole point is that you don't change how you work:
   Buffer. Your training loop doesn't know. Your optimizer doesn't know. The
   memory system knows, and that's who needed to.
 - **ONNX Runtime**: same story, execution provider flavor.
+- **llama.cpp**: serves through the pool on a fork branch — parity verified
+  against stock across two GPU vendors.
 - **Android**: the same pool, imported as an AHardwareBuffer — verified on a
   Galaxy S24+.
 
@@ -162,8 +201,8 @@ end-to-end on real hardware: AMD RDNA3, Strix Halo, Intel B70 (Vulkan *and*
 Level Zero), NVIDIA GTX 1080 Ti (CUDA path, small-model duty), Adreno
 Android — see [docs/HARDWARE_SUPPORT.md](docs/HARDWARE_SUPPORT.md). Some
 things are designed but thinly tested (RDMA on real NICs, DStorage import,
-GDeflate). The autograd ops currently run through ATen
-with Vulkan dispatch landing; the numbers are validated against PyTorch in
+GDeflate). The autograd ops currently run through ATen with Vulkan dispatch
+landing; the numbers are validated against PyTorch in
 [test_autograd_numerics.py](python/vulkanvm_torch/test_autograd_numerics.py).
 
 What we claim, we test. What we haven't tested, we say.
@@ -176,13 +215,13 @@ What we claim, we test. What we haven't tested, we say.
 |---|---|
 | One GPU, zero fragmentation, no penalty laps | Core: Chonk Buffer |
 | PyTorch training with everything in GPU memory | Core + PyTorch integration |
-| Two GPUs, different vendors, one model | Core: cross-GPU sharing |
-| 90 GB model on a 24 GB card | Core + auto-placement planner + expert streaming |
+| Two GPUs, different vendors, one model | Multi-GPU lanes + exchange zone |
+| 90 GB model on a 24 GB card | The coach + the crate + the supply van |
 | Two computers, one relay team | + Transport: TCP/RDMA/UCX |
 | Tensor math without leaving the track | + Compute layer |
 | All of it on your phone | Core: Android AHardwareBuffer |
-| To see what's happening inside | `vvm-info`, `GET /vvm/stats`, `VVM_LOG_LEVEL=warn` for quiet |
-| To finish every lap without collisions | Core: retirement queue (R11) |
+| To hear the race | `vvm-info`, `GET /vvm/stats`, `VVM_LOG_LEVEL=warn` |
+| To finish every lap without collisions | The baton-return official (R11) |
 
 The race is the same. The track is finally connected.
 
