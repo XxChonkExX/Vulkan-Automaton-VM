@@ -120,15 +120,17 @@ int main() {
         }
     }
 
-    // XTX = biggest discrete 0x1002; Ti = discrete 0x10DE.
-    int idxAmd = -1, idxNv = -1;
+    // XTX = biggest discrete 0x1002; second side = discrete of another
+    // vendor (NVIDIA 0x10DE or Intel 0x8086).
+    int idxAmd = -1, idxB = -1;
     uint64_t biggest = 0;
     // Prefer the largest AMD discrete heap as the AMD side.
     for (size_t i = 0; i < devices.size(); ++i) {
         const bool discrete =
             devices[i].props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
-        if (devices[i].vendorID == 0x10DE && discrete && idxNv < 0) {
-            idxNv = static_cast<int>(i);
+        if ((devices[i].vendorID == 0x10DE || devices[i].vendorID == 0x8086) &&
+            discrete && idxB < 0) {
+            idxB = static_cast<int>(i);
         }
         if (devices[i].vendorID != 0x1002 ||
             devices[i].props.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
@@ -144,18 +146,20 @@ int main() {
         }
         if (local > biggest) { biggest = local; idxAmd = static_cast<int>(i); }
     }
-    if (idxAmd < 0 || idxNv < 0) {
-        std::cout << "SKIP: need one AMD discrete + one NVIDIA discrete (have amd="
-                  << idxAmd << " nv=" << idxNv << ")\n";
+    if (idxAmd < 0 || idxB < 0) {
+        std::cout << "SKIP: need one AMD discrete + one non-AMD discrete (have amd="
+                  << idxAmd << " second=" << idxB << ")\n";
         vkDestroyInstance(instance, nullptr);
         return 0;
     }
+    const char* nameB =
+        devices[idxB].vendorID == 0x8086 ? "Intel" : "NV";
     std::cout << "Pair: AMD [" << idxAmd << "] " << devices[idxAmd].props.deviceName
-              << " <-> NV [" << idxNv << "] " << devices[idxNv].props.deviceName << "\n";
+              << " <-> " << nameB << " [" << idxB << "] " << devices[idxB].props.deviceName << "\n";
 
     DeviceConfig devA, devN;
     if (!createDeviceForPool(devices[idxAmd], "amd", instance, devA) ||
-        !createDeviceForPool(devices[idxNv], "nv", instance, devN)) {
+        !createDeviceForPool(devices[idxB], "second", instance, devN)) {
         std::cerr << "FAIL: device creation for pair\n";
         vkDestroyInstance(instance, nullptr);
         return 1;
@@ -168,11 +172,9 @@ int main() {
     // (copyDeviceToDeviceHostStaged maps staging blocks). Without it the
     // pool falls back to device-local types whose hostPtr is null and every
     // staged copy fails. Discrete NVIDIA has GART host-visible types.
-    poolCfg.enableHostVisible = true;
+    poolCfg.enableHostVisible = false;
     poolCfg.enableExternal = true;
-    // No device addresses: this probe only does transfer copies, and the
-    // Ti's driver may not expose bufferDeviceAddress (Pascal-era gap).
-    poolCfg.enableDeviceAddress = false;
+    poolCfg.enableDeviceAddress = true;
     poolCfg.maxBlocks = 8;
     poolCfg.maxHeapFraction = 0.0f;
     poolCfg.maxPoolBytes = 0;
@@ -190,7 +192,7 @@ int main() {
     for (int dir = 0; dir < 2; ++dir) {
         const uint32_t s = dir == 0 ? 0 : 1;
         const uint32_t d = dir == 0 ? 1 : 0;
-        std::cout << "\n=== direction " << (dir == 0 ? "AMD->NV" : "NV->AMD") << " ===\n";
+        std::cout << "\n=== direction " << (dir == 0 ? "AMD->B" : "B->AMD") << " ===\n";
         auto peer = manager->queryPeerAccess(s, d);
         std::cout << "queryPeerAccess: canDirectCopy=" << (peer.canDirectCopy ? "yes" : "no")
                   << " external=" << (peer.externalMemorySupported ? "yes" : "no")
@@ -207,7 +209,7 @@ int main() {
             // dedicated src so the round-trip still exercises the staged
             // path, which is the supported cross-vendor route.
             std::cout << "info: exportable src unavailable on "
-                      << (s == 0 ? "AMD" : "NV")
+                      << (s == 0 ? "AMD" : nameB)
                       << ", using plain dedicated src\n";
             // Plain sub-allocated src also routes to the staged path.
             src = manager->getPool(s).allocate(kSize, kUsage);
@@ -269,7 +271,7 @@ int main() {
         auto src = manager->getPool(s).allocate(kBig, kUsage);
         auto dst = manager->getPool(d).allocate(kBig, kUsage);
         if (!src || !dst) {
-            std::cout << "bandwidth " << (dir == 0 ? "AMD->NV" : "NV->AMD")
+            std::cout << "bandwidth " << (dir == 0 ? "AMD->B" : "B->AMD")
                       << ": SKIP (alloc failed)\n";
             if (src) manager->getPool(s).deallocate(std::move(*src));
             if (dst) manager->getPool(d).deallocate(std::move(*dst));
@@ -280,7 +282,7 @@ int main() {
         auto t1 = std::chrono::steady_clock::now();
         const double sec = std::chrono::duration<double>(t1 - t0).count();
         const double gbps = (double)kBig / (1024.0 * 1024.0 * 1024.0) / sec;
-        std::cout << "bandwidth " << (dir == 0 ? "AMD->NV" : "NV->AMD") << ": "
+        std::cout << "bandwidth " << (dir == 0 ? "AMD->B" : "B->AMD") << ": "
                   << (ok ? "OK" : "FAIL") << " 256 MiB in " << sec << " s = "
                   << gbps << " GiB/s (via working path)\n";
         if (!ok) ++failures;
@@ -295,7 +297,7 @@ int main() {
     for (int dir = 0; dir < 2; ++dir) {
         const uint32_t s = dir == 0 ? 0 : 1;
         const uint32_t d = dir == 0 ? 1 : 0;
-        const char* tag = dir == 0 ? "AMD->NV" : "NV->AMD";
+        const char* tag = dir == 0 ? "AMD->B" : "B->AMD";
         const VkDeviceSize kLeg = 64ull * 1024 * 1024;
         const VkBufferUsageFlags kUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT |

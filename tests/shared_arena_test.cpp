@@ -260,7 +260,7 @@ int main() {
         return 1;
     }
 
-    // Device + import + staging per DISCRETE GPU (AMD + NVIDIA only).
+    // Device + import + staging per DISCRETE GPU (AMD + NVIDIA + Intel).
     std::vector<ArenaDevice> ar;
     for (size_t i = 0; i < devices.size(); ++i) {
         const bool discrete =
@@ -268,7 +268,8 @@ int main() {
         if (!discrete) continue;
         const bool isNv = devices[i].vendorID == 0x10DE;
         const bool isAmd = devices[i].vendorID == 0x1002;
-        if (!isNv && !isAmd) continue;
+        const bool isIntel = devices[i].vendorID == 0x8086;
+        if (!isNv && !isAmd && !isIntel) continue;
         ArenaDevice d;
         if (!createDeviceFor(devices[i], devices[i].props.deviceName, d)) {
             std::cerr << "  " << devices[i].props.deviceName << ": device creation failed\n";

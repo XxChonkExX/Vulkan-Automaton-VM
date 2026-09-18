@@ -19,7 +19,7 @@ Status tiers (be honest — this table is a promise):
 | AMD Vulkan (RDNA4/RDNA5) | 3 — Designed | Same code path as RDNA3; no RDNA4/5 hardware exercised |
 | Intel Arc Pro (Battlemage, Vulkan) | **1 — Verified** | Arc Pro B70: llama.cpp Chonk integration verified (docs/inference_benchmarks.md). Driver note: stock Pro driver 8861 was 24x broken for compute; consumer WHQL 8974+ required |
 | Cross-vendor direct P2P (Linux, DMA-BUF) | **1 — Verified** | RADV NAVI31 export -> ANV Battlemage G31 import, zero-copy, data-verified (`multi_gpu_test`, native Ubuntu; docs/LINUX_TEST_RESULTS_2026-08-25.md) |
-| Intel Level Zero GPU-direct | 2 — Compile-tested | Builds against Level Zero SDK; no cross-vendor copy exercised |
+| Intel Level Zero GPU-direct | **1 — Verified** | Arc Pro B70 via ze_loader: device discovery (31.9 GB heap), device alloc plane (1 MiB/64 MiB/1 GiB alloc/echo/free), full UnifiedMemoryPool over the L0 backend (`l0_backend_test`, 2026-09-17). v1 note: heapBudget returns invalid (static heap size fallback) |
 | NVIDIA (CUDA path) | **1 — Verified** | GTX 1080 Ti (sm_61, PCIe 3.0 x8): CudaMemoryBackend end-to-end — `cuda_backend_test` ALL PASS (alloc/echo/free, budget, full pool + reserve + dedicated), llama.cpp `GGML_CUDA_VVM_POOL` 4B gate byte-identical, 90 GB auto-plan coherent (SERVE_TEST_RESULTS.md 2026-09-17; llama `ccfac2928`, VulkanVM `4310d8f`). Card currently off-box; roles: small-model duty (57.7 t/s on 4B), prefill, dense/KV offload |
 | NVIDIA (Vulkan path) | **1 — Verified** | Same 1080 Ti as Vulkan device (11 GB): Chonk pool exercised at 4B scale via ggml-vulkan (split follows VRAM 68/32); 90 GB sessions ran via the CUDA path |
 | Tenstorrent | 3 — Designed | Vulkan ICD built and submitted to TT; loosely supported |
@@ -52,7 +52,8 @@ Status tiers (be honest — this table is a promise):
 | Vulkan -> OpaqueFd -> HIP import (Linux) | **1 — Verified** | Chonk allocator (PyTorch pluggable allocator) |
 | Vulkan -> Win32 -> HIP import (Windows) | 3 — Designed | Windows uses different handle semantics; untested |
 | Vulkan <-> AHardwareBuffer (Android) | **1 — Verified** | Galaxy S24+ (tests/chonk_slab_test covers the allocator; android_test covers the import) |
-| CUDA external-memory import | 3 — Designed | Cross-vendor direct import refused both ways on Windows (AMD->NV import OOM; NV reports no exportable type for STORAGE\|TRANSFER); verified paths are host-staged staging copies and the VK_EXT_external_memory_host shared arena (3.85 GiB/s zero-copy, tests/shared_arena_test) |
+| Cross-vendor shared host arena (VK_EXT_external_memory_host) | **1 — Verified** | XTX + Arc Pro B70 both accept HOST_ALLOCATION import (4096 alignment); zero-copy B70<->XTX 5.2 GiB/s, manager `copyDeviceToDeviceArena` 6.1 GiB/s, byte-verified both directions (`shared_arena_test`, 2026-09-17; Intel included in probe from 2026-09-17) |
+| Cross-vendor direct import (Windows) | **Refused (by design)** | Opaque handles are driver-private: AMD->NVIDIA returns VkResult -13; AMD->Intel AVs inside vkAllocateMemory (B70, found via `p2p_xn_test`). `copyDeviceToDevice`/`allocateDistributed` now gate direct import to same-vendor on Windows and fall back to host-staged (3.5 GiB/s symmetric XTX<->B70). Linux dma-buf cross-vendor is real and unaffected |
 
 ## Test coverage tiers
 

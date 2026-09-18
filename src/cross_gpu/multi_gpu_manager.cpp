@@ -329,6 +329,20 @@ std::vector<std::optional<Allocation>> MultiGPUPoolManager::allocateDistributed(
         
         // Create import info from export info. Each peer needs its OWN dup'ed
         // handle because a successful import consumes (transfers) one handle.
+#if defined(VVM_PLATFORM_WINDOWS)
+        // Cross-vendor import is refused on Windows - sometimes as a driver
+        // crash (AMD master -> Intel peer AVs in vkAllocateMemory). Same-
+        // vendor only on Windows; Linux dma-buf cross-vendor stays enabled.
+        {
+            const auto masterV = getVendorProperties(master.config.physicalDevice);
+            const auto peerV = getVendorProperties(peer.config.physicalDevice);
+            if (masterV.vendorID != peerV.vendorID) {
+                VVM_LOG_WARN("allocateDistributed: peer {} is cross-vendor; "
+                             "direct import unsupported on Windows, skipping", i);
+                continue;   // results[i] stays nullopt - caller handles partial
+            }
+        }
+#endif
         auto importInfo = duplicateForImport(*exportInfo);
         importInfo.type = pairCaps.recommendedType;
         importInfo.size = exportInfo->size;
@@ -459,6 +473,22 @@ bool MultiGPUPoolManager::copyDeviceToDevice(
         return copyDeviceToDeviceHostStaged(srcDeviceIndex, dstDeviceIndex,
                                             src, dst, srcOffset, dstOffset, size, fence);
     }
+
+#if defined(VVM_PLATFORM_WINDOWS)
+    // Cross-vendor opaque-handle import is refused on Windows: gracefully by
+    // some drivers (AMD->NVIDIA returns VkResult -13), by a driver CRASH on
+    // others (AMD->Intel AVs inside vkAllocateMemory - found via p2p_xn_test
+    // on the Arc Pro B70). The verified cross-vendor paths are host-staged
+    // copies and the shared host arena; direct import stays same-vendor on
+    // Windows. Linux dma-buf cross-vendor is real and unaffected
+    // (docs/LINUX_TEST_RESULTS_2026-08-25.md).
+    if (srcVendorProps.vendorID != dstVendorProps.vendorID) {
+        VVM_LOG_INFO("copyDeviceToDevice: cross-vendor direct import unsupported "
+                     "on Windows, using host-staged");
+        return copyDeviceToDeviceHostStaged(srcDeviceIndex, dstDeviceIndex,
+                                            src, dst, srcOffset, dstOffset, size, fence);
+    }
+#endif
 
     VVM_LOG_INFO("copyDeviceToDevice: using vendor P2P path: {}", p2pCaps.notes);
 
