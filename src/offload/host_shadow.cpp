@@ -25,8 +25,13 @@ HostShadowManager::HostShadowManager(VkPhysicalDevice physicalDevice, VkDevice d
     : physicalDevice_(physicalDevice), device_(device), config_(config) {
     VVM_LOG_INFO("HostShadowManager: physicalDevice={}, device={}, hostShadowSize={}",
                  physicalDevice, device, config.hostShadowSize);
-    createShadowBuffer();
-    VVM_LOG_INFO("HostShadowManager: shadow buffer created, size={}", shadowBuffer_.size);
+    if (!createShadowBuffer()) {
+        // Fail-soft is preserved (offload paths fail on empty shadow), but a
+        // silent success log here used to hide the failure until much later.
+        VVM_LOG_ERROR("HostShadowManager: shadow buffer creation failed - offload unavailable");
+    } else {
+        VVM_LOG_INFO("HostShadowManager: shadow buffer created, size={}", shadowBuffer_.size);
+    }
     
     // Create command pool for copy operations using the transfer queue family
     VkCommandPoolCreateInfo poolInfo{};
