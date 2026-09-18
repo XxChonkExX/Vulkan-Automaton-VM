@@ -1,10 +1,11 @@
 # Changelog
 
-## v0.4.0 (in progress — release candidate)
+## v0.4.0 (2026-09-18)
 
 Memory-lifetime correctness, cross-vendor hardening on the returned B70,
 and release packaging. Full suite green (36 binaries; only skip is CUDA
-with no NVIDIA hardware on box).
+with no NVIDIA hardware on box). CI: Linux GCC/Clang (core + full),
+Windows MSVC (core + full), Android compile - all green.
 
 ### Lifetime & ownership (new contract rule R11)
 
@@ -63,6 +64,19 @@ with no NVIDIA hardware on box).
 - `IoRingBackend::close` drains in-flight ring ops on both platforms
   (teardown-while-DMA use-after-free class).
 - `storage_e2e_stream_test` self-generates its pack (CI-ready, no args).
+
+### Cross-platform CI (release-day hardening)
+
+- Linux GCC + Clang green (core + full): LP64 lambda return-type fix,
+  `fread` short-read checks, switch exhaustiveness, dead deprecated
+  `OffloadConfig` members removed.
+- Test portability: `buddy_test` CHECK arity, `std::filesystem` temp dir
+  in `storage_e2e_stream_test`, sequenced fuzz counter in
+  `storage_queue_test` (genuine unsequenced UB), portable
+  VirtualAlloc/mmap arenas in `shared_arena_test` - and the
+  manager-owned `createSharedArena(size)` overload now builds on Linux.
+- C++20 `[=, this]` captures; duplicate `VVM_BUILD_SHARED` definition
+  dropped from the network target.
 
 ### Diagnostics & packaging
 
