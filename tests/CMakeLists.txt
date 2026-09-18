@@ -380,3 +380,11 @@ target_include_directories(udp_verb_test PRIVATE
 )
 add_test(NAME udp_verb_test COMMAND udp_verb_test)
 endif()
+# Retirement queue (GPU-lifetime-safe reclamation) test
+add_executable(retirement_test retirement_test.cpp)
+target_link_libraries(retirement_test PRIVATE vulkan_vm)
+target_include_directories(retirement_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
+add_test(NAME retirement_test COMMAND retirement_test)
