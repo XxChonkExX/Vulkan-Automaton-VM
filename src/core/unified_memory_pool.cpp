@@ -62,7 +62,9 @@ struct UnifiedMemoryPoolImpl {
     // except retireTimeline_, the pool-owned ticket timeline for internal
     // async use.
     struct RetirementItem {
-        Allocation allocation;
+        // Null for cmd-only items (see retireCommandPool): no memory to
+        // reclaim, only teardown (cmd freed, cmdPool destroyed).
+        std::optional<Allocation> allocation;
         VkCommandBuffer cmd = VK_NULL_HANDLE;  // freed at reclaim (see below)
         VkCommandPool cmdPool = VK_NULL_HANDLE;  // destroyed at reclaim (or NULL)
         CompletionToken token;  // consulted by collect(); see isTokenComplete
@@ -155,6 +157,9 @@ struct UnifiedMemoryPoolImpl {
                 VkCommandBuffer cmd, VkCommandPool cmdPool);
     bool retire(Allocation&& alloc, CompletionToken token,
                 VkCommandBuffer cmd, VkCommandPool cmdPool);
+    // Cmd-only retire for transient submit teardown (no memory attached).
+    bool retireCommandPool(VkCommandBuffer cmd, VkCommandPool pool,
+                           CompletionToken token);
     uint32_t collect();
     std::pair<VkSemaphore, uint64_t> retireTicket();
     std::optional<CompletionToken> retireToken();
@@ -466,6 +471,10 @@ bool UnifiedMemoryPool::retire(Allocation&& alloc, CompletionToken token,
 std::optional<CompletionToken> UnifiedMemoryPool::retireToken() {
     return impl_->retireToken();
 }
+bool UnifiedMemoryPool::retireCommandPool(VkCommandBuffer cmd, VkCommandPool pool,
+                                          CompletionToken token) {
+    return impl_->retireCommandPool(cmd, pool, std::move(token));
+}
 void UnifiedMemoryPool::unreserve(VkDeviceSize bytes) { impl_->unreserve(bytes); }
 VkDeviceSize UnifiedMemoryPool::reservedBytes() const { return impl_->reservedBytes(); }
 std::optional<ExternalMemoryInfo> UnifiedMemoryPool::exportMemory(const Allocation& alloc, ExternalHandleType type) { return impl_->exportMemory(alloc, type); }
@@ -543,16 +552,26 @@ UnifiedMemoryPoolImpl::~UnifiedMemoryPoolImpl() {
         // Retired-but-uncollected items: destroy their buffers; free memory
         // only for dedicated items (sub-allocated ones share their block's
         // memory, freed by the blocks loop below - freeing here would
-        // double-free). The GPU work they waited on dies with the device.
+        // double-free). Retired cmd pools die here too (their GPU work is
+        // complete-or-dying with the device; leaving them leaks and trips
+        // VUID-vkDestroyDevice-device-05137). The GPU work they waited on
+        // dies with the device.
+        // Cmd-only items (no allocation) need no memory handling.
         for (auto& item : retired_) {
-            if (item.allocation.buffer) {
-                backend_->destroy_buffer(reinterpret_cast<uint64_t>(item.allocation.buffer));
+            if (item.cmdPool) {
+                vkDestroyCommandPool(device_, item.cmdPool, nullptr);
+                item.cmdPool = VK_NULL_HANDLE;
+                item.cmd = VK_NULL_HANDLE;
             }
-            if (item.allocation.blockIndex == UINT32_MAX && item.allocation.memory) {
-                if (item.allocation.hostPtr) {
-                    backend_->unmap(reinterpret_cast<uint64_t>(item.allocation.memory));
+            if (!item.allocation) continue;
+            if (item.allocation->buffer) {
+                backend_->destroy_buffer(reinterpret_cast<uint64_t>(item.allocation->buffer));
+            }
+            if (item.allocation->blockIndex == UINT32_MAX && item.allocation->memory) {
+                if (item.allocation->hostPtr) {
+                    backend_->unmap(reinterpret_cast<uint64_t>(item.allocation->memory));
                 }
-                backend_->free(reinterpret_cast<uint64_t>(item.allocation.memory));
+                backend_->free(reinterpret_cast<uint64_t>(item.allocation->memory));
             }
         }
         retired_.clear();
@@ -2119,6 +2138,34 @@ bool UnifiedMemoryPoolImpl::retire(Allocation&& alloc, CompletionToken token,
     return true;
 }
 
+// Transient submit teardown (async copyBuffer and friends): the command
+// pool dies at reclaim time, never under in-flight work. Destroying it
+// earlier is VUID-vkDestroyCommandPool-commandPool-00041.
+bool UnifiedMemoryPoolImpl::retireCommandPool(VkCommandBuffer cmd, VkCommandPool pool,
+                                             CompletionToken token) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (cmd == VK_NULL_HANDLE || pool == VK_NULL_HANDLE) return false;
+    if (device_ == VK_NULL_HANDLE) return false;
+    switch (token.kind) {
+        case CompletionToken::Kind::Ready:
+            break;
+        case CompletionToken::Kind::VulkanTimeline: {
+            if (!isVulkanBackend() || !token.timeline) return false;
+            const VkDevice dev = token.device != VK_NULL_HANDLE ? token.device : device_;
+            if (dev == VK_NULL_HANDLE) return false;
+            token.device = dev;
+            break;
+        }
+        case CompletionToken::Kind::Foreign:
+            if (!token.isComplete) return false;
+            break;
+        default:
+            return false;
+    }
+    retired_.push_back(RetirementItem{std::nullopt, cmd, pool, std::move(token)});
+    return true;
+}
+
 uint32_t UnifiedMemoryPoolImpl::collect() {
     std::lock_guard<std::mutex> lock(mutex_);
     uint32_t reclaimed = 0;
@@ -2131,7 +2178,9 @@ uint32_t UnifiedMemoryPoolImpl::collect() {
                 if (pool) vkFreeCommandBuffers(device_, pool, 1, &it->cmd);
                 if (it->cmdPool) vkDestroyCommandPool(device_, it->cmdPool, nullptr);
             }
-            deallocateLocked(std::move(it->allocation));
+            if (it->allocation) {
+                deallocateLocked(std::move(*it->allocation));
+            }
             it = retired_.erase(it);
             ++reclaimed;
         } else {
@@ -2614,6 +2663,32 @@ bool UnifiedMemoryPoolImpl::copyBuffer(const Allocation& src, const Allocation& 
     bool waitInternal = (fence == VK_NULL_HANDLE);
     VkFence done = fence;
     VkFence internalFence = VK_NULL_HANDLE;
+    // Async teardown needs a ticket timeline to retire the transient pool
+    // against: destroying it under in-flight work is
+    // VUID-vkDestroyCommandPool-commandPool-00041. Without a ticket there
+    // is no GPU-completion tracking, so degrade to synchronous (safe).
+    VkSemaphore ticket = VK_NULL_HANDLE;
+    uint64_t ticketValue = 0;
+    VkTimelineSemaphoreSubmitInfo tlInfo{};
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    if (!waitInternal) {
+        auto [t, v] = retireTicket();
+        if (t != VK_NULL_HANDLE) {
+            ticket = t;
+            ticketValue = v;
+            tlInfo.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+            tlInfo.signalSemaphoreValueCount = 1;
+            tlInfo.pSignalSemaphoreValues = &ticketValue;
+            si.pNext = &tlInfo;
+            si.signalSemaphoreCount = 1;
+            si.pSignalSemaphores = &ticket;
+        } else {
+            waitInternal = true;
+        }
+    }
     if (waitInternal) {
         VkFenceCreateInfo fi{};
         fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
@@ -2624,19 +2699,27 @@ bool UnifiedMemoryPoolImpl::copyBuffer(const Allocation& src, const Allocation& 
         done = internalFence;
     }
 
-    VkSubmitInfo si{};
-    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
     rc = vkQueueSubmit(queue, 1, &si, done);
-
-    if (waitInternal && rc == VK_SUCCESS) {
-        rc = vkWaitForFences(device_, 1, &internalFence, VK_TRUE, UINT64_MAX);
+    if (rc != VK_SUCCESS) {
+        if (internalFence) vkDestroyFence(device_, internalFence, nullptr);
+        vkDestroyCommandPool(device_, pool, nullptr);
+        return false;
     }
-
-    if (internalFence) vkDestroyFence(device_, internalFence, nullptr);
-    vkDestroyCommandPool(device_, pool, nullptr);
-    return rc == VK_SUCCESS;
+    if (waitInternal) {
+        rc = vkWaitForFences(device_, 1, &internalFence, VK_TRUE, UINT64_MAX);
+        if (internalFence) vkDestroyFence(device_, internalFence, nullptr);
+        vkDestroyCommandPool(device_, pool, nullptr);
+        return rc == VK_SUCCESS;
+    }
+    // Genuinely async: the caller fence is signaled by the submit above;
+    // the transient pool retires against the ticketed value and dies at
+    // reclaim time, after the GPU is done with it.
+    if (!retireCommandPool(cmd, pool,
+                           CompletionToken::vulkanTimeline(ticket, ticketValue, device_))) {
+        VVM_LOG_ERROR("copyBuffer: async teardown retire failed; leaking transient pool (safe)");
+        return false;
+    }
+    return true;
 }
 
 std::optional<MigrationOperation> UnifiedMemoryPoolImpl::offloadToHost(Allocation& alloc) {

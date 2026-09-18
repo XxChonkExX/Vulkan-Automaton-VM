@@ -343,6 +343,54 @@ int main() {
         }
     }
 
+    // E: fenced (async-path) copyBuffer retires its transient pool instead
+    // of destroying it under in-flight work (VUID-00041 class). Repeated
+    // fenced copies verify clean, and a collect() sweep reaps the retired
+    // teardowns.
+    {
+        auto pool = UnifiedMemoryPool::create(dc, poolCfg());
+        CHECK(pool.has_value(), "pool create");
+        if (pool.has_value()) {
+            const VkMemoryPropertyFlags kHost =
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            auto ea = pool->allocate(4ull * 1024ull * 1024ull,
+                                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                    VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                    kHost);
+            auto eb = pool->allocate(4ull * 1024ull * 1024ull,
+                                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                    VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                    kHost);
+            CHECK(ea.has_value() && eb.has_value(), "E: allocs");
+            CHECK(ea->hostPtr != nullptr && eb->hostPtr != nullptr,
+                  "E: host-mapped");
+            if (ea.has_value() && eb.has_value() && ea->hostPtr && eb->hostPtr) {
+                std::vector<uint8_t> epat(4ull * 1024ull * 1024ull, 0xAB);
+                std::memcpy(ea->hostPtr, epat.data(), epat.size());
+                VkFenceCreateInfo efi{};
+                efi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+                VkFence efence = VK_NULL_HANDLE;
+                CHECK(vkCreateFence(dc.device, &efi, nullptr, &efence) == VK_SUCCESS,
+                      "E: fence");
+                for (int i = 0; i < 5; ++i) {
+                    CHECK(vkResetFences(dc.device, 1, &efence) == VK_SUCCESS,
+                          "E: fence reset");
+                    CHECK(pool->copyBuffer(*ea, *eb, 0, 0, epat.size(), efence),
+                          "E: fenced copy accepted");
+                    CHECK(vkWaitForFences(dc.device, 1, &efence, VK_TRUE,
+                                          UINT64_MAX) == VK_SUCCESS,
+                          "E: fence wait");
+                }
+                CHECK(std::memcmp(eb->hostPtr, epat.data(), epat.size()) == 0,
+                      "E: data verified after fenced copies");
+                CHECK(pool->collect() >= 5,
+                      "E: collect reaped retired transient pools");
+                vkDestroyFence(dc.device, efence, nullptr);
+            }
+        }
+    }
+
     vkDestroyDevice(dc.device, nullptr);
     vkDestroyInstance(instance, nullptr);
     std::printf("retirement_test: %d checks, %d failures\n", checks, failures);

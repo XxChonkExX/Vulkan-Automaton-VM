@@ -482,7 +482,14 @@ public:
                                                       VkBufferUsageFlags usage);
 
     // One-shot copy between two allocations on the same device via transfer
-    // queue. Creates a transient command pool/buffer, submits, waits, destroys.
+    // queue. Creates a transient command pool/buffer per call.
+    // fence == NULL: submits, waits, destroys (fully synchronous).
+    // fence != NULL: genuinely async - the submit signals the caller fence
+    // plus a ticket timeline, and the transient pool retires against that
+    // ticket (destroyed by a later collect(), never under in-flight work,
+    // which would be VUID-vkDestroyCommandPool-commandPool-00041). Without
+    // timeline support it degrades to synchronous rather than tearing down
+    // early. Either way the caller must eventually pump collect().
     bool copyBuffer(const Allocation& src, const Allocation& dst,
                     VkDeviceSize srcOffset, VkDeviceSize dstOffset,
                     VkDeviceSize size, VkFence fence = VK_NULL_HANDLE);
@@ -526,6 +533,14 @@ public:
     // Token form of retireTicket(): pool-owned timeline plus a fresh signal
     // value wrapped in a CompletionToken. Returns nullopt when unavailable.
     std::optional<CompletionToken> retireToken();
+    // Retire a transient command buffer/pool pair against a token (async
+    // submit teardown, R11): the buffer is freed and the pool destroyed
+    // when collect() observes the token - never under in-flight work.
+    // Used internally by the fenced copyBuffer path; exposed for custom
+    // submit flows with the same lifetime problem. Returns false with no
+    // state changed on null handles or an unusable token.
+    bool retireCommandPool(VkCommandBuffer cmd, VkCommandPool pool,
+                           CompletionToken token);
 
     // Stats & Info
     PoolStats getStats() const;

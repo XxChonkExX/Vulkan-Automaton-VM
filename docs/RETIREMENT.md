@@ -69,9 +69,18 @@ retiring migration staging/teardown through the pool, pipelined staging,
 and temporary-import policy for binary hand-off to foreign APIs.
 External semaphores shipped separately (`docs/EXTERNAL_SEMAPHORES.md`).
 
+`retireCommandPool()` extends the gate to bare teardown: the fenced
+`copyBuffer` path signals a ticket timeline in the same submit and
+retires its transient pool against it (destroying it under in-flight
+work was VUID-vkDestroyCommandPool-commandPool-00041 - proven live
+under validation layers, fixed, re-proven silent). Without timeline
+support the fenced path degrades to synchronous rather than tearing
+down early. Pool destruction also destroys uncollected retired cmd
+pools (previously leaked - VUID-vkDestroyDevice-device-05137).
+
 ## Tests
 
-`tests/retirement_test.cpp` (39 checks on XTX + B70, was 25):
+`tests/retirement_test.cpp` (60 checks on XTX + B70, was 25):
 - A: retire against a never-signaled value — `collect()` reclaims nothing,
   memory stays accounted; scope exit exercises the dtor path.
 - B: signaled ticket — `collect()` reclaims exactly 1, stats return to

@@ -31,6 +31,14 @@
   B70<->XTX 256 MiB: 3.75 -> 8.61 GiB/s (2.3x) and 3.89 -> 7.19 GiB/s
   reverse, data verified, zero validation errors. Opt out with
   `VVM_STAGED_PIPELINE=0`.
+- **Fenced `copyBuffer` teardown fix (R11)**: the async path destroyed
+  its transient command pool under in-flight work
+  (VUID-vkDestroyCommandPool-commandPool-00041, reproduced live under
+  validation). The submit now also signals a ticket timeline and the
+  pool retires via the new `retireCommandPool()` (cmd-only retirement
+  items); without timeline support it degrades to synchronous. Pool
+  destruction reaps uncollected retired cmd pools. New section E in
+  `retirement_test` (60 checks total, green on B70).
 
 ## v0.4.0 (2026-09-18)
 
