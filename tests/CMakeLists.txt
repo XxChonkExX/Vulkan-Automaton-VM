@@ -402,3 +402,12 @@ target_include_directories(retirement_test PRIVATE
     ${TEST_EXTRA_INCLUDES}
 )
 add_test(NAME retirement_test COMMAND retirement_test)
+
+# Backend-neutral completion tokens (CPU-only: Ready/Foreign consult rules)
+add_executable(completion_token_test completion_token_test.cpp)
+target_link_libraries(completion_token_test PRIVATE vulkan_vm)
+target_include_directories(completion_token_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
+add_test(NAME completion_token_test COMMAND completion_token_test)

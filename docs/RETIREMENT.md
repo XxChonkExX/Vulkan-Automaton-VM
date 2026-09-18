@@ -52,17 +52,22 @@ Allocation  +  timeline semaphore + value  -->  retire()
 - No ticket timeline (feature off): falls back to synchronous wait on the
   caller fence.
 
-## Scope (v0.4)
+## Scope (v0.5)
 
-Vulkan pools only (timeline semaphores). HIP/L0/CUDA pools return `false`
-from `retire()`; their paths keep explicit waits. The offload/migration
-engine keeps its fence waits for now — porting it onto retirement is
-future work, as are a backend-neutral completion-token abstraction,
-pipelined staging, and external semaphores.
+Vulkan pools retire via timelines as before; any pool now also retires via
+`CompletionToken` (`vulkan_vm/completion_token.hpp`): `Ready` reclaims on
+the next `collect()` with no device at all, `Foreign` consults a
+caller-supplied non-blocking callback (the hook a HIP/CUDA/L0 event poll
+plugs into - must never block, it runs under the pool mutex), and
+`VulkanTimeline` is the classic path. `retireToken()` is the token form
+of `retireTicket()`. The offload/migration engine keeps its fence waits
+for now - porting it onto retirement is future work, as are pipelined
+staging and temporary-import policy for binary hand-off to foreign APIs.
+External semaphores shipped separately (`docs/EXTERNAL_SEMAPHORES.md`).
 
 ## Tests
 
-`tests/retirement_test.cpp` (25 checks, all passing on XTX + B70):
+`tests/retirement_test.cpp` (39 checks on XTX + B70, was 25):
 - A: retire against a never-signaled value — `collect()` reclaims nothing,
   memory stays accounted; scope exit exercises the dtor path.
 - B: signaled ticket — `collect()` reclaims exactly 1, stats return to

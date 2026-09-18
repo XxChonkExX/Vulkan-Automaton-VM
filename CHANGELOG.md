@@ -11,6 +11,12 @@
   ownership. Verified live on XTX+B70 (both kinds PASS);
   `tests/external_semaphore_test.cpp` skips cleanly without a capable
   device. (`docs/EXTERNAL_SEMAPHORES.md`)
+- **Backend-neutral completion tokens** (`vulkan_vm/completion_token.hpp`):
+  one retire/collect gate for every backend - `Ready` (no device needed),
+  `VulkanTimeline` (the classic path, now delegated), `Foreign`
+  (caller-supplied non-blocking consult, e.g. a hipEventQuery poll).
+  Plus `retireToken()`, a CPU-only `completion_token_test`, and 14 new
+  token checks in `retirement_test` (39 total, green on B70).
 
 ## v0.4.0 (2026-09-18)
 

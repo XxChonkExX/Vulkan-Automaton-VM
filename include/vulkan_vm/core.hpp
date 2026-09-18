@@ -46,6 +46,7 @@
 
 #include "vulkan_vm/buddy_allocator.hpp"
 #include "vulkan_vm/utils.hpp"
+#include "vulkan_vm/completion_token.hpp"
 
 namespace vvm {
 
@@ -495,6 +496,18 @@ public:
     bool retire(Allocation&& alloc, VkSemaphore timeline, uint64_t value,
                 VkCommandBuffer cmd = VK_NULL_HANDLE,
                 VkCommandPool cmdPool = VK_NULL_HANDLE);
+    // Backend-neutral retire(): same gate, but completion is a
+    // CompletionToken instead of a Vulkan timeline. Ready tokens reclaim
+    // on the next collect() on ANY backend (including foreign pools with
+    // no VkDevice); Foreign tokens consult the caller's callback (e.g. a
+    // hipEventQuery/cudaEventQuery poll wrapped in a lambda - must never
+    // block, it runs under the pool mutex). cmd/cmdPool rules are
+    // identical, except cmd requires a VkDevice (rejected on deviceless
+    // pools). Returns false with no state changed on invalid generation,
+    // unpaired cmd/cmdPool, or an unusable token for this pool.
+    bool retire(Allocation&& alloc, CompletionToken token,
+                VkCommandBuffer cmd = VK_NULL_HANDLE,
+                VkCommandPool cmdPool = VK_NULL_HANDLE);
     uint32_t collect();
 
     // Ticket source for retire(): pool-owned timeline plus a fresh signal
@@ -503,6 +516,9 @@ public:
     // Returns {NULL, 0} when unavailable (non-Vulkan backend, or the timeline
     // semaphore feature is off) - use the synchronous path instead.
     std::pair<VkSemaphore, uint64_t> retireTicket();
+    // Token form of retireTicket(): pool-owned timeline plus a fresh signal
+    // value wrapped in a CompletionToken. Returns nullopt when unavailable.
+    std::optional<CompletionToken> retireToken();
 
     // Stats & Info
     PoolStats getStats() const;

@@ -57,15 +57,15 @@ struct UnifiedMemoryPoolImpl {
     PFN_vkSetDebugUtilsObjectNameEXT fnSetDebugName_ = nullptr;
 
     // Retirement queue (GPU-lifetime-safe reclamation): allocations handed to
-    // retire() wait here until collect() observes their timeline value. The
-    // timeline stays caller-owned (pool never destroys it) except
-    // retireTimeline_, the pool-owned ticket timeline for internal async use.
+    // retire() wait here until collect() observes their completion token. The
+    // token's referenced objects stay caller-owned (pool never destroys them)
+    // except retireTimeline_, the pool-owned ticket timeline for internal
+    // async use.
     struct RetirementItem {
         Allocation allocation;
         VkCommandBuffer cmd = VK_NULL_HANDLE;  // freed at reclaim (see below)
         VkCommandPool cmdPool = VK_NULL_HANDLE;  // destroyed at reclaim (or NULL)
-        VkSemaphore timeline = VK_NULL_HANDLE; // caller-owned (or retireTimeline_)
-        uint64_t value = 0;
+        CompletionToken token;  // consulted by collect(); see isTokenComplete
     };
     std::vector<RetirementItem> retired_;
     VkSemaphore retireTimeline_ = VK_NULL_HANDLE;
@@ -153,8 +153,11 @@ struct UnifiedMemoryPoolImpl {
     void deallocateLocked(Allocation&& alloc);
     bool retire(Allocation&& alloc, VkSemaphore timeline, uint64_t value,
                 VkCommandBuffer cmd, VkCommandPool cmdPool);
+    bool retire(Allocation&& alloc, CompletionToken token,
+                VkCommandBuffer cmd, VkCommandPool cmdPool);
     uint32_t collect();
     std::pair<VkSemaphore, uint64_t> retireTicket();
+    std::optional<CompletionToken> retireToken();
     bool ensureRetireTimeline();
     bool reserve(VkDeviceSize bytes);
     void unreserve(VkDeviceSize bytes);
@@ -456,6 +459,13 @@ bool UnifiedMemoryPool::retire(Allocation&& alloc, VkSemaphore timeline, uint64_
 }
 uint32_t UnifiedMemoryPool::collect() { return impl_->collect(); }
 std::pair<VkSemaphore, uint64_t> UnifiedMemoryPool::retireTicket() { return impl_->retireTicket(); }
+bool UnifiedMemoryPool::retire(Allocation&& alloc, CompletionToken token,
+                               VkCommandBuffer cmd, VkCommandPool cmdPool) {
+    return impl_->retire(std::move(alloc), std::move(token), cmd, cmdPool);
+}
+std::optional<CompletionToken> UnifiedMemoryPool::retireToken() {
+    return impl_->retireToken();
+}
 void UnifiedMemoryPool::unreserve(VkDeviceSize bytes) { impl_->unreserve(bytes); }
 VkDeviceSize UnifiedMemoryPool::reservedBytes() const { return impl_->reservedBytes(); }
 std::optional<ExternalMemoryInfo> UnifiedMemoryPool::exportMemory(const Allocation& alloc, ExternalHandleType type) { return impl_->exportMemory(alloc, type); }
@@ -2015,6 +2025,27 @@ void UnifiedMemoryPoolImpl::deallocate(UniqueAllocation&& alloc) {
 // Retirement queue: GPU-lifetime-safe reclamation.
 // ---------------------------------------------------------------------------
 
+bool isTokenComplete(const CompletionToken& token, VkDevice defaultDevice) {
+    switch (token.kind) {
+        case CompletionToken::Kind::Ready:
+            return true;
+        case CompletionToken::Kind::VulkanTimeline: {
+            const VkDevice dev =
+                token.device != VK_NULL_HANDLE ? token.device : defaultDevice;
+            if (token.timeline == VK_NULL_HANDLE || dev == VK_NULL_HANDLE) {
+                return false;
+            }
+            uint64_t cur = 0;
+            return vkGetSemaphoreCounterValue(dev, token.timeline, &cur) == VK_SUCCESS &&
+                   cur >= token.value;
+        }
+        case CompletionToken::Kind::Foreign:
+            return static_cast<bool>(token.isComplete) ? token.isComplete() : false;
+        default:
+            return false;
+    }
+}
+
 bool UnifiedMemoryPoolImpl::ensureRetireTimeline() {
     if (retireTimeline_) return true;
     if (!isVulkanBackend() || device_ == VK_NULL_HANDLE) return false;
@@ -2040,19 +2071,51 @@ std::pair<VkSemaphore, uint64_t> UnifiedMemoryPoolImpl::retireTicket() {
     return {retireTimeline_, retireNextValue_++};
 }
 
+std::optional<CompletionToken> UnifiedMemoryPoolImpl::retireToken() {
+    auto [timeline, value] = retireTicket();
+    if (timeline == VK_NULL_HANDLE) return std::nullopt;
+    return CompletionToken::vulkanTimeline(timeline, value, device_);
+}
+
 bool UnifiedMemoryPoolImpl::retire(Allocation&& alloc, VkSemaphore timeline,
                                    uint64_t value, VkCommandBuffer cmd,
                                    VkCommandPool cmdPool) {
-    std::lock_guard<std::mutex> lock(mutex_);
     if (!isVulkanBackend() || device_ == VK_NULL_HANDLE || !timeline) return false;
+    return retire(std::move(alloc),
+                  CompletionToken::vulkanTimeline(timeline, value, device_),
+                  cmd, cmdPool);
+}
+
+bool UnifiedMemoryPoolImpl::retire(Allocation&& alloc, CompletionToken token,
+                                   VkCommandBuffer cmd, VkCommandPool cmdPool) {
+    std::lock_guard<std::mutex> lock(mutex_);
     // cmd without a pool (or vice versa) cannot be torn down at reclaim.
     if ((cmd == VK_NULL_HANDLE) != (cmdPool == VK_NULL_HANDLE)) return false;
+    // Command teardown needs a VkDevice; deviceless (foreign) pools retire
+    // bare allocations only.
+    if (cmd != VK_NULL_HANDLE && device_ == VK_NULL_HANDLE) return false;
     if (!isValidGeneration(alloc.generation)) return false;
+    switch (token.kind) {
+        case CompletionToken::Kind::Ready:
+            break;  // no device needed; reclaims on the next collect()
+        case CompletionToken::Kind::VulkanTimeline: {
+            if (!isVulkanBackend() || !token.timeline) return false;
+            const VkDevice dev = token.device != VK_NULL_HANDLE ? token.device : device_;
+            if (dev == VK_NULL_HANDLE) return false;
+            token.device = dev;  // pin the consult device at retire time
+            break;
+        }
+        case CompletionToken::Kind::Foreign:
+            if (!token.isComplete) return false;  // fail closed, no consult
+            break;
+        default:
+            return false;
+    }
     // Generation stays live across the retire window: the registry copy in
     // dedicatedAllocations_ must not be freed by anyone meanwhile, and the
     // double-free guard must see exactly one deallocate at collect().
     // (trim()/defragment() never touch dedicateds or live buddy ranges.)
-    retired_.push_back(RetirementItem{std::move(alloc), cmd, cmdPool, timeline, value});
+    retired_.push_back(RetirementItem{std::move(alloc), cmd, cmdPool, std::move(token)});
     return true;
 }
 
@@ -2060,12 +2123,9 @@ uint32_t UnifiedMemoryPoolImpl::collect() {
     std::lock_guard<std::mutex> lock(mutex_);
     uint32_t reclaimed = 0;
     for (auto it = retired_.begin(); it != retired_.end();) {
-        uint64_t cur = 0;
         // Query failure (device lost) keeps the item queued: freeing GPU
         // memory against a lost device is unsafe, leaking is safer.
-        if (it->timeline &&
-            vkGetSemaphoreCounterValue(device_, it->timeline, &cur) == VK_SUCCESS &&
-            cur >= it->value) {
+        if (isTokenComplete(it->token, device_)) {
             if (it->cmd) {
                 const VkCommandPool pool = it->cmdPool ? it->cmdPool : transferCmdPool_;
                 if (pool) vkFreeCommandBuffers(device_, pool, 1, &it->cmd);

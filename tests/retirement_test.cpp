@@ -8,6 +8,9 @@
 //      returns true while the fence is still unsignaled (256 MiB copy takes
 //      milliseconds; the status check runs in microseconds), data verifies
 //      after the fence, and collect() reclaims the retired teardown.
+//   D. backend-neutral CompletionTokens: Ready reclaims with no GPU work,
+//      Foreign consults the callback per collect, retireToken() feeds the
+//      token overload like B.
 // Skips cleanly when no discrete GPU or no timeline-semaphore feature.
 #include "vulkan_vm/vulkan_vm.hpp"
 #include "vulkan_vm/utils.hpp"
@@ -293,6 +296,50 @@ int main() {
                 pool1.deallocate(std::move(*dst));
                 pool0.deallocate(std::move(*src));
             }
+        }
+    }
+
+    // D: backend-neutral tokens - Ready needs no GPU work, Foreign
+    // consults per collect, retireToken() feeds the token overload.
+    {
+        auto pool = UnifiedMemoryPool::create(dc, poolCfg());
+        CHECK(pool.has_value(), "pool create");
+        if (pool.has_value()) {
+            const uint64_t baseUsed = pool->getStats().totalUsed;
+            auto d1 = pool->allocate(1ull * 1024ull * 1024ull,
+                                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            CHECK(d1.has_value(), "D1: allocate 1 MiB");
+            CHECK(pool->retire(std::move(*d1), CompletionToken::ready()),
+                  "D1: Ready retire accepted");
+            CHECK(pool->collect() == 1, "D1: Ready reclaims on first collect");
+            CHECK(pool->getStats().totalUsed == baseUsed,
+                  "D1: baseline restored");
+            auto d2 = pool->allocate(1ull * 1024ull * 1024ull,
+                                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            CHECK(d2.has_value(), "D2: allocate 1 MiB");
+            int polls = 0;
+            CHECK(pool->retire(std::move(*d2), CompletionToken::foreign(
+                                                  [&] { return ++polls >= 2; })),
+                  "D2: Foreign retire accepted");
+            CHECK(pool->collect() == 0, "D2: first collect reclaims nothing");
+            CHECK(pool->collect() == 1, "D2: second collect reclaims");
+            CHECK(polls == 2, "D2: consulted once per collect");
+            auto tok = pool->retireToken();
+            if (!tok.has_value()) {
+                std::printf("SKIP D3: no timeline support\n");
+            } else {
+                signalTicket(dc.device, dc.transferQueue, dc.transferQueueFamily,
+                             tok->timeline, tok->value);
+                auto d3 = pool->allocate(1ull * 1024ull * 1024ull,
+                                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                CHECK(d3.has_value(), "D3: allocate 1 MiB");
+                CHECK(pool->retire(std::move(*d3), std::move(*tok)),
+                      "D3: token retire accepted");
+                CHECK(pool->collect() == 1,
+                      "D3: token collect reclaims post-signal");
+            }
+            CHECK(pool->getStats().totalUsed == baseUsed,
+                  "D: baseline restored");
         }
     }
 
