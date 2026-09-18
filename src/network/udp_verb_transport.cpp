@@ -331,13 +331,18 @@ struct UdpVerbTransport::Impl {
                         wp.total = h.totalPkts;
                         wp.lastMs = nowMs();
                         if (wp.contig == h.seq) {
-                            uint32_t expect = h.seq;
-                            // Fast-forward over any already-seen tail packets.
+                            // This packet closes the edge; skip forward over
+                            // already-buffered successors only. The old
+                            // `expect = h.seq; ... contig = expect + 1` double
+                            // counted the applied packet whenever the seen-skip
+                            // ran, claiming one past the true gap edge - the
+                            // missing chunk was then never retransmitted.
+                            uint32_t expect = h.seq + 1;
                             while (expect < wp.total &&
                                    writeContig_[h.xid].seen.count(expect)) {
                                 ++expect;
                             }
-                            wp.contig = expect + 1;
+                            wp.contig = expect;
                         }
                         wp.seen.insert(h.seq);
                         Header ack = makeHdr(MsgType::Ack, h.xid, wp.contig,
