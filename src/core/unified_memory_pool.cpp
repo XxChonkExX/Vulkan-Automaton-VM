@@ -469,10 +469,15 @@ UnifiedMemoryPoolImpl::~UnifiedMemoryPoolImpl() {
     // teardown (blocks_/dedicatedAllocations_ are mutated under mutex_).
     std::lock_guard<std::mutex> lock(mutex_);
     if (device_) {
-        VVM_LOG_WARN("~UnifiedMemoryPool destroying LIVE pool (device={}, blocks={}, "
-                     "dedicated={}) - if this is not process exit, a move/ownership bug "
-                     "is freeing a stored pool",
-                     (void*)device_, blocks_.size(), dedicatedAllocations_.size());
+        // Normal at process exit (static containers outlive pools); a real
+        // mid-run ownership bug is only interesting on demand, so the warn
+        // is opt-in rather than noise in every test/server shutdown log.
+        if (getenv("VVM_WARN_LIVE_POOL")) {
+            VVM_LOG_WARN("~UnifiedMemoryPool destroying LIVE pool (device={}, blocks={}, "
+                         "dedicated={}) - if this is not process exit, a move/ownership bug "
+                         "is freeing a stored pool",
+                         (void*)device_, blocks_.size(), dedicatedAllocations_.size());
+        }
         // Clean up dedicated allocations (exportable/imported)
         for (auto& alloc : dedicatedAllocations_) {
             if (alloc.buffer) {
@@ -592,6 +597,16 @@ bool UnifiedMemoryPoolImpl::isVulkanBackend() const {
 }
 
 bool UnifiedMemoryPoolImpl::validateConfig() const {
+    // Block geometry boundary: the buddy core divides by minAlignment and
+    // assumes power-of-two blocks, so enforce it once here instead of
+    // corrupting silently on a misconfigured pool.
+    if (config_.minAlignment == 0 || !isPowerOfTwoU64(config_.blockSize) ||
+        config_.blockSize < config_.minAlignment) {
+        VVM_LOG_ERROR("Invalid blockSize={} / minAlignment={} "
+                      "(block must be a power of two >= minAlignment, minAlignment > 0)",
+                      config_.blockSize, config_.minAlignment);
+        return false;
+    }
     // Chonk Chunks validation: both knobs must be set together, sizes must be
     // powers of two, and a chunk must hold at least one min-aligned allocation.
     auto pow2 = [](VkDeviceSize v) { return v != 0 && (v & (v - 1)) == 0; };
@@ -988,11 +1003,11 @@ VkDeviceSize UnifiedMemoryPoolImpl::heapSizeBytes() const {
 bool UnifiedMemoryPoolImpl::wouldExceedBudget(VkDeviceSize additionalBytes) const {
     // Note: caller must hold mutex_ if called from within another locked method
     VkDeviceSize currentPool = reservedBytes_;
-    for (const auto& block : blocks_) currentPool += block.size;
-    for (const auto& alloc : dedicatedAllocations_) currentPool += alloc.size;
+    for (const auto& block : blocks_) currentPool = satAddU64(currentPool, block.size);
+    for (const auto& alloc : dedicatedAllocations_) currentPool = satAddU64(currentPool, alloc.size);
 
     // Hard byte cap.
-    if (config_.maxPoolBytes > 0 && currentPool + additionalBytes > config_.maxPoolBytes) {
+    if (config_.maxPoolBytes > 0 && satAddU64(currentPool, additionalBytes) > config_.maxPoolBytes) {
         VVM_LOG_WARN("budget: pool ({} MB) + {} MB would exceed maxPoolBytes ({} MB)",
                      currentPool / (1024 * 1024), additionalBytes / (1024 * 1024),
                      config_.maxPoolBytes / (1024 * 1024));
@@ -1042,7 +1057,7 @@ bool UnifiedMemoryPoolImpl::wouldExceedBudget(VkDeviceSize additionalBytes) cons
         // reservedBytes_ counts as committed here: the driver-reported usage
         // cannot see memory we intend to allocate but haven't yet.
         const VkDeviceSize cap = static_cast<VkDeviceSize>(heapSize * config_.maxHeapFraction);
-        if (heapUsed + reservedBytes_ + additionalBytes > cap) {
+        if (satAddU64(satAddU64(heapUsed, reservedBytes_), additionalBytes) > cap) {
             VVM_LOG_WARN("budget: heap usage {} MB + {} MB would exceed {} MB ({}% of {} MB cap); allocate() failing soft instead of stealing VRAM",
                          heapUsed / (1024 * 1024), additionalBytes / (1024 * 1024),
                          cap / (1024 * 1024), static_cast<int>(config_.maxHeapFraction * 100.0f),
@@ -2708,7 +2723,7 @@ VkDeviceSize UnifiedMemoryPoolImpl::alignUp(VkDeviceSize value, VkDeviceSize ali
         alignment |= alignment >> 32;
         alignment++;
     }
-    return (value + alignment - 1) & ~(alignment - 1);
+    return satAddU64(value, alignment - 1) & ~(alignment - 1);
 }
 
 // RAII factory: the only way to construct a UniqueAllocation. The private

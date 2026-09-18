@@ -151,6 +151,19 @@ inline VkDeviceSize getHeapUsage(const VkPhysicalDeviceMemoryBudgetPropertiesEXT
     return budget.heapUsage[heapIndex];
 }
 
+// Saturating unsigned addition for allocator size arithmetic: every
+// `size + align - 1` / `used + request` site in the allocator must go
+// through here so a hostile request size (e.g. UINT64_MAX) fails soft
+// (saturated values never fit any real capacity) instead of wrapping to a
+// small grant. Valid inputs are unaffected (no saturation below the cap).
+inline VkDeviceSize satAddU64(VkDeviceSize a, VkDeviceSize b) {
+    return (b > UINT64_MAX - a) ? UINT64_MAX : (a + b);
+}
+
+inline bool isPowerOfTwoU64(uint64_t v) {
+    return v != 0 && (v & (v - 1)) == 0;
+}
+
 // Debug helpers
 VVM_API void printMemoryTypes(const VkPhysicalDeviceMemoryProperties& props);
 VVM_API void printQueueFamilies(VkPhysicalDevice physicalDevice);

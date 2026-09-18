@@ -154,11 +154,14 @@ std::optional<VkDeviceSize> BuddyAllocator::allocateAligned(VkDeviceSize size, V
     return withLock([this, size, alignment]() -> std::optional<VkDeviceSize> {
         if (maxOrder_ < 0) return std::nullopt;
         VkDeviceSize granted = size < minSize_ ? minSize_ : size;
-        granted = ((granted + minSize_ - 1) / minSize_) * minSize_;
+        granted = (satAddU64(granted, minSize_ - 1) / minSize_) * minSize_;
 
         // Over-allocate enough to guarantee an alignment-aligned start inside
         // the grant: worst-case misalignment is (alignment - minSize_).
-        const VkDeviceSize padded = granted + alignment - minSize_;
+        // satAddU64 keeps hostile sizes failing soft instead of wrapping;
+        // sub-minSize alignments need no over-allocation at all.
+        const VkDeviceSize padded = (alignment >= minSize_)
+            ? satAddU64(granted, alignment - minSize_) : granted;
         auto raw = allocateUnlocked(padded);
         if (!raw.has_value()) return std::nullopt;
 
