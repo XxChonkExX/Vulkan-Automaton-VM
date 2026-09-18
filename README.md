@@ -3,7 +3,7 @@
 **VulkanVM** unifies GPU memory management and data movement behind Vulkan
 external-memory primitives, then lets the frameworks you already use consume
 that memory directly. One pool, one allocator family, every vendor —
-AMD, Intel, (NVIDIA path designed), Tenstorrent-ICD, Android.
+AMD, Intel, NVIDIA (1080 Ti-class verified), Tenstorrent-ICD, Android.
 
 **Version**: 0.3.0-dev
 
@@ -130,7 +130,8 @@ Qwen3.6-40B Q4_K_M, 21.5 t/s decode pooled across RX 7900 XTX + Arc Pro B70.
 | UCX · Windows ND · NDK transport | 2 — Compile-tested |
 | Windows IoRing backend (real NVMe reads, `mode=ioring`) | **1 — Verified** |
 | DStorage zero-copy bridge (shared-committed D3D12 heap -> VK import, B70) | **1 — Verified** |
-| NVIDIA (CUDA/Vulkan) · Tenstorrent | 3 — Designed |
+| NVIDIA (CUDA/Vulkan, GTX 1080 Ti-class) | **1 — Verified** |
+| Tenstorrent | 3 — Designed |
 | Mali · PowerVR · Xclipse | Untested |
 
 Full evidence-linked matrix: [docs/HARDWARE_SUPPORT.md](docs/HARDWARE_SUPPORT.md).
@@ -195,7 +196,9 @@ the latest native-Linux campaign is documented in
 This is a serious experimental systems project — not a polished universal GPU
 framework. The honest list:
 
-- NVIDIA: designed, not validated (no hardware — help wanted)
+- NVIDIA: verified on GTX 1080 Ti (CUDA + Vulkan pool paths; card currently
+  off-box). Pascal-class kernels are slow for MoE decode - roles: small models,
+  prefill, dense/KV offload
 - Android: verified on Adreno only; Mali/PowerVR/Xclipse untested
 - Custom autograd: Vulkan compute bridge not fully integrated; ops execute
   through ATen; numerical suite in progress

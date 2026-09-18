@@ -515,6 +515,12 @@ hand-tuned on both backends after the rebase.
 
 ## RAM bandwidth staircase + measurement traps (2026-09-17, Windows)
 
+> **Current rig state (2026-09-17 evening):** XTX driver 32.0.31021.6002,
+> B70 driver 101.8974 (Pro), iGPU on; topology Vulkan0 XTX / Vulkan1 iGPU /
+> Vulkan2 B70; 1080 Ti pulled (no CUDA device); RAM 64 GB (2x32 KF560C40)
+> @ 6000 XMP. Champion (Windows, Vulkan, ncmoe-999, -ts "1,0,0", pool ON):
+> 16.38-17.40 t/s warm.
+
 Hardware churn this session: 1080 Ti out, Arc Pro B70 back in (Vulkan0 XTX /
 Vulkan1 iGPU / Vulkan2 B70 - no CUDA device on box until it returns). A
 96 GB mixed 4-DIMM experiment (2x32 KF560C40 + 2x16 KF556C40) was tried and

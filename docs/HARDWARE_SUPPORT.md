@@ -20,8 +20,8 @@ Status tiers (be honest — this table is a promise):
 | Intel Arc Pro (Battlemage, Vulkan) | **1 — Verified** | Arc Pro B70: llama.cpp Chonk integration verified (docs/inference_benchmarks.md). Driver note: stock Pro driver 8861 was 24x broken for compute; consumer WHQL 8974+ required |
 | Cross-vendor direct P2P (Linux, DMA-BUF) | **1 — Verified** | RADV NAVI31 export -> ANV Battlemage G31 import, zero-copy, data-verified (`multi_gpu_test`, native Ubuntu; docs/LINUX_TEST_RESULTS_2026-08-25.md) |
 | Intel Level Zero GPU-direct | 2 — Compile-tested | Builds against Level Zero SDK; no cross-vendor copy exercised |
-| NVIDIA (CUDA path) | 3 — Designed | No hardware; community help wanted (see README notice) |
-| NVIDIA (Vulkan path) | 3 — Designed | ggml-vulkan covers NVIDIA generally; VulkanVM pool integration untested on NVIDIA |
+| NVIDIA (CUDA path) | **1 — Verified** | GTX 1080 Ti (sm_61, PCIe 3.0 x8): CudaMemoryBackend end-to-end — `cuda_backend_test` ALL PASS (alloc/echo/free, budget, full pool + reserve + dedicated), llama.cpp `GGML_CUDA_VVM_POOL` 4B gate byte-identical, 90 GB auto-plan coherent (SERVE_TEST_RESULTS.md 2026-09-17; llama `ccfac2928`, VulkanVM `4310d8f`). Card currently off-box; roles: small-model duty (57.7 t/s on 4B), prefill, dense/KV offload |
+| NVIDIA (Vulkan path) | **1 — Verified** | Same 1080 Ti as Vulkan device (11 GB): Chonk pool exercised at 4B scale via ggml-vulkan (split follows VRAM 68/32); 90 GB sessions ran via the CUDA path |
 | Tenstorrent | 3 — Designed | Vulkan ICD built and submitted to TT; loosely supported |
 
 ## Android
@@ -52,7 +52,7 @@ Status tiers (be honest — this table is a promise):
 | Vulkan -> OpaqueFd -> HIP import (Linux) | **1 — Verified** | Chonk allocator (PyTorch pluggable allocator) |
 | Vulkan -> Win32 -> HIP import (Windows) | 3 — Designed | Windows uses different handle semantics; untested |
 | Vulkan <-> AHardwareBuffer (Android) | **1 — Verified** | Galaxy S24+ (tests/chonk_slab_test covers the allocator; android_test covers the import) |
-| CUDA external-memory import | 3 — Designed | |
+| CUDA external-memory import | 3 — Designed | Cross-vendor direct import refused both ways on Windows (AMD->NV import OOM; NV reports no exportable type for STORAGE\|TRANSFER); verified paths are host-staged staging copies and the VK_EXT_external_memory_host shared arena (3.85 GiB/s zero-copy, tests/shared_arena_test) |
 
 ## Test coverage tiers
 
