@@ -510,3 +510,40 @@ change did not move the RDNA3 expert-kernel bottleneck. The champion
 delta (19.34 -> 16.66) is thermal compression across the session, not
 the rebase - same-session controls track together. Auto-plan reproduces
 hand-tuned on both backends after the rebase.
+
+---
+
+## RAM bandwidth staircase + measurement traps (2026-09-17, Windows)
+
+Hardware churn this session: 1080 Ti out, Arc Pro B70 back in (Vulkan0 XTX /
+Vulkan1 iGPU / Vulkan2 B70 - no CUDA device on box until it returns). A
+96 GB mixed 4-DIMM experiment (2x32 KF560C40 + 2x16 KF556C40) was tried and
+reverted. Two traps worth archiving:
+
+1. **WMI memory-speed columns lie.** Speed=4800 + ConfiguredClockSpeed=3600
+   on every boot of the 4-DIMM config; the kit had actually trained to
+   ~3600 effective. A multi-threaded PRNG fill/verify instrument (24
+   threads, aggregate write GB/s) is the honest meter:
+   | Config | write GB/s | champion warm tg |
+   |---|---|---|
+   | 96 GB 4-DIMM (~3600 effective) | 80.3 | 13.87-14.04 |
+   | second boot, "4800" (unchanged) | 81.6 | 14.30-14.61 |
+   | 64 GB 2x32 @ 6000 (final) | 126.2 | **16.38-17.40** |
+   CPU-experts decode tracks host bandwidth line-for-line; the final config
+   reproduces the 16.03-16.11 baseline (plus small build gains).
+   Conclusion: mixed-capacity 4-DIMM DDR5 = bandwidth AND stability loss
+   (one PFN_LIST_CORRUPT bugcheck, never trained past 3600). Matched
+   2-DIMM @ 6000 is the rig's home state.
+2. **Raw `/completion` on the 90 GB model needs `ignore_eos=true`.** The
+   unsloth GGUF declares eos_token_id=248046, which the model emits as a
+   no-op break before `<think>`; llama-server stops after exactly 1 token
+   (`stopped by EOS`, no content) on any prompt that triggers thinking.
+   Fixed n_predict benches are unaffected once ignore_eos is set. Chat
+   endpoint unaffected.
+
+Also: `/vvm/stats` now concatenates Vulkan + CUDA pool arrays in combined
+builds (was Vulkan-only by #if order; CUDA side returns [] until a CUDA
+device is present). System clock ran +95 min fast (dual-boot drift; w32tm
+stripchart shows a doubling artifact after corrections - use an HTTP-Date
+probe for ground truth); manually re-synced, +1 s residual, w32time left
+stopped.
