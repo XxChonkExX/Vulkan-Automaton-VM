@@ -644,8 +644,6 @@ std::optional<MigrationOperation> OffloadManager::offloadLocked(Allocation& allo
     // region. mprotect on memory mapped via vkMapMemory is undefined
     // behavior -- the Vulkan driver owns the underlying mmap, and changing
     // page protections can SIGSEGV the driver or corrupt GPU-side data.
-    // (Config.useMprotect is now the default-false sentinel for user-
-    // provided mmap'd regions only; see OffloadConfig docs.)
     
     // Submit migration
     MigrationEngine::MigrationRequest req;

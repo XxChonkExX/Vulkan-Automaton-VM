@@ -73,6 +73,10 @@ ExternalMemoryCaps queryExternalMemoryCaps(VkPhysicalDevice physicalDevice) {
                 case VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID:
                     caps.supportsAndroidHardwareBuffer = true; break;
 #endif
+                default:
+                    // D3D11/D3D12-resource/Metal-class types: no caps fields;
+                    // import paths query per-type support explicitly.
+                    break;
             }
         }
     }

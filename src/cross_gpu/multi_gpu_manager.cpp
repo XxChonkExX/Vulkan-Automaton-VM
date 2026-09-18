@@ -683,12 +683,12 @@ namespace {
 // (measured XN: 4 MiB -> 1.9, 16 MiB -> 2.8, 64 MiB -> 3.3 GiB/s).
 // Default 16 MiB (32 MiB peak host); override via VVM_STAGED_CHUNK_MB.
 VkDeviceSize stagedChunkSize() {
-    static const VkDeviceSize v = [] {
+    static const VkDeviceSize v = []() -> VkDeviceSize {
         if (const char* e = std::getenv("VVM_STAGED_CHUNK_MB")) {
             const unsigned long long mb = std::strtoull(e, nullptr, 0);
             if (mb >= 1 && mb <= 1024) return static_cast<VkDeviceSize>(mb) << 20;
         }
-        return 16ull * 1024 * 1024;
+        return static_cast<VkDeviceSize>(16) * 1024 * 1024;
     }();
     return v;
 }

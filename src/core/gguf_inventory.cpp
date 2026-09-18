@@ -15,8 +15,8 @@ namespace vvm {
 
 namespace {
 
-uint32_t rd32(FILE* f) { uint32_t v = 0; (void)fread(&v, 4, 1, f); return v; }
-uint64_t rd64(FILE* f) { uint64_t v = 0; (void)fread(&v, 8, 1, f); return v; }
+uint32_t rd32(FILE* f) { uint32_t v = 0; if (fread(&v, 4, 1, f) != 1) return 0; return v; }
+uint64_t rd64(FILE* f) { uint64_t v = 0; if (fread(&v, 8, 1, f) != 1) return 0; return v; }
 std::string rdStr(FILE* f) {
     const uint64_t n = rd64(f);
     std::string s;

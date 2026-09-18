@@ -226,8 +226,6 @@ int main() {
     try {
         OffloadConfig offloadConfig;
         offloadConfig.hostShadowSize = 2ull * 1024 * 1024 * 1024;  // 2GB
-        offloadConfig.useMadvise = true;
-        offloadConfig.useMprotect = true;
         offloadConfig.transferQueue = transferQueue;
         offloadConfig.transferQueueFamily = queues.transfer.value_or(queues.compute.value());
         

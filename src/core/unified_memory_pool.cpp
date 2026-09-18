@@ -605,10 +605,6 @@ bool UnifiedMemoryPoolImpl::initialize(const DeviceConfig& device, const PoolCon
             shadow = std::min(shadow, config_.maxHostShadowBytes);
         }
         offloadConfig.hostShadowSize = shadow;
-        // madvise/mprotect on vkMapMemory regions is unsafe (see OffloadConfig
-        // docs); these MUST stay disabled by default.
-        offloadConfig.useMadvise = false;
-        offloadConfig.useMprotect = false;
         offloadConfig.transferQueue = deviceConfig_.transferQueue;
         offloadConfig.transferQueueFamily = deviceConfig_.transferQueueFamily != UINT32_MAX
             ? deviceConfig_.transferQueueFamily

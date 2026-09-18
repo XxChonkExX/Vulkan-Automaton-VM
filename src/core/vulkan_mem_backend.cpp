@@ -281,6 +281,10 @@ std::unique_ptr<IDeviceMemoryBackend> create_memory_backend(MemBackendKind kind,
             // Dynamic nvcuda (ships with every NVIDIA driver); nullptr when
             // NVIDIA is absent. backendDeviceIndex selects the device.
             return CudaMemoryBackend::create(cfg.backendDeviceIndex);
+        case MemBackendKind::Auto:
+            // Resolved by the pool before dispatch (see mem_backend.hpp);
+            // reaching here means a caller bypassed resolution - fail closed.
+            return nullptr;
     }
     return nullptr;
 }

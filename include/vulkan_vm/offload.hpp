@@ -20,10 +20,9 @@ struct OffloadConfig {
     // 4 GiB host shadow. NOTE: `4 * 1024 * 1024 * 1024` is int arithmetic
     // (32-bit) and overflows to 0; the literal must be size_t / 1ULL.
     VkDeviceSize hostShadowSize = 4ull * 1024 * 1024 * 1024;  // 4GB host shadow
-    [[deprecated("unsafe on vkMapMemory memory; use only on user-allocated mmap regions")]]
-    bool useMadvise = false;
-    [[deprecated("unsafe on vkMapMemory memory; use only on user-allocated mmap regions")]]
-    bool useMprotect = false;
+    // NOTE: useMadvise/useMprotect were removed in 0.4 (deprecated since
+    // they were never read - mprotect/madvise on vkMapMemory memory is
+    // undefined behavior; the driver owns that mmap).
     VkQueue transferQueue = VK_NULL_HANDLE;
     uint32_t transferQueueFamily = UINT32_MAX;
     // Mapping lifetime management
