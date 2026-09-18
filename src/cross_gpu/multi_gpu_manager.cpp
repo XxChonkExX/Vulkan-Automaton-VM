@@ -593,38 +593,72 @@ bool MultiGPUPoolManager::copyDeviceToDevice(
         return false;
     }
 
-    VkFence done = fence;
-    VkFence internalFence = VK_NULL_HANDLE;
-    if (fence == VK_NULL_HANDLE) {
-        VkFenceCreateInfo fInfo{};
-        fInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        if (vkCreateFence(dev.device, &fInfo, nullptr, &internalFence) != VK_SUCCESS) {
-            vkDestroyCommandPool(dev.device, cmdPool, nullptr);
-            dstPool.deallocate(std::move(*remote));
-            return false;
-        }
-        done = internalFence;
-    }
+    // Opportunistically reclaim previously retired copies: bounds the retired
+    // set across many async copies without blocking.
+    dstPool.collect();
 
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &cmd;
-    rc = vkQueueSubmit(queue, 1, &submitInfo, done);
 
-    // Always wait before tearing down the command pool and the imported
-    // alias: with a caller-provided fence, skipping an internal wait would
-    // destroy the command buffer and the remote-alias memory while the GPU
-    // copy is still reading it.
-    if (rc == VK_SUCCESS) {
-        rc = vkWaitForFences(dev.device, 1, &done, VK_TRUE, UINT64_MAX);
+    if (fence != VK_NULL_HANDLE) {
+        // Caller-provided fence => genuinely asynchronous (P1-8): signal the
+        // caller's fence AND a pool ticket timeline in one submit, then retire
+        // the whole teardown (imported alias + command pool) instead of
+        // waiting. The caller waits its fence whenever it wants; collect()
+        // reclaims the resources after the GPU copy completes.
+        bool submitted = false;
+        auto [ticketTl, ticketVal] = dstPool.retireTicket();
+        if (ticketTl) {
+            VkTimelineSemaphoreSubmitInfo tlInfo{};
+            tlInfo.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+            tlInfo.signalSemaphoreValueCount = 1;
+            tlInfo.pSignalSemaphoreValues = &ticketVal;
+            submitInfo.pNext = &tlInfo;
+            submitInfo.signalSemaphoreCount = 1;
+            submitInfo.pSignalSemaphores = &ticketTl;
+            rc = vkQueueSubmit(queue, 1, &submitInfo, fence);
+            submitted = (rc == VK_SUCCESS);
+            if (submitted &&
+                dstPool.retire(std::move(*remote), ticketTl, ticketVal, cmd, cmdPool)) {
+                return true;  // async: teardown deferred to collect()
+            }
+            // retire() refused after a ticket (should not happen): fall
+            // through to the synchronous wait below WITHOUT resubmitting.
+            VVM_LOG_WARN("copyDeviceToDevice: retire refused, falling back to sync wait");
+        }
+        // No ticket timeline available, or retire refused: synchronous wait on
+        // the caller fence, then immediate teardown (previous behavior).
+        submitInfo.pNext = nullptr;
+        submitInfo.signalSemaphoreCount = 0;
+        if (!submitted) {
+            rc = vkQueueSubmit(queue, 1, &submitInfo, fence);
+        }
+        if (rc == VK_SUCCESS) {
+            rc = vkWaitForFences(dev.device, 1, &fence, VK_TRUE, UINT64_MAX);
+        }
+    } else {
+        // No caller fence: internal fence, submit, wait, teardown.
+        VkFenceCreateInfo fInfo{};
+        fInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        VkFence internalFence = VK_NULL_HANDLE;
+        if (vkCreateFence(dev.device, &fInfo, nullptr, &internalFence) != VK_SUCCESS) {
+            vkDestroyCommandPool(dev.device, cmdPool, nullptr);
+            dstPool.deallocate(std::move(*remote));
+            return false;
+        }
+        rc = vkQueueSubmit(queue, 1, &submitInfo, internalFence);
+        if (rc == VK_SUCCESS) {
+            rc = vkWaitForFences(dev.device, 1, &internalFence, VK_TRUE, UINT64_MAX);
+        }
+        vkDestroyFence(dev.device, internalFence, nullptr);
     }
 
     if (rc != VK_SUCCESS) {
         VVM_LOG_ERROR("copyDeviceToDevice: queue submit/wait failed rc={}", static_cast<int>(rc));
     }
 
-    if (internalFence) vkDestroyFence(dev.device, internalFence, nullptr);
     vkDestroyCommandPool(dev.device, cmdPool, nullptr);
     dstPool.deallocate(std::move(*remote));
     return rc == VK_SUCCESS;

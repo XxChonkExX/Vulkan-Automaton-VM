@@ -39,6 +39,7 @@
 #include <span>
 #include <memory>
 #include <mutex>
+#include <utility>
 #include <functional>
 #include <cassert>
 #include <unordered_set>
@@ -477,6 +478,31 @@ public:
     bool copyBuffer(const Allocation& src, const Allocation& dst,
                     VkDeviceSize srcOffset, VkDeviceSize dstOffset,
                     VkDeviceSize size, VkFence fence = VK_NULL_HANDLE);
+
+    // GPU-lifetime-safe reclamation (retirement queue): hand an allocation to
+    // the pool together with a timeline semaphore + value; the memory returns
+    // to the buddy allocator only after collect() observes the value signaled.
+    // The pool never destroys the semaphore (caller-owned); the timeline must
+    // have been created on this pool's VkDevice (use retireTicket() for that).
+    // The optional cmd is freed at reclaim time from cmdPool if given, else
+    // from the pool's transfer command pool; a given cmdPool is destroyed too
+    // (lets one-shot copy paths defer their whole teardown past completion).
+    // cmd and cmdPool must be both set or both null.
+    // Returns false with no state changed when the pool cannot track GPU
+    // completion: non-Vulkan backend, or cmd given but no transfer pool -
+    // the caller must then wait itself and deallocate() normally.
+    // Thread-safe; collect() never blocks and returns the reclaim count.
+    bool retire(Allocation&& alloc, VkSemaphore timeline, uint64_t value,
+                VkCommandBuffer cmd = VK_NULL_HANDLE,
+                VkCommandPool cmdPool = VK_NULL_HANDLE);
+    uint32_t collect();
+
+    // Ticket source for retire(): pool-owned timeline plus a fresh signal
+    // value. Signal the returned value in your own submit (alongside any
+    // caller fence), then retire() resources against (timeline, value).
+    // Returns {NULL, 0} when unavailable (non-Vulkan backend, or the timeline
+    // semaphore feature is off) - use the synchronous path instead.
+    std::pair<VkSemaphore, uint64_t> retireTicket();
 
     // Stats & Info
     PoolStats getStats() const;
