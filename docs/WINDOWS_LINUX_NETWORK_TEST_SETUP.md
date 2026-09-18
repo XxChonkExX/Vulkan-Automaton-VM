@@ -33,9 +33,8 @@ SERVER_PID=$!
 echo "X2 server PID: $SERVER_PID"
 ```
 
-### Run Validation Layers (Release Gate)
+### Run Validation Layers (Release Gate, X2/Linux)
 ```bash
-# Full ctest with validation layers
 VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation ctest --test-dir . --output-on-failure -j$(nproc)
 # Must pass 11/11 suites clean
 ```
@@ -73,7 +72,7 @@ Copy-Item build\vulkan_vm.dll build\tests\ -Force
 Copy-Item build\src\network\vulkan_vm_network.dll build\tests\ -Force
 ```
 
-### Run Validation Layers (Release Gate)
+### Run Validation Layers (Release Gate, Windows)
 ```powershell
 $env:VK_INSTANCE_LAYERS = "VK_LAYER_KHRONOS_validation"
 ctest --test-dir build -C Release --output-on-failure

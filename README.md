@@ -131,7 +131,7 @@ Qwen3.6-40B Q4_K_M, 21.5 t/s decode pooled across RX 7900 XTX + Arc Pro B70.
 | AMD HIP interop / DMA-BUF (Strix Halo) | **1 — Verified** |
 | Intel Arc Pro B70 (Battlemage Vulkan) | **1 — Verified** |
 | Android Adreno AHardwareBuffer (S24+) | **1 — Verified** |
-| Intel Level Zero GPU-direct | 2 — Compile-tested |
+| Intel Level Zero GPU-direct (Arc Pro B70) | **1 — Verified** |
 | UCX · Windows ND · NDK transport | 2 — Compile-tested |
 | Windows IoRing backend (real NVMe reads, `mode=ioring`) | **1 — Verified** |
 | DStorage zero-copy bridge (shared-committed D3D12 heap -> VK import, B70) | **1 — Verified** |
@@ -299,11 +299,21 @@ earned it. The keeper of this library is also known as ChonkE.
 
 ## Changelog
 
-Version history and the (extensive) experimental changelog live in
-[OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md) and the git history. v0.3.0-dev:
-layer separation (Core/Transport/Compute/Integrations), Chonk allocator
-exact-fit + Chonk Chunks, llama.cpp integration at parity, Android
-AHardwareBuffer verified, audit-driven correctness pass. Native-Linux
+Release-by-release history lives in [CHANGELOG.md](CHANGELOG.md); the
+(extensive) experimental changelog and research narrative live in
+[OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md) and the git history.
+
+**v0.4 (in progress):** GPU-lifetime retirement queue (R11) with genuinely
+async cross-GPU copies, exactly-once migration completion, allocator
+hardening (saturating arithmetic, concurrent fuzz), same-vendor P2P gating
+after the Intel cross-vendor driver crash, shared host arena at 6.1 GiB/s,
+Level Zero verified on the B70, `vvm-info` diagnostics, `VVM_LOG_LEVEL`,
+network DoS hardening (slow-loris header bound, chunked staging, conn caps),
+storage-stream L0-L4 landed with e2e tests.
+
+**v0.3:** layer separation (Core/Transport/Compute/Integrations), Chonk
+allocator exact-fit + Chonk Chunks, llama.cpp integration at parity,
+Android AHardwareBuffer verified, audit-driven correctness pass. Native-Linux
 campaign (2026-08-25): cross-vendor P2P + verbs/RDMA verification, RDMA
 teardown hang root-caused and fixed, ANV 26.0.3 import crash characterized,
 validation-layer VUID cleanup — full evidence in
