@@ -216,6 +216,23 @@ void IoRingBackend::close() {
     }
     pending_.clear();
 
+    // Drain true-IoRing-mode completions too: the loop above only covers the
+    // OVERLAPPED floor. Unreaped ring ops still DMA into arena slots; closing
+    // the ring and freeing the arena first is use-after-free. Bounded wait:
+    // a wedged ring must not hang teardown (leftovers are LOUD, not silent).
+    if (inFlight_ > 0) {
+        const ULONGLONG deadline = ::GetTickCount64() + 5000;
+        std::vector<uint64_t> ids, failed;
+        while (inFlight_ > 0 && ::GetTickCount64() < deadline) {
+            pollCompletions(&ids, &failed);
+            if (inFlight_ > 0) ::Sleep(1);
+        }
+        if (inFlight_ > 0) {
+            VVM_LOG_ERROR("IoRingBackend::close: {} ops still in flight after drain; "
+                          "proceeding (kernel DMA may target freed memory)", inFlight_);
+        }
+    }
+
     destroyRing();
 
     if (file_) { ::CloseHandle(static_cast<HANDLE>(file_)); file_ = nullptr; }
@@ -494,6 +511,23 @@ Result IoRingBackend::open() {
 
 void IoRingBackend::close() {
     if (!open_ && !arena_ && fd_ < 0 && !ring_) return;
+#if defined(VVM_HAS_LIBURING)
+    // Drain in-flight io_uring ops before tearing down: io_uring_queue_exit
+    // does not cancel or wait, so freeing the arena / closing the fd first
+    // lets kernel DMA target freed memory (use-after-free). Bounded wait;
+    // leftovers are LOUD, not silent.
+    if (ioringMode_ && inFlight_ > 0) {
+        std::vector<uint64_t> ids, failed;
+        for (int i = 0; i < 5000 && inFlight_ > 0; ++i) {
+            pollCompletions(&ids, &failed);
+            if (inFlight_ > 0) ::usleep(1000);
+        }
+        if (inFlight_ > 0) {
+            VVM_LOG_ERROR("IoRingBackend::close: {} ops still in flight after drain; "
+                          "proceeding (kernel DMA may target freed memory)", inFlight_);
+        }
+    }
+#endif
     destroyRing();
     if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
     if (arena_) { ::free(arena_); arena_ = nullptr; }
