@@ -108,7 +108,13 @@ void printDeviceProperties(VkPhysicalDevice physicalDevice) {
                  VK_API_VERSION_MINOR(props.apiVersion),
                  VK_API_VERSION_PATCH(props.apiVersion),
                  props.driverVersion);
-    VVM_LOG_INFO("  Vendor: {:#04x}, Device: {:#04x}", props.vendorID, props.deviceID);
+    // VVM_LOG supports only literal {} - pre-format hex.
+    {
+        char ven[8], dev[8];
+        std::snprintf(ven, sizeof(ven), "0x%04x", props.vendorID);
+        std::snprintf(dev, sizeof(dev), "0x%04x", props.deviceID);
+        VVM_LOG_INFO("  Vendor: {}, Device: {}", ven, dev);
+    }
     VVM_LOG_INFO("  Limits: maxMemAlloc={} MB, bufferAlignment={}",
                  props.limits.maxMemoryAllocationCount / (1024*1024),
                  props.limits.minUniformBufferOffsetAlignment);

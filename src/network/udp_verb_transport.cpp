@@ -9,6 +9,7 @@
 #include "vulkan_vm/network/udp_verb_transport.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #if defined(_WIN32)
 #include <BaseTsd.h>
 using ssize_t = SSIZE_T;
@@ -26,6 +27,10 @@ using ssize_t = SSIZE_T;
 
 namespace vvm {
 namespace network {
+
+// Defined in tcp_transport.cpp: WSAStartup once per process on Windows.
+void ensureSocketsInit();
+
 
 namespace {
 
@@ -296,11 +301,15 @@ struct UdpVerbTransport::Impl {
                         break;
                     }
                     std::memcpy(dst, payload, h.payloadLen);
-                    if (xf && xf->expectData && h.seq < 3)
-                        VVM_LOG_INFO("udp-verb[{}] RX s={} plen={} d0..3={:02x} {:02x} {:02x} {:02x}",
-                                     boundPort_, h.seq, h.payloadLen,
-                                     h.payloadLen>0?dst[0]:0, h.payloadLen>1?dst[1]:0,
-                                     h.payloadLen>2?dst[2]:0, h.payloadLen>3?dst[3]:0);
+                    if (xf && xf->expectData && h.seq < 3) {
+                        // VVM_LOG supports only literal {} - pre-format hex.
+                        char hex[4*5];
+                        std::snprintf(hex, sizeof(hex), "%02x %02x %02x %02x",
+                                      h.payloadLen>0?dst[0]:0, h.payloadLen>1?dst[1]:0,
+                                      h.payloadLen>2?dst[2]:0, h.payloadLen>3?dst[3]:0);
+                        VVM_LOG_INFO("udp-verb[{}] RX s={} plen={} d0..3={}",
+                                     boundPort_, h.seq, h.payloadLen, hex);
+                    }
 
                     if (xf && xf->expectData && xf->totalPkts == h.totalPkts) {
                         // Read-response path: bitmap + contiguous ACK.
@@ -409,11 +418,15 @@ size_t len = static_cast<size_t>(min_val);
                         std::vector<uint8_t> pkt(sizeof(dh) + len);
                         std::memcpy(pkt.data(), &dh, sizeof(dh));
                         if (len) std::memcpy(pkt.data() + sizeof(dh), src + off, len);
-                        if (s < 3)
-                            VVM_LOG_INFO("udp-verb[{}] TX s={} len={} b0..3={:02x} {:02x} {:02x} {:02x}",
-                                         boundPort_, s, len,
-                                         len>0?src[off]:0, len>1?src[off+1]:0,
-                                         len>2?src[off+2]:0, len>3?src[off+3]:0);
+                        if (s < 3) {
+                            // VVM_LOG supports only literal {} - pre-format hex.
+                            char hex[4*5];
+                            std::snprintf(hex, sizeof(hex), "%02x %02x %02x %02x",
+                                          len>0?src[off]:0, len>1?src[off+1]:0,
+                                          len>2?src[off+2]:0, len>3?src[off+3]:0);
+                            VVM_LOG_INFO("udp-verb[{}] TX s={} len={} b0..3={}",
+                                         boundPort_, s, len, hex);
+                        }
                         sendTo(from, pkt.data(), pkt.size());
                         if ((s % kWindowPkts) == (kWindowPkts - 1))
                             std::this_thread::sleep_for(
@@ -441,9 +454,16 @@ UdpVerbTransport::~UdpVerbTransport() { shutdown(); }
 bool UdpVerbTransport::initialize() {
     if (impl_->running_) return true;
 
+    ensureSocketsInit();
+
     impl_->sock = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (impl_->sock < 0) {
+    if (impl_->sock == kSockInvalid) {
+#ifdef VVM_PLATFORM_WINDOWS
+        // Winsock does not set errno; WSAGetLastError is the only source.
+        VVM_LOG_ERROR("udp-verb: socket() failed: WSA error {}", WSAGetLastError());
+#else
         VVM_LOG_ERROR("udp-verb: socket() failed: {}", strerror(errno));
+#endif
         return false;
     }
 
@@ -475,7 +495,12 @@ bool UdpVerbTransport::initialize() {
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = INADDR_ANY;
     if (::bind(impl_->sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+#ifdef VVM_PLATFORM_WINDOWS
+        VVM_LOG_ERROR("udp-verb: bind on udp/{} failed: WSA error {}",
+                      port, WSAGetLastError());
+#else
         VVM_LOG_ERROR("udp-verb: bind on udp/{} failed: {}", port, strerror(errno));
+#endif
         return false;
     }
     impl_->boundPort_ = port;
