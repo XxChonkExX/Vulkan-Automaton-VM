@@ -49,7 +49,7 @@ push to main ──► ci.yml        (cloud: compile matrix + CPU tests)
    cd ~/VulkanVM   # or wherever the repo lives
    git pull
    bash ci/gpu_linux.sh                    # incremental
-   FRESH=1 bash ci/gpu_linux.sh            # fresh-clone mode (0.3 gate)
+   FRESH=1 bash ci/gpu_linux.sh            # fresh-clone mode (0.4 gate)
    CHONK_TEST_MODEL=/path/to/some.gguf bash ci/gpu_linux.sh   # + server smoke
    ```
 

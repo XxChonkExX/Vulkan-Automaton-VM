@@ -87,9 +87,41 @@ pool and the pools talk:
 - **Staged path**: when they don't, the transport layer moves the bytes
   efficiently and tells you honestly that it did.
 
-The llama.cpp integration runs one 40B model pooled across an AMD 7900 XTX and
-an Intel Arc Pro B70 — different vendors, one model, verified at parity with
-stock ([docs/inference_benchmarks.md](docs/inference_benchmarks.md)).
+The llama.cpp integration serves a 90 GB MoE model on a single 24 GB card:
+dense layers and KV cache live in VRAM while 48×512 experts stream from RAM
+at ~17 GB/s — no hand-tuning, because the auto-placement planner reads the
+model file and puts every tensor class where it runs fastest. Different
+vendors, one model, verified at parity with stock
+([docs/inference_benchmarks.md](docs/inference_benchmarks.md)) — and a live
+`GET /vvm/stats` endpoint shows every pool's fill level while it serves.
+
+## Finishing the lap safely: the retirement queue
+
+Here is the mistake every young memory system makes: the CPU frees a buffer
+the microsecond *it* is done with it — while the GPU is still mid-stride on
+that same memory. The next allocation reuses the bytes, and now two runners
+are sprinting on the same lane. Corruption that looks like bad luck.
+
+Version 0.4's big idea: **CPU lifetime is not GPU lifetime.** When you hand
+memory back now, you also hand over a timeline ticket — "I'm done with this
+after signal 42." The pool files it in the retirement queue and only truly
+frees it once the GPU passes signal 42. Nobody waits; everybody is safe.
+The cross-GPU copy path uses the same trick to become genuinely asynchronous
+instead of stop-and-wait. See [docs/RETIREMENT.md](docs/RETIREMENT.md) for
+the full contract (rule R11 in
+[docs/LIFETIME_CONTRACT.md](docs/LIFETIME_CONTRACT.md)).
+
+## The shared arena: one whiteboard, two runners
+
+Cross-vendor GPUs can't import each other's memory on Windows — the drivers
+just refuse (one returns an error, Intel *crashes*). So instead of handing
+the baton directly, both GPUs agree to use **one whiteboard in system RAM**:
+a single allocation that the XTX *and* the B70 both map into their own
+memory space. GPU A DMAs its bytes onto the whiteboard, GPU B DMAs them off
+— zero CPU copies, 5–6 GiB/s, byte-verified both directions. When even that
+isn't available, the staged path copies through RAM the honest way (3.5
+GiB/s) and tells you that's what happened — check the P2P policy matrix in
+`vvm-info` output.
 
 ## The network: recruiting the next team
 
@@ -126,10 +158,11 @@ The whole point is that you don't change how you work:
 ## The honest part
 
 This is experimental, homebrewed, and proud of it. Some things are verified
-end-to-end on real hardware (AMD RDNA3, Strix Halo, Intel B70, Adreno
-Android — see [docs/HARDWARE_SUPPORT.md](docs/HARDWARE_SUPPORT.md)). Some
-things are designed but never touched real silicon (NVIDIA, we're looking at
-you — [help wanted](README.md)). The autograd ops currently run through ATen
+end-to-end on real hardware: AMD RDNA3, Strix Halo, Intel B70 (Vulkan *and*
+Level Zero), NVIDIA GTX 1080 Ti (CUDA path, small-model duty), Adreno
+Android — see [docs/HARDWARE_SUPPORT.md](docs/HARDWARE_SUPPORT.md). Some
+things are designed but thinly tested (RDMA on real NICs, DStorage import,
+GDeflate). The autograd ops currently run through ATen
 with Vulkan dispatch landing; the numbers are validated against PyTorch in
 [test_autograd_numerics.py](python/vulkanvm_torch/test_autograd_numerics.py).
 
@@ -144,9 +177,12 @@ What we claim, we test. What we haven't tested, we say.
 | One GPU, zero fragmentation, no penalty laps | Core: Chonk Buffer |
 | PyTorch training with everything in GPU memory | Core + PyTorch integration |
 | Two GPUs, different vendors, one model | Core: cross-GPU sharing |
+| 90 GB model on a 24 GB card | Core + auto-placement planner + expert streaming |
 | Two computers, one relay team | + Transport: TCP/RDMA/UCX |
 | Tensor math without leaving the track | + Compute layer |
 | All of it on your phone | Core: Android AHardwareBuffer |
+| To see what's happening inside | `vvm-info`, `GET /vvm/stats`, `VVM_LOG_LEVEL=warn` for quiet |
+| To finish every lap without collisions | Core: retirement queue (R11) |
 
 The race is the same. The track is finally connected.
 

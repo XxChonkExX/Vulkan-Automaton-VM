@@ -40,7 +40,7 @@ if(WIN32)
     endif()
 endif()
 
-project(VulkanVM LANGUAGES CXX VERSION 0.3.0)
+project(VulkanVM LANGUAGES CXX VERSION 0.4.0)
 
 # Convenience: core-only = Chonk Buffer standalone (no transport/tensor/
 # bindings). Individual options still override if set explicitly after this.
@@ -150,7 +150,7 @@ endif()
 # Layer aliases (namespaced, QoL for find_package/consumers)
 # Include directories (target-based)
 # ============================================================================
-# LAYER MODEL (0.3)
+# LAYER MODEL (0.4)
 #   VulkanVM::Core      (vulkan_vm)          - pools, external memory,
 #                                              multi-GPU, host staging
 #   VulkanVM::Transport (vulkan_vm_network)  - TCP, RDMA, UCX, NDK, cluster

@@ -1,4 +1,4 @@
-# Windows → Linux Network Test Setup (0.3 Release Gates)
+# Windows → Linux Network Test Setup (0.4 Release Gates)
 
 > For X2 (Strix Halo, Ubuntu native) and Windows box (XTX + B70, WSL2).
 > Run these steps to execute the **Windows→Linux TCP soak** and **validation layers** gates.
@@ -113,7 +113,7 @@ VVM_DISABLE_SAME_PROCESS_ZC=1 ./examples/network_test server 51000 51001
 [SUMMARY] 100 iterations, 0 errors, avg 11.9 GB/s
 ```
 
-### Soak Parameters for 0.3 Gate
+### Soak Parameters for 0.4 Gate
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
 | `--bytes` | 16777216 (16 MiB) | Exercises staging + fragmentation |
@@ -142,12 +142,12 @@ ibv_devinfo  # verify rxe0
 ### Run RDMA Test (Windows client → Linux server)
 ```powershell
 # On Windows native (needs rdma-core in WSL2 path, complex)
-# Skip for 0.3 if not ready; TCP soak is the gate.
+# Skip for 0.4 if not ready; TCP soak is the gate.
 ```
 
 ---
 
-## 5. Checklist for 0.3 Release
+## 5. Checklist for 0.4 Release
 
 | Gate | Command | Status |
 |------|---------|--------|
@@ -192,4 +192,4 @@ cmake --build build_rdma --target vulkan_vm vulkan_vm_network -j$(nproc) > /dev/
 ---
 
 **Last updated**: 2026-08-27 (commit `d0ec614`)
-**Target**: 0.3.0 release gates
+**Target**: 0.4.0 release gates

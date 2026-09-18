@@ -4,7 +4,7 @@
 > rules, it is a bug. If you consume VulkanVM from another project, these are
 > the guarantees you may rely on — and the rules you must follow.
 >
-> Status: **0.3 contract**. APIs may still change before release, but the
+> Status: **0.4 contract**. APIs may still change before release, but the
 > ownership MODEL below is the intended stable model.
 
 ---

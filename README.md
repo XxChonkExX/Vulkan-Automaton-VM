@@ -5,7 +5,7 @@ external-memory primitives, then lets the frameworks you already use consume
 that memory directly. One pool, one allocator family, every vendor —
 AMD, Intel, NVIDIA (1080 Ti-class verified), Tenstorrent-ICD, Android.
 
-**Version**: 0.3.0-dev
+**Version**: 0.4.0-dev
 
 > **Status**: experimental systems software. Core allocator + local GPU paths
 > are hardware-verified (see `docs/HARDWARE_SUPPORT.md`); the **network

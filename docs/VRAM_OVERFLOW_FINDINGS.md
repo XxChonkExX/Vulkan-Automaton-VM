@@ -56,10 +56,13 @@ Two corollaries:
    minimal vs f16 (community KL studies); q4_0 is where degradation becomes
    noticeable.
 
-## Follow-ups
+## Follow-ups (status 0.4)
 
-- [ ] Hook: set a VRAM-aware budget (per-device `maxHeapFraction`) with a
-      `GGML_VK_VVM_HEAP_FRACTION` override.
-- [ ] Consider cross-GPU rebalancing when one pool nears its VRAM ceiling
-      (ShardPlacer policy hook).
-- [ ] Surface a warning log when committed bytes exceed 90% of VRAM.
+- [x] Hook: VRAM-aware budget — `GGML_VVM_HEAP_FRACTION` shipped and
+      validated (0.80–0.85 sweet spot on display-attached cards; pool
+      self-caps, `/vvm/stats.usedBytes` > VRAM is the spill diagnostic).
+- [~] Cross-GPU rebalancing: the auto-placement planner (`--vvm-split
+      ...=auto`) rediscovers optimal *initial* placement from the model
+      file; *runtime* rebalancing of a live pool remains open.
+- [x] 90%-of-VRAM warning log — fires once per pool
+      (`warnedHighWater_`).

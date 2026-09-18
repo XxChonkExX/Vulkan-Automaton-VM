@@ -1,6 +1,6 @@
 # VulkanVM Network Threat Model
 
-> Status: **0.3 draft**. The wire-format parser is hardened (magic, version,
+> Status: **0.4 draft**. The wire-format parser is hardened (magic, version,
 > message-type validation, size limits with absolute hard caps). This document
 > covers the *system-level* attack surface around that parser, what is
 > defended today, and what remains open.
@@ -65,7 +65,7 @@ acceptance of the open gaps in §5.
 4. Prefer host-staged TCP with small `maxBodySize` config over RDMA for
    untrusted peers (RDMA registration exposes pinned host memory).
 
-## 5. Hardening roadmap (0.3+)
+## 5. Hardening roadmap (0.4+)
 
 Ordered by severity:
 

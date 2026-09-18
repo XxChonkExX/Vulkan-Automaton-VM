@@ -1,6 +1,10 @@
 # Storage Stream — Frontier Architecture & Restructure Plan
 
-> Status: **design** (v0.4 target). Supersedes the v0.3 scaffolding in
+> Status: **implementing (landed in 0.4)**. L0 pack format, L1 cache (Clock +
+> pinning), L2 request queue (Little's-Law depth), and the L3 IoRing /
+> OVERLAPPED backend are implemented and e2e-tested (`storage_e2e_stream_test`).
+> Still open: DStorage shared-heap import (stub), GDeflate (probe only),
+> full KV-lane wiring. Supersedes the v0.3 scaffolding in
 > `src/offload/storage_stream.cpp`.
 >
 > The naive first pass (single global mutex, blocking pread + copyBuffer, one

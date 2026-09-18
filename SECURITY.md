@@ -4,8 +4,8 @@
 
 | Version | Support |
 |---|---|
-| 0.3.x | Security fixes for the Core (Chonk Buffer) and wire-protocol parser |
-| <= 0.2.x | Experimental snapshots — **not supported**, upgrade |
+| 0.4.x | Security fixes for the Core (Chonk Buffer) and wire-protocol parser |
+| <= 0.3.x | Experimental snapshots — **not supported**, upgrade |
 
 ## Reporting a vulnerability
 
