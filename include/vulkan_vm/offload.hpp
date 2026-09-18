@@ -182,7 +182,9 @@ private:
     std::optional<MigrationContext*> acquireContext();
     void releaseContext(MigrationContext* ctx);
     bool submitCopy(MigrationContext* ctx, const MigrationRequest& req);
-    void removePendingOp(MigrationId id);
+    // Exactly-once completion gate: consult-and-erase pendingOps_; the first
+    // completer runs onComplete + releaseContext, later calls are no-ops.
+    bool completeOp(const MigrationOperation& op);
 };
 
 // ============================================================================

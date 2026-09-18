@@ -495,34 +495,42 @@ void MigrationEngine::waitMigration(const MigrationOperation& op) {
     if (op.completionFence) {
         vkWaitForFences(device_, 1, &op.completionFence, VK_TRUE, UINT64_MAX);
     }
+    completeOp(op);
+}
+
+bool MigrationEngine::pollMigration(const MigrationOperation& op) {
+    if (!op.completionFence) {
+        return completeOp(op);
+    }
+    if (vkGetFenceStatus(device_, op.completionFence) == VK_SUCCESS) {
+        return completeOp(op);
+    }
+    return false;
+}
+
+// Exactly-once completion: the pendingOps_ entry is the single token.
+// Whoever erases it first (wait or poll, any thread) runs the completion;
+// losers are silent no-ops. Without this, poll-then-wait (or concurrent
+// waiters) double-fires onComplete - e.g. the shadow-region free hook -
+// and double-releases the context.
+bool MigrationEngine::completeOp(const MigrationOperation& op) {
+    {
+        std::lock_guard<std::mutex> lock(pendingOpsMutex_);
+        auto it = pendingOps_.find(op.id);
+        if (it == pendingOps_.end()) {
+            return true;  // already completed (or never submitted)
+        }
+        pendingOps_.erase(it);
+    }
+    // Run the CALLER's copy: the post-submit owner may have attached
+    // onComplete after submitMigration registered the (empty) stored copy.
     if (op.onComplete) {
         op.onComplete();
     }
     if (op.owningContext) {
         releaseContext(static_cast<MigrationContext*>(op.owningContext));
     }
-    removePendingOp(op.id);
-}
-
-bool MigrationEngine::pollMigration(const MigrationOperation& op) {
-    if (!op.completionFence) {
-        if (op.onComplete) op.onComplete();
-        if (op.owningContext) releaseContext(static_cast<MigrationContext*>(op.owningContext));
-        removePendingOp(op.id);
-        return true;
-    }
-    if (vkGetFenceStatus(device_, op.completionFence) == VK_SUCCESS) {
-        if (op.onComplete) op.onComplete();
-        if (op.owningContext) releaseContext(static_cast<MigrationContext*>(op.owningContext));
-        removePendingOp(op.id);
-        return true;
-    }
-    return false;
-}
-
-void MigrationEngine::removePendingOp(MigrationId id) {
-    std::lock_guard<std::mutex> lock(pendingOpsMutex_);
-    pendingOps_.erase(id);
+    return true;
 }
 
 void MigrationEngine::flush() {

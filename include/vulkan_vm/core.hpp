@@ -232,7 +232,9 @@ struct VVM_API Allocation {
     void* savedHostPtr = nullptr;
 
     // Generation counter for handle validation (prevents stale handle use).
-    // Incremented on deallocate; allocation must match current generation to be valid.
+    // Identity model: each allocation gets a unique id registered in the
+    // pool's live-set; deallocate() retires it. A handle is valid only while
+    // its id is live (double-free and zero-handle frees are rejected).
     uint64_t generation = 0;
 };
 
