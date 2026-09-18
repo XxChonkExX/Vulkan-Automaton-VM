@@ -3,6 +3,21 @@
 *Or: what this project actually does, explained the way I wish someone had
 explained it to me.*
 
+## TL;DR: You should read though.
+
+| You want | You use |
+|---|---|
+| One GPU, zero fragmentation, no penalty laps | Core: Chonk Buffer |
+| PyTorch training with everything in GPU memory | Core + PyTorch integration |
+| Two GPUs, different vendors, one model | Multi-GPU lanes + exchange zone |
+| 90 GB model on a 24 GB card | The coach + the crate + the supply van |
+| Two computers, one relay team | + Transport: TCP/RDMA/UCX |
+| Tensor math without leaving the track | + Compute layer |
+| All of it on your phone | Core: Android AHardwareBuffer |
+| To hear the race | `vvm-info`, `GET /vvm/stats`, `VVM_LOG_LEVEL=warn` |
+| To finish every lap without collisions | The baton-return official (R11) |
+
+The race is the same. The track is finally connected.
 ---
 
 ## The relay race
@@ -19,16 +34,17 @@ GPU memory  →  copy to staging  →  system RAM  →  copy again  →  next ru
 ```
 
 Each copy is a **penalty lap**. Your GPU — the fastest runner you own — stands
-at the fence waiting while the baton gets photocopied, notarized, and carried
-over by hand. Do that every layer, every token, every step, and your monster
-GPU spends its life waiting at fences.
+at the start block waiting while the baton gets photocopied, notarized, and carried
+over by hand by slower runners. Do that every layer, every token, every step, and your monster
+GPU spends its life waiting.
 
 Multi-vendor makes it crueler. AMD hands you a baton shaped like a DMA-BUF.
 Intel wants a Level Zero handle. NVIDIA wants CUDA. Android wants an
-AHardwareBuffer. The batons don't fit each other's hands, so everybody
-translates, and translating means copying.
+AHardwareBuffer. The batons don't fit each other's hands easily, so everybody
+translates, and translating means copying, fumbling and dropping the baton
+costing extra time.
 
-**VulkanVM's whole job is to get rid of the penalty laps.**
+**VulkanVM's whole job is to get rid of the penalty laps and keep the baton going.**
 
 ---
 
@@ -78,7 +94,7 @@ is very strict about who owns the baton at every moment.
 
 ## The coach: who carries which baton
 
-A modern model isn't one race — it's forty races at once with wildly different
+A modern model isn't just one race — it's forty races at once with wildly different
 batons: attention, dense weights, 48×512 experts, the KV cache, one giant
 embedding table. Somebody has to decide which runner carries which baton, and
 "give the GPU everything" is the wrong answer more often than you'd think.
@@ -117,7 +133,7 @@ system always tells you which one you got:
   and never pretends to be something faster. (`vvm-info` prints the policy;
   `VVM_P2P_POLICY=host` forces it.)
 
-## The supply van: races bigger than your pockets
+## The Supply van: Super Fast SSD Storage/Logistics and RAM Delivery
 
 Here's the party trick: serving a **90 GB model on a single 24 GB card**.
 That race has more batons than any runner can hold, so the team recruits
@@ -154,10 +170,10 @@ asynchronous: pass the baton, keep running, it re-enters circulation only
 when safe. The fine print is contract rule R11:
 [docs/RETIREMENT.md](docs/RETIREMENT.md).
 
-## The network: recruiting the next team
+## The network: Same Race Together
 
 When one computer isn't enough, the transport layer recruits other machines
-into the relay — same track, next building:
+into the relay — same race and finish line, helping on the next track over:
 
 - **TCP** for the honest, works-everywhere path
 - **RDMA** when the NIC can DMA straight out of your pool
@@ -209,21 +225,7 @@ What we claim, we test. What we haven't tested, we say.
 
 ---
 
-## TL;DR
 
-| You want | You use |
-|---|---|
-| One GPU, zero fragmentation, no penalty laps | Core: Chonk Buffer |
-| PyTorch training with everything in GPU memory | Core + PyTorch integration |
-| Two GPUs, different vendors, one model | Multi-GPU lanes + exchange zone |
-| 90 GB model on a 24 GB card | The coach + the crate + the supply van |
-| Two computers, one relay team | + Transport: TCP/RDMA/UCX |
-| Tensor math without leaving the track | + Compute layer |
-| All of it on your phone | Core: Android AHardwareBuffer |
-| To hear the race | `vvm-info`, `GET /vvm/stats`, `VVM_LOG_LEVEL=warn` |
-| To finish every lap without collisions | The baton-return official (R11) |
-
-The race is the same. The track is finally connected.
 
 *— the relay race analogy is Mike/ChonkE's; it cuts to the heart of what
 Automaton/Chonk Buffer does.*
