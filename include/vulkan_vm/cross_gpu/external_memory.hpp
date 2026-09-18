@@ -15,8 +15,8 @@ struct ExternalMemoryCaps {
     VkExternalMemoryFeatureFlags supportedFeatures = 0;
 };
 
-ExternalMemoryCaps queryExternalMemoryCaps(VkPhysicalDevice physicalDevice);
-VkPhysicalDeviceProperties getVendorProperties(VkPhysicalDevice physicalDevice);
+VVM_API ExternalMemoryCaps queryExternalMemoryCaps(VkPhysicalDevice physicalDevice);
+VVM_API VkPhysicalDeviceProperties getVendorProperties(VkPhysicalDevice physicalDevice);
 
 struct VendorPairCaps {
     bool nvidiaToAmd = false;
@@ -28,6 +28,6 @@ struct VendorPairCaps {
     std::string notes;
 };
 
-VendorPairCaps getCrossVendorCaps(VkPhysicalDevice src, VkPhysicalDevice dst);
+VVM_API VendorPairCaps getCrossVendorCaps(VkPhysicalDevice src, VkPhysicalDevice dst);
 
 } // namespace vvm
