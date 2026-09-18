@@ -7,6 +7,11 @@ AMD, Intel, NVIDIA (1080 Ti-class verified), Tenstorrent-ICD, Android.
 
 **Version**: 0.3.0-dev
 
+> **Status**: experimental systems software. Core allocator + local GPU paths
+> are hardware-verified (see `docs/HARDWARE_SUPPORT.md`); the **network
+> transport is NOT hardened for untrusted peers** — deploy only on trusted
+> networks or behind access control (`SECURITY.md`, `docs/THREAT_MODEL.md`).
+
 > **New here?** Start with [explainfordummyuser.md](explainfordummyuser.md) —
 > *"the relay race tour"*: what problem this solves and how it all fits
 > together, written for humans first. Then come back for the details below.

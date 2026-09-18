@@ -40,13 +40,14 @@ public:
     BuddyAllocator& operator=(const BuddyAllocator&) = delete;
 
     // Returns offset into the block, or nullopt on failure / OOM of metadata.
-    std::optional<VkDeviceSize> allocate(VkDeviceSize size);
+    [[nodiscard]] std::optional<VkDeviceSize> allocate(VkDeviceSize size);
 
     // Exact-fit grant whose START is aligned to `alignment` (power of two,
     // >= minSize). Implemented by over-allocating and returning both the
     // leading slack and the tail to the free lists; granted size is still
     // exactly alignUp(size, minSize_).
-    std::optional<VkDeviceSize> allocateAligned(VkDeviceSize size, VkDeviceSize alignment);
+    [[nodiscard]] std::optional<VkDeviceSize> allocateAligned(VkDeviceSize size,
+                                                              VkDeviceSize alignment);
 
     // size may be 0 ("unknown"); if non-zero it is validated against the recorded size.
     void deallocate(VkDeviceSize offset, VkDeviceSize size = 0);
@@ -113,7 +114,7 @@ private:
     void coalesce(int order, VkDeviceSize offset);
 
     // Core allocation path; caller must hold the lock when threadSafe_.
-    std::optional<VkDeviceSize> allocateUnlocked(VkDeviceSize size);
+    [[nodiscard]] std::optional<VkDeviceSize> allocateUnlocked(VkDeviceSize size);
 
     VkDeviceSize blockSize_ = 0;
     VkDeviceSize minSize_   = 0;

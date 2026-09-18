@@ -388,18 +388,18 @@ public:
     ~UnifiedMemoryPool();
 
 // Allocation
-    std::optional<Allocation> allocate(VkDeviceSize size,
+    [[nodiscard]] std::optional<Allocation> allocate(VkDeviceSize size,
                                        VkBufferUsageFlags usage,
                                        VkMemoryPropertyFlags flags = 0);
     
     // Rich allocation descriptor. exportable=true routes to a dedicated
     // exportable allocation; memoryUsage maps to memory types internally.
-    std::optional<Allocation> allocate(const AllocDesc& desc);
+    [[nodiscard]] std::optional<Allocation> allocate(const AllocDesc& desc);
     
     // Allocate a dedicated VkDeviceMemory for a single exportable buffer.
     // Each exportable allocation gets its own dedicated memory (not sub-allocated).
     // This is required by the Vulkan spec for reliable external memory import.
-    std::optional<Allocation> allocateDedicatedExportable(
+    [[nodiscard]] std::optional<Allocation> allocateDedicatedExportable(
         VkDeviceSize size, VkBufferUsageFlags usage,
         VkMemoryPropertyFlags flags = 0);
     
@@ -407,18 +407,18 @@ public:
     // Used as the oversized-allocation fallback in allocate(): requests larger
     // than config_.blockSize cannot be served by the buddy blocks, so they get
     // their own VkDeviceMemory instead of failing.
-    std::optional<Allocation> allocateDedicated(
+    [[nodiscard]] std::optional<Allocation> allocateDedicated(
         VkDeviceSize size, VkBufferUsageFlags usage,
         VkMemoryPropertyFlags flags = 0);
 
     // Non-Vulkan standalone allocation (oversized requests on HIP/L0 pools):
     // a backend-native dedicated allocation, tracked in dedicatedAllocations_
     // so lifetime/free paths treat it identically to Vulkan dedicateds.
-    std::optional<Allocation> allocateDedicatedBackend(
+    [[nodiscard]] std::optional<Allocation> allocateDedicatedBackend(
         VkDeviceSize size, VkBufferUsageFlags usage,
         VkMemoryPropertyFlags flags = 0);
     
-    std::optional<Allocation> allocateTensor(VkDeviceSize size,
+    [[nodiscard]] std::optional<Allocation> allocateTensor(VkDeviceSize size,
                                              VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     
     void deallocate(Allocation&& alloc);
@@ -469,7 +469,7 @@ public:
     // multiple DIFFERENT devices (the cross-GPU zero-copy path: every GPU
     // DMAes into the same RAM); importing twice into ONE device is not
     // guaranteed by the spec.
-    std::optional<Allocation> importMemoryHostPointer(void* hostPtr,
+    [[nodiscard]] std::optional<Allocation> importMemoryHostPointer(void* hostPtr,
                                                       VkDeviceSize size,
                                                       VkBufferUsageFlags usage);
 

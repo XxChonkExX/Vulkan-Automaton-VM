@@ -141,7 +141,7 @@ private:
     VkFence bindFence_ = VK_NULL_HANDLE;
     VkFence copyFence_ = VK_NULL_HANDLE;
 
-    bool allocatePageMemory(uint32_t memoryTypeIndex, SparsePage& out);
+    [[nodiscard]] bool allocatePageMemory(uint32_t memoryTypeIndex, SparsePage& out);
     static VkDeviceSize alignUp(VkDeviceSize value, VkDeviceSize alignment);
     void destroy();
 };

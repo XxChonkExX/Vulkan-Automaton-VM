@@ -73,7 +73,7 @@ public:
     // ========================================================================
     
     // Allocate locally and optionally advertise to cluster
-    std::optional<Allocation> allocateLocal(
+    [[nodiscard]] std::optional<Allocation> allocateLocal(
         VkDeviceSize size,
         VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
@@ -83,7 +83,7 @@ public:
         bool advertise = false);  // register in cluster directory
     
     // Allocate tensor-optimized (bindless-ready)
-    std::optional<Allocation> allocateTensor(
+    [[nodiscard]] std::optional<Allocation> allocateTensor(
         VkDeviceSize size,
         VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
@@ -113,7 +113,7 @@ public:
         bool enableRdma = true);
     
     // Sync version
-    std::optional<RemoteAllocationDesc> allocateRemote(
+    [[nodiscard]] std::optional<RemoteAllocationDesc> allocateRemote(
         const NodeId& target,
         VkDeviceSize size,
         VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -129,7 +129,7 @@ public:
     // ========================================================================
     
     // Export local allocation for remote RDMA or host-staged access
-    std::optional<RemoteAllocationDesc> exportForRemote(
+    [[nodiscard]] std::optional<RemoteAllocationDesc> exportForRemote(
         const Allocation& alloc,
         bool enableRdma = true,
         bool forceHostShadow = false);
@@ -139,7 +139,7 @@ public:
     // ========================================================================
     
     // Import remote allocation (RDMA or host-staged fallback)
-    std::optional<Allocation> importRemote(
+    [[nodiscard]] std::optional<Allocation> importRemote(
         const RemoteAllocationDesc& desc,
         VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
@@ -209,7 +209,7 @@ public:
     void setUcxTransport(vvm::network::UcxTransport* ucxTransport);
     
     // UCX-enabled export: registers GPU memory with UCX and returns RMA keys
-    std::optional<bool> exportForRemoteUcx(
+    [[nodiscard]] std::optional<bool> exportForRemoteUcx(
         const RemoteAllocationDesc& desc,
         const Allocation& alloc,
         uint32_t deviceIndex);
@@ -362,7 +362,7 @@ private:
     NetworkStats networkStats_;
     
     // Internal helpers
-    std::optional<Allocation> createLocalAllocationForImport(
+    [[nodiscard]] std::optional<Allocation> createLocalAllocationForImport(
         const RemoteAllocationDesc& desc,
         VkBufferUsageFlags usage);
     
@@ -381,7 +381,7 @@ private:
     // ========================================================================
 
     bool initCopyEngine();
-    std::optional<Allocation> createStaging(VkDeviceSize size);
+    [[nodiscard]] std::optional<Allocation> createStaging(VkDeviceSize size);
     bool copyDeviceToHost(const Allocation& src, VkDeviceSize srcOffset,
                           const Allocation& staging, VkDeviceSize size);
     bool copyHostToDevice(const Allocation& staging, const Allocation& dst,

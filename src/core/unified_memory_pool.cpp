@@ -5,8 +5,10 @@
 #include "vulkan_vm/vulkan_mem_backend.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 
 namespace vvm {
@@ -620,6 +622,24 @@ bool UnifiedMemoryPoolImpl::initialize(const DeviceConfig& device, const PoolCon
 
     VVM_LOG_INFO("UnifiedMemoryPool initialized successfully (blockSize={} MB, alignment={} KB)",
                  config_.blockSize / (1024*1024), config_.minAlignment / 1024);
+    // One-line env summary (audit QoL): every VVM_* knob that changes pool
+    // behavior, printed once per pool so bug reports carry their config.
+    {
+        const char* keys[] = {"VVM_WARN_LIVE_POOL", "VVM_SKIP_CMDPOOL",
+                              "VVM_SKIP_INITBLOCK", "VVM_DEVICE_INDEX",
+                              "VVM_STAGED_CHUNK_MB", "VVM_P2P_POLICY",
+                              "VVM_ALLOW_CROSSVENDOR_ZC"};
+        std::string summary;
+        for (const char* k : keys) {
+            if (const char* v = std::getenv(k)) {
+                if (!summary.empty()) summary += " ";
+                summary += k;
+                summary += "=";
+                summary += v;
+            }
+        }
+        VVM_LOG_INFO("VVM env: {}", summary.empty() ? "(defaults)" : summary.c_str());
+    }
     if (isVulkan && deviceConfig_.physicalDevice != VK_NULL_HANDLE) {
         const VkDeviceSize cap = driverMaxSingleAlloc(deviceConfig_.physicalDevice);
         if (cap == UINT64_MAX) {

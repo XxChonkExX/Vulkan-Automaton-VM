@@ -160,7 +160,7 @@ public:
     // ========================================================================
     // Creates a pool of parallel connections to a remote endpoint for striped
     // stream transfers. Returns true if poolSize connections were established.
-    bool createConnectionPool(const std::string& host, uint16_t port, size_t poolSize = 4);
+    [[nodiscard]] bool createConnectionPool(const std::string& host, uint16_t port, size_t poolSize = 4);
     
     // Striped stream write: distributes data across pool connections.
     // Use for large outbound transfers (model weights, tensor data).

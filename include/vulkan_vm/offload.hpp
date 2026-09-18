@@ -62,7 +62,7 @@ public:
     HostShadowManager& operator=(const HostShadowManager&) = delete;
     
     // Allocate region in host shadow
-    std::optional<VkDeviceSize> allocateRegion(VkDeviceSize size);
+    [[nodiscard]] std::optional<VkDeviceSize> allocateRegion(VkDeviceSize size);
     void freeRegion(VkDeviceSize offset, VkDeviceSize size);
     
     // Map/unmap for CPU access
@@ -109,7 +109,7 @@ private:
     VkCommandPool cmdPool_ = VK_NULL_HANDLE;
     mutable std::mutex mutex_;  // protects shadowBuffer_ and freeRanges
     
-    bool createShadowBuffer();
+    [[nodiscard]] bool createShadowBuffer();
     void destroyShadowBuffer();
     VkDeviceSize alignUp(VkDeviceSize value, VkDeviceSize alignment);
 };

@@ -173,7 +173,7 @@ ExternalHandle exportMemory(
 
 // Import external handle as Vulkan memory
 // Consumes the handle on success
-std::optional<Allocation> importMemory(
+[[nodiscard]] std::optional<Allocation> importMemory(
     UnifiedMemoryPool& pool,
     ExternalHandle&& handle,
     VkBufferUsageFlags usage,
