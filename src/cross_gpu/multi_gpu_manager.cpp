@@ -5,6 +5,9 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#endif
 
 namespace vvm {
 
@@ -204,11 +207,15 @@ bool MultiGPUPoolManager::createSharedArena(void* hostPtr, VkDeviceSize size,
     return imported > 0;
 }
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__linux__)
 bool MultiGPUPoolManager::createSharedArena(VkDeviceSize size,
                                             VkBufferUsageFlags usage) {
     if (hasSharedArena()) return false;
-    // 64 KB-aligned VirtualAlloc (satisfies any sane import alignment).
+    if (size == 0) return false;
+    // Page-committed host pages for HOST_ALLOCATION import: VirtualAlloc
+    // (64 KB-aligned) on Windows, mmap(MAP_ANONYMOUS) (page-aligned) on
+    // Linux - the dma-buf-era counterpart, no D3D12 stack needed.
+#if defined(_WIN32)
     void* arena = VirtualAlloc(nullptr, static_cast<SIZE_T>(size),
                                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!arena) {
@@ -216,14 +223,34 @@ bool MultiGPUPoolManager::createSharedArena(VkDeviceSize size,
                       size / (1024 * 1024));
         return false;
     }
+#else
+    void* arena = mmap(nullptr, static_cast<size_t>(size),
+                       PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
+                       -1, 0);
+    if (arena == MAP_FAILED) {
+        VVM_LOG_ERROR("createSharedArena: mmap failed ({} MB)",
+                      size / (1024 * 1024));
+        return false;
+    }
+#endif
     if (!createSharedArena(arena, size, usage)) {
+#if defined(_WIN32)
         VirtualFree(arena, 0, MEM_RELEASE);
+#else
+        munmap(arena, static_cast<size_t>(size));
+#endif
         return false;
     }
     // Ownership: freed AFTER the pools (declared before instances_ =
     // reverse-destruction order frees it last).
-    arenaOwner_ = std::shared_ptr<void>(arena, [](void* p) {
-        if (p) VirtualFree(p, 0, MEM_RELEASE);
+    arenaOwner_ = std::shared_ptr<void>(arena, [size](void* p) {
+        if (!p) return;
+#if defined(_WIN32)
+        (void)size;
+        VirtualFree(p, 0, MEM_RELEASE);
+#else
+        munmap(p, static_cast<size_t>(size));
+#endif
     });
     return true;
 }

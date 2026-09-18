@@ -1,5 +1,5 @@
-// Shared host arena probe (VK_EXT_external_memory_host): one VirtualAlloc'd
-// arena imported as VkDeviceMemory on EVERY discrete GPU. Verifies the
+// Shared host arena probe (VK_EXT_external_memory_host): one page-aligned
+// host arena imported as VkDeviceMemory on EVERY discrete GPU. Verifies the
 // cross-vendor zero-copy path: AMD XTX writes the arena via GPU DMA, NVIDIA
 // Ti reads it via GPU DMA - no CPU memcpy in the loop. Reports per-device
 // capability (ext, importable, alignment) + round-trip verdicts + timed
@@ -10,6 +10,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <sys/mman.h>
 #endif
 
 #include <chrono>
@@ -21,6 +23,28 @@
 using namespace vvm;
 
 namespace {
+
+// Page-committed host block for HOST_ALLOCATION import: VirtualAlloc on
+// Windows, mmap(MAP_ANONYMOUS) on POSIX. Caller frees with arenaFree.
+void* arenaAlloc(VkDeviceSize size) {
+#ifdef _WIN32
+    return VirtualAlloc(nullptr, static_cast<SIZE_T>(size),
+                        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+    void* p = mmap(nullptr, static_cast<size_t>(size), PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p == MAP_FAILED ? nullptr : p;
+#endif
+}
+
+void arenaFree(void* p, VkDeviceSize size) {
+#ifdef _WIN32
+    (void)size;
+    if (p) VirtualFree(p, 0, MEM_RELEASE);
+#else
+    if (p) munmap(p, static_cast<size_t>(size));
+#endif
+}
 
 struct ArenaDevice {
     VkDevice device = VK_NULL_HANDLE;
@@ -249,13 +273,13 @@ int main() {
     auto devices = enumerateDevices(instance);
     std::cout << "Physical devices: " << devices.size() << "\n";
 
-    // Arena: 64 MiB (a multiple of any sane import alignment; VirtualAlloc
-    // base is 64 KB-aligned on Windows).
+    // Arena: 64 MiB (a multiple of any sane import alignment; the
+    // allocation base is page-committed and suitably aligned on both
+    // Windows (64 KB) and Linux (page size) - see arenaAlloc).
     const VkDeviceSize kArena = 64ull * 1024 * 1024;
-    void* arena = VirtualAlloc(nullptr, static_cast<SIZE_T>(kArena),
-                               MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    void* arena = arenaAlloc(kArena);
     if (!arena) {
-        std::cerr << "FAIL: VirtualAlloc arena\n";
+        std::cerr << "FAIL: arena alloc\n";
         vkDestroyInstance(instance, nullptr);
         return 1;
     }
@@ -299,7 +323,7 @@ int main() {
     if (ar.empty()) {
         std::cout << "\nVERDICT: no GPUs accept HOST_ALLOCATION import - the "
                      "shared-arena path is out on this driver set\n";
-        VirtualFree(arena, 0, MEM_RELEASE);
+        arenaFree(arena, kArena);
         vkDestroyInstance(instance, nullptr);
         return 0;
     }
@@ -453,7 +477,7 @@ int main() {
     }
 
     // Manager-level integration: MultiGPUPoolManager::createSharedArena
-    // (manager-owned VirtualAlloc) + copyDeviceToDeviceArena (two DMA legs,
+    // (manager-owned host pages) + copyDeviceToDeviceArena (two DMA legs,
     // no memcpy) + teardown hygiene (imports freed by pool dtors, arena
     // pages freed last).
     {
@@ -487,7 +511,7 @@ int main() {
                 std::cerr << "FAIL: manager create for arena test\n";
                 ++failures;
             } else {
-                // 256 MiB manager-owned arena (VirtualAlloc inside).
+                // 256 MiB manager-owned arena (host pages inside).
                 const VkDeviceSize kMgr = 256ull * 1024 * 1024;
                 if (!manager->createSharedArena(kMgr)) {
                     std::cerr << "FAIL: manager createSharedArena\n";
@@ -565,7 +589,7 @@ int main() {
 
     std::cout << "\n=== " << (failures == 0 ? "SHARED ARENA PROBE CLEAN" : "SHARED ARENA PROBE FAILURES")
               << " (" << failures << ") ===\n";
-    VirtualFree(arena, 0, MEM_RELEASE);
+    arenaFree(arena, kArena);
     for (auto& d : ar) teardown(d);
     vkDestroyInstance(instance, nullptr);
     return failures == 0 ? 0 : 1;

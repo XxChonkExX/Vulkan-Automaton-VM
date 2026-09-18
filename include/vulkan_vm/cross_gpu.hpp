@@ -112,17 +112,17 @@ public:
         Allocation import;        // dedicated-style tracked import
         bool imported = false;
     };
-    // hostPtr must stay alive (VirtualAlloc'd by the caller, or the
-    // manager's own arena below) while the arena exists.
+    // hostPtr must stay alive (page-aligned host pages owned by the
+    // caller, or the manager's own arena below) while the arena exists.
     bool createSharedArena(void* hostPtr, VkDeviceSize size,
                            VkBufferUsageFlags usage =
                                VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    // Manager-owned arena: VirtualAlloc'd here (Windows), freed AFTER the
-    // pools release their imports (declared before instances_ below:
-    // reverse-destruction order = the owner dies last).
-#ifdef _WIN32
+    // Manager-owned arena: VirtualAlloc'd on Windows, mmap'd on Linux, freed
+    // AFTER the pools release their imports (declared before instances_
+    // below: reverse-destruction order = the owner dies last).
+#if defined(_WIN32) || defined(__linux__)
     bool createSharedArena(VkDeviceSize size,
                            VkBufferUsageFlags usage =
                                VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
