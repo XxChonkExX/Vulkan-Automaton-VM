@@ -262,7 +262,10 @@ static void testFuzz() {
         const uint8_t op = static_cast<uint8_t>(rng() % 4);
         switch (op) {
             case 0: case 1: { // enqueue + submit
-                IORequest r = makeReq(nextKey++, nextKey * 4096, 4096,
+                // NOTE: sequence the key bump first - `makeReq(nextKey++,
+                // nextKey * ...)` is unsequenced UB (argument order).
+                const uint64_t key = nextKey++;
+                IORequest r = makeReq(key, key * 4096, 4096,
                                       static_cast<uint32_t>(rng() % kPriorities));
                 if (q.enqueue(r) == RequestQueue::Enqueue::Ok) q.submit(&be);
                 break;

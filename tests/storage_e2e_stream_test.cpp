@@ -16,15 +16,13 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include <thread>
-
-#ifdef _WIN32
-#include <windows.h>
-#endif
 
 using namespace vvm::storage;
 using namespace vvm::storage::pack;
@@ -37,12 +35,16 @@ int main(int argc, char** argv) {
     std::string packPath;
     bool selfGenerated = false;
     if (argc < 2) {
-        char tmpPath[MAX_PATH];
-        if (GetTempPathA(MAX_PATH, tmpPath) == 0) {
-            std::cerr << "FAIL: no pack given and GetTempPath failed\n";
+        // Portable temp dir (std::filesystem): GetTempPathA is Win32-only.
+        std::error_code ec;
+        const std::filesystem::path tmpDir =
+            std::filesystem::temp_directory_path(ec);
+        if (ec) {
+            std::cerr << "FAIL: no pack given and temp dir lookup failed: "
+                      << ec.message() << "\n";
             return 1;
         }
-        packPath = std::string(tmpPath) + "vvm_e2e_selftest.vmex";
+        packPath = (tmpDir / "vvm_e2e_selftest.vmex").string();
         selfGenerated = true;
 
         PackWriter<PackTraits> writer;
