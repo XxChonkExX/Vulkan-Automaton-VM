@@ -30,6 +30,7 @@
 #include <chrono>
 #include <functional>
 #include <cstdio>
+#include <cstdlib>
 #include <cstdarg>
 #include <sstream>
 #include <string_view>
@@ -50,6 +51,20 @@ enum class LogLevel {
     Warning = 3,
     Error = 4
 };
+
+// Default level from VVM_LOG_LEVEL (trace/debug/info/warn[ing]/error;
+// unset or unrecognized => Info). Read once per process.
+inline LogLevel levelFromEnv() {
+    if (const char* e = std::getenv("VVM_LOG_LEVEL")) {
+        if (std::strcmp(e, "trace") == 0) return LogLevel::Trace;
+        if (std::strcmp(e, "debug") == 0) return LogLevel::Debug;
+        if (std::strcmp(e, "info") == 0) return LogLevel::Info;
+        if (std::strcmp(e, "warn") == 0 || std::strcmp(e, "warning") == 0)
+            return LogLevel::Warning;
+        if (std::strcmp(e, "error") == 0) return LogLevel::Error;
+    }
+    return LogLevel::Info;
+}
 
 namespace detail {
 
@@ -118,6 +133,7 @@ public:
     static Logger& instance();
     
     void setLevel(LogLevel level) { level_ = level; }
+    LogLevel level() const { return level_; }
     void setCallback(std::function<void(LogLevel, const std::string&)> cb) { callback_ = std::move(cb); }
 
     // Type-safe logging with {} placeholder support
@@ -137,14 +153,16 @@ public:
 
 private:
     Logger() = default;
-    LogLevel level_ = LogLevel::Info;
+    LogLevel level_ = levelFromEnv();
     std::function<void(LogLevel, const std::string&)> callback_;
 };
 
-#define VVM_LOG_TRACE(...)  ::vvm::Logger::instance().log(::vvm::LogLevel::Trace, __VA_ARGS__)
-#define VVM_LOG_DEBUG(...)  ::vvm::Logger::instance().log(::vvm::LogLevel::Debug, __VA_ARGS__)
-#define VVM_LOG_INFO(...)   ::vvm::Logger::instance().log(::vvm::LogLevel::Info, __VA_ARGS__)
-#define VVM_LOG_WARN(...)   ::vvm::Logger::instance().log(::vvm::LogLevel::Warning, __VA_ARGS__)
-#define VVM_LOG_ERROR(...)  ::vvm::Logger::instance().log(::vvm::LogLevel::Error, __VA_ARGS__)
+// Level check first: filtered-out calls neither format arguments nor
+// allocate, so hot-path INFO/DEBUG logging is free under a higher level.
+#define VVM_LOG_TRACE(...)  do { if (::vvm::Logger::instance().level() <= ::vvm::LogLevel::Trace) ::vvm::Logger::instance().log(::vvm::LogLevel::Trace, __VA_ARGS__); } while (0)
+#define VVM_LOG_DEBUG(...)  do { if (::vvm::Logger::instance().level() <= ::vvm::LogLevel::Debug) ::vvm::Logger::instance().log(::vvm::LogLevel::Debug, __VA_ARGS__); } while (0)
+#define VVM_LOG_INFO(...)   do { if (::vvm::Logger::instance().level() <= ::vvm::LogLevel::Info) ::vvm::Logger::instance().log(::vvm::LogLevel::Info, __VA_ARGS__); } while (0)
+#define VVM_LOG_WARN(...)   do { if (::vvm::Logger::instance().level() <= ::vvm::LogLevel::Warning) ::vvm::Logger::instance().log(::vvm::LogLevel::Warning, __VA_ARGS__); } while (0)
+#define VVM_LOG_ERROR(...)  do { if (::vvm::Logger::instance().level() <= ::vvm::LogLevel::Error) ::vvm::Logger::instance().log(::vvm::LogLevel::Error, __VA_ARGS__); } while (0)
 
 } // namespace vvm
