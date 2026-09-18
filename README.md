@@ -3,14 +3,15 @@
 **VulkanVM** unifies GPU memory management and data movement behind Vulkan
 external-memory primitives, then lets the frameworks you already use consume
 that memory directly. One pool, one allocator family, every vendor —
-AMD, Intel, NVIDIA (1080 Ti-class verified), Tenstorrent-ICD, Android.
+AMD, Intel, NVIDIA, Android. (Tenstorrent has paths as well with a bespoke ICD, untested).
 
 **Version**: 0.4.0-dev
 
-> **Status**: experimental systems software. Core allocator + local GPU paths
+> **Status**: THis is experimental systems software. The Core allocator + local GPU paths
 > are hardware-verified (see `docs/HARDWARE_SUPPORT.md`); the **network
 > transport is NOT hardened for untrusted peers** — deploy only on trusted
 > networks or behind access control (`SECURITY.md`, `docs/THREAT_MODEL.md`).
+> Please take care and caution when streaming.
 
 > **New here?** Start with [explainfordummyuser.md](explainfordummyuser.md) —
 > *"the relay race tour"*: what problem this solves and how it all fits
@@ -57,9 +58,10 @@ VulkanVM
     └── Android — AHardwareBuffer platform backend (Core), NDK transport
 ```
 
-**Dependency direction**: Integrations → {Compute, Core}; Compute → Core
+**Dependency Direction**: Integrations → {Compute, Core}; Compute → Core
 (collectives add Transport); Transport → Core. **Core depends on nothing but
-Vulkan** — the Chonk Buffer builds and ships standalone.
+Vulkan** — the Chonk Buffer builds and ships standalone. Take what you need,
+leave what you dont. Stackable and configurable.
 
 ---
 
@@ -222,7 +224,7 @@ framework. The honest list:
 
 What we claim, we test. What we haven't tested, we say.
 
-Built and homebrewed with love — local power. — Mike/ChonkE
+Built and Homebrewed with Love — Local Power. — Mike/ChonkE
 
 ---
 
