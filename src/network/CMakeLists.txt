@@ -54,8 +54,12 @@ set(NETWORK_CORE_SRCS
 
 set(NETWORK_PRIV_DEFS
     VVM_NETWORK_EXPORTS
-    VVM_BUILD_SHARED=${VVM_BUILD_SHARED}
 )
+# NOTE: no VVM_BUILD_SHARED here on purpose. vulkan_vm already propagates it
+# as PUBLIC VVM_BUILD_SHARED=1 (shared builds), which reaches these TUs via
+# the PUBLIC link below. Adding a PRIVATE copy expanded the CMake option to
+# ON instead of 1, producing "-DVVM_BUILD_SHARED=1 -DVVM_BUILD_SHARED=ON"
+# and a -Wmacro-redefined warning on GCC/Clang.
 
 # These alter the layout of public classes (guarded members in the headers),
 # so every TU that includes the network headers must see the same value.

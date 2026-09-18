@@ -783,7 +783,7 @@ bool UdpVerbTransport::rdmaWriteAsync(
     const RdmaConnection& conn, const RdmaMemoryRegion& localRegion,
     uint64_t remoteAddr, uint32_t remoteRkey, VkDeviceSize size,
     CompletionCallback callback, uint64_t timeoutNs) {
-    std::thread([=]() {
+    std::thread([=, this]() {
         bool ok = rdmaWrite(conn, localRegion, remoteAddr, remoteRkey, size,
                             timeoutNs);
         if (callback) callback(ok, ok ? "" : "udp-verb write failed");
@@ -795,7 +795,7 @@ bool UdpVerbTransport::rdmaReadAsync(
     const RdmaConnection& conn, const RdmaMemoryRegion& localRegion,
     uint64_t remoteAddr, uint32_t remoteRkey, VkDeviceSize size,
     CompletionCallback callback, uint64_t timeoutNs) {
-    std::thread([=]() {
+    std::thread([=, this]() {
         bool ok = rdmaRead(conn, localRegion, remoteAddr, remoteRkey, size,
                            timeoutNs);
         if (callback) callback(ok, ok ? "" : "udp-verb read failed");

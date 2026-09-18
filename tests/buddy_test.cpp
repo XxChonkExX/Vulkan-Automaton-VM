@@ -186,10 +186,10 @@ int main() {
             });
         }
         for (auto& th : threads) th.join();
-        CHECK(bad.load() == 0, "no mid-run invariant violations");
-        CHECK(conc.checkInvariants(), "invariants hold after join");
-        CHECK(conc.getLargestFree() == kBlock, "full coalescing recovery");
-        CHECK(conc.internalWasteBytes() == 0, "no waste after full drain");
+        CHECK(bad.load() == 0);
+        CHECK(conc.checkInvariants());
+        CHECK(conc.getLargestFree() == kBlock);
+        CHECK(conc.internalWasteBytes() == 0);
     }
 
     // --- 12. Exact-fit grants (llama.cpp pattern: few large, odd-sized buffers) ---

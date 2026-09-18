@@ -58,6 +58,11 @@ std::unique_ptr<RdmaTransport> RdmaTransport::create(
 #endif
         case Backend::Auto:
             break;
+        default:
+            // Backend requested but not compiled in (or future enumerator):
+            // fall through to the auto-resolution below, which picks the
+            // best available instead of failing the transport outright.
+            break;
     }
 
     // Auto: prefer verbs, then NDKPI, then UDP fallback.
