@@ -27,7 +27,7 @@ HIP stream wait) without a Vulkan queue on their side.
 | `defaultSemaphoreHandleType()` | `OPAQUE_FD` on Linux/Android, `OPAQUE_WIN32` on Windows. |
 
 Handle types: timeline and binary both support `OPAQUE_FD` / `OPAQUE_WIN32`.
-`OPAQUE_WIN32_KMT` and `SYNC_FD` are deliberately out of scope for v0.5
+`OPAQUE_WIN32_KMT` and `SYNC_FD` are deliberately out of scope for v0.4.1
 (KMT is adapter-local; sync-fd is a temporary-import regime of its own).
 
 ## Ownership rules

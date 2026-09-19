@@ -52,7 +52,7 @@ Allocation  +  timeline semaphore + value  -->  retire()
 - No ticket timeline (feature off): falls back to synchronous wait on the
   caller fence.
 
-## Scope (v0.5)
+## Scope (v0.4.1)
 
 Vulkan pools retire via timelines as before; any pool now also retires via
 `CompletionToken` (`vulkan_vm/completion_token.hpp`): `Ready` reclaims on

@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.5.0 (in progress)
+## v0.4.1 (2026-09-18)
 
 ### Semaphores & completion (Pillar 1)
 

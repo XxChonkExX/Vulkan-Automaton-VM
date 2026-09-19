@@ -40,7 +40,7 @@ if(WIN32)
     endif()
 endif()
 
-project(VulkanVM LANGUAGES CXX VERSION 0.4.0)
+project(VulkanVM LANGUAGES CXX VERSION 0.4.1)
 
 # Convenience: core-only = Chonk Buffer standalone (no transport/tensor/
 # bindings). Individual options still override if set explicitly after this.
