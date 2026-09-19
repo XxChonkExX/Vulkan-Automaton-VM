@@ -398,15 +398,19 @@ bool MigrationEngine::submitCopy(MigrationContext* ctx, const MigrationRequest& 
         VkBufferMemoryBarrier barrier{};
         barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
         barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
         barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.buffer = hostBuf;
         barrier.offset = req.dstOffset;
         barrier.size = req.size;
+        // Transfer-only queues accept a narrow stage set (VUID-06462) and
+        // access masks must match it (VUID-02818): HOST_BIT is legal
+        // everywhere and is exactly the consumer here (the CPU reads after
+        // fence-wait).
         vkCmdPipelineBarrier(ctx->cmdBuffer,
                              VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_HOST_BIT,
                              0, 0, nullptr, 1, &barrier, 0, nullptr);
     } else {
         VVM_LOG_INFO("Copying host->device: src={}, dst={}, size={}", hostBuf, deviceBuf, req.size);
@@ -415,15 +419,18 @@ bool MigrationEngine::submitCopy(MigrationContext* ctx, const MigrationRequest& 
         VkBufferMemoryBarrier barrier{};
         barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
         barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.buffer = deviceBuf;
         barrier.offset = req.dstOffset;
         barrier.size = req.size;
+        // Same queue-family rule (VUID-06462/02818): the next consumer
+        // (shader or copy) adds its own barrier for its domain; this one
+        // makes the writes available for a later transfer read.
         vkCmdPipelineBarrier(ctx->cmdBuffer,
                              VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
                              0, 0, nullptr, 1, &barrier, 0, nullptr);
     }
 

@@ -132,7 +132,7 @@ struct MigrationContext {
 
 using MigrationId = uint64_t;
 
-class MigrationEngine {
+class VVM_API MigrationEngine {
 public:
     MigrationEngine(VkDevice device, VkQueue transferQueue, uint32_t queueFamily,
                     uint32_t maxConcurrent = 4);

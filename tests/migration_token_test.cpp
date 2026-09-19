@@ -173,49 +173,53 @@ int main() {
     shell.offset = 0;
     shell.size = kSize;
 
-    MigrationEngine engine(device, queue, qf);
+    // The engine (cmd pools, timeline, contexts) must die before the
+    // VkDevice it was built on - scope it tightly.
+    {
+        MigrationEngine engine(device, queue, qf);
 
-    // E1+E2 (leg 1): host -> device.
-    MigrationEngine::MigrationRequest up{};
-    up.allocation = &shell;
-    up.srcOffset = 0;
-    up.dstOffset = 0;
-    up.size = kSize;
-    up.toHost = false;
-    up.hostShadowBuffer = hostA.buffer;
-    auto opUp = engine.submitMigration(up);
-    CHECK(opUp.has_value(), "E1: submit host->device accepted");
-    if (opUp.has_value()) {
-        const CompletionToken& tok = opUp->completionToken;
-        CHECK(tok.kind == CompletionToken::Kind::VulkanTimeline,
-              "E1: token is VulkanTimeline kind");
-        CHECK(tok.timeline != VK_NULL_HANDLE, "E1: token semaphore set");
-        CHECK(tok.device == device, "E1: token device set");
-        CHECK(tok.value >= 1, "E1: token value never born-signaled 0");
-        engine.waitMigration(*opUp);
-        CHECK(engine.pollMigration(*opUp),
-              "E2: poll agrees done after wait");
-        CHECK(isTokenComplete(tok, device),
-              "E2: token consult agrees done after wait");
-    }
+        // E1+E2 (leg 1): host -> device.
+        MigrationEngine::MigrationRequest up{};
+        up.allocation = &shell;
+        up.srcOffset = 0;
+        up.dstOffset = 0;
+        up.size = kSize;
+        up.toHost = false;
+        up.hostShadowBuffer = hostA.buffer;
+        auto opUp = engine.submitMigration(up);
+        CHECK(opUp.has_value(), "E1: submit host->device accepted");
+        if (opUp.has_value()) {
+            const CompletionToken& tok = opUp->completionToken;
+            CHECK(tok.kind == CompletionToken::Kind::VulkanTimeline,
+                  "E1: token is VulkanTimeline kind");
+            CHECK(tok.timeline != VK_NULL_HANDLE, "E1: token semaphore set");
+            CHECK(tok.device == device, "E1: token device set");
+            CHECK(tok.value >= 1, "E1: token value never born-signaled 0");
+            engine.waitMigration(*opUp);
+            CHECK(engine.pollMigration(*opUp),
+                  "E2: poll agrees done after wait");
+            CHECK(isTokenComplete(tok, device),
+                  "E2: token consult agrees done after wait");
+        }
 
-    // E3 (leg 2): device -> hostB, then byte-verify the round trip.
-    MigrationEngine::MigrationRequest down{};
-    down.allocation = &shell;
-    down.srcOffset = 0;
-    down.dstOffset = 0;
-    down.size = kSize;
-    down.toHost = true;
-    down.hostShadowBuffer = hostB.buffer;
-    auto opDown = engine.submitMigration(down);
-    CHECK(opDown.has_value(), "E3: submit device->host accepted");
-    if (opDown.has_value()) {
-        engine.waitMigration(*opDown);
-        CHECK(engine.pollMigration(*opDown), "E3: poll agrees done");
-        CHECK(isTokenComplete(opDown->completionToken, device),
-              "E3: token consult agrees done");
-        CHECK(std::memcmp(hostB.mapped, pattern.data(), pattern.size()) == 0,
-              "E3: host->device->host pattern intact");
+        // E3 (leg 2): device -> hostB, then byte-verify the round trip.
+        MigrationEngine::MigrationRequest down{};
+        down.allocation = &shell;
+        down.srcOffset = 0;
+        down.dstOffset = 0;
+        down.size = kSize;
+        down.toHost = true;
+        down.hostShadowBuffer = hostB.buffer;
+        auto opDown = engine.submitMigration(down);
+        CHECK(opDown.has_value(), "E3: submit device->host accepted");
+        if (opDown.has_value()) {
+            engine.waitMigration(*opDown);
+            CHECK(engine.pollMigration(*opDown), "E3: poll agrees done");
+            CHECK(isTokenComplete(opDown->completionToken, device),
+                  "E3: token consult agrees done");
+            CHECK(std::memcmp(hostB.mapped, pattern.data(), pattern.size()) == 0,
+                  "E3: host->device->host pattern intact");
+        }
     }
 
     freeBuffer(device, dev);

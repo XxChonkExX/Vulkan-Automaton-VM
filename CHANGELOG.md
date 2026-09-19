@@ -47,6 +47,12 @@
   items); without timeline support it degrades to synchronous. Pool
   destruction reaps uncollected retired cmd pools. New section E in
   `retirement_test` (60 checks total, green on B70).
+- **Build plate (v0.4.1 packaging)**: `MigrationEngine` exported from
+  the shared library (hidden-visibility link failure for
+  `migration_token_test` on every CI platform); migration submit
+  barriers made transfer-queue legal (stage + access-mask VUIDs,
+  proven silent under validation); test engine lifetime scoped before
+  device teardown.
 - **Network hardening (THREAT_MODEL §5)** : per-IP connection cap (8)
   + accept token bucket (32/s) alongside the global cap; explicit TLS
   handshake bound (10 s); per-node heartbeat minimum interval (1 s,
