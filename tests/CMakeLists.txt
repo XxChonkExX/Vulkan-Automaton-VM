@@ -394,6 +394,35 @@ target_include_directories(udp_verb_test PRIVATE
 )
 add_test(NAME udp_verb_test COMMAND udp_verb_test)
 endif()
+
+# Wire-format parser hardening (THREAT_MODEL §5): deterministic self-test
+# runs everywhere; libFuzzer entry inside for manual runs (see file header).
+if(VVM_BUILD_NETWORK)
+add_executable(wire_fuzz wire_fuzz.cpp)
+target_link_libraries(wire_fuzz PRIVATE
+    vulkan_vm_network
+    ${CMAKE_DL_LIBS}
+)
+target_include_directories(wire_fuzz PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
+add_test(NAME wire_fuzz COMMAND wire_fuzz)
+endif()
+
+# TCP accept-gate hardening (loopback; per-IP + global caps) — no GPU.
+if(VVM_BUILD_NETWORK)
+add_executable(tcp_hardening_test tcp_hardening_test.cpp)
+target_link_libraries(tcp_hardening_test PRIVATE
+    vulkan_vm_network
+    ${CMAKE_DL_LIBS}
+)
+target_include_directories(tcp_hardening_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
+add_test(NAME tcp_hardening_test COMMAND tcp_hardening_test)
+endif()
 # Retirement queue (GPU-lifetime-safe reclamation) test
 add_executable(retirement_test retirement_test.cpp)
 target_link_libraries(retirement_test PRIVATE vulkan_vm)

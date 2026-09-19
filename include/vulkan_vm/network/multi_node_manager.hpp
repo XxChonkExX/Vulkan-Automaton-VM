@@ -329,6 +329,12 @@ private:
     // Heartbeat
     std::thread heartbeatThread_;
     std::atomic<bool> stopHeartbeat_{false};
+    // Inbound heartbeat ingress limit (THREAT_MODEL §5): last accepted
+    // beat per sender NodeId; faster senders get error responses without
+    // a view merge. Separate mutex: the serve path must not block on the
+    // cluster-view lock to decide a rejection.
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> lastHeartbeat_;
+    mutable std::mutex heartbeatMutex_;
     
     // Local pools (one per GPU)
     std::vector<UnifiedMemoryPool> localPools_;
@@ -400,6 +406,9 @@ private:
     
     void onTcpRequest(TcpMessage& request, TcpMessage& response);
     std::optional<std::vector<NodeInfo>> handleRegisterRequest(const NodeInfo& info);
+    // Membership roster check (THREAT_MODEL §5): true when the roster is
+    // empty (open cluster) or the id string is listed.
+    bool isClusterMember(const NodeId& id) const;
     std::optional<RemoteAllocationDesc> handleAllocateRequest(const NodeId& requester, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags flags, bool enableRdma);
     std::optional<RemoteAllocationDesc> handleExportRequest(const NodeId& owner, uint64_t localAllocId, bool enableRdma, bool forceHostShadow);
     std::optional<Allocation> handleImportRequest(const NodeId& owner, const RemoteAllocationDesc& desc, VkBufferUsageFlags usage);

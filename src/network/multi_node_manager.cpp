@@ -1399,8 +1399,13 @@ void MultiNodePoolManager::onTcpRequest(TcpMessage& request, TcpMessage& respons
                 return;
             }
             auto view = handleRegisterRequest(info);
+            if (!view) {
+                // Membership rejection (non-empty roster, stranger node).
+                response = makeResponse(request.type, TcpFlagsError);
+                return;
+            }
             response = makeResponse(request.type, TcpFlagsResponse);
-            if (view) response.body = serializeNodeList(*view);
+            response.body = serializeNodeList(*view);
             break;
         }
         case MsgGetClusterView: {
@@ -1573,6 +1578,27 @@ void MultiNodePoolManager::onTcpRequest(TcpMessage& request, TcpMessage& respons
             if (!deserializeNodeId(p, end, node)) {
                 response = makeResponse(request.type, TcpFlagsError);
                 return;
+            }
+            // Membership gate first: strangers get nothing, not even timing.
+            if (!isClusterMember(node)) {
+                VVM_LOG_WARN("Heartbeat rejected: {} not in cluster roster",
+                             node.toString());
+                response = makeResponse(request.type, TcpFlagsError);
+                return;
+            }
+            // Ingress rate limit: at most one accepted beat per node per
+            // heartbeatMinInterval; faster senders burn one error response
+            // and no view merge (THREAT_MODEL §5 heartbeat DoS).
+            {
+                std::lock_guard<std::mutex> lock(heartbeatMutex_);
+                const auto now = std::chrono::steady_clock::now();
+                auto it = lastHeartbeat_.find(node.toString());
+                if (it != lastHeartbeat_.end() &&
+                    now - it->second < networkConfig_.heartbeatMinInterval) {
+                    response = makeResponse(request.type, TcpFlagsError);
+                    return;
+                }
+                lastHeartbeat_[node.toString()] = now;
             }
             NodeInfo info;
             info.id = node;
@@ -1804,6 +1830,15 @@ std::optional<std::vector<NodeInfo>> MultiNodePoolManager::handleRegisterRequest
 
     VVM_LOG_INFO("Node registration from: {}", info.id.toString());
 
+    // Membership gate: a non-empty roster rejects strangers before they
+    // touch cluster state (THREAT_MODEL §5; IDs are self-asserted without
+    // TLS identity, so this is a bar-raiser, not authentication).
+    if (!isClusterMember(info.id)) {
+        VVM_LOG_WARN("Registration rejected: {} not in cluster roster",
+                     info.id.toString());
+        return std::nullopt;
+    }
+
     std::lock_guard<std::mutex> lock(clusterViewMutex_);
     bool found = false;
     for (auto& existing : clusterView_) {
@@ -1818,6 +1853,16 @@ std::optional<std::vector<NodeInfo>> MultiNodePoolManager::handleRegisterRequest
     }
 
     return clusterView_;
+}
+
+// Membership roster (THREAT_MODEL §5): empty roster = open cluster.
+bool MultiNodePoolManager::isClusterMember(const NodeId& id) const {
+    if (networkConfig_.clusterMembers.empty()) return true;
+    const std::string key = id.toString();
+    for (const auto& member : networkConfig_.clusterMembers) {
+        if (member == key) return true;
+    }
+    return false;
 }
 
 // ============================================================================

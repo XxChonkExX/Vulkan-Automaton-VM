@@ -72,6 +72,24 @@ struct NetworkConfig {
     // header cannot hold a worker for headerLen * socketTimeout. Generous
     // for any healthy peer (headers arrive in ms on lab networks).
     int32_t headerTimeoutMs = 5000;
+    // Accept-path limits (THREAT_MODEL §5): per-source-IP concurrent cap
+    // plus a token-bucket accept rate. A single peer cannot eat the whole
+    // table or fork-bomb serve threads, legitimate bursts still pass.
+    size_t maxConnectionsPerIp = 8;
+    double maxAcceptsPerSecond = 32.0;
+    // TLS handshake bound (THREAT_MODEL §5): explicit timeout around
+    // SSL_accept on the server path (socket timeouts alone are coarse).
+    int32_t tlsHandshakeTimeoutMs = 10000;
+    // Heartbeat ingress limit (THREAT_MODEL §5): fastest accepted beat per
+    // node; faster senders get error responses without a view merge.
+    std::chrono::milliseconds heartbeatMinInterval{1000};
+    // Cluster membership roster (THREAT_MODEL §5): NodeId.toString() entries
+    // ("host:port#index"). Empty = open cluster (any peer may register and
+    // heartbeat). Non-empty = RegisterNode/Heartbeat from non-members are
+    // rejected. NOTE: IDs are self-asserted without TLS identity - this
+    // raises the bar vs open (casual joiners, misconfigurations) but is not
+    // authentication; true auth needs TLS client certs + fingerprint roster.
+    std::vector<std::string> clusterMembers;
     
     // Security (optional)
     bool useTls = false;

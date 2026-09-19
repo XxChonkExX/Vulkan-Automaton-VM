@@ -65,27 +65,42 @@ acceptance of the open gaps in §5.
 4. Prefer host-staged TCP with small `maxBodySize` config over RDMA for
    untrusted peers (RDMA registration exposes pinned host memory).
 
-## 5. Hardening roadmap (0.4+)
+## 5. Hardening roadmap (0.4+, landed in 0.5 unless noted)
 
 Ordered by severity:
 
 1. **Socket timeouts** — header/idle timeout (default 30 s) and handshake
-   timeout on both TLS and plaintext accept paths. (Small fix, closes the
-   two cheapest DoS vectors.)
+    timeout on both TLS and plaintext accept paths. (Small fix, closes the
+    two cheapest DoS vectors.) LANDED: 32-byte header bound (5 s scoped),
+    5-minute idle reaper, explicit TLS handshake bound
+    (`tlsHandshakeTimeoutMs`, 10 s); plaintext has no handshake beyond
+    the socket timeouts.
 2. **Per-peer connection cap + accept rate limit** — e.g. 8 concurrent
-   connections per source IP, token-bucket on new connections.
+    connections per source IP, token-bucket on new connections. LANDED:
+    `maxConnectionsPerIp` (8) + `maxAcceptsPerSecond` (32) alongside the
+    existing global `maxConnections` (64); loopback-tested.
 3. **Chunked staging** — never allocate body-size staging up front; stream
-   into fixed 4 MiB slices (matches the existing streaming design) so a
-   declared 1 GiB body cannot force a 1 GiB host allocation before a single
-   byte is validated as arriving.
+    into fixed 4 MiB slices (matches the existing streaming design) so a
+    declared 1 GiB body cannot force a 1 GiB host allocation before a single
+    byte is validated as arriving. LANDED in 0.4.
 4. **Cluster membership authorization** — after TLS identity, check the
-   cert fingerprint/CN against the configured cluster roster; reject with a
-   distinct error. Config format: `cluster.members = <fingerprint list>`.
+    cert fingerprint/CN against the configured cluster roster; reject with a
+    distinct error. Config format: `cluster.members = <fingerprint list>`.
+    LANDED as ID roster (`NetworkConfig::clusterMembers`, NodeId strings):
+    RegisterNode/Heartbeat from non-members are rejected. NOTE: IDs are
+    self-asserted without TLS identity, so this is a bar-raiser against
+    casual joiners and misconfigurations, not authentication; cert
+    fingerprint checks remain future work.
 5. **Heartbeat rate limiting** — per-peer token bucket; violations drop the
-   connection.
+    connection. LANDED as per-node minimum interval
+    (`heartbeatMinInterval`, 1 s): faster beaters get error responses
+    without a view merge (connections stay up; only the beat is refused).
 6. **Fuzz the wire parser** — libFuzzer target over
-   `deserializeHeader/parseMessage` with the hard caps asserted as
-   invariants (complements the existing unit tests).
+    `deserializeHeader/parseMessage` with the hard caps asserted as
+    invariants (complements the existing unit tests). LANDED:
+    `tests/wire_fuzz.cpp` (deterministic self-test on every CI runner
+    plus a libFuzzer entry; NodeInfo/NodeList caps asserted) and
+    subtraction-based bounds in the `detail::` getters.
 
 ## 6. Non-goals
 

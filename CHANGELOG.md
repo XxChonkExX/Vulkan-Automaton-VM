@@ -47,6 +47,15 @@
   items); without timeline support it degrades to synchronous. Pool
   destruction reaps uncollected retired cmd pools. New section E in
   `retirement_test` (60 checks total, green on B70).
+- **Network hardening (THREAT_MODEL §5)** : per-IP connection cap (8)
+  + accept token bucket (32/s) alongside the global cap; explicit TLS
+  handshake bound (10 s); per-node heartbeat minimum interval (1 s,
+  excess beats refused without a view merge); cluster membership roster
+  (`clusterMembers`, ID-based bar-raiser documented as non-auth);
+  `wire_fuzz` self-test + libFuzzer entry with NodeInfo/NodeList caps
+  asserted, and subtraction-based bounds in the `detail::` getters.
+  Accept gates proven on loopback, roster + rate gates proven live
+  between two loopback managers; `tcp_hardening_test` runs on CI.
 - **DirectStorage stubs rolled**: `dstorageRuntimeAvailable()` now
   probes the real redistributable (SDK build + `dstorage.dll` export)
   instead of returning true blindly, and `dstorageImportToPool()`

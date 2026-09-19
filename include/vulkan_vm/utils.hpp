@@ -597,15 +597,23 @@ inline bool getU8(const uint8_t*& p, const uint8_t* end, uint8_t& out) {
     return true;
 }
 
+// Bytes remaining from the cursor. All getters below maintain p <= end
+// (they advance only after a bounds check), so the subtraction is
+// well-defined; unlike p + len > end it cannot wrap near the top of the
+// address space.
+inline size_t remaining(const uint8_t* p, const uint8_t* end) {
+    return static_cast<size_t>(end - p);
+}
+
 inline bool getU16(const uint8_t*& p, const uint8_t* end, uint16_t& out) {
-    if (p + 2 > end) return false;
+    if (remaining(p, end) < 2) return false;
     out = static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
     p += 2;
     return true;
 }
 
 inline bool getU32(const uint8_t*& p, const uint8_t* end, uint32_t& out) {
-    if (p + 4 > end) return false;
+    if (remaining(p, end) < 4) return false;
     out = 0;
     for (int i = 0; i < 4; ++i) out |= static_cast<uint32_t>(p[i]) << (8 * i);
     p += 4;
@@ -613,7 +621,7 @@ inline bool getU32(const uint8_t*& p, const uint8_t* end, uint32_t& out) {
 }
 
 inline bool getU64(const uint8_t*& p, const uint8_t* end, uint64_t& out) {
-    if (p + 8 > end) return false;
+    if (remaining(p, end) < 8) return false;
     out = 0;
     for (int i = 0; i < 8; ++i) out |= static_cast<uint64_t>(p[i]) << (8 * i);
     p += 8;
@@ -623,7 +631,7 @@ inline bool getU64(const uint8_t*& p, const uint8_t* end, uint64_t& out) {
 inline bool getStr(const uint8_t*& p, const uint8_t* end, std::string& out) {
     uint32_t len = 0;
     if (!getU32(p, end, len)) return false;
-    if (p + len > end) return false;
+    if (remaining(p, end) < len) return false;
     out.assign(reinterpret_cast<const char*>(p), len);
     p += len;
     return true;
@@ -632,7 +640,7 @@ inline bool getStr(const uint8_t*& p, const uint8_t* end, std::string& out) {
 inline bool getBytes(const uint8_t*& p, const uint8_t* end, std::vector<uint8_t>& out) {
     uint32_t len = 0;
     if (!getU32(p, end, len)) return false;
-    if (p + len > end) return false;
+    if (remaining(p, end) < len) return false;
     out.assign(p, p + len);
     p += len;
     return true;

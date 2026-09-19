@@ -900,6 +900,7 @@ struct TcpTransport::Impl {
         std::chrono::steady_clock::time_point lastActivity;
         bool isServerSide = false;
         std::unique_ptr<TlsConnection> tlsConn;  // per-connection TLS state
+        std::string peerIp;  // server-side remote address (rate/table accounting)
     };
     
     // ----- server -----
@@ -931,6 +932,12 @@ struct TcpTransport::Impl {
 
     // Network config (for caps, rate limits, etc.)
     NetworkConfig netConfig;
+
+    // Accept token bucket (THREAT_MODEL §5): bounds new serve threads per
+    // second even when the connection table has room. Guarded by connsMutex.
+    double acceptTokens = 32.0;
+    std::chrono::steady_clock::time_point lastAcceptRefill =
+        std::chrono::steady_clock::now();
 
     // ============================================================================
     // Connection Pool for Parallel Stream Transfers (TCP Stream Striping)
@@ -1429,21 +1436,57 @@ void TcpTransport::acceptLoop() {
 #endif
         }
         setTimeouts(client, 30000);
-        // Connection cap (THREAT_MODEL §5): reject excess concurrent
-        // connections immediately instead of spawning a serve thread.
+        // Render the peer address once for the table below.
+        char ipBuf[INET_ADDRSTRLEN] = {};
+        const char* ipText = inet_ntop(
+            AF_INET, &peer.sin_addr, ipBuf, static_cast<SockLenType>(sizeof(ipBuf)));
+        const std::string peerIp = ipText ? ipText : "unknown";
+        // Connection cap + per-IP cap + accept rate (THREAT_MODEL §5):
+        // reject excess accepts immediately instead of spawning a serve
+        // thread. A single peer cannot eat the whole table or fork-bomb
+        // workers; legitimate bursts still pass.
         {
             std::lock_guard<std::mutex> lock(impl_->connsMutex);
             if (impl_->conns.size() >= impl_->netConfig.maxConnections) {
-                VVM_LOG_WARN("acceptLoop: connection cap {} reached; rejecting peer",
-                             impl_->netConfig.maxConnections);
+                VVM_LOG_WARN("acceptLoop: connection cap {} reached; rejecting peer {}",
+                             impl_->netConfig.maxConnections, peerIp);
                 closeSocket(client);
                 continue;
             }
+            size_t sameIp = 0;
+            for (const auto& [id, ci] : impl_->conns) {
+                if (ci.isServerSide && ci.peerIp == peerIp) ++sameIp;
+            }
+            if (sameIp >= impl_->netConfig.maxConnectionsPerIp) {
+                VVM_LOG_WARN("acceptLoop: per-IP cap {} reached for {}; rejecting",
+                             impl_->netConfig.maxConnectionsPerIp, peerIp);
+                closeSocket(client);
+                continue;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            const double elapsed =
+                std::chrono::duration<double>(now - impl_->lastAcceptRefill).count();
+            impl_->lastAcceptRefill = now;
+            impl_->acceptTokens = std::min(
+                impl_->netConfig.maxAcceptsPerSecond,
+                impl_->acceptTokens + elapsed * impl_->netConfig.maxAcceptsPerSecond);
+            if (impl_->acceptTokens < 1.0) {
+                VVM_LOG_WARN("acceptLoop: accept rate exceeded; rejecting peer {}",
+                             peerIp);
+                closeSocket(client);
+                continue;
+            }
+            impl_->acceptTokens -= 1.0;
         }
         uint64_t id = impl_->nextConnId++;
         {
             std::lock_guard<std::mutex> lock(impl_->connsMutex);
-            impl_->conns[id] = {client, std::chrono::steady_clock::now(), true};
+            Impl::ConnectionInfo ci;
+            ci.socket = client;
+            ci.lastActivity = std::chrono::steady_clock::now();
+            ci.isServerSide = true;
+            ci.peerIp = peerIp;
+            impl_->conns[id] = std::move(ci);
         }
         {
             std::lock_guard<std::mutex> lock(impl_->serveThreadsMutex);
@@ -1458,8 +1501,14 @@ void TcpTransport::serveConnection(uint64_t connId, uintptr_t sRaw) {
     // TLS handshake for server — create per-connection SSL object
     std::unique_ptr<TlsConnection> tlsConn;
     if (impl_->tlsContext && impl_->tlsContext->enabled && impl_->tlsContext->serverMode) {
+        // Explicit handshake bound (THREAT_MODEL §5): a peer that connects
+        // and then stalls inside the handshake must not hold this worker
+        // for the full connection timeout. Restored below either way.
+        setTimeouts(s, impl_->netConfig.tlsHandshakeTimeoutMs);
         tlsConn = std::make_unique<TlsConnection>(impl_->tlsContext->context(), s);
-        if (!tlsConn->accept()) {
+        const bool hsOk = tlsConn->accept();
+        setTimeouts(s, 30000);
+        if (!hsOk) {
             VVM_LOG_ERROR("TLS handshake failed for conn {}", connId);
             closeSocket(s);
             {
