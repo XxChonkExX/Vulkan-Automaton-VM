@@ -61,8 +61,15 @@ Two corollaries:
 - [x] Hook: VRAM-aware budget — `GGML_VVM_HEAP_FRACTION` shipped and
       validated (0.80–0.85 sweet spot on display-attached cards; pool
       self-caps, `/vvm/stats.usedBytes` > VRAM is the spill diagnostic).
-- [~] Cross-GPU rebalancing: the auto-placement planner (`--vvm-split
+- [x] Cross-GPU rebalancing: the auto-placement planner (`--vvm-split
       ...=auto`) rediscovers optimal *initial* placement from the model
-      file; *runtime* rebalancing of a live pool remains open.
+      file; *runtime* moves are now live via
+      `MultiGPUPoolManager::migrateAllocation` (allocate on dst, copy,
+      Ready-token retire of src - all-or-nothing with rollback) plus
+      `poolPressures()` snapshots (used/budget/driver-used per instance)
+      for the policy brain. Verified 0->1->0 with byte checks
+      (`multi_gpu_test` section M). Victim selection stays with the
+      allocation owner (tensor/placement layer) - the manager cannot pick
+      what it does not own.
 - [x] 90%-of-VRAM warning log — fires once per pool
       (`warnedHighWater_`).

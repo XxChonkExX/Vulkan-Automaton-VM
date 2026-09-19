@@ -31,6 +31,14 @@
   B70<->XTX 256 MiB: 3.75 -> 8.61 GiB/s (2.3x) and 3.89 -> 7.19 GiB/s
   reverse, data verified, zero validation errors. Opt out with
   `VVM_STAGED_PIPELINE=0`.
+- **Runtime rebalancing**: `MultiGPUPoolManager::migrateAllocation`
+  (allocate on dst, copy, Ready-token retire of src, rollback on any
+  failure) + `poolPressures()` (used/budget/driver-used per instance
+  for policy brains). Verified live 0->1->0 with byte checks, pressure
+  sanity, and retired-src reclamation (`multi_gpu_test` section M).
+- **`VVM_PREFER_PURE_DEVICE_LOCAL`**: env knob for the existing
+  ReBAR-exclusion swap (largest-heap pure type now a tested
+  `findLargestHeapPureDeviceLocal` in utils + `memory_type_test`).
 - **Fenced `copyBuffer` teardown fix (R11)**: the async path destroyed
   its transient command pool under in-flight work
   (VUID-vkDestroyCommandPool-commandPool-00041, reproduced live under

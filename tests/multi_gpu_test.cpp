@@ -277,6 +277,115 @@ int main() {
         manager->getPool(0).deallocate(std::move(*src));
     }
 
+    // M: live-allocation migration 0->1->0 with byte verification, plus
+    // pressure snapshots and invalid-argument rejection.
+    {
+        auto msrc = manager->getPool(0).allocateDedicatedExportable(kSize, kUsage);
+        auto mstg0 = manager->getPool(0).allocate(
+            kSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        auto mstg1 = manager->getPool(1).allocate(
+            kSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (!msrc || !mstg0 || !mstg1 || !mstg0->hostPtr || !mstg1->hostPtr) {
+            std::cerr << "FAIL: M setup allocs\n" << std::flush;
+            failures++;
+        } else {
+            std::vector<uint8_t> mpat(static_cast<size_t>(kSize));
+            for (size_t i = 0; i < mpat.size(); ++i) mpat[i] = static_cast<uint8_t>(i * 3 + 11);
+            std::memcpy(mstg0->hostPtr, mpat.data(), mpat.size());
+            if (!manager->getPool(0).copyBuffer(*mstg0, *msrc, 0, 0, kSize)) {
+                std::cerr << "FAIL: M fill\n" << std::flush;
+                failures++;
+            } else {
+                // M2: invalid arguments rejected, nothing touched.
+                auto scratch = manager->getPool(0).allocate(1 << 20, kUsage);
+                if (!scratch) {
+                    std::cerr << "FAIL: M2 scratch alloc\n" << std::flush;
+                    failures++;
+                } else {
+                    auto rSame = manager->migrateAllocation(0, 0, std::move(*scratch), kUsage);
+                    if (rSame) {
+                        std::cerr << "FAIL: M2 same-index accepted\n" << std::flush;
+                        failures++;
+                        manager->getPool(0).deallocate(std::move(*rSame));
+                        // scratch was consumed by the (wrongly accepted) call.
+                    } else {
+                        std::cout << "  M2 same-index rejected: PASS\n" << std::flush;
+                        manager->getPool(0).deallocate(std::move(*scratch));
+                    }
+                    Allocation empty{};
+                    auto rNull = manager->migrateAllocation(0, 1, std::move(empty), kUsage);
+                    if (rNull) {
+                        std::cerr << "FAIL: M2 null-buffer accepted\n" << std::flush;
+                        failures++;
+                        manager->getPool(1).deallocate(std::move(*rNull));
+                    } else {
+                        std::cout << "  M2 null-buffer rejected: PASS\n" << std::flush;
+                    }
+                }
+
+                // M1: migrate 0->1 live; bytes verify on the new handle.
+                auto moved = manager->migrateAllocation(0, 1, std::move(*msrc), kUsage);
+                if (!moved) {
+                    std::cerr << "FAIL: M1 migrate 0->1\n" << std::flush;
+                    failures++;
+                } else {
+                    std::memset(mstg1->hostPtr, 0, mpat.size());
+                    bool mread = manager->getPool(1).copyBuffer(*moved, *mstg1, 0, 0, kSize);
+                    if (!mread || std::memcmp(mstg1->hostPtr, mpat.data(), mpat.size()) != 0) {
+                        std::cerr << "FAIL: M1 migrated bytes mismatch\n" << std::flush;
+                        failures++;
+                    } else {
+                        std::cout << "  M1 migrate 0->1 verified: PASS\n" << std::flush;
+                    }
+                    auto pr = manager->poolPressures();
+                    if (pr.size() != 2 || pr[0].instanceIndex != 0 ||
+                        pr[1].instanceIndex != 1 || pr[0].budgetBytes == 0 ||
+                        pr[1].budgetBytes == 0) {
+                        std::cerr << "FAIL: M1 pressures insane\n" << std::flush;
+                        failures++;
+                    } else {
+                        std::cout << "  M1 pressures: pool0 used=" << pr[0].usedBytes
+                                  << " budget=" << pr[0].budgetBytes << " p="
+                                  << pr[0].pressure << " | pool1 used=" << pr[1].usedBytes
+                                  << " budget=" << pr[1].budgetBytes << " p="
+                                  << pr[1].pressure << "\n" << std::flush;
+                    }
+                    if (manager->getPool(0).collect() != 1) {
+                        std::cerr << "FAIL: M1 retired src not reclaimed\n" << std::flush;
+                        failures++;
+                    } else {
+                        std::cout << "  M1 retired src reclaimed: PASS\n" << std::flush;
+                    }
+
+                    // M3: migrate back 1->0; bytes verify again.
+                    auto back = manager->migrateAllocation(1, 0, std::move(*moved), kUsage);
+                    if (!back) {
+                        std::cerr << "FAIL: M3 migrate 1->0\n" << std::flush;
+                        failures++;
+                    } else {
+                        std::memset(mstg0->hostPtr, 0, mpat.size());
+                        bool bread = manager->getPool(0).copyBuffer(*back, *mstg0, 0, 0, kSize);
+                        if (!bread || std::memcmp(mstg0->hostPtr, mpat.data(), mpat.size()) != 0) {
+                            std::cerr << "FAIL: M3 migrated bytes mismatch\n" << std::flush;
+                            failures++;
+                        } else {
+                            std::cout << "  M3 migrate 1->0 verified: PASS\n" << std::flush;
+                        }
+                        if (manager->getPool(1).collect() != 1) {
+                            std::cerr << "FAIL: M3 retired src not reclaimed\n" << std::flush;
+                            failures++;
+                        }
+                        manager->getPool(0).deallocate(std::move(*back));
+                    }
+                }
+            }
+            manager->getPool(1).deallocate(std::move(*mstg1));
+            manager->getPool(0).deallocate(std::move(*mstg0));
+        }
+    }
+
     std::cout << "\n=== " << (failures == 0 ? "ALL P2P TESTS PASSED" : "P2P TESTS FAILED")
               << " (" << failures << " failures) ===\n" << std::flush;
 

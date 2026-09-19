@@ -146,6 +146,37 @@ public:
                                  VkDeviceSize dstOffset = 0,
                                  VkDeviceSize size = VK_WHOLE_SIZE);
 
+    // ---- Runtime rebalancing ------------------------------------------------
+    // Per-instance pressure snapshot for policy brains (placement / tensor
+    // layers): pool-used bytes vs device-local heap budget. pressure is
+    // used/budget (0 when the budget is unknown). driverUsedBytes is the
+    // live driver-side consumption (includes external users like the
+    // display compositor, which the pool cannot see).
+    struct PoolPressure {
+        uint32_t instanceIndex = UINT32_MAX;
+        VkDeviceSize usedBytes = 0;
+        VkDeviceSize budgetBytes = 0;
+        VkDeviceSize driverUsedBytes = 0;
+        float pressure = 0.0f;
+    };
+    std::vector<PoolPressure> poolPressures() const;
+
+    // Move one live allocation src->dst at runtime: allocate on dst, copy,
+    // retire the src (Ready token - the synchronous copy is complete on
+    // return), and hand back the dst allocation. The caller swaps its
+    // handle and pumps collect() on the src pool eventually (also swept
+    // opportunistically on entry). All-or-nothing: dst-alloc or copy
+    // failure rolls back and the src allocation is untouched (still
+    // valid, still owned). A rejected retire (stale handle - caller bug)
+    // consumes the handle; pass live allocations.
+    // usage/memFlags describe the DST allocation; memFlags == 0 mirrors
+    // the src's flags. Only same-process manager pools participate.
+    std::optional<Allocation> migrateAllocation(uint32_t srcDeviceIndex,
+                                                uint32_t dstDeviceIndex,
+                                                Allocation&& alloc,
+                                                VkBufferUsageFlags usage,
+                                                VkMemoryPropertyFlags memFlags = 0);
+
 private:
     // Arena lifetime owner: declared BEFORE instances_ so reverse-destruction
     // order frees the host pages AFTER the pools release their imports

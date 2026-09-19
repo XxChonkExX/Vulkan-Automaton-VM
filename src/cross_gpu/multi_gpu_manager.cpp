@@ -313,6 +313,76 @@ bool MultiGPUPoolManager::copyDeviceToDeviceArena(
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Runtime rebalancing: live-allocation migration between pools
+// ---------------------------------------------------------------------------
+
+std::vector<MultiGPUPoolManager::PoolPressure> MultiGPUPoolManager::poolPressures() const {
+    std::vector<PoolPressure> out;
+    out.reserve(instances_.size());
+    for (uint32_t i = 0; i < instances_.size(); ++i) {
+        PoolPressure p;
+        p.instanceIndex = i;
+        const PoolStats st = instances_[i].pool.getStats();
+        p.usedBytes = st.totalUsed;
+        const DeviceMemoryInfo mi = instances_[i].pool.getDeviceMemoryInfo();
+        VkDeviceSize budget = 0;
+        VkDeviceSize driverUsed = 0;
+        for (size_t h = 0; h < mi.heapSizes.size() && h < mi.heapUsed.size() &&
+                            h < VK_MAX_MEMORY_HEAPS; ++h) {
+            if (mi.memProps.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+                budget += mi.heapSizes[h];
+                driverUsed += mi.heapUsed[h];
+            }
+        }
+        p.budgetBytes = budget;
+        p.driverUsedBytes = driverUsed;
+        p.pressure = (budget > 0)
+            ? static_cast<float>(static_cast<double>(p.usedBytes) /
+                                 static_cast<double>(budget))
+            : 0.0f;
+        out.push_back(p);
+    }
+    return out;
+}
+
+std::optional<Allocation> MultiGPUPoolManager::migrateAllocation(
+    uint32_t srcDeviceIndex, uint32_t dstDeviceIndex, Allocation&& alloc,
+    VkBufferUsageFlags usage, VkMemoryPropertyFlags memFlags) {
+    if (srcDeviceIndex >= instances_.size() || dstDeviceIndex >= instances_.size() ||
+        srcDeviceIndex == dstDeviceIndex) {
+        return std::nullopt;
+    }
+    if (!alloc.buffer || alloc.size == 0) return std::nullopt;
+    auto& srcPool = instances_[srcDeviceIndex].pool;
+    auto& dstPool = instances_[dstDeviceIndex].pool;
+    // Opportunistic sweep (same habit as copyDeviceToDevice entry).
+    srcPool.collect();
+
+    const VkMemoryPropertyFlags flags =
+        memFlags != 0 ? memFlags : alloc.memoryFlags;
+    auto dst = dstPool.allocate(alloc.size, usage, flags);
+    if (!dst) {
+        VVM_LOG_WARN("migrateAllocation: dst allocation failed ({} bytes)", alloc.size);
+        return std::nullopt;
+    }
+    // Synchronous copy (null fence): on return the bytes are there, so the
+    // src retires against a Ready token - no GPU work outstanding.
+    if (!copyDeviceToDevice(srcDeviceIndex, dstDeviceIndex, alloc, *dst, 0, 0, alloc.size)) {
+        VVM_LOG_WARN("migrateAllocation: copy failed; rolling back dst");
+        dstPool.deallocate(std::move(*dst));
+        return std::nullopt;
+    }
+    if (!srcPool.retire(std::move(alloc), CompletionToken::ready())) {
+        VVM_LOG_WARN("migrateAllocation: src retire rejected; rolling back dst");
+        dstPool.deallocate(std::move(*dst));
+        return std::nullopt;
+    }
+    VVM_LOG_INFO("migrateAllocation: moved {} bytes instance {} -> {}",
+                 dst->size, srcDeviceIndex, dstDeviceIndex);
+    return dst;
+}
+
 std::vector<std::optional<Allocation>> MultiGPUPoolManager::allocateDistributed(
     VkDeviceSize size, VkBufferUsageFlags usage) {
     
