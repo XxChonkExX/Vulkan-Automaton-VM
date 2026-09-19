@@ -163,9 +163,59 @@ std::optional<MultiGPUPoolManager> MultiGPUPoolManager::create(
     if (vkCreateSemaphore(masterDevice, &semInfo, nullptr, &manager.timelineSemaphore_) != VK_SUCCESS) {
         return std::nullopt;
     }
-    
+    manager.timelineDevice_ = masterDevice;
+
     manager.timelineValue_ = 0;
     return manager;
+}
+
+MultiGPUPoolManager::~MultiGPUPoolManager() {
+    // Pools die with instances_ (member destruction, after this body); the
+    // sync timeline is manager-owned and dies here, while the device is
+    // still alive by contract. (Leaking it trips
+    // VUID-vkDestroyDevice-device-05137 at device teardown.)
+    if (timelineSemaphore_ != VK_NULL_HANDLE && timelineDevice_ != VK_NULL_HANDLE) {
+        vkDestroySemaphore(timelineDevice_, timelineSemaphore_, nullptr);
+        timelineSemaphore_ = VK_NULL_HANDLE;
+        timelineDevice_ = VK_NULL_HANDLE;
+    }
+}
+
+MultiGPUPoolManager::MultiGPUPoolManager(MultiGPUPoolManager&& other) noexcept
+    : arenaOwner_(std::move(other.arenaOwner_)),
+      instances_(std::move(other.instances_)),
+      timelineSemaphore_(other.timelineSemaphore_),
+      timelineDevice_(other.timelineDevice_),
+      timelineValue_(other.timelineValue_),
+      arena_(std::move(other.arena_)),
+      arenaPointer_(other.arenaPointer_),
+      arenaSize_(other.arenaSize_) {
+    other.timelineSemaphore_ = VK_NULL_HANDLE;
+    other.timelineDevice_ = VK_NULL_HANDLE;
+    other.arenaPointer_ = nullptr;
+    other.arenaSize_ = 0;
+}
+
+MultiGPUPoolManager& MultiGPUPoolManager::operator=(MultiGPUPoolManager&& other) noexcept {
+    if (this != &other) {
+        // Destroy current timeline before overwriting (same rule as dtor).
+        if (timelineSemaphore_ != VK_NULL_HANDLE && timelineDevice_ != VK_NULL_HANDLE) {
+            vkDestroySemaphore(timelineDevice_, timelineSemaphore_, nullptr);
+        }
+        arenaOwner_ = std::move(other.arenaOwner_);
+        instances_ = std::move(other.instances_);
+        timelineSemaphore_ = other.timelineSemaphore_;
+        timelineDevice_ = other.timelineDevice_;
+        timelineValue_ = other.timelineValue_;
+        arena_ = std::move(other.arena_);
+        arenaPointer_ = other.arenaPointer_;
+        arenaSize_ = other.arenaSize_;
+        other.timelineSemaphore_ = VK_NULL_HANDLE;
+        other.timelineDevice_ = VK_NULL_HANDLE;
+        other.arenaPointer_ = nullptr;
+        other.arenaSize_ = 0;
+    }
+    return *this;
 }
 
 // ---------------------------------------------------------------------------

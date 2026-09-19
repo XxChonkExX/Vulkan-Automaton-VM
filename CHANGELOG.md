@@ -47,6 +47,11 @@
   items); without timeline support it degrades to synchronous. Pool
   destruction reaps uncollected retired cmd pools. New section E in
   `retirement_test` (60 checks total, green on B70).
+- **Teardown hygiene**: `MultiGPUPoolManager` dtor now destroys its
+  sync timeline (leaked since creation - VUID-05137 at device
+  teardown), with move ctor/assign disarming the source. `retirement_test`
+  section E frees its allocs. Both suites run silent under validation
+  layers (no VUIDs, no stale-handle or unmap warnings).
 
 ## v0.4.0 (2026-09-18)
 

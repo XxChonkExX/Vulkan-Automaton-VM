@@ -53,9 +53,15 @@ public:
     MultiGPUPoolManager() = default;
     MultiGPUPoolManager(const MultiGPUPoolManager&) = delete;
     MultiGPUPoolManager& operator=(const MultiGPUPoolManager&) = delete;
-    MultiGPUPoolManager(MultiGPUPoolManager&&) noexcept = default;
-    MultiGPUPoolManager& operator=(MultiGPUPoolManager&&) noexcept = default;
-    ~MultiGPUPoolManager() = default;
+    // Moves transfer the sync timeline (source is disarmed, or both dtors
+    // would destroy it).
+    MultiGPUPoolManager(MultiGPUPoolManager&& other) noexcept;
+    MultiGPUPoolManager& operator=(MultiGPUPoolManager&& other) noexcept;
+    // Destroys the manager-owned sync timeline (created in create()).
+    // Pools (and their imports of it, if any) die with the instances
+    // below; the device outlives the manager by contract (same rule as
+    // the pools: destroy the manager before its VkDevices).
+    ~MultiGPUPoolManager();
     
     // One call: allocates on master, imports on all peers
     // Returns vector of allocations (one per device), all aliasing same memory
@@ -185,6 +191,7 @@ private:
     std::shared_ptr<void> arenaOwner_;
     std::vector<GPUInstance> instances_;
     VkSemaphore timelineSemaphore_ = VK_NULL_HANDLE;
+    VkDevice timelineDevice_ = VK_NULL_HANDLE;  // owns timelineSemaphore_
     uint64_t timelineValue_ = 0;
     // Shared arena state (see createSharedArena).
     std::vector<ArenaDeviceEntry> arena_;

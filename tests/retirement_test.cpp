@@ -387,6 +387,8 @@ int main() {
                 CHECK(pool->collect() >= 5,
                       "E: collect reaped retired transient pools");
                 vkDestroyFence(dc.device, efence, nullptr);
+                pool->deallocate(std::move(*eb));
+                pool->deallocate(std::move(*ea));
             }
         }
     }
