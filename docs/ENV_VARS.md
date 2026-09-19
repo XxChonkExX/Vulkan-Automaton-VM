@@ -22,6 +22,7 @@ UPGRADING note.
 | `VVM_ALLOW_CROSSVENDOR_ZC` | off | Force same-process zero-copy import cross-vendor (same crash caveat as `force-direct`). |
 | `VVM_SKIP_CMDPOOL` | off | Skip transfer command-pool creation (init-path bisect). |
 | `VVM_SKIP_INITBLOCK` | off | Skip initial block bootstrap (init-path bisect). |
+| `VVM_PREFER_PURE_DEVICE_LOCAL` | off | Set (any value) to exclude HOST_VISIBLE types from device-local selection (ReBAR-mapped VRAM loses ~3x decode on Intel; ReBAR stays for upload paths). |
 
 ## Storage backend
 

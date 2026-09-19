@@ -236,30 +236,6 @@ VkDeviceSize totalDeviceVRAM(VkPhysicalDevice physicalDevice) {
     return total;
 }
 
-// Largest-heap pure DEVICE_LOCAL type. findMemoryTypeIndex returns the
-// FIRST match, which is wrong on NVIDIA: early pure types can sit on small
-// heaps (a 1080 Ti pool landed on a 256 MB heap and OOMed its first block).
-// Used by the preferPureDeviceLocal swap; the initial MemoryTypeSelector
-// pass is score-based and unaffected.
-static std::optional<uint32_t> findLargestHeapPureDeviceLocal(
-    const VkPhysicalDeviceMemoryProperties& memProps) {
-    std::optional<uint32_t> best;
-    uint64_t bestHeap = 0;
-    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
-        const VkMemoryPropertyFlags f = memProps.memoryTypes[i].propertyFlags;
-        if ((f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) continue;
-        if (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) continue;
-        const uint32_t h = memProps.memoryTypes[i].heapIndex;
-        if (h >= memProps.memoryHeapCount) continue;
-        const uint64_t hs = memProps.memoryHeaps[h].size;
-        if (!best.has_value() || hs > bestHeap) {
-            best = i;
-            bestHeap = hs;
-        }
-    }
-    return best;
-}
-
 // Driver single-allocation cap (Vulkan 1.1 maxMemoryAllocationSize).
 // Windows AMD/Intel drivers refuse single vkAllocateMemory at/above ~4 GiB
 // (spec explicitly permits refusing >= 4 GiB), so pool growth must never
@@ -615,6 +591,12 @@ bool UnifiedMemoryPoolImpl::initialize(const DeviceConfig& device, const PoolCon
     if (!validateConfig()) {
         return false;
     }
+    // Experiment knob (see inference_benchmarks.md: ReBAR-mapped VRAM loses
+    // ~3x decode bandwidth on Intel): exclude HOST_VISIBLE types from the
+    // device-local selection. PoolConfig still wins when explicitly set.
+    if (std::getenv("VVM_PREFER_PURE_DEVICE_LOCAL")) {
+        config_.preferPureDeviceLocal = true;
+    }
     if (!selectMemoryTypes()) {
         return false;
     }
@@ -651,9 +633,10 @@ bool UnifiedMemoryPoolImpl::initialize(const DeviceConfig& device, const PoolCon
     // behavior, printed once per pool so bug reports carry their config.
     {
         const char* keys[] = {"VVM_WARN_LIVE_POOL", "VVM_SKIP_CMDPOOL",
-                              "VVM_SKIP_INITBLOCK", "VVM_DEVICE_INDEX",
-                              "VVM_STAGED_CHUNK_MB", "VVM_P2P_POLICY",
-                              "VVM_ALLOW_CROSSVENDOR_ZC"};
+                               "VVM_SKIP_INITBLOCK", "VVM_DEVICE_INDEX",
+                               "VVM_STAGED_CHUNK_MB", "VVM_P2P_POLICY",
+                               "VVM_ALLOW_CROSSVENDOR_ZC",
+                               "VVM_PREFER_PURE_DEVICE_LOCAL"};
         std::string summary;
         for (const char* k : keys) {
             if (const char* v = std::getenv(k)) {

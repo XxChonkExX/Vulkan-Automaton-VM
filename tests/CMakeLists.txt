@@ -412,6 +412,15 @@ target_include_directories(completion_token_test PRIVATE
 )
 add_test(NAME completion_token_test COMMAND completion_token_test)
 
+# Memory-type selection (largest-heap pure DEVICE_LOCAL) — CPU-only
+add_executable(memory_type_test memory_type_test.cpp)
+target_link_libraries(memory_type_test PRIVATE vulkan_vm)
+target_include_directories(memory_type_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${TEST_EXTRA_INCLUDES}
+)
+add_test(NAME memory_type_test COMMAND memory_type_test)
+
 # MigrationEngine completion tokens (device-gated; skips without one).
 # Submits real copies and checks the op token + poll/token agreement.
 add_executable(migration_token_test migration_token_test.cpp)

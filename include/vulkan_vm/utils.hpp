@@ -71,8 +71,14 @@ VVM_API std::optional<uint32_t> findMemoryTypeIndex(const VkPhysicalDeviceMemory
                                              VkMemoryPropertyFlags required,
                                              VkMemoryPropertyFlags preferred = 0);
 
-// Find memory type index for importing external memory on a DESTINATION device.
-// Given the source device's memory type index and required flags, this queries
+// Largest-heap pure DEVICE_LOCAL type. findMemoryTypeIndex returns the
+// FIRST match, which is wrong on NVIDIA: early pure types can sit on small
+// heaps (a 1080 Ti pool landed on a 256 MB heap and OOMed its first block).
+// Used by the preferPureDeviceLocal swap.
+VVM_API std::optional<uint32_t> findLargestHeapPureDeviceLocal(
+    const VkPhysicalDeviceMemoryProperties& memProps);
+
+// Find memory type index for importing external memory on a DESTINATION device.// Given the source device's memory type index and required flags, this queries
 // the destination device's memory properties to find a compatible type.
 // This is required because memoryTypeIndex is NOT portable across devices.
 VVM_API std::optional<uint32_t> findImportMemoryTypeIndex(VkPhysicalDevice dstPhysicalDevice,

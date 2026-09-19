@@ -80,6 +80,25 @@ std::optional<uint32_t> findMemoryTypeIndex(const VkPhysicalDeviceMemoryProperti
     return std::nullopt;
 }
 
+std::optional<uint32_t> findLargestHeapPureDeviceLocal(
+    const VkPhysicalDeviceMemoryProperties& memProps) {
+    std::optional<uint32_t> best;
+    uint64_t bestHeap = 0;
+    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+        const VkMemoryPropertyFlags f = memProps.memoryTypes[i].propertyFlags;
+        if ((f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) continue;
+        if (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) continue;
+        const uint32_t h = memProps.memoryTypes[i].heapIndex;
+        if (h >= memProps.memoryHeapCount) continue;
+        const uint64_t hs = memProps.memoryHeaps[h].size;
+        if (!best.has_value() || hs > bestHeap) {
+            best = i;
+            bestHeap = hs;
+        }
+    }
+    return best;
+}
+
 void getMemoryTypeProperties(uint32_t memoryTypeIndex,
                              VkMemoryPropertyFlags& flags,
                              const VkPhysicalDeviceMemoryProperties& memProps) {
