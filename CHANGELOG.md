@@ -47,6 +47,15 @@
   items); without timeline support it degrades to synchronous. Pool
   destruction reaps uncollected retired cmd pools. New section E in
   `retirement_test` (60 checks total, green on B70).
+- **DirectStorage stubs rolled**: `dstorageRuntimeAvailable()` now
+  probes the real redistributable (SDK build + `dstorage.dll` export)
+  instead of returning true blindly, and `dstorageImportToPool()`
+  imports a producer-created D3D12 shared-heap NT handle via
+  `pool->importMemory` (R3/R4 ownership) instead of erroring TODO.
+  The SDK-backed producer (`submitBatch`) stays honestly stubbed -
+  no SDK on any build machine. `storage_dstorage_test` gains
+  config-robust probe checks + no-device arg validation; the B70
+  bridge round-trip still passes.
 - **Teardown hygiene**: `MultiGPUPoolManager` dtor now destroys its
   sync timeline (leaked since creation - VUID-05137 at device
   teardown), with move ctor/assign disarming the source. `retirement_test`

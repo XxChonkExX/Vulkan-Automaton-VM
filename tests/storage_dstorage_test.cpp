@@ -24,6 +24,36 @@ int main() {
     std::cout << "  runtime(dstorage.dll): " << (DStorageBackend::runtimeAvailable() ? "yes" : "no")
               << "  d3d12: " << (DStorageBackend::d3d12Available() ? "yes" : "no") << "\n";
 
+    // ---- Path-B helpers: no device needed, run on every CI runner ----
+    {
+        // Producer path needs the SDK build AND the redistributable DLL.
+        const bool runtime = storage::dstorageRuntimeAvailable();
+#if defined(VVM_HAS_DSTORAGE)
+        if (runtime != DStorageBackend::runtimeAvailable()) {
+            std::cerr << "FAIL: runtime probe disagrees with backend probe\n";
+            return 1;
+        }
+        std::cout << "  producer path: " << (runtime ? "armed" : "no redistributable") << "\n";
+#else
+        if (runtime) {
+            std::cerr << "FAIL: runtime reported without the SDK build\n";
+            return 1;
+        }
+        std::cout << "  producer path: not built (needs VVM_BUILD_DSTORAGE)\n";
+#endif
+        // Null-argument validation for the NT-handle import (no device).
+        Allocation sink{};
+        if (storage::dstorageImportToPool(nullptr, nullptr, 0, nullptr)) {
+            std::cerr << "FAIL: null pool/out accepted\n";
+            return 1;
+        }
+        if (storage::dstorageImportToPool(nullptr, reinterpret_cast<void*>(0x1), 64, &sink)) {
+            std::cerr << "FAIL: null pool accepted\n";
+            return 1;
+        }
+        std::cout << "  import arg validation: PASS\n";
+    }
+
     // ---- Vulkan instance ----
     VkApplicationInfo appInfo{};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
