@@ -27,8 +27,13 @@ export CHONK_ACT_GB=0.25
 export CHONK_STAGING_GB=0.25
 export CHONK_GRAD_ACCUM=16
 export CHONK_GRADIENT_CHECKPOINT=1
-export CHONK_PAUSE=0.02
-export CHONK_OPTIMIZER_PAUSE=0.5
+export CHONK_PAUSE=0
+export CHONK_OPTIMIZER_PAUSE=0.1
+# Attention key-tile: 16384 halves the tile-loop iterations per chunk (same
+# exact online-softmax result — corrections telescope regardless of tile
+# size). Transients scale with tile: ~2.6GB peak vs ~1.3GB, fits the ~30GB
+# GTT headroom under the 100GB cap.
+export CHONK_ATTN_TILE=16384
 export CHONK_MAX_STEPS=10000
 export CHONK_MAX_GTT_GB=100
 export CHONK_SAVE_INTERVAL=1
