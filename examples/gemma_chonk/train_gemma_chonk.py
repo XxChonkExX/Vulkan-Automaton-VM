@@ -197,6 +197,15 @@ def main():
             step = st.get("step", 0)
             print(f"[Resume] {RESUME_DIR} step={step} coords={resume_coords}",
                   flush=True)
+            try:
+                optimizer.load_state_dict(st["optimizer"])
+                scheduler.load_state_dict(st["scheduler"])
+                ema.shadow = {k: v.cuda() for k, v in st["ema"].items()}
+                optimizer.step_count = st.get("adam_step_count",
+                                              optimizer.step_count)
+                print("[Resume] optimizer/scheduler/ema restored", flush=True)
+            except Exception as e:
+                print(f"[Resume] optimizer state partial: {e}", flush=True)
         except Exception as e:
             print(f"[Resume] unreadable ({e}); cold start", flush=True)
 

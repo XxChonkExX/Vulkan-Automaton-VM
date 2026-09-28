@@ -127,39 +127,27 @@ def dequantize_weight(qweight, scales, zeros, bits: int = 8, group_size=128,
 
 
 class QuantMatmulFn(torch.autograd.Function):
-    """Dequant + matmul with minimal graph retention.
+    """Matmul against the frozen dequantized weight.
 
-    Saves ONLY the (pool-backed) quantized buffers for backward; the
-    dequantized weight is materialized transiently in forward and REBUILT
-    in backward. This keeps the autograd graph ~zero-cost: without it, every
-    chunk's forward saves 16GB+ of dequantized bf16 weights and the pool
-    carves that on top of the model-size savings.
-
-    NOTE: do NOT permanently cache the dequantized weight here. A full bf16
-    cache is ~60GB on a 30B model — on top of the INT4 copy that is storing
-    the weights twice (75GB for weights alone) and it alone pushes a 131K
-    run past the ~120GB practical wall. The transient dequant below is
-    bounded (largest module ~268MB) and the slab's best-fit + warm-block
-    reuse makes the per-chunk alloc/free cycle hit the same blocks without
-    driver round-trips.
+    The dequantized bf16 weight of every QuantLinear is CONSTANT during
+    LoRA training (adapters modify the layer output, never the base), so
+    QuantLinear caches it once (_cached_weight) and this Function saves
+    and reuses the SAME tensor in backward: dequant runs ONCE per run
+    instead of twice per chunk per module. Cost: one steady bf16 copy of
+    the quantized params (not per-chunk, not graph-retained beyond the
+    shared tensor).
     """
 
     @staticmethod
-    def forward(ctx, x, qweight, scales, zeros, bits, group_size, bias):
-        ctx.save_for_backward(qweight, scales, zeros, bias)
-        ctx.bits = int(bits)
-        ctx.group_size = int(group_size)
-        w = dequantize_weight(qweight, scales, zeros, ctx.bits, ctx.group_size,
-                              dtype=torch.bfloat16)
+    def forward(ctx, x, w, bias):
+        ctx.save_for_backward(w, bias)
         return F.linear(x, w, bias)
 
     @staticmethod
     def backward(ctx, grad_output):
-        qweight, scales, zeros, bias = ctx.saved_tensors
-        w = dequantize_weight(qweight, scales, zeros, ctx.bits, ctx.group_size,
-                              dtype=torch.bfloat16)
+        w, bias = ctx.saved_tensors
         grad_x = grad_output @ w
-        return grad_x, None, None, None, None, None, None
+        return grad_x, None, None
 
 
 class QuantLinear(nn.Module):
@@ -190,10 +178,15 @@ class QuantLinear(nn.Module):
                                  self.bits, self.group_size,
                                  dtype=torch.bfloat16)
 
+    def _cached_weight(self):
+        w = self.__dict__.get("_w_cache")
+        if w is None:
+            w = self.dequantized_weight()
+            self._w_cache = w
+        return w
+
     def forward(self, x):
-        return QuantMatmulFn.apply(
-            x, self.qweight, self.scales, self.zeros,
-            self.bits, self.group_size, self.bias)
+        return QuantMatmulFn.apply(x, self._cached_weight(), self.bias)
 
 
 def quantize_module_weight(linear: nn.Module, bits=8, group_size=128):

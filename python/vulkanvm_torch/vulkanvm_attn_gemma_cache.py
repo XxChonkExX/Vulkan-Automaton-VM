@@ -106,17 +106,18 @@ class GemmaAttnCache(torch.autograd.Function):
                 m = m_new
 
             if kc > 0:
-                ck, cv = layer.get_cached_kv(kc)
-                ck = ck[:batch, :, :kc]
-                cv = cv[:batch, :, :kc]
-                # sliding: skip tiles fully outside every query's window
                 if ctx.window > 0:
                     k_lo = max(0, (kc - ctx.window) // KT * KT)
                 else:
                     k_lo = 0
+                # Windowed ranges dequant only [k_lo:kc]; windowless layers
+                # serve from the persistent bf16 prefix cache.
+                ck, cv = layer.get_cached_kv(kc, k_lo)
+                off = k_lo
                 for k0 in range(k_lo, kc, KT):
                     k1 = min(k0 + KT, kc)
-                    tile_step(ck[:, :, k0:k1], cv[:, :, k0:k1], k0)
+                    tile_step(ck[:, :, k0 - off:k1 - off],
+                              cv[:, :, k0 - off:k1 - off], k0)
 
             # Current-chunk tile (the only grad-bearing K/V).
             tile_step(k_cur, v_cur, kc)
@@ -186,16 +187,16 @@ class GemmaAttnCache(torch.autograd.Function):
                     p_t.to(qdt).transpose(-2, -1), dyg).sum(dim=2).float()
 
         if kc > 0:
-            ck, cv = layer.get_cached_kv(kc)
-            ck = ck[:ctx.batch, :, :kc]
-            cv = cv[:ctx.batch, :, :kc]
             if ctx.window > 0:
                 k_lo = max(0, (kc - ctx.window) // KT * KT)
             else:
                 k_lo = 0
+            ck, cv = layer.get_cached_kv(kc, k_lo)
+            off = k_lo
             for k0 in range(k_lo, kc, KT):
                 k1 = min(k0 + KT, kc)
-                back_tile(ck[:, :, k0:k1], cv[:, :, k0:k1], k0)
+                back_tile(ck[:, :, k0 - off:k1 - off],
+                          cv[:, :, k0 - off:k1 - off], k0)
 
         dk_cur = torch.zeros_like(k_cur, dtype=torch.float32)
         dv_cur = torch.zeros_like(v_cur, dtype=torch.float32)

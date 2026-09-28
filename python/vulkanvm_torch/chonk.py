@@ -514,37 +514,55 @@ class ChonkFullLayer(StaticLayer):
                 dtype=torch.bfloat16, device=device)
         return base._shared_dequant_k, base._shared_dequant_v
 
-    def _dequantize_prefix(self, b, length):
-        """Dequantize prefix [0:length] into the SHARED scratch (in place, no
-        per-call allocation) and return views of it. Valid until the next
-        dequant call — consumers (update cat, attention) read immediately."""
+    def _dequantize_prefix(self, b, start, length=None, out_k=None, out_v=None):
+        """Dequantize [start:start+length) of the INT4 cache. Returns views
+        into the shared scratch whose LOCAL index 0 == global `start`, or
+        writes into caller-provided bf16 buffers (for the windowless-layer
+        persistent prefix cache). Legacy call _dequantize_prefix(b, L) means
+        [0:L)."""
+        if length is None:
+            length = start
+            start = 0
         cls = type(self)
-        scratch_k, scratch_v = cls._shared_scratch(self._prealloc_device)
-        # Narrow to THIS layer's geometry (mixed-geometry models share one
-        # max-sized scratch; uniform models are unaffected).
-        k_out = scratch_k[:, :self._num_kv_heads, :length, :self._head_dim]
-        v_out = scratch_v[:, :self._num_kv_heads, :length, :self._head_dim]
+        if out_k is None:
+            scratch_k, scratch_v = cls._shared_scratch(self._prealloc_device)
+            k_out = scratch_k[:, :self._num_kv_heads, start:start + length,
+                               :self._head_dim]
+            v_out = scratch_v[:, :self._num_kv_heads, start:start + length,
+                               :self._head_dim]
+        else:
+            k_out, v_out = out_k, out_v
         packed_head_dim = self._head_dim // 2
         packed_stride = self.max_cache_len * packed_head_dim
         for h in range(self._num_kv_heads):
-            offset = h * packed_stride
+            offset = h * packed_stride + start * packed_head_dim
             k_packed = self._k_data[offset:offset + length * packed_head_dim].view(1, length, packed_head_dim)
             v_packed = self._v_data[offset:offset + length * packed_head_dim].view(1, length, packed_head_dim)
-            # Dequantize directly into the shared-scratch slice (no fresh
+            # Dequantize directly into the target slice (no fresh
             # [1,length,128] alloc per head — see _dequantize_int4 note).
-            self._dequantize_int4(k_packed, self._k_scales, 0, length, h, out=k_out[0, h])
-            self._dequantize_int4(v_packed, self._v_scales, 0, length, h, out=v_out[0, h])
+            self._dequantize_int4(k_packed, self._k_scales, start, length, h, out=k_out[0, h])
+            self._dequantize_int4(v_packed, self._v_scales, start, length, h, out=v_out[0, h])
         return k_out, v_out
 
-    def get_cached_kv(self, length):
-        """Return dequantized keys/values for the first 'length' tokens.
-        Returns (k, v) with shape (batch, num_heads, length, head_dim).
-        Used by attention recompute patch."""
+    # Windowless (full-attention) layers keep a persistent dequantized
+    # bf16 prefix: the INT4 prefix is frozen per block (causal append),
+    # so re-dequantizing it every forward AND backward AND update() is
+    # pure waste that grows linearly with depth (quadratic per block).
+    _bf16_prefix = False
+    _bf16_k = None
+    _bf16_v = None
+
+    def get_cached_kv(self, length, k_lo=0):
+        """Return dequantized keys/values covering global [k_lo:length).
+        Windowless layers serve from the persistent bf16 prefix (k_lo==0);
+        sliding layers dequantize only the windowed range into shared
+        scratch (LOCAL index 0 == k_lo -- callers subtract k_lo)."""
         if not self._quantize:
             return self.keys, self.values
         b = 1
-        k, v = self._dequantize_prefix(b, length)
-        return k, v
+        if k_lo == 0 and getattr(self, "_bf16_k", None) is not None:
+            return self._bf16_k[:, :, :length], self._bf16_v[:, :, :length]
+        return self._dequantize_prefix(b, k_lo, length - k_lo)
 
     def lazy_initialization(self, key_states, value_states):
         self.dtype, self.device = key_states.dtype, key_states.device
@@ -572,6 +590,20 @@ class ChonkFullLayer(StaticLayer):
             # block (64 layers x 8 heads x 2 x chunks) = the +0.54GB/chunk
             # ratchet the histogram caught (131072-byte class doubling with kc).
             self._write_quantized(ks.detach(), vs.detach(), start, kv_length)
+            if getattr(self, "_bf16_prefix", False):
+                # Persistent bf16 prefix (windowless layers): append the
+                # dequantized view of the JUST-WRITTEN region -- numerically
+                # identical to the on-demand dequant it replaces.
+                if self._bf16_k is None:
+                    self._bf16_k = torch.empty(
+                        1, self._num_kv_heads, self.max_cache_len,
+                        self._head_dim, dtype=torch.bfloat16,
+                        device=self._prealloc_device)
+                    self._bf16_v = torch.empty_like(self._bf16_k)
+                self._dequantize_prefix(
+                    b, start, kv_length,
+                    out_k=self._bf16_k[:, :, start:start + kv_length],
+                    out_v=self._bf16_v[:, :, start:start + kv_length])
         else:
             ks = key_states.to(self.keys.dtype)
             vs = value_states.to(self.values.dtype)
@@ -591,14 +623,14 @@ class ChonkFullLayer(StaticLayer):
             return ks, vs
 
         if self._quantize:
-            # NO cat: write the current chunk into the shared scratch (the
-            # cached prefix is already dequantized there by _write_quantized's
-            # read path... actually dequantize the prefix first), then return
-            # the scratch view as the full [cached|current] k/v. The patched
-            # attention only reads shapes from these (it uses the layer paths),
-            # so a detached view is correct — and no full-prefix bf16 cat is
-            # ever allocated (the cat was the 8.6GB/32-chunk pool ratchet).
-            k_cached, v_cached = self._dequantize_prefix(b, start)
+            if getattr(self, "_bf16_k", None) is not None:
+                # bf16 prefix path: rows [0:start+kv_length) are current.
+                return (self._bf16_k[:, :, :start + kv_length],
+                        self._bf16_v[:, :, :start + kv_length])
+            # Consumers of this return only read SHAPES (the patched
+            # attention uses layer._last_* and get_cached_kv), so the old
+            # full-prefix dequant here was pure waste. Keep the chunk rows
+            # in scratch for shape/debug value only.
             sk, sv = type(self)._shared_scratch(self._prealloc_device)
             sk = sk[:, :self._num_kv_heads, :, :self._head_dim]
             sv = sv[:, :self._num_kv_heads, :, :self._head_dim]
@@ -761,6 +793,11 @@ def build_chonk_cache(config, batch_size, max_cache_len, pool=None):
             base, host_ptr = pool.alloc_base(per_layer_total, f"chonk_kv_cache_layer_{i}")
             layer = ChonkFullLayer(max_cache_len, base, 0, storage_dtype, compute_dtype, device, quantize_kv, kvH_i, D_i)
             layer._prealloc(batch_size, kvH_i, D_i)
+            if lt in ("full_attention", "attention"):
+                # Windowless layer: persistent bf16 prefix cache (small --
+                # kvH*D per layer, ~537MB total for Gemma4's 8 alt layers
+                # at 32k) skips the per-chunk full-prefix dequant entirely.
+                layer._bf16_prefix = True
         else:
             layer = LinearAttentionLayer(**layer_kwargs)
         layers.append(layer)
