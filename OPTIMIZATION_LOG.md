@@ -627,3 +627,60 @@ CHONK_MAX_POOL_GB=85 CHONK_MAX_GTT_GB=115`
   targets verified non-zero.
 - Known steady state: ~54GB pool × ~1.5 GTT + desktop ≈ box edge on 123GB;
   VT+GDM-down is the recommended posture for long stretches.
+
+## 2026-09-27: phantom-RAM leak is exit-triggered, not crash-triggered
+- Packed trainer (pool allocator) exited CLEANLY on SIGTERM (5s, graceful,
+  GTT counter returned to 0.0 GB) yet ~67GB of RAM remained orphaned:
+  unaccounted by MemFree/Cached/AnonPages/Slab/PageTables, no owning
+  process, no GTT attribution, no reclaim after 90+ min of uptime later.
+  Same signature as the post-crash phantom earlier tonight.
+- Conclusion: the dedicated exportable vkAllocateMemory blocks (pool path)
+  are not returned to the kernel at process teardown even on clean exit.
+  Every pool session leaks ~2/3 of RAM until reboot.
+- Fix candidate (not yet implemented): explicit teardown hook -- drain
+  pool, vkFreeMemory all dedicated allocations, destroy instance/queues
+  before process exit; verify RAM returns.
+- Operational rule until fixed: check_driver.sh before any big launch;
+  reboot on ORPHANED verdict (user script in ~/check_driver.sh).
+
+## 2026-09-27 (late): the Chonk lora_B zero-grad mystery -- SOLVED
+Four stacked bugs, all found via single-process bisection (chonk_probe*.py):
+1. ROOT CAUSE -- semantic buffers unmaterialized on meta builds. Gemma4
+   carries embed_scale=sqrt(hidden) as a register_buffer; the meta build
+   left it unmaterialized and the old empty_like fill read whatever VK
+   pages held: fresh pages = 0 -> dead forward (loss ln(V)=12.48, lora_B
+   absorbing zero-grad state since grad_B ~ A*x = 0); recycled pages =
+   garbage -> loss 17-25. One buffer, both "nondeterministic" failure
+   modes. FIX: build on CPU (transformers inits ALL semantic buffers in
+   __init__ -- layer_scalar, softcap, clamp bounds, inv_timescales, rope),
+   then replace params with pool views; buffers .to(cuda). Correct by
+   construction for any architecture.
+2. Chunk slice bug: block[:, cs:ce] used chunk SIZE as START offset ->
+   empty first chunk + ever-growing mega-chunks anchored at 1024 (the 68GB
+   mask blowups / garbage loss at depth). FIX: block[:, pos:ce], and
+   tok_m = ce - pos - 1.
+3. lm_head: tied checkpoints omit lm_head.weight; quant list included it
+   -> never landed, stayed meta. FIX: tie lm_head.weight to the landed
+   embed pool view post-build.
+4. Adapters stranded on CPU after the CPU-build change. FIX: rematerialize
+   pass now moves every non-cuda trainable param with proper init.
+Certification (chonk_probe.py): storage byte-exact (C1/C2/C3), forward
+alive end-to-end (embed 20.1, L47 inputs 2576, logits at softcap 30),
+adapters causal (B=1 -> delta 60), lora_B grads 6.8 through the real
+chunked path. lora_A grad=0 at init is textbook (B=0). Side findings:
+pool hostPtr mapping does not alias device memory (host reads see 0);
+clean-exit phantom-RAM leak (logged above) still stands.
+Phase A relaunched on the Chonk vehicle (32k-only, 40 steps) from the
+DPO-merged base.
+5. (the big one) Persistent CHECKPOINT BUFFERS never loaded. Gemma4 stores
+   per-layer layer_scalar (branch scaling, trained values 0.0045..0.69) as
+   persistent buffers; manual param-landing skipped them and CPU init
+   defaulted to ones(1) -> residual branches at full magnitude (35->656),
+   loss 4.63 -> 39.8 through BOTH eager and patched paths. Found via
+   submodule-level layer-0 diffing vs a plain-bf16 reference (probe5c).
+   FIX: load_checkpoint_buffers() lands every checkpoint-stored buffer
+   after build. Verified: layer0-out 34.75 vs ref 35.25 (quant noise).
+   Training now starts at loss 6.76 and descends (first chunks, pre-step).
+NOTE: this entire class (1-5) is loader logic, hardware-independent; the
+phantom-RAM leak and the 4GB allocation wall ARE driver-side (RADV/amdgpu
+GTT) -- both real, separate root causes that co-occurred tonight.

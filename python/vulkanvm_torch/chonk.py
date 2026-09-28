@@ -520,8 +520,10 @@ class ChonkFullLayer(StaticLayer):
         dequant call — consumers (update cat, attention) read immediately."""
         cls = type(self)
         scratch_k, scratch_v = cls._shared_scratch(self._prealloc_device)
-        k_out = scratch_k[:, :, :length]
-        v_out = scratch_v[:, :, :length]
+        # Narrow to THIS layer's geometry (mixed-geometry models share one
+        # max-sized scratch; uniform models are unaffected).
+        k_out = scratch_k[:, :self._num_kv_heads, :length, :self._head_dim]
+        v_out = scratch_v[:, :self._num_kv_heads, :length, :self._head_dim]
         packed_head_dim = self._head_dim // 2
         packed_stride = self.max_cache_len * packed_head_dim
         for h in range(self._num_kv_heads):
@@ -598,6 +600,8 @@ class ChonkFullLayer(StaticLayer):
             # ever allocated (the cat was the 8.6GB/32-chunk pool ratchet).
             k_cached, v_cached = self._dequantize_prefix(b, start)
             sk, sv = type(self)._shared_scratch(self._prealloc_device)
+            sk = sk[:, :self._num_kv_heads, :, :self._head_dim]
+            sv = sv[:, :self._num_kv_heads, :, :self._head_dim]
             sk[0, :, start:start+kv_length].copy_(ks[0].to(torch.bfloat16))
             sv[0, :, start:start+kv_length].copy_(vs[0].to(torch.bfloat16))
             return sk[:, :, :start+kv_length], sv[:, :, :start+kv_length]
@@ -658,6 +662,32 @@ def reset_chonk_cache(cache):
             layer.reset()
 
 
+def _layer_kv_geom(text_cfg, layer_types, idx):
+    """Per-layer (num_kv_heads, head_dim) for the KV cache.
+
+    Standard layers use the top-level values. Gemma4-style alternative
+    layers (full_attention + attention_k_eq_v: wide single KV head) use
+    the global values -- mirroring the attention module's own logic
+    (global_head_dim + num_global_key_value_heads when alternative).
+    Falls back to standard values for configs without these fields
+    (Granite/Qwen paths unchanged).
+    """
+    lt = layer_types[idx] if idx < len(layer_types) else "attention"
+    alt = bool(getattr(text_cfg, "attention_k_eq_v", False)) \
+        and lt not in ("sliding_attention",)
+    # NOTE: `alt` mirrors `not self.is_sliding`; sliding layers are never
+    # alternative even when the flag is set (matches module __init__).
+    if alt and lt == "full_attention" \
+            and getattr(text_cfg, "num_global_key_value_heads", None) \
+            and getattr(text_cfg, "global_head_dim", None):
+        return (int(text_cfg.num_global_key_value_heads),
+                int(text_cfg.global_head_dim))
+    num_kv_heads = getattr(text_cfg, "num_key_value_heads", None)
+    head_dim = getattr(text_cfg, "head_dim", None) or (
+        text_cfg.hidden_size // text_cfg.num_attention_heads)
+    return (int(num_kv_heads), int(head_dim))
+
+
 def build_chonk_cache(config, batch_size, max_cache_len, pool=None):
     """Build a ChonkCache for the given text config. Allocates one pool
     block holding every full-attention layer's keys and values, then
@@ -702,25 +732,50 @@ def build_chonk_cache(config, batch_size, max_cache_len, pool=None):
     per_layer_total = per_layer_bytes + scale_bytes
     total = per_layer_total * n_full
 
+    def _layer_bytes(kvH, D):
+        b = int(2 * batch_size * kvH * max_cache_len * D * bytes_per_element)
+        if quantize_kv:
+            b += 2 * kvH * max_cache_len * compute_dtype.itemsize
+        return b
+
     if pool is None:
         pool = ChonkPool()
 
     layers = []
+    max_kvH, max_D, max_total = 0, 0, 0
     for i, lt in enumerate(layer_types):
-        if lt in ("full_attention", "attention"):
+        # Sliding-window layers get full ChonkFullLayer caches too: the
+        # window is enforced analytically in the attention kernel (distant
+        # tiles are never visited), so storing full history stays correct
+        # while keeping one code path. (Gemma4: 40 sliding 8x256 + 8 full
+        # alternative 1x512 -- per-layer geometry below.)
+        if lt in ("full_attention", "attention", "sliding_attention"):
+            kvH_i, D_i = _layer_kv_geom(text_cfg, layer_types, i)
+            per_layer_total = _layer_bytes(kvH_i, D_i)
+            max_kvH = max(max_kvH, kvH_i)
+            max_D = max(max_D, D_i)
+            max_total = max(max_total, per_layer_total)
             # Per-layer allocation: avoid one monolithic 32GB exportable block
             # (drivers reject a single contiguous vkAllocateMemory that large;
             # per-layer ~0.5GB blocks fit the bucket ladder and the GTT heap).
             base, host_ptr = pool.alloc_base(per_layer_total, f"chonk_kv_cache_layer_{i}")
-            layer = ChonkFullLayer(max_cache_len, base, 0, storage_dtype, compute_dtype, device, quantize_kv, num_kv_heads, head_dim)
-            layer._prealloc(batch_size, num_kv_heads, head_dim)
+            layer = ChonkFullLayer(max_cache_len, base, 0, storage_dtype, compute_dtype, device, quantize_kv, kvH_i, D_i)
+            layer._prealloc(batch_size, kvH_i, D_i)
         else:
             layer = LinearAttentionLayer(**layer_kwargs)
         layers.append(layer)
+    # Size the class-level shared dequant scratch to the maximum geometry so
+    # every layer's prefix fits (mixed-geometry models). _prealloc wrote
+    # last-layer-wins values; the maxes below prevail.
+    if max_kvH > 0:
+        ChonkFullLayer._scratch_kvH = max_kvH
+        ChonkFullLayer._scratch_D = max_D
+        ChonkFullLayer._shared_dequant_k = None
+        ChonkFullLayer._shared_dequant_v = None
 
     cache = Cache(layers=layers)
     cache.pool = pool
-    cache.full_layer_bytes = per_layer_total
+    cache.full_layer_bytes = max_total
     cache._batch_size = batch_size
     return cache
 
@@ -823,15 +878,21 @@ def build_model_from_chonk_buffer(config, model_buffer, dtype=torch.bfloat16,
     skip_modules = set(skip_modules or [])
     skip_prefixes = tuple(f"{m}." for m in skip_modules)
 
-    with torch.device('meta'):
-        model = AutoModelForCausalLM.from_config(
-            config, torch_dtype=dtype, trust_remote_code=True,
-            attn_implementation=attn_implementation,
-        )
+    # Build on CPU, NOT meta: transformers sets semantic BUFFERS inside
+    # module __init__ (Gemma4: embed_scale=sqrt(hidden), layer_scalar=1,
+    # softcap, +/-inf clamp bounds, inv_timescales, rotary inv_freq).
+    # Under torch.device('meta') these stay unmaterialized and ANY fill
+    # (zeros, garbage) poisons the forward -- embed_scale=0 zeroes every
+    # activation exactly. A CPU build materializes them with correct
+    # values; params are replaced by pool views immediately after, so the
+    # CPU weight storage is transient.
+    model = AutoModelForCausalLM.from_config(
+        config, torch_dtype=dtype, trust_remote_code=True,
+        attn_implementation=attn_implementation,
+    )
     typed = model_buffer.view(dtype)
     offset = 0
     for name, param in list(model.named_parameters()):
-        skip = name.startswith(skip_prefixes)
         if name.startswith(skip_prefixes):
             continue  # quantized: module swapped to QuantLinear after PEFT
         numel = param.numel()
@@ -845,23 +906,16 @@ def build_model_from_chonk_buffer(config, model_buffer, dtype=torch.bfloat16,
         setattr(parent, parts[-1], nn.Parameter(view))
         offset += numel
 
-    # Materialize meta buffers on CUDA (rotary inv_freq etc.)
+    # Buffers: the CPU build initialized them with their true values
+    # (scales, scalars, rope tables); move them to CUDA as-is.
     for name, buf in list(model.named_buffers()):
-        if buf.device.type != "meta":
+        if buf.device.type == "cuda":
             continue
         parts = name.split(".")
         parent = model
         for p in parts[:-1]:
             parent = getattr(parent, p)
-        if parts[-1] in ("inv_freq", "original_inv_freq") and hasattr(
-            parent, "compute_default_rope_parameters"
-        ):
-            inv_freq, _ = parent.compute_default_rope_parameters(parent.config, device="cuda")
-            if parts[-1] == "original_inv_freq":
-                inv_freq = inv_freq.clone()
-            setattr(parent, parts[-1], inv_freq)
-        else:
-            setattr(parent, parts[-1], torch.empty_like(buf, device="cuda"))
+        setattr(parent, parts[-1], buf.to("cuda"))
 
     print(f"Built model from Chonk Buffer: {offset * dtype.itemsize / 1e9:.2f} GB "
           f"({len(list(model.named_parameters()))} params)")
@@ -1059,18 +1113,27 @@ def load_model_directly_to_chonk(model_path, config, pool: ChonkPool, dtype=torc
     # Checkpoint was saved from the multimodal wrapper: keys use
     # 'model.language_model.*' for the text model and bare 'lm_head.weight'.
     # The text-only model built from_config uses 'model.*' names, so remap.
-    def to_ckpt_name(name):
+    # Ordered candidates: exact name first (Qwen/Granite-style checkpoints
+    # whose keys already match), then the language_model-infixed variant
+    # (Gemma4 unified checkpoints). Backward-compatible by construction.
+    def to_ckpt_names(name):
         if name in ("lm_head.weight", "model.lm_head.weight"):
-            return "lm_head.weight"
-        return name
+            yield "lm_head.weight"
+            return
+        yield name
+        if name.startswith("model."):
+            yield "model.language_model." + name[len("model."):]
 
     for model_file in model_files:
         print(f"  Loading {model_file}...")
         state_dict = load_file(model_file, device='cpu')
 
         for name, param in param_map.items():
-            ck_name = to_ckpt_name(name)
-            tensor = state_dict.get(ck_name) if ck_name else None
+            tensor = None
+            for ck_name in to_ckpt_names(name):
+                tensor = state_dict.get(ck_name)
+                if tensor is not None:
+                    break
             if tensor is None:
                 continue  # stored in another shard (slot stays as-is)
 
@@ -1218,6 +1281,41 @@ def patch_linear_cache_for_chunked_training():
     print("Patched LinearAttentionLayer for chunked training (state reassignment)")
 
 
+def load_checkpoint_buffers(model, model_path):
+    """Land persistent buffers stored in the checkpoint (Gemma4 layer_scalar,
+    clamp bounds). from_pretrained applies these via _load_state_dict; the
+    manual param-landing path skips them. A ones() default where the trained
+    value is 0.05 turns a 35-magnitude residual into 656 (loss 4.6 -> 39.8)."""
+    import glob as _glob
+    from safetensors import safe_open
+
+    def _cands(name):
+        if name in ("lm_head.weight", "model.lm_head.weight"):
+            return ["lm_head.weight"]
+        out = [name]
+        if name.startswith("model."):
+            out.append("model.language_model." + name[len("model."):])
+        return out
+
+    landed = 0
+    for f in sorted(_glob.glob(f"{model_path}/*.safetensors")):
+        with safe_open(f, framework="pt") as sf:
+            keys = set(sf.keys())
+            for name, buf in list(model.named_buffers()):
+                if buf.device.type != "cuda" or buf.numel() == 0:
+                    continue
+                for cand in _cands(name):
+                    if cand in keys:
+                        t = sf.get_tensor(cand)
+                        if tuple(t.shape) == tuple(buf.shape):
+                            buf.copy_(t.to(buf.dtype).to(buf.device))
+                            landed += 1
+                        break
+    if landed:
+        print(f"Landed {landed} checkpoint buffers (layer_scalar etc.)")
+    return landed
+
+
 def build_lora_chonk_setup(model_path, config, batch_size, max_cache_len,
                             lora_r=64, lora_alpha=128, lora_dropout=0.05,
                             dtype=torch.bfloat16, chunk_size_mb=512,
@@ -1275,6 +1373,21 @@ def build_lora_chonk_setup(model_path, config, batch_size, max_cache_len,
         attn_implementation=attn_implementation,
         skip_modules=quantize_modules)
 
+    # 3b. Tied embeddings: the checkpoint omits lm_head.weight (tied at save
+    # time); the meta build leaves it as a never-landed meta parameter. Tie
+    # it to the landed embed view so the head reads pool memory.
+    _lm = getattr(model, "lm_head", None)
+    if _lm is not None:
+        _emb = model.get_input_embeddings()
+        if _emb is not None:
+            _lm.weight = _emb.weight
+            print("Tied lm_head.weight to landed embed_tokens view")
+
+    # 3c. Persistent buffers from the checkpoint (layer_scalar & friends):
+    #     trained values that _load_state_dict applies in from_pretrained;
+    #     CPU init provides only ones()/default stand-ins.
+    load_checkpoint_buffers(model, model_path)
+
     # 4. LoRA adapters
     lora_config = LoraConfig(
         r=lora_r,
@@ -1289,12 +1402,12 @@ def build_lora_chonk_setup(model_path, config, batch_size, max_cache_len,
     print(f"LoRA applied: {n_trainable / 1e6:.1f}M trainable params "
           f"({n_trainable * 2 / 1e9:.2f} GB bf16)")
 
-    # 4b. When target base weights were left on meta (quantized path), PEFT
-    #     creates the LoRA adapters on meta too (it dispatches adapters to
-    #     base_layer.weight.device). Re-materialize them on cuda with the
-    #     standard PEFT gaussian init before swapping in the QuantLinear.
+    # 4b. Adapters inherit base_layer.weight.device at PEFT wrap time:
+    #     meta (old path) or CPU (CPU-built path for correct buffers) for
+    #     quantized targets whose base has not been swapped yet. Move every
+    #     trainable param onto CUDA with the standard PEFT init.
     for pname, p in list(model.named_parameters()):
-        if p.requires_grad and p.device.type == "meta":
+        if p.requires_grad and p.device.type != "cuda":
             fresh = torch.empty_like(p, device="cuda")
             if "lora_A" in pname:
                 torch.nn.init.kaiming_uniform_(fresh, a=math.sqrt(5))
@@ -1305,9 +1418,9 @@ def build_lora_chonk_setup(model_path, config, batch_size, max_cache_len,
             for part in parts[:-1]:
                 parent = getattr(parent, part)
             setattr(parent, parts[-1], torch.nn.Parameter(fresh))
-    if any(p.device.type == "meta" and p.requires_grad
+    if any(p.requires_grad and p.device.type != "cuda"
            for p in model.parameters()):
-        raise RuntimeError("trainable params left on meta after LoRA rematerialize")
+        raise RuntimeError("trainable params off-cuda after LoRA rematerialize")
 
     # 4c. Swap quantized base layers inside the PEFT wrappers, then replace
     #     the standalone (non-target) quantized Linears.
