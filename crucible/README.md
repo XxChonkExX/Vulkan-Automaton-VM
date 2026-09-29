@@ -1,7 +1,7 @@
 # crucible/
 
-The measurement methodology of the open RPG-model campaign: batteries,
-scorers, and the extraction instruments, with frozen probe packs and
+The Crucible is a method of refusal and abstention training: using batteries,
+scorers, and extraction instruments, with frozen probe packs and
 baseline results. Companion engineering (pool allocator, tiled attention,
 trainers) lives in `python/vulkanvm_torch/` and `examples/`.
 
