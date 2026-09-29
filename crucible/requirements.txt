@@ -1,0 +1,9 @@
+# requirements.txt (Crucible eval package)
+# Torch: install per host -- CUDA, ROCm, Intel XPU (intel-extension-for-pytorch),
+# or CPU-only. Any >=2.4 build works for the eval batteries.
+torch>=2.4
+transformers==5.14.1
+datasets>=2.19
+accelerate>=0.30
+safetensors
+numpy
