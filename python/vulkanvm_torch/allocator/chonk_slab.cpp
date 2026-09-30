@@ -17,6 +17,22 @@ Core::Core(IProvider* provider, size_t warmBlocks, size_t maxBlocks,
       maxBlocks_(maxBlocks),
       minBlocksOnOOM_(minBlocksOnOOM) {}
 
+void Core::setGrantHook(size_t thresholdBytes, GrantHook fn) {
+    grantHookThreshold_ = thresholdBytes;
+    grantHook_ = std::move(fn);
+}
+
+void Core::clearGrantHook() {
+    grantHookThreshold_ = 0;
+    grantHook_ = nullptr;
+}
+
+void Core::fireGrantHook(void* ptr, size_t aligned) {
+    if (!grantHook_ || aligned >= grantHookThreshold_) return;
+    const bool isReuse = !everGranted_.insert(ptr).second;
+    grantHook_(ptr, aligned, isReuse);
+}
+
 void* Core::alloc(size_t size, size_t* grantedSize) {
     size_t aligned = ((size + kAlign - 1) / kAlign) * kAlign;
     if (aligned == 0) aligned = kAlign;  // hipMalloc(0) semantics
@@ -65,6 +81,7 @@ void* Core::alloc(size_t size, size_t* grantedSize) {
         } else {
             best_blk->freeChunks.erase(best_it);
         }
+        fireGrantHook(ptr, aligned);
         return ptr;
     }
 
@@ -101,6 +118,7 @@ void* Core::alloc(size_t size, size_t* grantedSize) {
     } else {
         fc.erase(fc.begin());
     }
+    fireGrantHook(ptr, aligned);
     return ptr;
 }
 

@@ -473,6 +473,40 @@ static void test_provider_failure() {
     CHECK(core.checkInvariants());
 }
 
+// Grant hook (reuse-fill reporting): sub-threshold grants reported with
+// reuse flag; threshold-exact and larger grants silent; clear disables.
+static void test_grant_hook() {
+    FakeProvider prov;
+    Core core(&prov, 0, 0, 0);
+    struct Hit { void* ptr; size_t len; bool reuse; };
+    std::vector<Hit> hits;
+    core.setGrantHook(1 << 20, [&](void* p, size_t l, bool r) {
+        hits.push_back({p, l, r});
+    });
+    size_t g = 0;
+    void* a = core.alloc(1024, &g);   // 1 KB < 1 MB: reported, fresh
+    CHECK(a != nullptr);
+    CHECK(hits.size() == 1);
+    CHECK(!hits[0].reuse);
+    CHECK(hits[0].ptr == a && hits[0].len == g);
+    core.free(a, 0);
+    void* b = core.alloc(1024, &g);   // same range: reported, reuse
+    CHECK(b != nullptr && b == a);
+    CHECK(hits.size() == 2);
+    CHECK(hits[1].reuse && hits[1].ptr == a);
+    void* c = core.alloc(2 << 20, &g);  // 2 MB >= threshold: silent
+    CHECK(c != nullptr);
+    CHECK(hits.size() == 2);
+    core.clearGrantHook();
+    core.free(b, 0);
+    void* d = core.alloc(1024, &g);   // hook off: silent
+    CHECK(d != nullptr);
+    CHECK(hits.size() == 2);
+    core.free(d, 0);
+    core.free(c, 0);
+    CHECK(core.checkInvariants());
+}
+
 int main(int argc, char** argv) {
     size_t fuzzIters = 100000;
     if (argc > 1) fuzzIters = std::strtoull(argv[1], nullptr, 10);
@@ -486,6 +520,7 @@ int main(int argc, char** argv) {
     test_differential_fuzz(fuzzIters, 555555);
     test_unknown_free();
     test_provider_failure();
+    test_grant_hook();
 
     if (failures == 0) {
         std::printf("=== ALL CHONK SLAB TESTS PASSED (0 failures) ===\n");

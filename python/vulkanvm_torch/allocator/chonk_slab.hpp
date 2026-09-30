@@ -17,8 +17,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace vvm_torch {
@@ -27,7 +29,7 @@ namespace slab {
 struct Block {
     void* base = nullptr;        // mapped base address (device or host)
     void* extHandle = nullptr;   // opaque: HIP external memory in production
-    int fd = -1;                 // opaque: exported dma-buf fd in production
+    intptr_t fd = -1;            // opaque: exported dma-buf fd / Win32 HANDLE
     size_t size = 0;
     size_t liveBytes = 0;
     // Free chunks as (offset, size), kept sorted by offset.
@@ -62,6 +64,19 @@ public:
     // pointer. Unknown pointers are ignored (other allocators may free here).
     void free(void* ptr, size_t sizeHint = 0);
 
+    // Grant hook (reuse-fill reporting for the small-chunk floor hardening
+    // plan): reported for every grant with aligned size < thresholdBytes as
+    // (ptr, alignedLen, isReuse), where isReuse = this exact address has
+    // been granted before. Off by default (threshold 0). The provider layer
+    // binds it to memset/poison; the core never touches contents.
+    // Semantics note: history is NEVER cleared (not even when blocks die),
+    // so a recycled address reports reuse=true. That biases toward extra
+    // zeroing (safe direction: no correct consumer may rely on contents);
+    // it never under-reports a true reuse.
+    using GrantHook = std::function<void(void* ptr, size_t len, bool isReuse)>;
+    void setGrantHook(size_t thresholdBytes, GrantHook fn);
+    void clearGrantHook();
+
     // Release fully-free blocks while more than `keepFloor` blocks exist.
     // Returns the number of blocks released.
     size_t releaseEmptyBlocks(size_t keepFloor);
@@ -90,11 +105,16 @@ Stats stats() const;
 
 private:
     IProvider* provider_;
+    // Report a just-completed grant to the hook (no-op when disarmed).
+    void fireGrantHook(void* ptr, size_t aligned);
     std::vector<Block*> blocks_;
     std::unordered_map<void*, size_t> liveSizes_;  // ptr -> aligned size
     size_t warmBlocks_;
     size_t maxBlocks_;
     size_t minBlocksOnOOM_;
+    size_t grantHookThreshold_ = 0;  // 0 = hook disabled
+    GrantHook grantHook_;
+    std::unordered_set<void*> everGranted_;  // absolute ptrs; see note above
 };
 
 }  // namespace slab
