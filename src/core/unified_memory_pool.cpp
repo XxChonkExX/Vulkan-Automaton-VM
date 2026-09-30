@@ -48,6 +48,26 @@ struct UnifiedMemoryPoolImpl {
     // Budget held via reserve(): counts as committed in wouldExceedBudget
     // until unreserve()d. Guarded by mutex_ like everything else.
     VkDeviceSize reservedBytes_ = 0;
+    // Reuse-fill accounting (small-chunk floor hardening): all guarded by
+    // mutex_ like everything else; the buddy hook fires inside subAllocate,
+    // which runs under the pool lock (buddy instances are threadSafe=false).
+    uint64_t reuseFillBytes_ = 0;      // bytes actually memset by the hook
+    uint64_t reuseFillEvents_ = 0;     // hook invocations that filled
+    uint64_t reuseFillSkipped_ = 0;    // device-local grants (no host mapping)
+    uint64_t reuseFillUnflushed_ = 0;  // host-visible but non-coherent (tripwire:
+                                       // memory-type selection forces coherent,
+                                       // so nonzero means selection regressed)
+    // Last sub-threshold buddy grant (recorded by the hook for the
+    // device-local transfer-fill path in subAllocate; hook fires
+    // synchronously inside the buddy call, always under the pool lock).
+    bool lastGrantValid_ = false;
+    bool lastGrantReuse_ = false;
+    VkDeviceSize lastGrantLen_ = 0;
+    // Device-local fill outcomes (transfer queue path).
+    uint64_t reuseFillDeviceBytes_ = 0;
+    uint64_t reuseFillUnaligned_ = 0;  // size not multiple of 4 (vkCmdFillBuffer
+                                       // requires 4-byte units) -- skipped
+    uint64_t reuseFillNoQueue_ = 0;    // no transfer/graphics queue available
     uint32_t deviceLocalMemoryType_ = UINT32_MAX;
     uint32_t hostVisibleMemoryType_ = UINT32_MAX;
     uint32_t deviceLocalHeapIndex_ = UINT32_MAX;
@@ -125,6 +145,9 @@ struct UnifiedMemoryPoolImpl {
                                           uint32_t blockIndex,
                                           VkBufferUsageFlags usage);
     void subDeallocate(Allocation&& alloc);
+    // Bind the buddy reuse-fill hook for a freshly created block (upstream
+    // hardening plan item 2). No-op when VVM_ZERO_SMALL_BYTES=0.
+    void bindReuseFill(BlockInfo& block);
     VkDeviceSize alignUp(VkDeviceSize value, VkDeviceSize alignment);
     VkMemoryPropertyFlags usageToFlags(MemoryUsage usage) const;
     bool wouldExceedBudget(VkDeviceSize additionalBytes) const;
@@ -1317,9 +1340,99 @@ std::optional<VkDeviceMemory> UnifiedMemoryPoolImpl::allocateBlock(
     
     // Create buddy allocator for this block
     block.buddy = std::make_unique<BuddyAllocator>(size, config_.minAlignment);
-    
+    bindReuseFill(block);
+
     blocks_.push_back(std::move(block));
     return memory;
+}
+
+// Reuse-fill policy (small-chunk floor hardening, upstream plan item 2):
+//   VVM_ZERO_SMALL_BYTES  threshold below which grants are filled (default
+//                         "1048576" = 1 MiB; "0" disables the hook entirely)
+//   VVM_ZERO_SMALL_MODE   "reuse" (default: fill only previously-granted
+//                         ranges -- fresh pages are driver-zero) or "always"
+//   CHONK_DEBUG_FILL      unset/empty = zero-fill; "pattern"/"nan"/"1" =
+//                         0xFF poison fill (every float reads NaN, ints -1)
+//                         so stale-memory consumers scream on first contact.
+//                         Grant-side equivalent of the plan's poison-freed
+//                         item: consumers observe poison on receipt either way.
+// Policy is parsed once per process; the effective setting is logged once.
+// The hook fires inside buddy grants under the pool lock. Fills go through
+// the block's persistent host mapping; device-local blocks have no mapping
+// and are counted (stale risk honestly remains there -- smalls on discrete
+// GPUs route to host-visible staging pools in practice).
+// Reuse-fill policy (small-chunk floor hardening, upstream plan item 2):
+//   VVM_ZERO_SMALL_BYTES  threshold below which grants are filled (default
+//                         "1048576" = 1 MiB; "0" disables the hook entirely)
+//   VVM_ZERO_SMALL_MODE   "reuse" (default: fill only previously-granted
+//                         ranges -- fresh pages are driver-zero) or "always"
+//   CHONK_DEBUG_FILL      unset/empty = zero-fill; "pattern"/"nan"/"1" =
+//                         0xFF poison fill (every float reads NaN, ints -1)
+//                         so stale-memory consumers scream on first contact.
+//                         Grant-side equivalent of the plan's poison-freed
+//                         item: consumers observe poison on receipt either way.
+// Policy is parsed once per process; the effective setting is logged once.
+struct ReuseFillPolicy {
+    VkDeviceSize threshold = 1048576;
+    bool always = false;
+    unsigned char fill = 0x00;
+    uint32_t fill32() const {
+        return fill == 0 ? 0x00000000u : 0xFFFFFFFFu;  // vkCmdFillBuffer pattern
+    }
+};
+static const ReuseFillPolicy& reuseFillPolicy() {
+    static const ReuseFillPolicy policy = []() {
+        ReuseFillPolicy p;
+        if (const char* t = std::getenv("VVM_ZERO_SMALL_BYTES")) {
+            p.threshold = static_cast<VkDeviceSize>(std::strtoull(t, nullptr, 0));
+        }
+        if (const char* m = std::getenv("VVM_ZERO_SMALL_MODE")) {
+            p.always = (std::strcmp(m, "always") == 0);
+        }
+        if (const char* f = std::getenv("CHONK_DEBUG_FILL")) {
+            if (std::strcmp(f, "pattern") == 0 || std::strcmp(f, "nan") == 0 ||
+                std::strcmp(f, "1") == 0) {
+                p.fill = 0xFF;
+            }
+        }
+        VVM_LOG_INFO("reuse-fill: threshold={}B mode={} fill={} (VVM_ZERO_SMALL_BYTES/_MODE, CHONK_DEBUG_FILL)",
+                     p.threshold, p.always ? "always" : "reuse",
+                     p.fill == 0 ? "zeros" : "0xFF-poison");
+        return p;
+    }();
+    return policy;
+}
+
+void UnifiedMemoryPoolImpl::bindReuseFill(BlockInfo& block) {
+    const ReuseFillPolicy& policy = reuseFillPolicy();
+    if (policy.threshold == 0 || !block.buddy) return;
+    // 'policy' is a file-static accessor result (reference to function-local
+    // static): visible inside the lambda without capture.
+    // lastGrant* records the most recent sub-threshold grant for the
+    // device-local transfer-fill path in subAllocate (hook fires
+    // synchronously inside the buddy call, under the pool lock).
+    void* hostPtr = block.hostPtr;
+    const bool coherent = block.isCoherent;
+    block.buddy->setReuseFill(policy.threshold,
+        [this, hostPtr, coherent](VkDeviceSize off, VkDeviceSize len, bool isReuse) {
+            lastGrantValid_ = true;
+            lastGrantReuse_ = isReuse;
+            lastGrantLen_ = len;
+            if (!hostPtr) {
+                ++reuseFillSkipped_;
+                return;
+            }
+            const ReuseFillPolicy& pol = reuseFillPolicy();
+            if (!pol.always && !isReuse) return;  // fresh pages are driver-zero
+            std::memset(static_cast<char*>(hostPtr) + off, pol.fill, static_cast<size_t>(len));
+            if (!coherent) ++reuseFillUnflushed_;  // tripwire: selection forces coherent
+            reuseFillBytes_ += len;
+            if ((++reuseFillEvents_ % 4096) == 0) {
+                VVM_LOG_DEBUG("reuse-fill: {} events, {} MiB zeroed, {} skipped-device-local, {} unflushed",
+                              reuseFillEvents_, reuseFillBytes_ / (1024 * 1024),
+                              reuseFillSkipped_, reuseFillUnflushed_);
+            }
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -2836,6 +2949,69 @@ void UnifiedMemoryPoolImpl::trim() {
 // Private Helpers
 // ============================================================================
 
+// Transfer queue selection shared by copyBuffer/fillBufferSync.
+static void pickTransferQueue(const DeviceConfig& cfg, VkQueue* queue, uint32_t* family) {
+    *queue = cfg.transferQueue != VK_NULL_HANDLE ? cfg.transferQueue : cfg.graphicsQueue;
+    *family = cfg.transferQueueFamily != UINT32_MAX ? cfg.transferQueueFamily
+                                                    : cfg.graphicsQueueFamily;
+}
+
+// Synchronous vkCmdFillBuffer over [0, size) of buf. Transient command pool
+// per call (mirrors copyBuffer): no init dependency, no teardown races.
+// Size MUST be a non-zero multiple of 4 (VUID-vkCmdFillBuffer); the caller
+// enforces it. Holds the pool mutex across submit+wait by design: fills are
+// threshold-bounded smalls (<= VVM_ZERO_SMALL_BYTES), so the wait is
+// microseconds of GPU time plus submit overhead.
+static bool fillBufferSync(VkDevice device, VkQueue queue, uint32_t family,
+                           VkBuffer buf, VkDeviceSize size, uint32_t pattern) {
+    if (!device || queue == VK_NULL_HANDLE || buf == VK_NULL_HANDLE || size == 0 ||
+        (size % 4) != 0) {
+        return false;
+    }
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandPoolCreateInfo cp{};
+    cp.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    cp.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    cp.queueFamilyIndex = family;
+    if (vkCreateCommandPool(device, &cp, nullptr, &pool) != VK_SUCCESS) return false;
+    VkCommandBufferAllocateInfo cba{};
+    cba.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cba.commandPool = pool;
+    cba.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cba.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    bool ok = (vkAllocateCommandBuffers(device, &cba, &cmd) == VK_SUCCESS);
+    if (ok) {
+        VkCommandBufferBeginInfo bi{};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        ok = (vkBeginCommandBuffer(cmd, &bi) == VK_SUCCESS);
+        if (ok) {
+            vkCmdFillBuffer(cmd, buf, 0, size, pattern);
+            ok = (vkEndCommandBuffer(cmd) == VK_SUCCESS);
+        }
+    }
+    VkFence done = VK_NULL_HANDLE;
+    if (ok) {
+        VkFenceCreateInfo fi{};
+        fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        ok = (vkCreateFence(device, &fi, nullptr, &done) == VK_SUCCESS);
+    }
+    if (ok) {
+        VkSubmitInfo si{};
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cmd;
+        ok = (vkQueueSubmit(queue, 1, &si, done) == VK_SUCCESS);
+    }
+    if (ok) {
+        ok = (vkWaitForFences(device, 1, &done, VK_TRUE, UINT64_MAX) == VK_SUCCESS);
+    }
+    if (done) vkDestroyFence(device, done, nullptr);
+    vkDestroyCommandPool(device, pool, nullptr);
+    return ok;
+}
+
 std::optional<Allocation> UnifiedMemoryPoolImpl::subAllocate(VkDeviceSize size,
                                                           VkDeviceSize alignment,
                                                           uint32_t blockIndex,
@@ -2845,6 +3021,7 @@ std::optional<Allocation> UnifiedMemoryPoolImpl::subAllocate(VkDeviceSize size,
         VVM_LOG_ERROR("Block {} has no buddy allocator", blockIndex);
         return std::nullopt;
     }
+    lastGrantValid_ = false;  // arm the device-fill record below
     
     // Align size
     size = alignUp(size, alignment);
@@ -2868,7 +3045,9 @@ std::optional<Allocation> UnifiedMemoryPoolImpl::subAllocate(VkDeviceSize size,
     // Create buffer with the caller's usage flags (device address is added when
     // enabled at pool creation; buffers in a shared block are NOT exportable),
     // bound into the block at the buddy-assigned offset.
-    uint64_t usageBits = static_cast<uint64_t>(usage);
+    // TRANSFER_DST is always added: pool buffers must accept transfer fills
+    // (reuse-fill hardening) and copies; universally supported, benign.
+    uint64_t usageBits = static_cast<uint64_t>(usage) | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     if (config_.enableDeviceAddress) {
         usageBits |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
@@ -2887,6 +3066,35 @@ std::optional<Allocation> UnifiedMemoryPoolImpl::subAllocate(VkDeviceSize size,
         return std::nullopt;
     }
     VkBuffer buffer = reinterpret_cast<VkBuffer>(bufHandle);
+
+    // Device-local small-grant fill (floor hardening): the buddy hook cannot
+    // memset what it cannot map. If the just-completed grant was
+    // sub-threshold, fill the committed region via transfer queue BEFORE the
+    // buffer is handed out. Fill failure fails the allocation (deallocate +
+    // nullopt): handing out known-stale memory would defeat the mechanism.
+    if (lastGrantValid_) {
+        const bool devLocal = !block.isHostVisible;
+        const ReuseFillPolicy& pol = reuseFillPolicy();
+        const bool want = pol.threshold > 0 && (pol.always || lastGrantReuse_);
+        lastGrantValid_ = false;
+        if (devLocal && want) {
+            if (size < 4 || (size % 4) != 0) {
+                ++reuseFillUnaligned_;  // vkCmdFillBuffer needs 4-byte units
+            } else {
+                VkQueue queue = VK_NULL_HANDLE;
+                uint32_t family = 0;
+                pickTransferQueue(deviceConfig_, &queue, &family);
+                if (queue == VK_NULL_HANDLE ||
+                    !fillBufferSync(device_, queue, family, buffer, size, pol.fill32())) {
+                    VVM_LOG_ERROR("reuse-fill: device-local fill failed (block {}, size {})",
+                                  blockIndex, size);
+                    block.buddy->deallocate(offset, size);
+                    return std::nullopt;
+                }
+                reuseFillDeviceBytes_ += size;
+            }
+        }
+    }
 
     block.used += size;
 
