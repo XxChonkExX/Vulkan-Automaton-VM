@@ -684,3 +684,29 @@ DPO-merged base.
 NOTE: this entire class (1-5) is loader logic, hardware-independent; the
 phantom-RAM leak and the 4GB allocation wall ARE driver-side (RADV/amdgpu
 GTT) -- both real, separate root causes that co-occurred tonight.
+
+## 2026-09-30: allocator small-chunk hardening hypothesis (operator war story)
+OPERATOR EXPERIENCE: near-zero/NaN events in past training runs clustered
+at LARGE->SMALL BLOCK TRANSITIONS (bucket ladder steps), producing skips,
+NaNs, and near-zero guard triggers.
+UNIFIED MECHANISM HYPOTHESIS (strix, from operator's account + our data):
+fresh VK pages are zero; REUSED pool blocks are not. At size-class
+transitions (32k->512->256 chunks; block churn in accumulation cycles),
+freed blocks carry stale values. Any consumer assuming zeroed memory
+(optimizer states via empty+accumulate, scratch, bf16 prefix caches)
+receives garbage -> near-zero noise / inf patterns -> NaN guards ->
+chunk skips. Fresh runs = fresh pages = zeros = clean; long/fragmented
+runs = reuse = NaNs. EXACTLY the "run-dependent transients" signature of
+the 68 banked NaN dumps (bisect_nan was inconclusive on content-vs-state
+because the state was the ALLOCATOR'S, not the content's).
+HARDENING PLAN (fix candidates, measure first via live_histogram):
+ 1. CHONK_DEBUG_FILL=nan|pattern -- poison freed blocks in debug runs;
+    any stale-memory consumer screams on first contact.
+ 2. Zero-on-transition: memset blocks at size-class handoff (or always
+    zero sub-1MB allocations -- cheap for smalls, per operator's
+    small-chunk floor instinct).
+ 3. Uninitialized-buffer audit: enumerate empty()/view paths whose
+    consumers assume zeros; make them explicit torch.zeros.
+RELATED: the A4 GTT-growth anomaly is measured next with slab_stats;
+if free-chunk fragmentation under small-object churn is confirmed, the
+same fix pass addresses both bloat and stale-reuse.

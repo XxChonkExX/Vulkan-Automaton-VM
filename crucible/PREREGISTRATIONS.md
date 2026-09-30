@@ -76,3 +76,57 @@ rotation without amplification = pure-geometry claim. OUTCOME: ________
 If 14800 breaks the abstention band, the direction story PREDICTS lower
 projection mass on the same probes. Committed before results. OUTCOME:
 ________
+
+## PR-7 novelty-response battery (2026-09-29; b70-box, adopted strix)
+Structured exposure (+contrast) vs raw pretraining incidence as the
+independent variable ("nurturing," not exposure-vs-none). 20 novel-dark
++ 20 matched familiar probes, unseen by all trainings. Metrics per arm:
+hedge delta, verbosity delta, refusal volatility (temp 1.0 xN spread),
+register-collapse coding (dual-coded). Prediction: curriculum arms flat,
+base spiky, DPO-only intermediate. OUTCOME: ________
+
+## PR-8 theory-bridge alignment (2026-09-30; b70-box proposal, strix T2)
+Pehlevan-lab ICL alignment quantity (arXiv:2509.26551 pretrain-test
+alignment) operationalized over (training-lane distribution x abstained-
+probe category) per arm. First-pass operationalization: alignment(arm,
+category) = normalized share of arm training rows in lanes whose dominant
+epistemic register matches the category. PREDICTION (registered before
+computation): abstention threshold is MONOTONE (Spearman) in alignment
+across the 6+1 arms x 9 categories -- turns "same knob, threshold shaped
+by training data" into a fitted relation. Attribution: Letey/Lu/Pehlevan/
+Zavatone-Veth formulae; T1 (effective-context carryover fit) is
+b70-box's; T2 (alignment fit) is strix's; fits exchanged at draft time.
+OUTCOME: ________
+
+## PR-8 addendum: three-quantity ladder (2026-09-30; b70-box, adopted)
+Full resolvent machinery (e_misalign with F_k, sigma, lambda_tilde,
+kappa) STATED-PASSED at d=9 (performative precision; boundary noted).
+Computed instead, per their Fig 3 nonlinear-validity ladder:
+(1) lane-share alignment (pre-registered null, stands);
+(2) simple Ansatz spiked-test form: misalign_c = (C_train^-1)_cc,
+    C_train = arm lane-share matrix; prediction: category abstention
+    rate MONOTONE DECREASING in misalign_c per arm;
+(3) CKA replicating their ordering.
+PRE-REGISTERED ORDERING: Spearman fidelity lane-share ~= Ansatz > CKA;
+CKA winning on our data = genuine deviation from their nonlinear result,
+reported as such. OUTCOME: ________
+
+## PR-9 knob atlas + attention lensing (2026-09-30; b70-box proposal, strix co-registered)
+Per concept axis (abstention, refusal, good/evil framing, violence
+register, tone, ending): (1) direction extraction; (2) steering
+dose-response; (3) ABLATION FLIP-TEST as the false-positive gate
+(correlation = candidate, causal flip = knob -- the decoy lesson
+institutionalized); (4) dissociation matrix (steer A, measure all;
+off-diagonals flat = true knobs). STRIX AMENDMENTS, co-registered:
+(a) rung 3 specifies BIDIRECTIONAL flip (install AND remove); (b) rung 4
+flatness criterion: off-diagonal effect < 20% of diagonal effect.
+ATTENTION LENSING (operator-coined; training-time value-asymmetric
+salience; adjacent families all inference-time/factual/vision -- the
+training-time/value-asymmetric/text cell is unoccupied): per-token loss
+weighting (corpus-v2 arm 2) + inference head-steering. STRIX AMENDMENT:
+dose ladder pre-registered (weight ratios as the independent variable,
+not one point) + held-out transfer set (effect must transfer to
+unweighted evil-content probes). CAUSAL LINK: the lensing arm perturbs
+C_train deliberately -> PR-8's alignment-threshold relation gets a
+causal test (predicted threshold shift from known C_train shift).
+OUTCOME: ________
