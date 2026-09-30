@@ -710,3 +710,21 @@ HARDENING PLAN (fix candidates, measure first via live_histogram):
 RELATED: the A4 GTT-growth anomaly is measured next with slab_stats;
 if free-chunk fragmentation under small-object churn is confirmed, the
 same fix pass addresses both bloat and stale-reuse.
+
+## 2026-09-30: allocator hardening LANDED + evaluated (e209943/cd98175/b708ed2)
+Landed by b70-box per the stale-reuse plan; evaluated + integrated strix:
+- zero-fill on sub-1MB REUSE grants (VVM_ZERO_SMALL_BYTES=1048576,
+  MODE=reuse -- fresh pages already zero, so no wasted bandwidth);
+- knobs: =0 for clean A/B vs pre-update; CHONK_DEBUG_FILL=pattern|nan
+  poison mode; VVM_ZERO_SMALL_MODE=always escape.
+- Rebuilt from build/ tree, _build refreshed (the stale-August .so trap
+  noted: import path served old code silently), ctest 4/4 green
+  (buddy/slab/pool/alloc/place), 3 VVM_ZERO refs verified in binary.
+- REGIME CHANGE: pre/post-update NaN-transient metrics are NOT
+  comparable -- the update kills the mechanism the 68 dumps measured.
+  Allocator hash goes into run manifests from here (b708ed2).
+- CAUSAL TEST REGISTERED (follow-up): same training config twice,
+  VVM_ZERO_SMALL_BYTES=0 vs default, compare NaN-skip rates -- the
+  stale-reuse hypothesis's controlled experiment.
+- Bundled operator fd fix (int->intptr_t, Win32 HANDLE) reviewed and
+  accepted in-slab; torch-slab provider-side memset staged as follow-up.
