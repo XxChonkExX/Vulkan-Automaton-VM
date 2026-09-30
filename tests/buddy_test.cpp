@@ -372,6 +372,101 @@ int main() {
         CHECK(al.checkInvariants());
     }
 
+    // --- 17. Fail reasons: FULL vs FRAGMENTED vs TOO_LARGE vs INVALID ---
+    {
+        BuddyAllocator fr(kBlock, kMin);
+        using FR = BuddyAllocator::FailReason;
+        CHECK(fr.lastFailReason() == FR::None);  // fresh allocator, no attempt yet
+
+        auto g1 = fr.allocate(256 * 1024);   // @0
+        auto g2 = fr.allocate(256 * 1024);   // @256K
+        auto g3 = fr.allocate(256 * 1024);   // @512K
+        CHECK(g1 && g2 && g3);
+        CHECK(fr.lastFailReason() == FR::None);  // success leaves None
+        fr.deallocate(*g2, 256 * 1024);      // free middle: 256K@256K + 256K@768K
+        // 300 KB request: total free (512 KB) suffices, largest (256 KB) does not.
+        CHECK(!fr.allocate(300 * 1024).has_value());
+        CHECK(fr.lastFailReason() == FR::Fragmented);
+        CHECK(fr.checkInvariants());  // failed attempt changed nothing
+        // Fill the rest: now genuinely full.
+        auto g4 = fr.allocate(256 * 1024);
+        auto g5 = fr.allocate(256 * 1024);
+        CHECK(g4 && g5);
+        CHECK(!fr.allocate(256 * 1024).has_value());
+        CHECK(fr.lastFailReason() == FR::Full);
+        // Oversize beyond the block.
+        CHECK(!fr.allocate(2 * kBlock).has_value());
+        CHECK(fr.lastFailReason() == FR::TooLarge);
+        // Recovery clears the reason on next success.
+        fr.deallocate(*g4, 256 * 1024);
+        CHECK(fr.allocate(256 * 1024).has_value());
+        CHECK(fr.lastFailReason() == FR::None);
+    }
+
+    // --- 18. Zero-size, oversize, and uninitialized allocators ---
+    {
+        using FR = BuddyAllocator::FailReason;
+        BuddyAllocator z(kBlock, kMin);
+        CHECK(!z.allocate(0).has_value());
+        CHECK(z.lastFailReason() == FR::InvalidSize);
+        CHECK(z.checkInvariants());  // no state touched
+        CHECK(!z.allocateAligned(0, 512 * 1024).has_value());
+        // Bad constructor args -> invalid allocator, Uninitialized on use.
+        BuddyAllocator bad(1000, 256);
+        CHECK(!bad.isValid());
+        CHECK(!bad.allocate(128).has_value());
+        CHECK(bad.lastFailReason() == FR::Uninitialized);
+        CHECK(!bad.allocateAligned(128, 512).has_value());
+        CHECK(bad.lastFailReason() == FR::Uninitialized);
+    }
+
+    // --- 5b. Size-mismatch free still frees the recorded grant ---
+    {
+        BuddyAllocator sm(kBlock, kMin);
+        auto m = sm.allocate(256 * 1024);
+        CHECK(m.has_value());
+        sm.deallocate(*m, 128 * 1024);  // wrong size: warns, frees recorded grant
+        CHECK(sm.getLargestFree() == kBlock);
+        CHECK(sm.checkInvariants());
+    }
+
+    // --- 19. Reuse-fill hook: sub-threshold grants reported with reuse flag ---
+    {
+        BuddyAllocator rf(kBlock, kMin);
+        struct Hit { VkDeviceSize off, len; bool reuse; };
+        std::vector<Hit> hits;
+        rf.setReuseFill(1 * 1024 * 1024, [&](VkDeviceSize o, VkDeviceSize l, bool r) {
+            hits.push_back({o, l, r});
+        });
+        auto h1 = rf.allocate(100 * 1024);   // < 1 MB threshold, fresh block
+        CHECK(h1.has_value() && *h1 == 0);
+        CHECK(hits.size() == 1);
+        CHECK(!hits[0].reuse);               // first grant of offset 0: fresh
+        CHECK(hits[0].len == 256 * 1024);    // granted rounded to minSize_
+        rf.deallocate(*h1, 0);
+        auto h2 = rf.allocate(100 * 1024);   // same range again
+        CHECK(h2.has_value() && *h2 == 0);
+        CHECK(hits.size() == 2);
+        CHECK(hits[1].reuse);                // offset 0 granted before: reuse
+        rf.deallocate(*h2, 0);
+        auto big = rf.allocate(1 * 1024 * 1024);  // == threshold: no callback (strict <)
+        CHECK(big.has_value());
+        CHECK(hits.size() == 2);
+        CHECK(!rf.allocate(1 * 1024 * 1024).has_value());  // block full now
+        CHECK(rf.lastFailReason() == BuddyAllocator::FailReason::Full);
+        rf.deallocate(*big, 1 * 1024 * 1024);
+        rf.clearReuseFill();
+        auto last = rf.allocate(100 * 1024);
+        CHECK(last.has_value());
+        CHECK(hits.size() == 2);             // hook off: silent
+        CHECK(rf.checkInvariants());
+        rf.deallocate(*last, 0);
+        CHECK(rf.getLargestFree() == kBlock);
+        CHECK(rf.checkInvariants());
+        rf.deallocate(*big, 2 * 1024 * 1024);
+        CHECK(rf.getLargestFree() == kBlock);
+    }
+
     if (failures == 0) {
         std::printf("=== ALL BUDDY TESTS PASSED (0 failures) ===\n");
         return 0;

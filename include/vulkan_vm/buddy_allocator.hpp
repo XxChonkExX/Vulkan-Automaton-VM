@@ -4,6 +4,8 @@
 #include <vector>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
+#include <functional>
 #include <set>
 #include <cstdint>
 #include <cassert>
@@ -54,6 +56,29 @@ public:
 
     VkDeviceSize getLargestFree() const;
     float getFragmentation() const;
+    // Why the last allocate()/allocateAligned() failed. One line of state that
+    // turns every OOM you've debugged blind into a single log read.
+    // Auto-reset at the start of each allocation attempt.
+    enum class FailReason { None, Uninitialized, InvalidSize, TooLarge, Full, Fragmented };
+    FailReason lastFailReason() const;
+
+    // Reuse-fill hook: small-chunk floor hardening (upstream plan
+    // OPTIMIZATION_LOG 2026-09-30 item 2 -- "always zero sub-1MB
+    // allocations"). The buddy layer owns offset math, not memory contents,
+    // so it cannot memset itself; instead it reports every grant below
+    // `thresholdBytes` to a pool-layer callback as (offset, len, isReuse),
+    // where isReuse = this exact start offset has been granted before.
+    // Fresh pages are zero; reused blocks are not -- the pool binds this
+    // hook to its memset path and decides policy (zero-on-reuse vs
+    // always-zero-smalls). Off by default (threshold 0); zero overhead
+    // when unset -- including no reuse-history tracking. Reuse history is
+    // bounded by construction: at most blockSize_/minSize_ entries, and it
+    // is only maintained while the hook is armed (at 1 KB granularity over
+    // 24 GB that bound would be ~24M entries, so an unarmed allocator must
+    // not pay for it).
+    using ReuseFillFn = std::function<void(VkDeviceSize offset, VkDeviceSize len, bool isReuse)>;
+    void setReuseFill(VkDeviceSize thresholdBytes, ReuseFillFn fn);
+    void clearReuseFill();
     // Internal fragmentation: sum(granted - requested) over live allocations.
     // Near zero with exact-fit grants (granularity waste only).
     size_t internalWasteBytes() const;
@@ -101,7 +126,9 @@ private:
 
     // Decompose the region [offset, offset+len) into buddy-aligned power-of-two
     // chunks and push each onto its free list, coalescing as we go. Both offset
-    // and len must be multiples of minSize_. This is the unified free path: a
+    // and len must be multiples of minSize_ -- ENFORCED fail-soft at entry
+    // (contract violation logs and pushes nothing, so free accounting can
+    // never silently exceed reality). This is the unified free path: a
     // full power-of-two grant decomposes to a single chunk (identical to the
     // classic buddy free), while exact-fit grants decompose into O(log) chunks.
     void pushFreeRange(VkDeviceSize offset, VkDeviceSize len);
@@ -138,6 +165,13 @@ private:
     // Optional thread-safety
     mutable std::mutex mutex_;
     bool threadSafe_ = false;
+
+    FailReason lastFailReason_ = FailReason::None;
+
+    VkDeviceSize reuseFillThreshold_ = 0;  // 0 = hook disabled
+    ReuseFillFn reuseFillFn_;
+    // Every start offset ever granted (bounded: <= blockSize_/minSize_).
+    std::unordered_set<VkDeviceSize> everGranted_;
 
     // Thread-safe wrapper helpers
     template<typename Func>

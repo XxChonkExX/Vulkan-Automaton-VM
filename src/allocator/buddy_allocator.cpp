@@ -93,19 +93,45 @@ std::optional<VkDeviceSize> BuddyAllocator::splitTo(int order, int targetOrder) 
 
 std::optional<VkDeviceSize> BuddyAllocator::allocate(VkDeviceSize size) {
     return withLock([this, size]() -> std::optional<VkDeviceSize> {
+        lastFailReason_ = FailReason::None;
         return allocateUnlocked(size);
+    });
+}
+
+BuddyAllocator::FailReason BuddyAllocator::lastFailReason() const {
+    return withLock([this]() { return lastFailReason_; });
+}
+
+void BuddyAllocator::setReuseFill(VkDeviceSize thresholdBytes, ReuseFillFn fn) {
+    withLock([this, thresholdBytes, fn]() {
+        reuseFillThreshold_ = thresholdBytes;
+        reuseFillFn_ = std::move(fn);
+    });
+}
+
+void BuddyAllocator::clearReuseFill() {
+    withLock([this]() {
+        reuseFillThreshold_ = 0;
+        reuseFillFn_ = nullptr;
     });
 }
 
 std::optional<VkDeviceSize> BuddyAllocator::allocateUnlocked(VkDeviceSize size) {
     if (maxOrder_ < 0) {
         VVM_LOG_ERROR("BuddyAllocator: not properly initialized");
+        lastFailReason_ = FailReason::Uninitialized;
         return std::nullopt;
     }
-    if (size == 0) return std::nullopt;
+    if (size == 0) {
+        lastFailReason_ = FailReason::InvalidSize;
+        return std::nullopt;
+    }
 
     int target = sizeToOrder(size);
-    if (target < 0) return std::nullopt;
+    if (target < 0) {
+        lastFailReason_ = FailReason::TooLarge;
+        return std::nullopt;
+    }
 
     // Find the smallest order >= target that has a free block.
     int order = target;
@@ -113,6 +139,17 @@ std::optional<VkDeviceSize> BuddyAllocator::allocateUnlocked(VkDeviceSize size) 
         ++order;
     }
     if (order > maxOrder_) {
+        // Distinguish true-full from fragmented: memory exists but no
+        // single block fits the request.
+        VkDeviceSize total = 0, largest = 0;
+        for (int o = 0; o <= maxOrder_; ++o) {
+            if (!freeLists_[o].empty()) {
+                total += orderToSize(o) * static_cast<VkDeviceSize>(freeLists_[o].size());
+                largest = orderToSize(o);  // orders ascend: last nonempty is largest
+            }
+        }
+        lastFailReason_ = (total >= size && largest < size) ? FailReason::Fragmented
+                                                            : FailReason::Full;
         return std::nullopt;   // completely full
     }
 
@@ -140,19 +177,43 @@ std::optional<VkDeviceSize> BuddyAllocator::allocateUnlocked(VkDeviceSize size) 
     }
 
     allocated_[*result] = {target, granted, size};
+    // Reuse-fill hook: report sub-threshold grants (pool layer decides zeroing).
+    // everGranted_ is maintained ONLY while the hook is armed: at 1 KB
+    // granularity over a 24 GB block the set could reach ~24M entries, so
+    // an unarmed allocator must not pay for tracking it.
+    if (reuseFillFn_) {
+        const VkDeviceSize off = *result;
+        const bool isReuse = !everGranted_.insert(off).second;
+        if (granted < reuseFillThreshold_) {
+            reuseFillFn_(off, granted, isReuse);
+        }
+    }
     return result;
 }
 
 std::optional<VkDeviceSize> BuddyAllocator::allocateAligned(VkDeviceSize size, VkDeviceSize alignment) {
+    if (size == 0) {
+        // Match allocate(0): zero-size requests fail rather than granting a
+        // minSize_ block on the over-allocate path below.
+        return withLock([this]() -> std::optional<VkDeviceSize> {
+            lastFailReason_ = FailReason::InvalidSize;
+            return std::nullopt;
+        });
+    }
     if (alignment <= minSize_) {
         return allocate(size);
     }
-    if (!isPowerOfTwo(alignment) || alignment > blockSize_) {
-        return std::nullopt;
-    }
 
     return withLock([this, size, alignment]() -> std::optional<VkDeviceSize> {
-        if (maxOrder_ < 0) return std::nullopt;
+        lastFailReason_ = FailReason::None;
+        if (!isPowerOfTwo(alignment) || alignment > blockSize_) {
+            lastFailReason_ = FailReason::TooLarge;
+            return std::optional<VkDeviceSize>{};
+        }
+        if (maxOrder_ < 0) {
+            lastFailReason_ = FailReason::Uninitialized;
+            return std::optional<VkDeviceSize>{};
+        }
         VkDeviceSize granted = size < minSize_ ? minSize_ : size;
         granted = (satAddU64(granted, minSize_ - 1) / minSize_) * minSize_;
 
@@ -183,6 +244,14 @@ std::optional<VkDeviceSize> BuddyAllocator::allocateAligned(VkDeviceSize size, V
         }
 
         allocated_[aligned] = {order, granted, size};
+        // Reuse-fill hook (same contract as allocateUnlocked grants; tracked
+        // only while armed -- see note above).
+        if (reuseFillFn_) {
+            const bool isReuse = !everGranted_.insert(aligned).second;
+            if (granted < reuseFillThreshold_) {
+                reuseFillFn_(aligned, granted, isReuse);
+            }
+        }
         return aligned;
     });
 }
@@ -221,6 +290,9 @@ void BuddyAllocator::deallocate(VkDeviceSize offset, VkDeviceSize size) {
 void BuddyAllocator::coalesce(int order, VkDeviceSize offset) {
     while (order < maxOrder_) {
         const VkDeviceSize buddySize = orderToSize(order);
+        // Floor contract: coalesce only ever sees order-aligned offsets.
+        // XOR-buddy math is wrong otherwise -- fail loud, not corrupt.
+        assert(offset % buddySize == 0);
         const VkDeviceSize buddy = offset ^ buddySize;   // classic buddy address
 
         auto& set = freeLists_[order];
@@ -241,6 +313,16 @@ void BuddyAllocator::coalesce(int order, VkDeviceSize offset) {
 }
 
 void BuddyAllocator::pushFreeRange(VkDeviceSize offset, VkDeviceSize len) {
+    // Floor contract, enforced fail-soft: both offset and len must be
+    // multiples of minSize_. Every current caller upholds this (grants are
+    // minSize_-rounded by construction), so a violation means a NEW caller
+    // broke the invariant -- log loudly and push NOTHING rather than let
+    // free accounting silently exceed reality.
+    if ((offset % minSize_) != 0 || (len % minSize_) != 0) {
+        VVM_LOG_ERROR("pushFreeRange: contract violation (offset={}, len={}, minSize={}) -- range not pushed",
+                      offset, len, minSize_);
+        return;
+    }
     // Decompose [offset, offset+len) into buddy-aligned power-of-two chunks.
     // Both offset and len are multiples of minSize_ (caller contract), so every
     // chunk we carve is aligned to its own size and the XOR-buddy invariant of
@@ -255,7 +337,11 @@ void BuddyAllocator::pushFreeRange(VkDeviceSize offset, VkDeviceSize len) {
         // (unbounded for offset 0).
         VkDeviceSize alignLimit = (offset == 0) ? len : (offset & (~offset + 1));
         VkDeviceSize chunk = alignLimit < len ? alignLimit : floorPowerOfTwo(len);
-        if (chunk < minSize_) chunk = minSize_;
+        // Contract above guarantees chunk >= minSize_ (offset minSize_-aligned,
+        // len a positive minSize_ multiple). Assert the floor; never clamp --
+        // clamping upward here would overshoot the range end and corrupt
+        // free accounting.
+        assert(chunk >= minSize_);
 
         const int o = sizeToOrder(chunk);
         coalesce(o, offset);
