@@ -103,9 +103,17 @@ BuddyAllocator::FailReason BuddyAllocator::lastFailReason() const {
 }
 
 void BuddyAllocator::setReuseFill(VkDeviceSize thresholdBytes, ReuseFillFn fn) {
-    withLock([this, thresholdBytes, fn]() {
+    return withLock([this, thresholdBytes, fn]() {
         reuseFillThreshold_ = thresholdBytes;
         reuseFillFn_ = std::move(fn);
+        // Pre-size reuse history to its exact bound (blockSize_/minSize_
+        // distinct offsets max): without this, every grant in the hot path
+        // pays a node malloc + possible rehash under the pool lock. The
+        // attention/backward transient storm makes that the dominant cost
+        // of an armed hook -- far above the memset bytes themselves.
+        if (reuseFillFn_ && minSize_ > 0 && blockSize_ >= minSize_) {
+            everGranted_.reserve(static_cast<size_t>(blockSize_ / minSize_));
+        }
     });
 }
 
