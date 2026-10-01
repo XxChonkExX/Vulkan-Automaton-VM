@@ -170,6 +170,22 @@ def resolve_model():
         f"Usage: CRUCIBLE_MODEL=/path/to/model python scar_map.py <arm-name>")
 
 
+
+def _hipblas_probe():
+    """Fail-fast guard (b70-box proposal, adopted): one tiny fp32 batched
+    GEMM through hipblasLt. On gfx1151 stacks with broken library
+    resolution the rope outer-product dies at probe ~1 with an opaque
+    INVALID_VALUE; this surfaces it at launch with a clear message."""
+    import torch
+    try:
+        a = torch.randn(8, 96, 1, device="cuda", dtype=torch.float32)
+        b = torch.randn(8, 1, 171, device="cuda", dtype=torch.float32)
+        (a @ b).sum().item()
+    except RuntimeError as e:
+        raise SystemExit(
+            "HIPBLAS SANITY FAIL (check HIPBLASLT_TENSILE_LIBPATH points "
+            f"at a dir containing TensileLibrary_lazy_<gfx>.dat): {e}")
+
 def main():
     os.makedirs(os.path.join(SCARS, WHICH), exist_ok=True)
     model_dir, ignore_mismatch = resolve_model()
@@ -181,6 +197,7 @@ def main():
     model = Gemma4ForConditionalGeneration.from_pretrained(
         model_dir, dtype=DTYPE, device_map=dev, **kw)
     model.eval()
+    _hipblas_probe()
 
     probes = load_probes()
     print(f"[{WHICH}] {len(probes)} probes", flush=True)
