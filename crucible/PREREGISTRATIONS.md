@@ -10,7 +10,18 @@ replicates SFT-cannot-heal; (b) 0.15+ => contradiction, dataset diff
 follows. Preliminary 13600 = 0.174 occupies (b); 14800 is the replication.
 math: predicted wobble not trend (n=50 CI wide). fp: holds ~0.7 if
 dose-dependent premise scar; dips like heal2 (0.417) if SFT-inherent.
-OUTCOME (2026-09-29): CONTRADICTION BRANCH REPLICATED -- 14800 = 12/69,
+OUTCOME (2026-09-29): CONTRADICTION BRANCH REPLICATED -- 14800 = 12/69
+SETDIFF FOLLOWS (2026-09-30, prompt-only micro-SFT, OLD text, 300 rows
+x ~4 epochs, all epistemic content scrubbed): unk_idk 5/69 = healed-band.
+Fork (a) rejected at micro dose: agency/role framing ALONE does not
+restore abstention. Fork reading: instruction story insufficient; the
+data story (GM-uncertainty + prose-hedging lanes, or the persona in
+full-data context) advances. Abstained items (crit, nextroll, pocket,
+rng, wearing) are chance-flavored/easy cases, none in the hard
+categories (epistemic/hidden/expertise/metaphysical all silent).
+Premise held 16/24 (no dose scar): the premise scar is HEAVY-SFT-
+specific, not prompt-driven. Branch disposed per operator ruling
+(transcripts + verdict kept); NEW text remains the only forward prompt.,
 third independent line at exactly 0.174. SFT-cannot-heal does not hold
 for XTX data; category-coverage set-diff is first-order. fp held 0.667
 (premise scar = heavy-SFT-specific). math declined monotonically
@@ -129,4 +140,41 @@ not one point) + held-out transfer set (effect must transfer to
 unweighted evil-content probes). CAUSAL LINK: the lensing arm perturbs
 C_train deliberately -> PR-8's alignment-threshold relation gets a
 causal test (predicted threshold shift from known C_train shift).
+OUTCOME: ________
+
+## PR-10 cross-family disposition fingerprint (2026-09-30; operator + XTX observation, strix registration)
+Observation (atlas, verified from raw data): all 7 Gemma4 arms carry a
+mid-band abstention consensus at L23-32 (48-67% depth; band-mass 42-47%
+in every arm regardless of training method); method modulates LATE-band
+access (DPO-lineage spike-over-plateau; SFT-family spike~plateau).
+PREDICTION, registered before extraction: Granite-30B arms (official +
+abliterated/SFT line, from the campaign archive) show the same mid-band
+consensus at PROPORTIONAL DEPTH (60-layer family predicts consensus
+~L29-40, i.e., 48-67% of depth), with the SFT-trained arm showing
+spike~plateau. Confirmation = disposition-as-fingerprint generalizes
+across families; absence or depth-shifted band = Gemma4-specific,
+reported as such. Qwen-27B family = second cross-family point when
+convenient. No GPU until n5 repair completes.
+OUTCOME: ________
+
+## PR-11 valence-band measurement (2026-09-30; operator proposal, strix design)
+Extend the consensus-band methodology from abstention to MORAL VALENCE
+(operator: "measure good/evil behaviors like the abstention band --
+heretic-style multi-direction measurement at depth"). Design: matched-
+pair probe set (same scenario, heroic vs cruel framing; substrate =
+b70-box's matched good/evil lanes from the salience PR), extract
+per-layer valence directions per arm via the existing instrument
+(prompt-class contrast: mean(good-cue residuals) - mean(evil-cue)),
+then the two questions that made abstention a finding:
+(a) RESIDENCE: is there a cross-arm consensus band (cos at matched
+    layers), and at what depth?
+(b) ACCESS: does the access profile differ by lineage (our corpus-SFT
+    line vs XTX's dark-trained line vs official)?
+PRE-REGISTERED FORKS: (i) valence is banded like abstention (mid-band
+residence, method-dependent access) -> "concept residence is
+architectural" generalizes beyond epistemic concepts; (ii) valence is
+DIFFUSE (no sharp band, broad low-cos) -> valence is distributed where
+epistemics are localized -- itself a finding, and it predicts lensing
+the valence axis will be harder to steer. Slots after PR-10 (Granite);
+same instrument, second probe class.
 OUTCOME: ________
