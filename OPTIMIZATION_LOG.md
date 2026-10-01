@@ -728,3 +728,12 @@ Landed by b70-box per the stale-reuse plan; evaluated + integrated strix:
   stale-reuse hypothesis's controlled experiment.
 - Bundled operator fd fix (int->intptr_t, Win32 HANDLE) reviewed and
   accepted in-slab; torch-slab provider-side memset staged as follow-up.
+
+## 2026-10-01: cuda double residency -> standing guard (operator doctrine)
+Operator: "watch for ghosts/doubles -- wrappers, verbage, racing
+ourselves." Codified as cuda_residency.py (python/vulkanvm_torch):
+storage-level byte audit (dedupe by data_ptr: tied weights count once,
+live duplicates count twice) + single-flight process lock. Call audit()
+at post-load / post-wrap / post-merge with expected_gb; warn_ratio 1.25.
+Known-legit double: EMA shadow (allowlist). The unified+text 51GB
+double-load is the case that motivated it (caught mid-run, fixed).
