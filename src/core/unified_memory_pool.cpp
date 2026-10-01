@@ -1113,6 +1113,22 @@ bool UnifiedMemoryPoolImpl::wouldExceedBudget(VkDeviceSize additionalBytes) cons
         return true;
     }
 
+    // BUDGET-TRUTH LOG: fires on EVERY wouldExceedBudget call when
+    // CHONK_BUDGET_LOG=1, before any cap gates. If heapBudget claims
+    // headroom while sysfs GTT is exhausted, the extension feeds false
+    // abundance (b70-box 049 point 2).
+    static const bool budgetTruthLog = []() {
+        const char* e = getenv("CHONK_BUDGET_LOG");
+        return e && e[0] == '1';
+    }();
+    if (budgetTruthLog) {
+        FILE* gttf = fopen("/sys/class/drm/card1/device/mem_info_gtt_used", "r");
+        long sysfsGtt = -1;
+        if (gttf) { if (fscanf(gttf, "%ld", &sysfsGtt) != 1) sysfsGtt = -1; fclose(gttf); }
+        VVM_LOG_INFO("BUDGET-TRUTH: pool={}MB +req={}MB | sysfs_gtt_used={}MB",
+                     currentPool / (1024 * 1024), additionalBytes / (1024 * 1024),
+                     sysfsGtt / (1024 * 1024));
+    }
     // Heap-fraction cap (VK_EXT_memory_budget / hipMemGetInfo when available).
     if (config_.maxHeapFraction > 0.0f) {
         VkDeviceSize heapBudget = 0;
@@ -1156,6 +1172,7 @@ bool UnifiedMemoryPoolImpl::wouldExceedBudget(VkDeviceSize additionalBytes) cons
         // reservedBytes_ counts as committed here: the driver-reported usage
         // cannot see memory we intend to allocate but haven't yet.
         const VkDeviceSize cap = static_cast<VkDeviceSize>(heapSize * config_.maxHeapFraction);
+
         if (satAddU64(satAddU64(heapUsed, reservedBytes_), additionalBytes) > cap) {
             VVM_LOG_WARN("budget: heap usage {} MB + {} MB would exceed {} MB ({}% of {} MB cap); allocate() failing soft instead of stealing VRAM",
                          heapUsed / (1024 * 1024), additionalBytes / (1024 * 1024),
